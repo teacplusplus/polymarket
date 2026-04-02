@@ -161,9 +161,21 @@ pub async fn fetch_order_filled_events_for_range(
     t_min_sec: i64,
     t_max_sec: i64,
 ) -> anyhow::Result<Vec<OrderFilledRow>> {
+    crate::poly_trace::api_line(
+        "GraphQL (Goldsky orderbook subgraph)",
+        &format!(
+            "POST {ORDERBOOK_SUBGRAPH_URL} orderFilledEvents where asset={asset_id} timestamp in [{t_min_sec}, {t_max_sec}] sec (paginated)"
+        ),
+    );
     let mut out = Vec::new();
     let mut cursor_ts = t_min_sec;
     loop {
+        crate::poly_trace::api_line(
+            "GraphQL page",
+            &format!(
+                "orderFilledEvents first={SUBGRAPH_PAGE} orderBy=timestamp asc cursor_ts={cursor_ts} tmax={t_max_sec}"
+            ),
+        );
         let query = r#"
             query Fills($first: Int!, $tmin: BigInt!, $tmax: BigInt!, $asset: String!) {
               orderFilledEvents(
@@ -171,11 +183,17 @@ pub async fn fetch_order_filled_events_for_range(
                 orderBy: timestamp
                 orderDirection: asc
                 where: {
-                  timestamp_gte: $tmin
-                  timestamp_lte: $tmax
                   or: [
-                    { makerAssetId: $asset }
-                    { takerAssetId: $asset }
+                    {
+                      timestamp_gte: $tmin
+                      timestamp_lte: $tmax
+                      makerAssetId: $asset
+                    }
+                    {
+                      timestamp_gte: $tmin
+                      timestamp_lte: $tmax
+                      takerAssetId: $asset
+                    }
                   ]
                 }
               ) {
@@ -256,6 +274,18 @@ pub async fn fetch_asset_snapshot(
     clob: &clob::Client,
     asset_id: &str,
 ) -> anyhow::Result<ApiAssetSnapshot> {
+    crate::poly_trace::api_line(
+        "Gamma (SDK gamma::Client)",
+        &format!(
+            "markets(MarketsRequest {{ clob_token_ids: [{asset_id}], include_tag: true, limit: 10 }}) — базовый URL из polymarket-client-sdk"
+        ),
+    );
+    crate::poly_trace::api_line(
+        "CLOB (SDK clob::Client)",
+        &format!(
+            "tick_size({asset_id}) + price_history(market={asset_id}, Interval::Max, fidelity=60) — базовый URL из polymarket-client-sdk"
+        ),
+    );
     let mut errors = Vec::new();
     let token_id: U256 = asset_id
         .trim()

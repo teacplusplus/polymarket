@@ -28,7 +28,12 @@ pub type MarketSnapshotBuffer = HashMap<String, HashMap<String, Vec<MarketSnapsh
 /// Мутации буфера — на `RwLockWriteGuard<MarketSnapshotBuffer>`.
 pub trait MarketSnapshotBufferMut {
     fn push_snapshot(&mut self, snapshot: MarketSnapshot);
-    fn drain_aggregated_snapshots(&mut self, timestamp_ms: i64) -> Vec<MarketSnapshot>;
+    /// `trace_frame_group`: индекс группы кадров (0..3) для `POLY_TRACE`, иначе `None`.
+    fn drain_aggregated_snapshots(
+        &mut self,
+        timestamp_ms: i64,
+        trace_frame_group: Option<usize>,
+    ) -> Vec<MarketSnapshot>;
 }
 
 impl MarketSnapshotBufferMut for MarketSnapshotBuffer {
@@ -41,7 +46,11 @@ impl MarketSnapshotBufferMut for MarketSnapshotBuffer {
         bucket.push(snapshot);
     }
 
-    fn drain_aggregated_snapshots(&mut self, timestamp_ms: i64) -> Vec<MarketSnapshot> {
+    fn drain_aggregated_snapshots(
+        &mut self,
+        timestamp_ms: i64,
+        trace_frame_group: Option<usize>,
+    ) -> Vec<MarketSnapshot> {
         let mut collected = Vec::new();
         for by_asset in self.values_mut() {
             for events in by_asset.values_mut() {
@@ -53,6 +62,9 @@ impl MarketSnapshotBufferMut for MarketSnapshotBuffer {
                     collected.push(aggregated_snapshot);
                 }
             }
+        }
+        if let Some(group) = trace_frame_group {
+            crate::poly_trace::buffer_drain(group, timestamp_ms, collected.len(), &collected);
         }
         collected
     }

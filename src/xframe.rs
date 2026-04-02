@@ -7,7 +7,6 @@ use xframe_features::FeatureLen;
 use xframe_features_derive::XFeatures;
 
 pub const SIZE: usize = 13;
-const WINDOW_MS: i64 = 60_000;
 
 /// Кадр признаков по одному ассету: состояние стакана и сделок на момент снапшота плюс лаги по последним `N` предыдущим кадрам (от ближайшего по времени к более ранним).
 ///
@@ -69,7 +68,7 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub delta_n_trade_side: [Option<i8>; N],
-    /// Число buy-сделок за скользящее окно `WINDOW_MS` мс по ключам кадров (wall time), включая текущий бакет при наличии сделки.
+    /// Число buy-сделок за скользящее окно длины бакета (мс) по временным меткам кадров, включая текущий бакет при наличии сделки.
     #[xfeature]
     pub buy_count_window: u64,
     /// Разность `buy_count_window` с `i`-м предыдущим кадром (в штуках сделок).
@@ -100,6 +99,7 @@ impl<const N: usize> XFrame<N> {
         snapshot: MarketSnapshot,
         frames: &BTreeMap<i64, XFrame<N>>,
         event_end_ms: Option<i64>,
+        window_ms: i64,
     ) -> XFrame<N> {
         let previous = frames.values().next_back();
 
@@ -136,13 +136,18 @@ impl<const N: usize> XFrame<N> {
             trade_side,
             ..Default::default()
         };
-        frame.populate_window_metrics(frames, wall_ts_ms);
+        frame.populate_window_metrics(frames, wall_ts_ms, window_ms);
         frame.populate_deltas(frames);
         frame
     }
 
-    fn populate_window_metrics(&mut self, frames: &BTreeMap<i64, XFrame<N>>, wall_ts_ms: i64) {
-        let window_start = wall_ts_ms - WINDOW_MS;
+    fn populate_window_metrics(
+        &mut self,
+        frames: &BTreeMap<i64, XFrame<N>>,
+        wall_ts_ms: i64,
+        window_ms: i64,
+    ) {
+        let window_start = wall_ts_ms.saturating_sub(window_ms.max(0));
         let mut trade_timestamps = Vec::new();
         let mut buy_count_window = if self.trade_side > 0 {
             1

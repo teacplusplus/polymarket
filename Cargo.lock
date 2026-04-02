@@ -2667,6 +2667,7 @@ dependencies = [
  "futures-util",
  "polymarket-client-sdk",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "serde_with",

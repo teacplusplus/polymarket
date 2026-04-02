@@ -82,6 +82,52 @@ pub(crate) fn aggregate_events(
     Some(aggregated_market_snapshot)
 }
 
+/// Сливает новый агрегат (события после предыдущего drain) с уже сохранённым состоянием того же бакета `aligned_ts`.
+/// Котировки — последнее непустое значение; объёмы сделок суммируются; последняя сделка берётся из новой порции, если в ней есть сделка.
+pub(crate) fn merge_incremental_bucket_snapshots(
+    prior: MarketSnapshot,
+    newer: MarketSnapshot,
+    aligned_ts_ms: i64,
+) -> MarketSnapshot {
+    let volume_sum =
+        prior.trade_volume_bucket.unwrap_or(0.0) + newer.trade_volume_bucket.unwrap_or(0.0);
+    let trade_volume_bucket = if volume_sum > 0.0 {
+        Some(volume_sum)
+    } else {
+        None
+    };
+
+    let newer_has_trade = newer.last_trade_size.is_some_and(|size| size > 0.0);
+    let (last_trade_price, last_trade_size, trade_side) = if newer_has_trade {
+        (
+            newer.last_trade_price.or(prior.last_trade_price),
+            newer.last_trade_size,
+            newer.trade_side.or(prior.trade_side),
+        )
+    } else {
+        (
+            prior.last_trade_price.or(newer.last_trade_price),
+            prior.last_trade_size.or(newer.last_trade_size),
+            prior.trade_side.or(newer.trade_side),
+        )
+    };
+
+    MarketSnapshot {
+        market_id: prior.market_id,
+        asset_id: prior.asset_id,
+        timestamp_ms: aligned_ts_ms,
+        best_bid: newer.best_bid.or(prior.best_bid),
+        best_ask: newer.best_ask.or(prior.best_ask),
+        tick_size: newer.tick_size.or(prior.tick_size),
+        spread: newer.spread.or(prior.spread),
+        last_trade_price,
+        last_trade_size,
+        trade_volume_bucket,
+        trade_side,
+        market_resolved: prior.market_resolved | newer.market_resolved,
+    }
+}
+
 struct ParsedOutcomeFill {
     price: f64,
     side: TradeSide,

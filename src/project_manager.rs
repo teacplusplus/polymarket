@@ -8,7 +8,9 @@ use crate::ws::{
     make_ws_channel, MarketSnapshot, MarketSnapshotBuffer, MarketSnapshotBufferMut,
     SnapshotsByAlignedTs, Ws,
 };
-use crate::market_snapshot::market_snapshot_from_historical_bucket;
+use crate::market_snapshot::{
+    market_snapshot_from_historical_bucket, merge_incremental_bucket_snapshots,
+};
 use crate::xframe::{SIZE, XFrame};
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
@@ -174,8 +176,13 @@ impl ProjectManager {
                 history
             };
 
-            let frame =
-                XFrame::<SIZE>::new(stored_market_snapshot, &frames_history, event_end_ms);
+            let window_ms = FRAME_BUILD_INTERVAL_SECS[index] as i64 * 1000;
+            let frame = XFrame::<SIZE>::new(
+                stored_market_snapshot,
+                &frames_history,
+                event_end_ms,
+                window_ms,
+            );
             let mut xframes_by_market_write_lock = self.xframes_by_market[index].write().await;
             if let Some(aligned_ts_to_xframe) = xframes_by_market_write_lock
                 .get_mut(market_id)
@@ -232,6 +239,12 @@ impl ProjectManager {
         }
         let t_min_sec = (now_ms - max_lookback_ms - 120_000).max(0) / 1000;
         let t_max_sec = now_ms / 1000;
+        crate::poly_trace::api_line(
+            "historical fills window",
+            &format!(
+                "asset_id={asset_id} t_min_sec={t_min_sec} t_max_sec={t_max_sec} past_bucket_count={past_bucket_count}"
+            ),
+        );
 
         let fills: Vec<OrderFilledRow> = fetch_order_filled_events_for_range(
             self.http.as_ref(),
@@ -315,8 +328,9 @@ impl ProjectManager {
                     history
                 };
 
+                let window_ms = interval_secs as i64 * 1000;
                 let frame =
-                    XFrame::<SIZE>::new(market_snapshot, &frames_history, event_end_ms);
+                    XFrame::<SIZE>::new(market_snapshot, &frames_history, event_end_ms, window_ms);
 
                 let mut did_insert = false;
                 {
@@ -344,6 +358,13 @@ impl ProjectManager {
                         .or_default()
                         .insert(aligned_timestamp_ms, snap_for_store);
                     drop(ws_snapshots_by_market_write_lock);
+                    crate::poly_trace::historical_xframe_insert(
+                        index,
+                        interval_secs,
+                        &market_id,
+                        asset_id,
+                        aligned_timestamp_ms,
+                    );
                 }
             }
             if let Some(min_ts) = inserted_this_batch.iter().copied().min() {
@@ -361,10 +382,21 @@ impl ProjectManager {
     }
 
     pub async fn ingest_snapshot(&self, snapshot: MarketSnapshot) {
-        for ws_buffer_rwlock_arc in &self.ws_buffer_by_market {
+        for (frame_group, ws_buffer_rwlock_arc) in self.ws_buffer_by_market.iter().enumerate() {
             let mut ws_buffer_by_market_write_lock = ws_buffer_rwlock_arc.write().await;
             ws_buffer_by_market_write_lock.push_snapshot(snapshot.clone());
+            let queue_len = ws_buffer_by_market_write_lock
+                .get(&snapshot.market_id)
+                .and_then(|by_asset_id| by_asset_id.get(&snapshot.asset_id))
+                .map(|events| events.len())
+                .unwrap_or(0);
             drop(ws_buffer_by_market_write_lock);
+            crate::poly_trace::buffer_ingest(
+                frame_group,
+                &snapshot.market_id,
+                &snapshot.asset_id,
+                queue_len,
+            );
         }
     }
 
@@ -382,7 +414,8 @@ impl ProjectManager {
         let snapshots: Vec<MarketSnapshot> = {
             let mut ws_buffer_by_market_write_lock =
                 self.ws_buffer_by_market[index].write().await;
-            let drained = ws_buffer_by_market_write_lock.drain_aggregated_snapshots(now_ms);
+            let drained = ws_buffer_by_market_write_lock
+                .drain_aggregated_snapshots(now_ms, Some(index));
             drop(ws_buffer_by_market_write_lock);
             drained
         };
@@ -438,30 +471,51 @@ impl ProjectManager {
                 .copied()
                 .flatten();
 
+            let optional_prior = {
+                let ws_snapshots_by_market_read_lock =
+                    self.ws_snapshots_by_market[index].read().await;
+                let optional = ws_snapshots_by_market_read_lock
+                    .get(&market_id)
+                    .and_then(|by_asset_id| by_asset_id.get(&asset_id))
+                    .and_then(|snapshots_by_aligned_ts| {
+                        snapshots_by_aligned_ts.get(&aligned_ts)
+                    })
+                    .cloned();
+                drop(ws_snapshots_by_market_read_lock);
+                optional
+            };
+
+            let had_prior_for_bucket = optional_prior.is_some();
+            let merged_snapshot = if let Some(prior) = optional_prior {
+                merge_incremental_bucket_snapshots(prior, snapshot, aligned_ts)
+            } else {
+                snapshot
+            };
+
             let frames_history = {
-                let mut xframes_by_market_write_lock =
-                    self.xframes_by_market[index].write().await;
-                let aligned_ts_to_xframe = xframes_by_market_write_lock
-                    .entry(market_id.clone())
-                    .or_insert_with(HashMap::new)
-                    .entry(asset_id.clone())
-                    .or_insert_with(BTreeMap::new);
-
-                if aligned_ts_to_xframe.contains_key(&aligned_ts) {
-                    drop(xframes_by_market_write_lock);
-                    continue;
-                }
-
-                let history = aligned_ts_to_xframe.clone();
-                drop(xframes_by_market_write_lock);
+                let xframes_by_market_read_lock = self.xframes_by_market[index].read().await;
+                let history = xframes_by_market_read_lock
+                    .get(&market_id)
+                    .and_then(|by_asset_id| by_asset_id.get(&asset_id))
+                    .map(|aligned_ts_to_xframe| {
+                        aligned_ts_to_xframe
+                            .range(..aligned_ts)
+                            .map(|(ts, xframe)| (*ts, xframe.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                drop(xframes_by_market_read_lock);
                 history
             };
 
-            let snapshot_for_store = snapshot.clone();
-            let frame =
-                XFrame::<SIZE>::new(snapshot, &frames_history, event_end_ms);
+            let window_ms = FRAME_BUILD_INTERVAL_SECS[index] as i64 * 1000;
+            let frame = XFrame::<SIZE>::new(
+                merged_snapshot.clone(),
+                &frames_history,
+                event_end_ms,
+                window_ms,
+            );
 
-            let mut did_insert = false;
             {
                 let mut xframes_by_market_write_lock =
                     self.xframes_by_market[index].write().await;
@@ -470,22 +524,51 @@ impl ProjectManager {
                     .or_insert_with(HashMap::new)
                     .entry(asset_id.clone())
                     .or_insert_with(BTreeMap::new);
-                if !aligned_ts_to_xframe.contains_key(&aligned_ts) {
-                    aligned_ts_to_xframe.insert(aligned_ts, frame);
-                    did_insert = true;
-                }
+                aligned_ts_to_xframe.insert(aligned_ts, frame);
+                let total_xframe_keys = aligned_ts_to_xframe.len();
                 drop(xframes_by_market_write_lock);
+                crate::poly_trace::xframes_insert(
+                    index,
+                    &market_id,
+                    &asset_id,
+                    aligned_ts,
+                    had_prior_for_bucket,
+                    total_xframe_keys,
+                );
             }
-            if did_insert {
+            {
                 let mut ws_snapshots_by_market_write_lock =
                     self.ws_snapshots_by_market[index].write().await;
                 ws_snapshots_by_market_write_lock
-                    .entry(market_id)
+                    .entry(market_id.clone())
                     .or_default()
-                    .entry(asset_id)
+                    .entry(asset_id.clone())
                     .or_default()
-                    .insert(aligned_ts, snapshot_for_store);
+                    .insert(aligned_ts, merged_snapshot);
+                let total_ws_keys = ws_snapshots_by_market_write_lock
+                    .get(&market_id)
+                    .and_then(|by_asset_id| by_asset_id.get(&asset_id))
+                    .map(|snapshots_by_aligned_ts| snapshots_by_aligned_ts.len())
+                    .unwrap_or(0);
                 drop(ws_snapshots_by_market_write_lock);
+                crate::poly_trace::ws_snapshots_insert(
+                    index,
+                    &market_id,
+                    &asset_id,
+                    aligned_ts,
+                    had_prior_for_bucket,
+                    total_ws_keys,
+                );
+            }
+            if had_prior_for_bucket {
+                self.recompute_xframes_after_historical_inserts(
+                    index,
+                    &market_id,
+                    &asset_id,
+                    aligned_ts,
+                    &HashSet::new(),
+                )
+                .await;
             }
         }
     }
@@ -524,23 +607,40 @@ fn spawn_api_worker_loop(
                     let asset_inner_key = api_asset_snapshot.stable.asset_id.clone();
                     let mut api_market_data_store_write_lock =
                         api_market_data_store.write().await;
+                    let end_date = api_asset_snapshot
+                        .stable
+                        .end_date_rfc3339
+                        .clone();
                     api_market_data_store_write_lock
-                        .entry(market_outer_key)
+                        .entry(market_outer_key.clone())
                         .or_default()
-                        .insert(asset_inner_key, api_asset_snapshot);
+                        .insert(asset_inner_key.clone(), api_asset_snapshot);
                     drop(api_market_data_store_write_lock);
+                    crate::poly_trace::api_context_stored(
+                        &market_outer_key,
+                        &asset_inner_key,
+                        end_date.as_deref(),
+                    );
+                    crate::poly_trace::job_done(&format!("FetchAssetFull {asset_id}"));
                 }
                 ApiDataJob::BuildHistoricalXFrames {
                     asset_id,
                     past_bucket_count,
                 } => {
-                    if let Err(error) = project_manager
+                    match project_manager
                         .build_historical_xframes(&asset_id, past_bucket_count)
                         .await
                     {
-                        eprintln!(
-                            "api_data_worker: BuildHistoricalXFrames {asset_id}: {error}"
-                        );
+                        Ok(()) => {
+                            crate::poly_trace::job_done(&format!(
+                                "BuildHistoricalXFrames {asset_id} past_bucket_count={past_bucket_count}"
+                            ));
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "api_data_worker: BuildHistoricalXFrames {asset_id}: {error}"
+                            );
+                        }
                     }
                 }
             }
