@@ -1,0 +1,19 @@
+[package]
+name = "poly"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+anyhow = "1.0"
+derivative = "2.2.0"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_with = "3.0"
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+xframe-features = { path = "./lib/xframe-features" }
+xframe-features-derive = { path = "./lib/xframe-features-derive" }
+polymarket-client-sdk = { version = "0.4.4", features = ["gamma", "data", "clob"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
