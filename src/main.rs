@@ -1,72 +1,137 @@
-pub mod poly_trace;
 pub mod util;
-pub mod api_data_manager;
 pub mod xframe;
 pub mod project_manager;
 pub mod market_snapshot;
-pub mod ws_parser;
-pub mod ws;
+pub mod run_log;
+pub mod btcusdt_ws;
+pub mod data_ws;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use project_manager::ProjectManager;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::api_data_manager::ApiDataJob;
+use crate::util::{
+    current_timestamp_ms, fetch_gamma_event_data_for_slug, GammaEventSlugData,
+};
+use crate::xframe::{XFRAME_INTERVAL_TYPE_15M, XFRAME_INTERVAL_TYPE_5M};
 
-/// Сколько последовательных бакетов (на каждую группировку [project_manager::FRAME_BUILD_INTERVAL_SECS]) загрузить назад.
-fn historical_bucket_count_from_env() -> usize {
-    std::env::var("POLYMARKET_HISTORICAL_BUCKETS")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
-        .filter(|&parsed| parsed > 0)
-        .unwrap_or(24)
-}
+async fn run_btc_updown_interval(
+    project_manager: Arc<ProjectManager>,
+    period_sec: i64,
+    slug_mid: &'static str,
+) {
+    let xframe_interval_type = match period_sec {
+        300 => XFRAME_INTERVAL_TYPE_5M,
+        900 => XFRAME_INTERVAL_TYPE_15M,
+        _ => XFRAME_INTERVAL_TYPE_15M,
+    };
 
-/// Slug события из URL вида `https://polymarket.com/event/<slug>` (например `btc-updown-5m-1775171700`).
-const DEFAULT_EVENT_SLUG: &str = "btc-updown-5m-1775171700";
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-/// Получить `clobTokenIds` из публичного Gamma API по slug (строка JSON внутри поля `clobTokenIds`).
-async fn fetch_clob_token_ids_for_event_slug(
-    http: &reqwest::Client,
-    slug: &str,
-) -> Result<Vec<String>> {
-    let url = format!("https://gamma-api.polymarket.com/events?slug={slug}");
-    crate::poly_trace::api_line(
-        "Gamma public API (HTTP)",
-        &format!("GET {url} (разрешение slug → clobTokenIds)"),
-    );
-    let response = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("GET {url}"))?;
-    let status = response.status();
-    let text = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("Gamma API HTTP {status}: {text}");
-    }
-    let events: serde_json::Value =
-        serde_json::from_str(&text).context("Gamma API: не JSON")?;
-    let event = events
-        .as_array()
-        .and_then(|array| array.first())
-        .context("Gamma API: пустой массив events")?;
-    let markets = event
-        .get("markets")
-        .and_then(|markets| markets.as_array())
-        .context("Gamma API: нет markets")?;
-    let mut out = Vec::new();
-    for market in markets {
-        let Some(raw) = market.get("clobTokenIds").and_then(|value| value.as_str()) else {
+    loop {
+        tick.tick().await;
+        let now_ms = current_timestamp_ms();
+        let poly_sec = now_ms / 1000;
+        let window_start_sec = (poly_sec / period_sec) * period_sec;     
+        let ws_end_sec = window_start_sec + period_sec;
+
+        if now_ms >= ws_end_sec * 1000 {
             continue;
-        };
-        let tokens: Vec<String> =
-            serde_json::from_str(raw).with_context(|| format!("parse clobTokenIds: {raw}"))?;
-        out.extend(tokens);
+        }
+
+        let mut ws_handle: Option<tokio::task::JoinHandle<()>> = None;
+        let mut subscribed: Vec<String> = Vec::new();
+
+        while current_timestamp_ms() < ws_end_sec * 1000 {
+            let now_poly_ms = current_timestamp_ms();
+            if now_poly_ms >= ws_end_sec * 1000 {
+                break;
+            }
+
+            let slug = format!("btc-updown-{slug_mid}-{window_start_sec}");
+            let (ids, market_event_start_ms, market_event_end_ms, price_to_beat) =
+                match fetch_gamma_event_data_for_slug(
+                project_manager.http.as_ref(),
+                &slug,
+            )
+            .await
+            {
+                Ok(GammaEventSlugData {
+                    clob_token_ids,
+                    market_event_start_ms,
+                    market_event_end_ms,
+                    price_to_beat,
+                }) => (
+                    clob_token_ids,
+                    market_event_start_ms,
+                    market_event_end_ms,
+                    price_to_beat,
+                ),
+                Err(e) => {
+                    run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                    continue;
+                }
+            };
+
+            let wall_end_ms = market_event_end_ms
+                .values()
+                .copied()
+                .flatten()
+                .max()
+                .unwrap_or(ws_end_sec * 1000);
+
+            let market_ids: Vec<String> = market_event_end_ms.keys().cloned().collect();
+
+            project_manager
+                .merge_market_event_data(
+                    market_event_start_ms,
+                    market_event_end_ms,
+                    price_to_beat,
+                )
+                .await;
+
+            let should_restart_ws = ids != subscribed;
+
+            if should_restart_ws {
+                if let Some(h) = ws_handle.take() {
+                    run_log::ws_stop_replace(slug_mid, &slug, subscribed.len());
+                    h.abort();
+                }
+
+                let remain_ms = (wall_end_ms - current_timestamp_ms()).max(0) as u64;
+                let session_deadline = Instant::now() + Duration::from_millis(remain_ms);
+
+                run_log::ws_start(slug_mid, &slug, &market_ids, &ids, remain_ms, wall_end_ms);
+
+                match data_ws::spawn_bounded_market_ws(
+                    project_manager.clone(),
+                    ids.clone(),
+                    session_deadline,
+                    xframe_interval_type,
+                ) {
+                    Ok(h) => {
+                        ws_handle = Some(h);
+                        subscribed = ids.clone();
+                    }
+                    Err(e) => {
+                        run_log::ws_spawn_err(slug_mid, &slug, &e);
+                        continue;
+                    }
+                }
+            }
+
+            tick.tick().await;
+        }
+
+        if let Some(h) = ws_handle.take() {
+            let slug = format!("btc-updown-{slug_mid}-{window_start_sec}");
+            run_log::ws_window_end_wait(slug_mid, &slug, subscribed.len());
+            let _ = h.await;
+            run_log::ws_task_joined(slug_mid, &slug);
+        }
     }
-    if out.is_empty() {
-        anyhow::bail!("ни одного clobTokenId в ответе Gamma для slug={slug:?}");
-    }
-    Ok(out)
 }
 
 #[tokio::main]
@@ -74,82 +139,16 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
-    run_debug_event_pipeline().await
-}
-
-/// Режим отладки: slug события → `clobTokenIds`, WebSocket, `FetchAssetFull` + `BuildHistoricalXFrames`, логи `POLY_TRACE`.
-async fn run_debug_event_pipeline() -> Result<()> {
-    let slug = std::env::var("POLYMARKET_EVENT_SLUG").unwrap_or_else(|_| DEFAULT_EVENT_SLUG.to_string());
-    eprintln!(
-        "=== poly debug: event slug={slug} (override: POLYMARKET_EVENT_SLUG) | отключить лог: POLY_TRACE=0 или POLYMARKET_TRACE=0 ==="
-    );
-
-    let http = reqwest::Client::builder()
-        .use_rustls_tls()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let asset_ids = fetch_clob_token_ids_for_event_slug(&http, &slug).await?;
-    eprintln!("=== clobTokenIds ({}) = {:?}", asset_ids.len(), asset_ids);
 
     let project_manager = ProjectManager::new();
-    ws::new(project_manager.clone(), asset_ids.clone())?;
-    let past_bucket_count = historical_bucket_count_from_env();
-    for asset_id in &asset_ids {
-        project_manager
-            .api
-            .api_job_sender
-            .send(ApiDataJob::FetchAssetFull {
-                asset_id: asset_id.clone(),
-            })
-            .await
-            .map_err(|_| anyhow!("api data worker dropped before startup"))?;
-        project_manager
-            .api
-            .api_job_sender
-            .send(ApiDataJob::BuildHistoricalXFrames {
-                asset_id: asset_id.clone(),
-                past_bucket_count,
-            })
-            .await
-            .map_err(|_| anyhow!("api data worker dropped before startup"))?;
-    }
-    eprintln!("=== WS + frame builders запущены; история загружается асинхронно. Остановка: Ctrl+C ===");
+
+
+
+    let pm5 = project_manager.clone();
+    tokio::spawn(run_btc_updown_interval(pm5, 300, "5m"));
+    let pm15 = project_manager.clone();
+    tokio::spawn(run_btc_updown_interval(pm15, 900, "15m"));
+
     std::future::pending::<()>().await;
     Ok(())
-}
-
-/*
- * Прежний вход: только `POLYMARKET_ASSET_IDS` (без разрешения slug).
- *
- * #[tokio::main]
- * async fn main() -> Result<()> {
- *     let asset_ids = read_asset_ids_from_env()?;
- *     let project_manager = ProjectManager::new();
- *     ws::new(project_manager.clone(), asset_ids.clone())?;
- *     let past_bucket_count = historical_bucket_count_from_env();
- *     for asset_id in &asset_ids {
- *         project_manager.api.api_job_sender.send(ApiDataJob::FetchAssetFull { asset_id: asset_id.clone() }).await?;
- *         project_manager.api.api_job_sender.send(ApiDataJob::BuildHistoricalXFrames { asset_id: asset_id.clone(), past_bucket_count }).await?;
- *     }
- *     std::future::pending::<()>().await;
- *     Ok(())
- * }
- *
- * fn read_asset_ids_from_env() -> Result<Vec<String>> { ... }
- */
-
-#[allow(dead_code)]
-fn read_asset_ids_from_env() -> Result<Vec<String>> {
-    let raw = std::env::var("POLYMARKET_ASSET_IDS")
-        .map_err(|_| anyhow!("set POLYMARKET_ASSET_IDS=asset1,asset2,..."))?;
-    let ids: Vec<String> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    if ids.is_empty() {
-        return Err(anyhow!("POLYMARKET_ASSET_IDS has no valid asset ids"));
-    }
-    Ok(ids)
 }

@@ -1,5 +1,5 @@
 use derivative::Derivative;
-use crate::ws::{MarketSnapshot, TradeSide};
+use crate::data_ws::{MarketSnapshot, TradeSide};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::BTreeMap;
@@ -8,9 +8,23 @@ use xframe_features_derive::XFeatures;
 
 pub const SIZE: usize = 13;
 
+/// Код интервала в признаках: рынок BTC up/down на 15 минут (`main`: `period_sec == 900`).
+pub const XFRAME_INTERVAL_TYPE_15M: f64 = 0.0;
+/// Код интервала: рынок на 5 минут (`period_sec == 300`).
+pub const XFRAME_INTERVAL_TYPE_5M: f64 = 1.0;
+
+const MIN_POSITIVE_ASK: f64 = 1e-12;
+
+/// Окно секундных цен BTC для μ и σ в z-score (≈ 60 мин). Ключи `prices_by_sec` — Unix-секунды.
+const BTC_PRICE_ZSCORE_WINDOW_SEC: i64 = SIZE as i64;
+/// Минимум точек в окне для выборочного СКО.
+const BTC_PRICE_ZSCORE_MIN_POINTS: usize = 2;
+
 /// Кадр признаков по одному ассету: состояние стакана и сделок на момент снапшота плюс лаги по последним `N` предыдущим кадрам (от ближайшего по времени к более ранним).
 ///
 /// Поля с атрибутом `#[xfeature]` попадают в вектор для обучения; `market_id`, `asset_id`, `trade_side` и `delta_n_trade_side` — без `#[xfeature]` (идентификаторы и сторона сделки для логики/отладки).
+///
+/// `xframe_interval_type`: см. [XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M].
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Derivative, Clone, XFeatures)]
 #[derivative(Default)]
@@ -19,9 +33,12 @@ pub struct XFrame<const N: usize> {
     pub market_id: String,
     /// Идентификатор токена в CLOB (`asset_id` / token id).
     pub asset_id: String,
-    /// Плановое время окончания / resolution события (Unix UTC, мс), из Gamma `end_date_rfc3339`; `None`, если дата ещё не подгружена или строка не распарсилась.
+    /// Тип окна BTC up/down: `0` — 15 мин ([XFRAME_INTERVAL_TYPE_15M]), `1` — 5 мин ([XFRAME_INTERVAL_TYPE_5M]).
     #[xfeature]
-    pub event_end_ms: Option<i64>,
+    pub xframe_interval_type: f64,
+    /// Длительность окна события из Gamma: `event_end_ms - event_start_ms` (мс); `None`, если начало или конец неизвестны, или конец раньше начала.
+    #[xfeature]
+    pub event_span_ms: Option<i64>,
     /// Лучшая цена bid на конец интервала / бакета снапшота.
     #[xfeature]
     pub best_bid: f64,
@@ -38,6 +55,14 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub delta_n_best_ask: [Option<f64>; N],
+    /// Отношение `best_bid / best_ask` по этому токену; `None`, если ask ≈ 0 (как «yes относительно ask» в виде одного числа).
+    #[xfeature]
+    pub best_bid_over_best_ask: Option<f64>,
+    /// Разность отношения bid/ask с `i`-м предыдущим кадром; `None`, если сравнивать нельзя.
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_best_bid_over_best_ask: [Option<f64>; N],
     /// Цена последней известной сделки на бакете; прокидывается с предыдущего кадра, если в текущем нет обновления.
     #[xfeature]
     pub last_trade_price: Option<f64>,
@@ -87,18 +112,22 @@ pub struct XFrame<const N: usize> {
     /// «Burstiness» интервалов между сделками в окне: `(std − mean) / (std + mean)` по мс-зазорам между временными метками сделок; `None`, если сделок меньше двух или знаменатель невалиден.
     #[xfeature]
     pub burstiness_transactions_count: Option<f64>,
-    /// Разность `burstiness_transactions_count` с `i`-м предыдущим кадром; `None`, если в одном из кадров метрики не было.
+    /// Z-score цены BTC/USDT: `(p - mu) / sigma`; история — `ProjectManager::rtds_btc_prices_by_sec` (ключ Unix-секунда); `p` — последняя точка в окне, `mu`/`sigma` — по всем ценам окна.
     #[xfeature]
-    #[derivative(Default(value = "[None; N]"))]
-    #[serde_as(as = "[_; N]")]
-    pub delta_n_burstiness_transactions_count: [Option<f64>; N],
+    pub btc_price_z_score: Option<f64>,
+    /// Относительное отклонение спота BTC от Gamma «price to beat»: `(price_to_beat - btc_spot) / price_to_beat * 100` (%); спот — последняя секундная цена из `rtds_btc_prices_by_sec`.
+    #[xfeature]
+    pub btc_price_vs_beat_pct: Option<f64>,
 }
 
 impl<const N: usize> XFrame<N> {
     pub fn new(
         snapshot: MarketSnapshot,
         frames: &BTreeMap<i64, XFrame<N>>,
+        event_start_ms: Option<i64>,
         event_end_ms: Option<i64>,
+        btc_price_z_score: Option<f64>,
+        btc_price_vs_beat_pct: Option<f64>,
         window_ms: i64,
     ) -> XFrame<N> {
         let previous = frames.values().next_back();
@@ -124,12 +153,23 @@ impl<const N: usize> XFrame<N> {
             None => 0,
         };
 
+        let best_bid_over_best_ask = (best_ask > MIN_POSITIVE_ASK).then_some(best_bid / best_ask);
+
+        let event_span_ms = match (event_start_ms, event_end_ms) {
+            (Some(start), Some(end)) => end.checked_sub(start),
+            _ => None,
+        };
+
         let mut frame = XFrame::<N> {
             market_id: snapshot.market_id,
             asset_id: snapshot.asset_id,
-            event_end_ms,
+            xframe_interval_type: snapshot.xframe_interval_type,
+            event_span_ms,
             best_bid,
             best_ask,
+            best_bid_over_best_ask,
+            btc_price_z_score,
+            btc_price_vs_beat_pct,
             last_trade_price,
             trade_size,
             trade_volume_bucket,
@@ -194,6 +234,13 @@ impl<const N: usize> XFrame<N> {
         for (lag_index, prior_frame) in frames.values().rev().take(N).enumerate() {
             self.delta_n_best_bid[lag_index] = Some(self.best_bid - prior_frame.best_bid);
             self.delta_n_best_ask[lag_index] = Some(self.best_ask - prior_frame.best_ask);
+            self.delta_n_best_bid_over_best_ask[lag_index] = match (
+                self.best_bid_over_best_ask,
+                prior_frame.best_bid_over_best_ask,
+            ) {
+                (Some(current_ratio), Some(prior_ratio)) => Some(current_ratio - prior_ratio),
+                _ => None,
+            };
             self.delta_n_last_trade_price[lag_index] = match (
                 self.last_trade_price,
                 prior_frame.last_trade_price,
@@ -209,14 +256,6 @@ impl<const N: usize> XFrame<N> {
                 Some(self.buy_count_window as i64 - prior_frame.buy_count_window as i64);
             self.delta_n_sell_count_window[lag_index] =
                 Some(self.sell_count_window as i64 - prior_frame.sell_count_window as i64);
-            self.delta_n_burstiness_transactions_count[lag_index] =
-                match (
-                    self.burstiness_transactions_count,
-                    prior_frame.burstiness_transactions_count,
-                ) {
-                    (Some(current_burst), Some(prior_burst)) => Some(current_burst - prior_burst),
-                    _ => None,
-                };
         }
     }
 
@@ -244,4 +283,35 @@ impl<const N: usize> XFrame<N> {
             None
         }
     }
+}
+
+/// z = (p - mu) / sigma: только секундный ряд `prices_by_sec` (ключ — Unix-секунда); `p` — цена последней точки в окне (самый поздний ключ ≤ `reference_sec`), `mu` и `sigma` — по всем ценам в том же окне.
+pub fn btc_price_z_score_from_sec_history(
+    prices_by_sec: &BTreeMap<i64, f64>,
+    reference_sec: i64,
+) -> Option<f64> {
+    let window_start_sec = reference_sec.saturating_sub(BTC_PRICE_ZSCORE_WINDOW_SEC);
+    let window: Vec<f64> = prices_by_sec
+        .range(window_start_sec..=reference_sec)
+        .map(|(_, price)| *price)
+        .collect();
+    let n = window.len();
+    if n < BTC_PRICE_ZSCORE_MIN_POINTS {
+        return None;
+    }
+    let current_price = *window.last()?;
+    let n_f = n as f64;
+    let mu = window.iter().sum::<f64>() / n_f;
+    let sum_sq_dev: f64 = window
+        .iter()
+        .map(|price| {
+            let d = price - mu;
+            d * d
+        })
+        .sum();
+    let sigma = (sum_sq_dev / (n_f - 1.0)).sqrt();
+    if !sigma.is_finite() || sigma <= MIN_POSITIVE_ASK {
+        return None;
+    }
+    Some((current_price - mu) / sigma)
 }
