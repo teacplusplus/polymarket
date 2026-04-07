@@ -13,6 +13,11 @@ pub const XFRAME_INTERVAL_TYPE_15M: f64 = 0.0;
 /// Код интервала: рынок на 5 минут (`period_sec == 300`).
 pub const XFRAME_INTERVAL_TYPE_5M: f64 = 1.0;
 
+/// Признак исхода токена в BTC up/down: токен «Up».
+pub const XFRAME_BTC_OUTCOME_UP: f64 = 1.0;
+/// Признак исхода: токен «Down».
+pub const XFRAME_BTC_OUTCOME_DOWN: f64 = 0.0;
+
 const MIN_POSITIVE_ASK: f64 = 1e-12;
 
 /// Окно секундных цен BTC для μ и σ в z-score (≈ 60 мин). Ключи `prices_by_sec` — Unix-секунды.
@@ -24,7 +29,7 @@ const BTC_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 ///
 /// Поля с атрибутом `#[xfeature]` попадают в вектор для обучения; `market_id`, `asset_id`, `trade_side` и `delta_n_trade_side` — без `#[xfeature]` (идентификаторы и сторона сделки для логики/отладки).
 ///
-/// `xframe_interval_type`: см. [XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M].
+/// `xframe_interval_type`: см. [XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]. `btc_up_down_outcome`: [XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN] (после ingest).
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Derivative, Clone, XFeatures)]
 #[derivative(Default)]
@@ -36,6 +41,10 @@ pub struct XFrame<const N: usize> {
     /// Тип окна BTC up/down: `0` — 15 мин ([XFRAME_INTERVAL_TYPE_15M]), `1` — 5 мин ([XFRAME_INTERVAL_TYPE_5M]).
     #[xfeature]
     pub xframe_interval_type: f64,
+    /// Исход токена по Gamma (`outcomes` + `clobTokenIds`): [XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN].
+    #[xfeature]
+    #[derivative(Default(value = "0.0"))]
+    pub btc_up_down_outcome: f64,
     /// Длительность окна события из Gamma: `event_end_ms - event_start_ms` (мс); `None`, если начало или конец неизвестны, или конец раньше начала.
     #[xfeature]
     pub event_span_ms: Option<i64>,
@@ -164,6 +173,7 @@ impl<const N: usize> XFrame<N> {
             market_id: snapshot.market_id,
             asset_id: snapshot.asset_id,
             xframe_interval_type: snapshot.xframe_interval_type,
+            btc_up_down_outcome: snapshot.btc_up_down_outcome,
             event_span_ms,
             best_bid,
             best_ask,

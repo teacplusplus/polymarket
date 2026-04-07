@@ -9,6 +9,7 @@ pub struct MarketSnapshot {
     pub market_id: String,
     pub asset_id: String,
     pub xframe_interval_type: f64,
+    pub btc_up_down_outcome: f64,
     pub timestamp_ms: i64,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
@@ -27,6 +28,7 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, timestamp_ms: i64) -> Optio
         market_id: first_event_snapshot.market_id.clone(),
         asset_id: first_event_snapshot.asset_id.clone(),
         xframe_interval_type: first_event_snapshot.xframe_interval_type,
+        btc_up_down_outcome: first_event_snapshot.btc_up_down_outcome,
         timestamp_ms,
         best_bid: None,
         best_ask: None,
@@ -42,6 +44,7 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, timestamp_ms: i64) -> Optio
     let mut last_trade_side = None;
 
     for event_market_snapshot in events {
+        aggregated_market_snapshot.btc_up_down_outcome = event_market_snapshot.btc_up_down_outcome;
         if event_market_snapshot.best_bid.is_some() {
             aggregated_market_snapshot.best_bid = event_market_snapshot.best_bid;
         }

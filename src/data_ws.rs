@@ -195,7 +195,13 @@ async fn ingest_single(
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
     };
-    let snapshots = parse_snapshots_from_event(value, event_type, xframe_interval_type);
+    let btc_up_down_by_asset_id = project_manager.btc_up_down_by_asset_id.read().await;
+    let snapshots = parse_snapshots_from_event(
+        value,
+        event_type,
+        xframe_interval_type,
+        &btc_up_down_by_asset_id,
+    );
     for snapshot in snapshots {
         project_manager
             .ws
@@ -207,17 +213,29 @@ async fn ingest_single(
     Ok(())
 }
 
-pub(crate) fn parse_snapshots_from_event(
+pub fn parse_snapshots_from_event(
     value: &Value,
     event_type: &str,
     xframe_interval_type: f64,
+    btc_up_down_by_asset_id: &HashMap<String, f64>,
 ) -> Vec<MarketSnapshot> {
     match event_type {
         "book" | "last_trade_price" | "best_bid_ask" | "tick_size_change" | "market_resolved" => {
-            parse_single_snapshot(value, event_type, xframe_interval_type).into_iter().collect()
+            parse_single_snapshot(
+                value,
+                event_type,
+                xframe_interval_type,
+                btc_up_down_by_asset_id,
+            )
+            .into_iter()
+            .collect()
         }
-        "price_change" => parse_price_change_snapshots(value, xframe_interval_type),
-        "new_market" => parse_new_market_snapshots(value, xframe_interval_type),
+        "price_change" => {
+            parse_price_change_snapshots(value, xframe_interval_type, btc_up_down_by_asset_id)
+        }
+        "new_market" => {
+            parse_new_market_snapshots(value, xframe_interval_type, btc_up_down_by_asset_id)
+        }
         _ => Vec::new(),
     }
 }
@@ -226,6 +244,7 @@ fn parse_single_snapshot(
     value: &Value,
     event_type: &str,
     xframe_interval_type: f64,
+    btc_up_down_by_asset_id: &HashMap<String, f64>,
 ) -> Option<MarketSnapshot> {
     let asset_id = value
         .get("asset_id")
@@ -241,6 +260,7 @@ fn parse_single_snapshot(
     if asset_id.is_empty() || market_id.is_empty() {
         return None;
     }
+    let btc_up_down_outcome = *btc_up_down_by_asset_id.get(&asset_id)?;
 
     let timestamp_ms = parse_i64(value.get("timestamp")).unwrap_or_else(current_timestamp_ms);
     let (best_bid, best_ask) = parse_book_best_bid_ask(value);
@@ -249,6 +269,7 @@ fn parse_single_snapshot(
         market_id,
         asset_id,
         xframe_interval_type,
+        btc_up_down_outcome,
         timestamp_ms,
         best_bid,
         best_ask,
@@ -263,7 +284,11 @@ fn parse_single_snapshot(
     })
 }
 
-fn parse_price_change_snapshots(value: &Value, xframe_interval_type: f64) -> Vec<MarketSnapshot> {
+fn parse_price_change_snapshots(
+    value: &Value,
+    xframe_interval_type: f64,
+    btc_up_down_by_asset_id: &HashMap<String, f64>,
+) -> Vec<MarketSnapshot> {
     let market_id = value
         .get("market")
         .or_else(|| value.get("condition_id"))
@@ -289,10 +314,14 @@ fn parse_price_change_snapshots(value: &Value, xframe_interval_type: f64) -> Vec
         if asset_id.is_empty() {
             continue;
         }
+        let Some(&btc_up_down_outcome) = btc_up_down_by_asset_id.get(&asset_id) else {
+            continue;
+        };
         snapshots.push(MarketSnapshot {
             market_id: market_id.clone(),
             asset_id,
             xframe_interval_type,
+            btc_up_down_outcome,
             timestamp_ms,
             best_bid: parse_f64(change.get("best_bid")),
             best_ask: parse_f64(change.get("best_ask")),
@@ -308,7 +337,11 @@ fn parse_price_change_snapshots(value: &Value, xframe_interval_type: f64) -> Vec
     snapshots
 }
 
-fn parse_new_market_snapshots(value: &Value, xframe_interval_type: f64) -> Vec<MarketSnapshot> {
+fn parse_new_market_snapshots(
+    value: &Value,
+    xframe_interval_type: f64,
+    btc_up_down_by_asset_id: &HashMap<String, f64>,
+) -> Vec<MarketSnapshot> {
     let market_id = value
         .get("market")
         .or_else(|| value.get("condition_id"))
@@ -330,10 +363,14 @@ fn parse_new_market_snapshots(value: &Value, xframe_interval_type: f64) -> Vec<M
         if asset_id.is_empty() {
             continue;
         }
+        let Some(&btc_up_down_outcome) = btc_up_down_by_asset_id.get(&asset_id) else {
+            continue;
+        };
         snapshots.push(MarketSnapshot {
             market_id: market_id.clone(),
             asset_id,
             xframe_interval_type,
+            btc_up_down_outcome,
             timestamp_ms,
             best_bid: None,
             best_ask: None,

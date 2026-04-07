@@ -1,4 +1,5 @@
 use crate::market_snapshot::aggregate_events;
+use anyhow::bail;
 use crate::btcusdt_ws::RtdsBtcLatest;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
@@ -29,6 +30,7 @@ pub struct ProjectManager {
     pub xframes_by_market: Arc<RwLock<MarketFrames>>,
     pub ws_buffer_by_market: Arc<RwLock<MarketSnapshotBuffer>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
+    pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, f64>>>,
     pub rtds_btc_latest: Arc<RwLock<Option<RtdsBtcLatest>>>,
     pub rtds_btc_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
     pub ws: Arc<Ws>,
@@ -54,6 +56,7 @@ impl ProjectManager {
             xframes_by_market: Arc::new(RwLock::new(HashMap::new())),
             ws_buffer_by_market: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
+            btc_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             rtds_btc_latest: Arc::new(RwLock::new(None)),
             rtds_btc_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
             ws,
@@ -66,7 +69,12 @@ impl ProjectManager {
         let project_manager_cloned = project_manager.clone();
         tokio::spawn(async move {
             while let Some(snapshot_arc) = ws_snapshot_receiver.recv().await {
-                project_manager_cloned.ingest_snapshot((*snapshot_arc).clone()).await;
+                if let Err(err) = project_manager_cloned
+                    .ingest_snapshot((*snapshot_arc).clone())
+                    .await
+                {
+                    eprintln!("ingest_snapshot: {err:#}");
+                }
             }
         });
 
@@ -83,6 +91,7 @@ impl ProjectManager {
         starts: HashMap<String, Option<i64>>,
         ends: HashMap<String, Option<i64>>,
         price_to_beat: Option<f64>,
+        btc_up_down_by_asset_id: HashMap<String, f64>,
     ) {
         let mut lock = self.event_data_by_market.write().await;
         for (market_id, start_ms) in starts {
@@ -99,11 +108,33 @@ impl ProjectManager {
                 entry.price_to_beat = Some(p);
             }
         }
+        drop(lock);
+
+        if !btc_up_down_by_asset_id.is_empty() {
+            let mut map = self.btc_up_down_by_asset_id.write().await;
+            for (asset_id, code) in btc_up_down_by_asset_id {
+                map.insert(asset_id, code);
+            }
+        }
     }
 
-    pub async fn ingest_snapshot(&self, snapshot: MarketSnapshot) {
+    pub async fn ingest_snapshot(&self, mut snapshot: MarketSnapshot) -> anyhow::Result<()> {
+        let Some(code) = self
+            .btc_up_down_by_asset_id
+            .read()
+            .await
+            .get(&snapshot.asset_id)
+            .copied()
+        else {
+            bail!(
+                "нет Up/Down для asset_id={} (нужен merge_market_event_data с outcomes из Gamma)",
+                snapshot.asset_id
+            );
+        };
+        snapshot.btc_up_down_outcome = code;
         let mut ws_buffer_by_market_write_lock = self.ws_buffer_by_market.write().await;
         ws_buffer_by_market_write_lock.push_snapshot(snapshot);
+        Ok(())
     }
 
     pub async fn run_frame_builder_loop(self: Arc<Self>) {
@@ -156,7 +187,6 @@ impl ProjectManager {
             let Some(snapshot) = aggregate_events(group, aligned_ts) else {
                 continue;
             };
-
             let frames_history = {
                 let xframes_by_market_read_lock = self.xframes_by_market.read().await;
                 let history = xframes_by_market_read_lock

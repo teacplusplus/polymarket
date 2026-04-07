@@ -51,8 +51,13 @@ async fn run_btc_updown_interval(
             }
 
             let slug = format!("btc-updown-{slug_mid}-{window_start_sec}");
-            let (ids, market_event_start_ms, market_event_end_ms, price_to_beat) =
-                match fetch_gamma_event_data_for_slug(
+            let (
+                ids,
+                market_event_start_ms,
+                market_event_end_ms,
+                price_to_beat,
+                btc_up_down_by_asset_id,
+            ) = match fetch_gamma_event_data_for_slug(
                 project_manager.http.as_ref(),
                 &slug,
             )
@@ -60,6 +65,7 @@ async fn run_btc_updown_interval(
             {
                 Ok(GammaEventSlugData {
                     clob_token_ids,
+                    btc_up_down_by_asset_id,
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
@@ -68,6 +74,7 @@ async fn run_btc_updown_interval(
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
+                    btc_up_down_by_asset_id,
                 ),
                 Err(e) => {
                     run_log::gamma_fetch_err(slug_mid, &slug, &e);
@@ -89,6 +96,7 @@ async fn run_btc_updown_interval(
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
+                    btc_up_down_by_asset_id,
                 )
                 .await;
 
