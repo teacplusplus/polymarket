@@ -6,15 +6,25 @@ use crate::util::current_timestamp_ms;
 use crate::data_ws::{
     make_ws_channel, MarketSnapshot, MarketSnapshotBuffer, MarketSnapshotBufferMut, Ws,
 };
-use crate::xframe::{btc_price_z_score_from_sec_history, SIZE, XFrame};
+use crate::xframe::{
+    btc_price_z_score_from_sec_history, find_opposite_asset_id, XFrame, SIZE,
+};
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
+
+/// Кадр, собранный в этом тике `build_frames_from_buffer_once`, до записи в `xframes_by_market`.
+struct BuiltXframeEntry {
+    market_id: String,
+    asset_id: String,
+    aligned_ts: i64,
+    frame: XFrame<SIZE>,
+}
 
 const FRAME_BUILD_INTERVAL_SEC: u64 = 1;
 
@@ -30,7 +40,7 @@ pub struct ProjectManager {
     pub xframes_by_market: Arc<RwLock<MarketFrames>>,
     pub ws_buffer_by_market: Arc<RwLock<MarketSnapshotBuffer>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
-    pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, f64>>>,
+    pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, i32>>>,
     pub rtds_btc_latest: Arc<RwLock<Option<RtdsBtcLatest>>>,
     pub rtds_btc_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
     pub ws: Arc<Ws>,
@@ -91,7 +101,7 @@ impl ProjectManager {
         starts: HashMap<String, Option<i64>>,
         ends: HashMap<String, Option<i64>>,
         price_to_beat: Option<f64>,
-        btc_up_down_by_asset_id: HashMap<String, f64>,
+        btc_up_down_by_asset_id: HashMap<String, i32>,
     ) {
         let mut lock = self.event_data_by_market.write().await;
         for (market_id, start_ms) in starts {
@@ -183,6 +193,8 @@ impl ProjectManager {
             (btc_price_z_score, btc_spot_usd)
         };
 
+        let mut built_xframes: Vec<BuiltXframeEntry> = Vec::new();
+
         for ((market_id, asset_id, aligned_ts), group) in by_bucket {
             let Some(snapshot) = aggregate_events(group, aligned_ts) else {
                 continue;
@@ -225,20 +237,73 @@ impl ProjectManager {
                 window_ms,
             );
 
-            run_log::xframe_built(
-                &market_id,
-                &asset_id,
-            );
+            run_log::xframe_built(&market_id, &asset_id);
 
-            let mut xframes_by_market_write_lock = self.xframes_by_market.write().await;
-            let aligned_ts_to_xframe = xframes_by_market_write_lock
-                .entry(market_id)
-                .or_insert_with(HashMap::new)
-                .entry(asset_id)
-                .or_insert_with(BTreeMap::new);
-            aligned_ts_to_xframe.insert(aligned_ts, frame);
-            drop(xframes_by_market_write_lock);
+            built_xframes.push(BuiltXframeEntry {
+                market_id,
+                asset_id,
+                aligned_ts,
+                frame,
+            });
         }
+
+
+        let mut batch_assets_by_market: HashMap<String, HashSet<String>> = HashMap::new();
+        for entry in &built_xframes {
+            batch_assets_by_market
+                .entry(entry.market_id.clone())
+                .or_default()
+                .insert(entry.asset_id.clone());
+        }
+        let batch_frame_by_bucket: HashMap<(String, String, i64), XFrame<SIZE>> = built_xframes
+            .iter()
+            .map(|entry| {
+                (
+                    (
+                        entry.market_id.clone(),
+                        entry.asset_id.clone(),
+                        entry.aligned_ts,
+                    ),
+                    entry.frame.clone(),
+                )
+            })
+            .collect();
+
+        let btc_up_down_by_asset_id: HashMap<String, i32> = {
+            let guard = self.btc_up_down_by_asset_id.read().await;
+            guard.clone()
+        };
+
+        for entry in &mut built_xframes {
+            let candidate_asset_ids: HashSet<String> = batch_assets_by_market.get(&entry.market_id).cloned().unwrap_or_default();
+
+            let other_asset_id = match find_opposite_asset_id(
+                &entry.asset_id,
+                &btc_up_down_by_asset_id,
+                &candidate_asset_ids,
+            ) {
+                Ok(id) => id,
+                Err(err) => {
+                    eprintln!("find_opposite_asset_id: {err:#}");
+                    return;
+                }
+            };
+            let Some(other_frame) = batch_frame_by_bucket.get(&(entry.market_id.clone(), other_asset_id.clone(), entry.aligned_ts)) else {
+                continue;
+            };
+            entry.frame.copy_other_leg_features_from(other_frame);
+        }
+
+        let mut xframes_by_market_lock = self.xframes_by_market.write().await;
+        for entry in built_xframes {
+            xframes_by_market_lock
+                .entry(entry.market_id)
+                .or_insert_with(HashMap::new)
+                .entry(entry.asset_id)
+                .or_insert_with(BTreeMap::new)
+                .insert(entry.aligned_ts, entry.frame);
+        }
+        drop(xframes_by_market_lock);
     }
 }
 

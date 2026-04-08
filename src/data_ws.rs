@@ -75,7 +75,7 @@ pub fn spawn_bounded_market_ws(
     project_manager: Arc<ProjectManager>,
     asset_ids: Vec<String>,
     session_deadline: Instant,
-    xframe_interval_type: f64,
+    xframe_interval_type: i32,
 ) -> Result<JoinHandle<()>> {
     if asset_ids.is_empty() {
         return Err(anyhow!("asset_ids cannot be empty"));
@@ -113,7 +113,7 @@ async fn run_single_market_ws_session_until(
     project_manager: Arc<ProjectManager>,
     asset_ids: Vec<String>,
     session_deadline: Instant,
-    xframe_interval_type: f64,
+    xframe_interval_type: i32,
 ) -> Result<()> {
     let (websocket_stream, _) = connect_async(POLYMARKET_MARKET_WS_URL)
         .await
@@ -176,7 +176,7 @@ async fn run_single_market_ws_session_until(
 async fn ingest_json_event(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
-    xframe_interval_type: f64,
+    xframe_interval_type: i32,
 ) -> Result<()> {
     if let Some(events) = value.as_array() {
         for event in events {
@@ -190,7 +190,7 @@ async fn ingest_json_event(
 async fn ingest_single(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
-    xframe_interval_type: f64,
+    xframe_interval_type: i32,
 ) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
@@ -216,8 +216,8 @@ async fn ingest_single(
 pub fn parse_snapshots_from_event(
     value: &Value,
     event_type: &str,
-    xframe_interval_type: f64,
-    btc_up_down_by_asset_id: &HashMap<String, f64>,
+    xframe_interval_type: i32,
+    btc_up_down_by_asset_id: &HashMap<String, i32>,
 ) -> Vec<MarketSnapshot> {
     match event_type {
         "book" | "last_trade_price" | "best_bid_ask" | "tick_size_change" | "market_resolved" => {
@@ -243,8 +243,8 @@ pub fn parse_snapshots_from_event(
 fn parse_single_snapshot(
     value: &Value,
     event_type: &str,
-    xframe_interval_type: f64,
-    btc_up_down_by_asset_id: &HashMap<String, f64>,
+    xframe_interval_type: i32,
+    btc_up_down_by_asset_id: &HashMap<String, i32>,
 ) -> Option<MarketSnapshot> {
     let asset_id = value
         .get("asset_id")
@@ -286,8 +286,8 @@ fn parse_single_snapshot(
 
 fn parse_price_change_snapshots(
     value: &Value,
-    xframe_interval_type: f64,
-    btc_up_down_by_asset_id: &HashMap<String, f64>,
+    xframe_interval_type: i32,
+    btc_up_down_by_asset_id: &HashMap<String, i32>,
 ) -> Vec<MarketSnapshot> {
     let market_id = value
         .get("market")
@@ -339,8 +339,8 @@ fn parse_price_change_snapshots(
 
 fn parse_new_market_snapshots(
     value: &Value,
-    xframe_interval_type: f64,
-    btc_up_down_by_asset_id: &HashMap<String, f64>,
+    xframe_interval_type: i32,
+    btc_up_down_by_asset_id: &HashMap<String, i32>,
 ) -> Vec<MarketSnapshot> {
     let market_id = value
         .get("market")

@@ -15,7 +15,7 @@ pub fn current_timestamp_ms() -> i64 {
 
 pub struct GammaEventSlugData {
     pub clob_token_ids: Vec<String>,
-    pub btc_up_down_by_asset_id: HashMap<String, f64>,
+    pub btc_up_down_by_asset_id: HashMap<String, i32>,
     pub market_event_start_ms: HashMap<String, Option<i64>>,
     pub market_event_end_ms: HashMap<String, Option<i64>>,
     pub price_to_beat: Option<f64>,
@@ -87,7 +87,7 @@ pub async fn fetch_gamma_event_data_for_slug(
     })
 }
 
-fn gamma_outcome_label_to_up_code(label: &str) -> Option<f64> {
+fn gamma_outcome_label_to_up_code(label: &str) -> Option<i32> {
     match label.trim().to_ascii_lowercase().as_str() {
         "up" => Some(XFRAME_BTC_OUTCOME_UP),
         "down" => Some(XFRAME_BTC_OUTCOME_DOWN),
@@ -98,7 +98,7 @@ fn gamma_outcome_label_to_up_code(label: &str) -> Option<f64> {
 fn zip_outcomes_clob_to_up_code(
     outcomes: &[String],
     clob_ids: &[String],
-) -> anyhow::Result<HashMap<String, f64>> {
+) -> anyhow::Result<HashMap<String, i32>> {
     if outcomes.len() != clob_ids.len() {
         anyhow::bail!(
             "Gamma: len(outcomes)={} != len(clobTokenIds)={}",

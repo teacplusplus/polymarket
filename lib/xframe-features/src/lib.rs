@@ -24,6 +24,12 @@ impl PushFeature for i64 {
     }
 }
 
+impl PushFeature for i32 {
+    fn push(&self, out: &mut Vec<f32>) {
+        out.push(*self as f32);
+    }
+}
+
 impl PushFeature for Option<i64> {
     fn push(&self, out: &mut Vec<f32>) {
         out.push(self.map(|v| v as f32).unwrap_or(f32::NAN));
@@ -72,6 +78,10 @@ impl FeatureLen for Option<u64> {
 }
 
 impl FeatureLen for i64 {
+    const LEN: usize = 1;
+}
+
+impl FeatureLen for i32 {
     const LEN: usize = 1;
 }
 

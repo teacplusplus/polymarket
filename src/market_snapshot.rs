@@ -8,8 +8,8 @@ pub enum TradeSide {
 pub struct MarketSnapshot {
     pub market_id: String,
     pub asset_id: String,
-    pub xframe_interval_type: f64,
-    pub btc_up_down_outcome: f64,
+    pub xframe_interval_type: i32,
+    pub btc_up_down_outcome: i32,
     pub timestamp_ms: i64,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,

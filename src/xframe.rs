@@ -1,22 +1,23 @@
 use derivative::Derivative;
+use anyhow::bail;
 use crate::data_ws::{MarketSnapshot, TradeSide};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use xframe_features::FeatureLen;
 use xframe_features_derive::XFeatures;
 
 pub const SIZE: usize = 13;
 
-/// Код интервала в признаках: рынок BTC up/down на 15 минут (`main`: `period_sec == 900`).
-pub const XFRAME_INTERVAL_TYPE_15M: f64 = 0.0;
+/// Код интервала в признаках: рынок BTC up/down на 15 минут (`main`: `period_sec == 900`); тот же тип, что [`XFrame::xframe_interval_type`].
+pub const XFRAME_INTERVAL_TYPE_15M: i32 = 0;
 /// Код интервала: рынок на 5 минут (`period_sec == 300`).
-pub const XFRAME_INTERVAL_TYPE_5M: f64 = 1.0;
+pub const XFRAME_INTERVAL_TYPE_5M: i32 = 1;
 
-/// Признак исхода токена в BTC up/down: токен «Up».
-pub const XFRAME_BTC_OUTCOME_UP: f64 = 1.0;
+/// Признак исхода токена в BTC up/down: токен «Up». Тот же смысл, что [`XFrame::btc_up_down_outcome`].
+pub const XFRAME_BTC_OUTCOME_UP: i32 = 1;
 /// Признак исхода: токен «Down».
-pub const XFRAME_BTC_OUTCOME_DOWN: f64 = 0.0;
+pub const XFRAME_BTC_OUTCOME_DOWN: i32 = 0;
 
 const MIN_POSITIVE_ASK: f64 = 1e-12;
 
@@ -30,6 +31,7 @@ const BTC_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 /// Поля с атрибутом `#[xfeature]` попадают в вектор для обучения; `market_id`, `asset_id`, `trade_side` и `delta_n_trade_side` — без `#[xfeature]` (идентификаторы и сторона сделки для логики/отладки).
 ///
 /// `xframe_interval_type`: см. [XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]. `btc_up_down_outcome`: [XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN] (после ingest).
+/// Поля `other_*` — копия микроструктуры противоположной ноги на тот же бакет; заполняются через [XFrame::copy_other_leg_features_from] в `ProjectManager` после вставки пары кадров.
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Derivative, Clone, XFeatures)]
 #[derivative(Default)]
@@ -40,11 +42,12 @@ pub struct XFrame<const N: usize> {
     pub asset_id: String,
     /// Тип окна BTC up/down: `0` — 15 мин ([XFRAME_INTERVAL_TYPE_15M]), `1` — 5 мин ([XFRAME_INTERVAL_TYPE_5M]).
     #[xfeature]
-    pub xframe_interval_type: f64,
+    #[derivative(Default(value = "0"))]
+    pub xframe_interval_type: i32,
     /// Исход токена по Gamma (`outcomes` + `clobTokenIds`): [XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN].
     #[xfeature]
-    #[derivative(Default(value = "0.0"))]
-    pub btc_up_down_outcome: f64,
+    #[derivative(Default(value = "0"))]
+    pub btc_up_down_outcome: i32,
     /// Длительность окна события из Gamma: `event_end_ms - event_start_ms` (мс); `None`, если начало или конец неизвестны, или конец раньше начала.
     #[xfeature]
     pub event_span_ms: Option<i64>,
@@ -121,6 +124,67 @@ pub struct XFrame<const N: usize> {
     /// «Burstiness» интервалов между сделками в окне: `(std − mean) / (std + mean)` по мс-зазорам между временными метками сделок; `None`, если сделок меньше двух или знаменатель невалиден.
     #[xfeature]
     pub burstiness_transactions_count: Option<f64>,
+    // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до burstiness. ---
+    #[xfeature]
+    #[derivative(Default(value = "0.0"))]
+    pub other_best_bid: f64,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_best_bid: [Option<f64>; N],
+    #[xfeature]
+    #[derivative(Default(value = "0.0"))]
+    pub other_best_ask: f64,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_best_ask: [Option<f64>; N],
+    #[xfeature]
+    pub other_best_bid_over_best_ask: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_best_bid_over_best_ask: [Option<f64>; N],
+    #[xfeature]
+    pub other_last_trade_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_last_trade_price: [Option<f64>; N],
+    #[xfeature]
+    #[derivative(Default(value = "0.0"))]
+    pub other_trade_size: f64,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_trade_size: [Option<f64>; N],
+    #[xfeature]
+    #[derivative(Default(value = "0.0"))]
+    pub other_trade_volume_bucket: f64,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_trade_volume_bucket: [Option<f64>; N],
+    pub other_trade_side: i8,
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_trade_side: [Option<i8>; N],
+    #[xfeature]
+    #[derivative(Default(value = "0"))]
+    pub other_buy_count_window: u64,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_buy_count_window: [Option<i64>; N],
+    #[xfeature]
+    #[derivative(Default(value = "0"))]
+    pub other_sell_count_window: u64,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_sell_count_window: [Option<i64>; N],
+    #[xfeature]
+    pub other_burstiness_transactions_count: Option<f64>,
     /// Z-score цены BTC/USDT: `(p - mu) / sigma`; история — `ProjectManager::rtds_btc_prices_by_sec` (ключ Unix-секунда); `p` — последняя точка в окне, `mu`/`sigma` — по всем ценам окна.
     #[xfeature]
     pub btc_price_z_score: Option<f64>,
@@ -189,6 +253,29 @@ impl<const N: usize> XFrame<N> {
         frame.populate_window_metrics(frames, wall_ts_ms, window_ms);
         frame.populate_deltas(frames);
         frame
+    }
+
+    /// Заполняет `other_*` копией признаков стакана/сделок с кадра противоположной ноги (`Up`/`Down`) на тот же `aligned_ts` (тот же `market_id`, другой `asset_id`).
+    pub fn copy_other_leg_features_from(&mut self, other: &XFrame<N>) {
+        self.other_best_bid = other.best_bid;
+        self.other_delta_n_best_bid = other.delta_n_best_bid;
+        self.other_best_ask = other.best_ask;
+        self.other_delta_n_best_ask = other.delta_n_best_ask;
+        self.other_best_bid_over_best_ask = other.best_bid_over_best_ask;
+        self.other_delta_n_best_bid_over_best_ask = other.delta_n_best_bid_over_best_ask;
+        self.other_last_trade_price = other.last_trade_price;
+        self.other_delta_n_last_trade_price = other.delta_n_last_trade_price;
+        self.other_trade_size = other.trade_size;
+        self.other_delta_n_trade_size = other.delta_n_trade_size;
+        self.other_trade_volume_bucket = other.trade_volume_bucket;
+        self.other_delta_n_trade_volume_bucket = other.delta_n_trade_volume_bucket;
+        self.other_trade_side = other.trade_side;
+        self.other_delta_n_trade_side = other.delta_n_trade_side;
+        self.other_buy_count_window = other.buy_count_window;
+        self.other_delta_n_buy_count_window = other.delta_n_buy_count_window;
+        self.other_sell_count_window = other.sell_count_window;
+        self.other_delta_n_sell_count_window = other.delta_n_sell_count_window;
+        self.other_burstiness_transactions_count = other.burstiness_transactions_count;
     }
 
     fn populate_window_metrics(
@@ -293,6 +380,39 @@ impl<const N: usize> XFrame<N> {
             None
         }
     }
+}
+
+/// Вторая нога BTC up/down: другой `asset_id` с противоположным кодом в `btc_up_down_by_asset_id` среди кандидатов (батч + уже сохранённые кадры по тому же `market_id`).
+pub fn find_opposite_asset_id(
+    asset_id: &str,
+    btc_up_down_by_asset_id: &HashMap<String, i32>,
+    candidate_asset_ids: &HashSet<String>,
+) -> anyhow::Result<String> {
+    let Some(&my_code) = btc_up_down_by_asset_id.get(asset_id) else {
+        bail!(
+            "неизвестный код btc up/down для asset_id={asset_id} в btc_up_down_by_asset_id"
+        );
+    };
+    let other_code = if my_code == XFRAME_BTC_OUTCOME_UP {
+        XFRAME_BTC_OUTCOME_DOWN
+    } else if my_code == XFRAME_BTC_OUTCOME_DOWN {
+        XFRAME_BTC_OUTCOME_UP
+    } else {
+        bail!(
+            "неизвестный код btc up/down ({my_code}) для asset_id={asset_id} в btc_up_down_by_asset_id"
+        );
+    };
+    for candidate_id in candidate_asset_ids {
+        if candidate_id == asset_id {
+            continue;
+        }
+        if btc_up_down_by_asset_id.get(candidate_id).copied() == Some(other_code) {
+            return Ok(candidate_id.clone());
+        }
+    }
+    bail!(
+        "неизвестный кандидат btc up/down ({my_code}) для asset_id={asset_id} в btc_up_down_by_asset_id"
+    );
 }
 
 /// z = (p - mu) / sigma: только секундный ряд `prices_by_sec` (ключ — Unix-секунда); `p` — цена последней точки в окне (самый поздний ключ ≤ `reference_sec`), `mu` и `sigma` — по всем ценам в том же окне.
