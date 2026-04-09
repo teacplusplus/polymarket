@@ -14,17 +14,17 @@ use std::time::{Duration, Instant};
 use crate::util::{
     current_timestamp_ms, fetch_gamma_event_data_for_slug, GammaEventSlugData,
 };
-use crate::xframe::{XFRAME_INTERVAL_TYPE_15M, XFRAME_INTERVAL_TYPE_5M};
+use crate::market_snapshot::XFrameIntervalKind;
 
 async fn run_btc_updown_interval(
     project_manager: Arc<ProjectManager>,
     period_sec: i64,
     slug_mid: &'static str,
 ) {
-    let xframe_interval_type = match period_sec {
-        300 => XFRAME_INTERVAL_TYPE_5M,
-        900 => XFRAME_INTERVAL_TYPE_15M,
-        _ => XFRAME_INTERVAL_TYPE_15M,
+    let xframe_interval_kind = match period_sec {
+        300 => XFrameIntervalKind::FiveMin,
+        900 => XFrameIntervalKind::FifteenMin,
+        _ => XFrameIntervalKind::FifteenMin,
     };
 
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -56,6 +56,7 @@ async fn run_btc_updown_interval(
                 market_event_start_ms,
                 market_event_end_ms,
                 price_to_beat,
+                gamma_question,
                 btc_up_down_by_asset_id,
             ) = match fetch_gamma_event_data_for_slug(
                 project_manager.http.as_ref(),
@@ -69,11 +70,13 @@ async fn run_btc_updown_interval(
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
+                    gamma_question,
                 }) => (
                     clob_token_ids,
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
+                    gamma_question,
                     btc_up_down_by_asset_id,
                 ),
                 Err(e) => {
@@ -96,6 +99,7 @@ async fn run_btc_updown_interval(
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
+                    gamma_question,
                     btc_up_down_by_asset_id,
                 )
                 .await;
@@ -117,7 +121,7 @@ async fn run_btc_updown_interval(
                     project_manager.clone(),
                     ids.clone(),
                     session_deadline,
-                    xframe_interval_type,
+                    xframe_interval_kind,
                 ) {
                     Ok(h) => {
                         ws_handle = Some(h);

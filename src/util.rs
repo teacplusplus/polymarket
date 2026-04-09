@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::xframe::{XFRAME_BTC_OUTCOME_DOWN, XFRAME_BTC_OUTCOME_UP};
+use crate::market_snapshot::{BtcUpDownDelayClass, BtcUpDownOutcome};
 
 pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,10 +15,11 @@ pub fn current_timestamp_ms() -> i64 {
 
 pub struct GammaEventSlugData {
     pub clob_token_ids: Vec<String>,
-    pub btc_up_down_by_asset_id: HashMap<String, i32>,
+    pub btc_up_down_by_asset_id: HashMap<String, BtcUpDownOutcome>,
     pub market_event_start_ms: HashMap<String, Option<i64>>,
     pub market_event_end_ms: HashMap<String, Option<i64>>,
     pub price_to_beat: Option<f64>,
+    pub gamma_question: Option<String>,
 }
 
 pub async fn fetch_gamma_event_data_for_slug(
@@ -58,6 +59,11 @@ pub async fn fetch_gamma_event_data_for_slug(
         .and_then(|meta| meta.get("priceToBeat"))
         .and_then(|n| n.as_f64().or_else(|| n.as_str()?.parse().ok()));
 
+    let gamma_question = v
+        .get("question")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+
     let mut market_event_start_ms = HashMap::new();
     let mut market_event_end_ms = HashMap::new();
 
@@ -84,13 +90,61 @@ pub async fn fetch_gamma_event_data_for_slug(
         market_event_start_ms,
         market_event_end_ms,
         price_to_beat,
+        gamma_question,
     })
 }
 
-fn gamma_outcome_label_to_up_code(label: &str) -> Option<i32> {
+/// Парсит `question` Gamma в духе `Bitcoin Up or Down - April 8, 3:35PM-3:40PM ET`:  
+/// если окно ровно 5 минут, возвращает класс пятиминутки внутри 15-минутного блока.
+pub fn btc_up_down_five_min_slot_from_gamma_question(question: &str) -> Option<BtcUpDownDelayClass> {
+    let (_, market_info) = question.split_once(" - ")?;
+    let (_, time_part) = market_info.split_once(", ")?;
+    let (start_time, end_with_tz) = time_part.split_once('-')?;
+    let end_time = end_with_tz.split_whitespace().next()?;
+
+    let (start_h, start_m) = parse_gamma_question_time_12h(start_time)?;
+    let (end_h, end_m) = parse_gamma_question_time_12h(end_time)?;
+
+    let start_total = (start_h as i32) * 60 + start_m as i32;
+    let mut end_total = (end_h as i32) * 60 + end_m as i32;
+    if end_total < start_total {
+        end_total += 24 * 60;
+    }
+    let duration_min = end_total - start_total;
+    if duration_min != 5 {
+        return None;
+    }
+
+    let minutes_since_midnight = (start_h as i32) * 60 + start_m as i32;
+    let rem = minutes_since_midnight.rem_euclid(15);
+    if rem % 5 != 0 {
+        return None;
+    }
+    BtcUpDownDelayClass::from_i32(rem / 5)
+}
+
+fn parse_gamma_question_time_12h(value: &str) -> Option<(u32, u32)> {
+    let (hour_raw, minute_ampm) = value.split_once(':')?;
+    if minute_ampm.len() < 4 {
+        return None;
+    }
+    let hour_12 = hour_raw.parse::<u32>().ok()?;
+    let minute = minute_ampm[..2].parse::<u32>().ok()?;
+    let am_pm = &minute_ampm[2..];
+    let hour_24 = match am_pm {
+        "AM" if hour_12 == 12 => 0,
+        "AM" => hour_12,
+        "PM" if hour_12 == 12 => 12,
+        "PM" => hour_12 + 12,
+        _ => return None,
+    };
+    Some((hour_24, minute))
+}
+
+fn gamma_outcome_label_to_btc_kind(label: &str) -> Option<BtcUpDownOutcome> {
     match label.trim().to_ascii_lowercase().as_str() {
-        "up" => Some(XFRAME_BTC_OUTCOME_UP),
-        "down" => Some(XFRAME_BTC_OUTCOME_DOWN),
+        "up" => Some(BtcUpDownOutcome::Up),
+        "down" => Some(BtcUpDownOutcome::Down),
         _ => None,
     }
 }
@@ -98,7 +152,7 @@ fn gamma_outcome_label_to_up_code(label: &str) -> Option<i32> {
 fn zip_outcomes_clob_to_up_code(
     outcomes: &[String],
     clob_ids: &[String],
-) -> anyhow::Result<HashMap<String, i32>> {
+) -> anyhow::Result<HashMap<String, BtcUpDownOutcome>> {
     if outcomes.len() != clob_ids.len() {
         anyhow::bail!(
             "Gamma: len(outcomes)={} != len(clobTokenIds)={}",
@@ -108,7 +162,7 @@ fn zip_outcomes_clob_to_up_code(
     }
     let mut map = HashMap::new();
     for (label, token_id) in outcomes.iter().zip(clob_ids.iter()) {
-        if let Some(code) = gamma_outcome_label_to_up_code(label) {
+        if let Some(code) = gamma_outcome_label_to_btc_kind(label) {
             map.insert(token_id.clone(), code);
         }
     }

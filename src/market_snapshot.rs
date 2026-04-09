@@ -4,12 +4,100 @@ pub enum TradeSide {
     Sell,
 }
 
+/// Тип окна BTC up/down (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[repr(i32)]
+pub enum XFrameIntervalKind {
+    #[default]
+    FifteenMin = 0,
+    FiveMin = 1,
+}
+
+impl XFrameIntervalKind {
+    #[inline]
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    #[inline]
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::FifteenMin),
+            1 => Some(Self::FiveMin),
+            _ => None,
+        }
+    }
+}
+
+/// Исход токена BTC up/down (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[repr(i32)]
+pub enum BtcUpDownOutcome {
+    #[default]
+    Down = 0,
+    Up = 1,
+}
+
+impl BtcUpDownOutcome {
+    #[inline]
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    #[inline]
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Down),
+            1 => Some(Self::Up),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::Down => Self::Up,
+            Self::Up => Self::Down,
+        }
+    }
+}
+
+/// Класс сдвига / номер пятиминутки в 15m-блоке (в [`crate::xframe::XFrame`] хранится как `i32`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[repr(i32)]
+pub enum BtcUpDownDelayClass {
+    /// 15m-рынок или первая пятиминутка в блоке.
+    #[default]
+    Aligned = 0,
+    /// Вторая пятиминутка (+5 мин).
+    Delay5Min = 1,
+    /// Третья пятиминутка (+10 мин).
+    Delay10Min = 2,
+}
+
+impl BtcUpDownDelayClass {
+    #[inline]
+    pub const fn as_i32(self) -> i32 {
+        self as i32
+    }
+
+    #[inline]
+    pub const fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Aligned),
+            1 => Some(Self::Delay5Min),
+            2 => Some(Self::Delay10Min),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketSnapshot {
     pub market_id: String,
     pub asset_id: String,
-    pub xframe_interval_type: i32,
-    pub btc_up_down_outcome: i32,
+    pub xframe_interval_kind: XFrameIntervalKind,
+    pub btc_up_down_outcome: BtcUpDownOutcome,
     pub timestamp_ms: i64,
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
@@ -27,7 +115,7 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, timestamp_ms: i64) -> Optio
     let mut aggregated_market_snapshot = MarketSnapshot {
         market_id: first_event_snapshot.market_id.clone(),
         asset_id: first_event_snapshot.asset_id.clone(),
-        xframe_interval_type: first_event_snapshot.xframe_interval_type,
+        xframe_interval_kind: first_event_snapshot.xframe_interval_kind,
         btc_up_down_outcome: first_event_snapshot.btc_up_down_outcome,
         timestamp_ms,
         best_bid: None,

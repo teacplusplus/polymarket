@@ -4,7 +4,8 @@ use crate::btcusdt_ws::RtdsBtcLatest;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
 use crate::data_ws::{
-    make_ws_channel, MarketSnapshot, MarketSnapshotBuffer, MarketSnapshotBufferMut, Ws,
+    make_ws_channel, BtcUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer,
+    MarketSnapshotBufferMut, Ws,
 };
 use crate::xframe::{
     btc_price_z_score_from_sec_history, find_opposite_asset_id, XFrame, SIZE,
@@ -28,19 +29,19 @@ struct BuiltXframeEntry {
 
 const FRAME_BUILD_INTERVAL_SEC: u64 = 1;
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MarketEventData {
     pub start_ms: Option<i64>,
     pub end_ms: Option<i64>,
-    /// Chainlink «price to beat» из Gamma `eventMetadata` для этого `condition_id`.
     pub price_to_beat: Option<f64>,
+    pub gamma_question: Option<String>,
 }
 
 pub struct ProjectManager {
     pub xframes_by_market: Arc<RwLock<MarketFrames>>,
     pub ws_buffer_by_market: Arc<RwLock<MarketSnapshotBuffer>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
-    pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, i32>>>,
+    pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, BtcUpDownOutcome>>>,
     pub rtds_btc_latest: Arc<RwLock<Option<RtdsBtcLatest>>>,
     pub rtds_btc_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
     pub ws: Arc<Ws>,
@@ -66,7 +67,7 @@ impl ProjectManager {
             xframes_by_market: Arc::new(RwLock::new(HashMap::new())),
             ws_buffer_by_market: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
-            btc_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
+            btc_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, BtcUpDownOutcome>::new())),
             rtds_btc_latest: Arc::new(RwLock::new(None)),
             rtds_btc_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
             ws,
@@ -101,7 +102,8 @@ impl ProjectManager {
         starts: HashMap<String, Option<i64>>,
         ends: HashMap<String, Option<i64>>,
         price_to_beat: Option<f64>,
-        btc_up_down_by_asset_id: HashMap<String, i32>,
+        gamma_question: Option<String>,
+        btc_up_down_by_asset_id: HashMap<String, BtcUpDownOutcome>,
     ) {
         let mut lock = self.event_data_by_market.write().await;
         for (market_id, start_ms) in starts {
@@ -110,12 +112,18 @@ impl ProjectManager {
             if let Some(p) = price_to_beat {
                 entry.price_to_beat = Some(p);
             }
+            if let Some(ref q) = gamma_question {
+                entry.gamma_question = Some(q.clone());
+            }
         }
         for (market_id, end_ms) in ends {
             let entry = lock.entry(market_id).or_default();
             entry.end_ms = end_ms;
             if let Some(p) = price_to_beat {
                 entry.price_to_beat = Some(p);
+            }
+            if let Some(ref q) = gamma_question {
+                entry.gamma_question = Some(q.clone());
             }
         }
         drop(lock);
@@ -215,13 +223,12 @@ impl ProjectManager {
                 history
             };
 
-            let (event_start_ms, event_end_ms, price_to_beat) = self
-                .event_data_by_market
-                .read()
-                .await
-                .get(&market_id)
-                .map(|t| (t.start_ms, t.end_ms, t.price_to_beat))
-                .unwrap_or((None, None, None));
+            let event_guard = self.event_data_by_market.read().await;
+            let event_data = event_guard.get(&market_id);
+            let event_end_ms = event_data.and_then(|t| t.end_ms);
+            let price_to_beat = event_data.and_then(|t| t.price_to_beat);
+            let gamma_question_owned = event_data.and_then(|t| t.gamma_question.clone());
+            drop(event_guard);
 
             let btc_price_vs_beat_pct =
                 btc_price_vs_price_to_beat_pct(price_to_beat, btc_spot_usd);
@@ -230,8 +237,8 @@ impl ProjectManager {
             let frame = XFrame::<SIZE>::new(
                 snapshot,
                 &frames_history,
-                event_start_ms,
                 event_end_ms,
+                gamma_question_owned.as_deref(),
                 btc_price_z_score,
                 btc_price_vs_beat_pct,
                 window_ms,
@@ -269,7 +276,7 @@ impl ProjectManager {
             })
             .collect();
 
-        let btc_up_down_by_asset_id: HashMap<String, i32> = {
+        let btc_up_down_by_asset_id: HashMap<String, BtcUpDownOutcome> = {
             let guard = self.btc_up_down_by_asset_id.read().await;
             guard.clone()
         };
@@ -280,12 +287,11 @@ impl ProjectManager {
             let other_asset_id = match find_opposite_asset_id(
                 &entry.asset_id,
                 &btc_up_down_by_asset_id,
-                &candidate_asset_ids,
-            ) {
+                &candidate_asset_ids) {
                 Ok(id) => id,
                 Err(err) => {
                     eprintln!("find_opposite_asset_id: {err:#}");
-                    return;
+                    continue;
                 }
             };
             let Some(other_frame) = batch_frame_by_bucket.get(&(entry.market_id.clone(), other_asset_id.clone(), entry.aligned_ts)) else {

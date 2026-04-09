@@ -12,7 +12,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-pub use crate::market_snapshot::{MarketSnapshot, TradeSide};
+pub use crate::market_snapshot::{
+    BtcUpDownDelayClass, BtcUpDownOutcome, MarketSnapshot, TradeSide, XFrameIntervalKind,
+};
 
 use crate::market_snapshot::aggregate_events;
 
@@ -75,7 +77,7 @@ pub fn spawn_bounded_market_ws(
     project_manager: Arc<ProjectManager>,
     asset_ids: Vec<String>,
     session_deadline: Instant,
-    xframe_interval_type: i32,
+    xframe_interval_kind: XFrameIntervalKind,
 ) -> Result<JoinHandle<()>> {
     if asset_ids.is_empty() {
         return Err(anyhow!("asset_ids cannot be empty"));
@@ -90,7 +92,7 @@ pub fn spawn_bounded_market_ws(
                 project_manager.clone(),
                 asset_ids.clone(),
                 session_deadline,
-                xframe_interval_type,
+                xframe_interval_kind,
             )
             .await
             {
@@ -113,7 +115,7 @@ async fn run_single_market_ws_session_until(
     project_manager: Arc<ProjectManager>,
     asset_ids: Vec<String>,
     session_deadline: Instant,
-    xframe_interval_type: i32,
+    xframe_interval_kind: XFrameIntervalKind,
 ) -> Result<()> {
     let (websocket_stream, _) = connect_async(POLYMARKET_MARKET_WS_URL)
         .await
@@ -144,7 +146,7 @@ async fn run_single_market_ws_session_until(
                 match message {
                     Message::Text(text) => {
                         if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
-                            ingest_json_event(&project_manager, &json_value, xframe_interval_type)
+                            ingest_json_event(&project_manager, &json_value, xframe_interval_kind)
                                 .await?;
                         }
                     }
@@ -154,7 +156,7 @@ async fn run_single_market_ws_session_until(
                                 ingest_json_event(
                                     &project_manager,
                                     &json_value,
-                                    xframe_interval_type,
+                                    xframe_interval_kind,
                                 )
                                 .await?;
                             }
@@ -176,21 +178,21 @@ async fn run_single_market_ws_session_until(
 async fn ingest_json_event(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
-    xframe_interval_type: i32,
+    xframe_interval_kind: XFrameIntervalKind,
 ) -> Result<()> {
     if let Some(events) = value.as_array() {
         for event in events {
-            ingest_single(project_manager, event, xframe_interval_type).await?;
+            ingest_single(project_manager, event, xframe_interval_kind).await?;
         }
         return Ok(());
     }
-    ingest_single(project_manager, value, xframe_interval_type).await
+    ingest_single(project_manager, value, xframe_interval_kind).await
 }
 
 async fn ingest_single(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
-    xframe_interval_type: i32,
+    xframe_interval_kind: XFrameIntervalKind,
 ) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
@@ -199,7 +201,7 @@ async fn ingest_single(
     let snapshots = parse_snapshots_from_event(
         value,
         event_type,
-        xframe_interval_type,
+        xframe_interval_kind,
         &btc_up_down_by_asset_id,
     );
     for snapshot in snapshots {
@@ -216,25 +218,25 @@ async fn ingest_single(
 pub fn parse_snapshots_from_event(
     value: &Value,
     event_type: &str,
-    xframe_interval_type: i32,
-    btc_up_down_by_asset_id: &HashMap<String, i32>,
+    xframe_interval_kind: XFrameIntervalKind,
+    btc_up_down_by_asset_id: &HashMap<String, BtcUpDownOutcome>,
 ) -> Vec<MarketSnapshot> {
     match event_type {
         "book" | "last_trade_price" | "best_bid_ask" | "tick_size_change" | "market_resolved" => {
             parse_single_snapshot(
                 value,
                 event_type,
-                xframe_interval_type,
+                xframe_interval_kind,
                 btc_up_down_by_asset_id,
             )
             .into_iter()
             .collect()
         }
         "price_change" => {
-            parse_price_change_snapshots(value, xframe_interval_type, btc_up_down_by_asset_id)
+            parse_price_change_snapshots(value, xframe_interval_kind, btc_up_down_by_asset_id)
         }
         "new_market" => {
-            parse_new_market_snapshots(value, xframe_interval_type, btc_up_down_by_asset_id)
+            parse_new_market_snapshots(value, xframe_interval_kind, btc_up_down_by_asset_id)
         }
         _ => Vec::new(),
     }
@@ -243,8 +245,8 @@ pub fn parse_snapshots_from_event(
 fn parse_single_snapshot(
     value: &Value,
     event_type: &str,
-    xframe_interval_type: i32,
-    btc_up_down_by_asset_id: &HashMap<String, i32>,
+    xframe_interval_kind: XFrameIntervalKind,
+    btc_up_down_by_asset_id: &HashMap<String, BtcUpDownOutcome>,
 ) -> Option<MarketSnapshot> {
     let asset_id = value
         .get("asset_id")
@@ -268,7 +270,7 @@ fn parse_single_snapshot(
     Some(MarketSnapshot {
         market_id,
         asset_id,
-        xframe_interval_type,
+        xframe_interval_kind,
         btc_up_down_outcome,
         timestamp_ms,
         best_bid,
@@ -286,8 +288,8 @@ fn parse_single_snapshot(
 
 fn parse_price_change_snapshots(
     value: &Value,
-    xframe_interval_type: i32,
-    btc_up_down_by_asset_id: &HashMap<String, i32>,
+    xframe_interval_kind: XFrameIntervalKind,
+    btc_up_down_by_asset_id: &HashMap<String, BtcUpDownOutcome>,
 ) -> Vec<MarketSnapshot> {
     let market_id = value
         .get("market")
@@ -320,7 +322,7 @@ fn parse_price_change_snapshots(
         snapshots.push(MarketSnapshot {
             market_id: market_id.clone(),
             asset_id,
-            xframe_interval_type,
+            xframe_interval_kind,
             btc_up_down_outcome,
             timestamp_ms,
             best_bid: parse_f64(change.get("best_bid")),
@@ -339,8 +341,8 @@ fn parse_price_change_snapshots(
 
 fn parse_new_market_snapshots(
     value: &Value,
-    xframe_interval_type: i32,
-    btc_up_down_by_asset_id: &HashMap<String, i32>,
+    xframe_interval_kind: XFrameIntervalKind,
+    btc_up_down_by_asset_id: &HashMap<String, BtcUpDownOutcome>,
 ) -> Vec<MarketSnapshot> {
     let market_id = value
         .get("market")
@@ -369,7 +371,7 @@ fn parse_new_market_snapshots(
         snapshots.push(MarketSnapshot {
             market_id: market_id.clone(),
             asset_id,
-            xframe_interval_type,
+            xframe_interval_kind,
             btc_up_down_outcome,
             timestamp_ms,
             best_bid: None,
