@@ -3,12 +3,18 @@ use anyhow::bail;
 use crate::btcusdt_ws::RtdsBtcLatest;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
+
+pub use crate::btc_updown_sibling::{
+    five_min_belongs_to_fifteen_window, BtcUpdownSiblingSlot, BtcUpdownSiblingWsState,
+};
+pub use crate::constants::{BtcUpdownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use crate::data_ws::{
     make_ws_channel, BtcUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer,
     MarketSnapshotBufferMut, Ws,
 };
 use crate::xframe::{
-    btc_price_z_score_from_sec_history, find_opposite_asset_id, XFrame, SIZE,
+    btc_price_z_score_from_sec_history, find_opposite_asset_id, find_same_outcome_sibling_asset_id,
+    XFrame, SIZE,
 };
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
@@ -16,6 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
+use crate::btc_updown_sibling::on_btc_updown_ws_connected;
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
 
@@ -42,6 +49,7 @@ pub struct ProjectManager {
     pub ws_buffer_by_market: Arc<RwLock<MarketSnapshotBuffer>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, BtcUpDownOutcome>>>,
+    pub btc_updown_sibling_ws_state: Arc<RwLock<BtcUpdownSiblingWsState>>,
     pub rtds_btc_latest: Arc<RwLock<Option<RtdsBtcLatest>>>,
     pub rtds_btc_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
     pub ws: Arc<Ws>,
@@ -68,6 +76,7 @@ impl ProjectManager {
             ws_buffer_by_market: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             btc_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, BtcUpDownOutcome>::new())),
+            btc_updown_sibling_ws_state: Arc::new(RwLock::new(BtcUpdownSiblingWsState::default())),
             rtds_btc_latest: Arc::new(RwLock::new(None)),
             rtds_btc_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
             ws,
@@ -134,6 +143,25 @@ impl ProjectManager {
                 map.insert(asset_id, code);
             }
         }
+    }
+
+    /// Вызывать при перезапуске подписки, сразу после лога старта WS и до `spawn_bounded_market_ws` (`btc-updown-5m-*` / `btc-updown-15m-*`).
+    /// Обновляет [`Self::btc_updown_sibling_ws_state`]; пару для sibling-признаков читает [`BtcUpdownSiblingWsState::paired_five_and_fifteen_market_ids`].
+    pub async fn on_btc_updown_ws_connected(
+        &self,
+        interval_sec: i64,
+        slug_window_start_unix_sec: i64,
+        market_ids: &[String],
+        gamma_question: Option<&str>,
+    ) {
+        on_btc_updown_ws_connected(
+            self.btc_updown_sibling_ws_state.clone(),
+            interval_sec,
+            slug_window_start_unix_sec,
+            market_ids,
+            gamma_question,
+        )
+        .await;
     }
 
     pub async fn ingest_snapshot(&self, mut snapshot: MarketSnapshot) -> anyhow::Result<()> {
@@ -282,7 +310,10 @@ impl ProjectManager {
         };
 
         for entry in &mut built_xframes {
-            let candidate_asset_ids: HashSet<String> = batch_assets_by_market.get(&entry.market_id).cloned().unwrap_or_default();
+            let candidate_asset_ids: HashSet<String> = batch_assets_by_market
+                .get(&entry.market_id)
+                .cloned()
+                .unwrap_or_default();
 
             let other_asset_id = match find_opposite_asset_id(
                 &entry.asset_id,
@@ -294,10 +325,56 @@ impl ProjectManager {
                     continue;
                 }
             };
-            let Some(other_frame) = batch_frame_by_bucket.get(&(entry.market_id.clone(), other_asset_id.clone(), entry.aligned_ts)) else {
+            let Some(other_frame) = batch_frame_by_bucket.get(&(
+                entry.market_id.clone(),
+                other_asset_id.clone(),
+                entry.aligned_ts,
+            )) else {
                 continue;
             };
-            entry.frame.copy_other_leg_features_from(other_frame);
+            entry.frame.merge_other_leg_features_from(other_frame);
+        }
+
+        let sibling_market_by_market: HashMap<String, String> = {
+            let sibling_ws_state_read_guard = self.btc_updown_sibling_ws_state.read().await;
+            let mut sibling_market_lookup = HashMap::new();
+            if let Some((five_market_id, fifteen_market_id)) =
+                sibling_ws_state_read_guard.paired_five_and_fifteen_market_ids()
+            {
+                sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
+                sibling_market_lookup.insert(fifteen_market_id, five_market_id);
+            }
+            sibling_market_lookup
+        };
+
+        for entry in &mut built_xframes {
+            let Some(sibling_market_id) = sibling_market_by_market.get(&entry.market_id) else {
+                continue;
+            };
+            let sibling_candidates = batch_assets_by_market
+                .get(sibling_market_id)
+                .cloned()
+                .unwrap_or_default();
+            let sibling_asset_id = match find_same_outcome_sibling_asset_id(
+                &entry.asset_id,
+                sibling_market_id.as_str(),
+                &btc_up_down_by_asset_id,
+                &sibling_candidates,
+            ) {
+                Ok(id) => id,
+                Err(err) => {
+                    eprintln!("find_same_outcome_sibling_asset_id: {err:#}");
+                    continue;
+                }
+            };
+            let Some(sibling_frame) = batch_frame_by_bucket.get(&(
+                sibling_market_id.clone(),
+                sibling_asset_id,
+                entry.aligned_ts,
+            )) else {
+                continue;
+            };
+            entry.frame.merge_sibling_market_features_from(sibling_frame);
         }
 
         let mut xframes_by_market_lock = self.xframes_by_market.write().await;

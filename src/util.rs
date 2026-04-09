@@ -3,7 +3,7 @@ use chrono::DateTime;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::market_snapshot::{BtcUpDownDelayClass, BtcUpDownOutcome};
+use crate::constants::BtcUpDownOutcome;
 
 pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,53 +92,6 @@ pub async fn fetch_gamma_event_data_for_slug(
         price_to_beat,
         gamma_question,
     })
-}
-
-/// Парсит `question` Gamma в духе `Bitcoin Up or Down - April 8, 3:35PM-3:40PM ET`:  
-/// если окно ровно 5 минут, возвращает класс пятиминутки внутри 15-минутного блока.
-pub fn btc_up_down_five_min_slot_from_gamma_question(question: &str) -> Option<BtcUpDownDelayClass> {
-    let (_, market_info) = question.split_once(" - ")?;
-    let (_, time_part) = market_info.split_once(", ")?;
-    let (start_time, end_with_tz) = time_part.split_once('-')?;
-    let end_time = end_with_tz.split_whitespace().next()?;
-
-    let (start_h, start_m) = parse_gamma_question_time_12h(start_time)?;
-    let (end_h, end_m) = parse_gamma_question_time_12h(end_time)?;
-
-    let start_total = (start_h as i32) * 60 + start_m as i32;
-    let mut end_total = (end_h as i32) * 60 + end_m as i32;
-    if end_total < start_total {
-        end_total += 24 * 60;
-    }
-    let duration_min = end_total - start_total;
-    if duration_min != 5 {
-        return None;
-    }
-
-    let minutes_since_midnight = (start_h as i32) * 60 + start_m as i32;
-    let rem = minutes_since_midnight.rem_euclid(15);
-    if rem % 5 != 0 {
-        return None;
-    }
-    BtcUpDownDelayClass::from_i32(rem / 5)
-}
-
-fn parse_gamma_question_time_12h(value: &str) -> Option<(u32, u32)> {
-    let (hour_raw, minute_ampm) = value.split_once(':')?;
-    if minute_ampm.len() < 4 {
-        return None;
-    }
-    let hour_12 = hour_raw.parse::<u32>().ok()?;
-    let minute = minute_ampm[..2].parse::<u32>().ok()?;
-    let am_pm = &minute_ampm[2..];
-    let hour_24 = match am_pm {
-        "AM" if hour_12 == 12 => 0,
-        "AM" => hour_12,
-        "PM" if hour_12 == 12 => 12,
-        "PM" => hour_12 + 12,
-        _ => return None,
-    };
-    Some((hour_24, minute))
 }
 
 fn gamma_outcome_label_to_btc_kind(label: &str) -> Option<BtcUpDownOutcome> {

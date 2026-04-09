@@ -1,4 +1,7 @@
+pub mod constants;
 pub mod util;
+pub mod gamma_question;
+pub mod btc_updown_sibling;
 pub mod xframe;
 pub mod project_manager;
 pub mod market_snapshot;
@@ -7,14 +10,14 @@ pub mod btcusdt_ws;
 pub mod data_ws;
 
 use anyhow::Result;
-use project_manager::ProjectManager;
+use project_manager::{ProjectManager, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::util::{
     current_timestamp_ms, fetch_gamma_event_data_for_slug, GammaEventSlugData,
 };
-use crate::market_snapshot::XFrameIntervalKind;
+use crate::constants::XFrameIntervalKind;
 
 async fn run_btc_updown_interval(
     project_manager: Arc<ProjectManager>,
@@ -22,8 +25,8 @@ async fn run_btc_updown_interval(
     slug_mid: &'static str,
 ) {
     let xframe_interval_kind = match period_sec {
-        300 => XFrameIntervalKind::FiveMin,
-        900 => XFrameIntervalKind::FifteenMin,
+        ps if ps == FIVE_MIN_SEC => XFrameIntervalKind::FiveMin,
+        ps if ps == FIFTEEN_MIN_SEC => XFrameIntervalKind::FifteenMin,
         _ => XFrameIntervalKind::FifteenMin,
     };
 
@@ -99,7 +102,7 @@ async fn run_btc_updown_interval(
                     market_event_start_ms,
                     market_event_end_ms,
                     price_to_beat,
-                    gamma_question,
+                    gamma_question.clone(),
                     btc_up_down_by_asset_id,
                 )
                 .await;
@@ -116,6 +119,14 @@ async fn run_btc_updown_interval(
                 let session_deadline = Instant::now() + Duration::from_millis(remain_ms);
 
                 run_log::ws_start(slug_mid, &slug, &market_ids, &ids, remain_ms, wall_end_ms);
+
+                project_manager
+                    .on_btc_updown_ws_connected(
+                        period_sec,
+                        window_start_sec,
+                        &market_ids,
+                        gamma_question.as_deref(),
+                    ).await;
 
                 match data_ws::spawn_bounded_market_ws(
                     project_manager.clone(),
@@ -153,13 +164,16 @@ async fn main() -> Result<()> {
         .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
     let project_manager = ProjectManager::new();
-
-
-
-    let pm5 = project_manager.clone();
-    tokio::spawn(run_btc_updown_interval(pm5, 300, "5m"));
-    let pm15 = project_manager.clone();
-    tokio::spawn(run_btc_updown_interval(pm15, 900, "15m"));
+    tokio::spawn(run_btc_updown_interval(
+        project_manager.clone(),
+        FIVE_MIN_SEC,
+        "5m",
+    ));
+    tokio::spawn(run_btc_updown_interval(
+        project_manager.clone(),
+        FIFTEEN_MIN_SEC,
+        "15m",
+    ));
 
     std::future::pending::<()>().await;
     Ok(())
