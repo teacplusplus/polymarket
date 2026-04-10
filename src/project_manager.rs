@@ -309,72 +309,85 @@ impl ProjectManager {
             guard.clone()
         };
 
-        for entry in &mut built_xframes {
-            let candidate_asset_ids: HashSet<String> = batch_assets_by_market
-                .get(&entry.market_id)
-                .cloned()
-                .unwrap_or_default();
-
-            let other_asset_id = match find_opposite_asset_id(
-                &entry.asset_id,
-                &btc_up_down_by_asset_id,
-                &candidate_asset_ids) {
-                Ok(id) => id,
-                Err(err) => {
-                    eprintln!("find_opposite_asset_id: {err:#}");
-                    continue;
-                }
-            };
-            let Some(other_frame) = batch_frame_by_bucket.get(&(
-                entry.market_id.clone(),
-                other_asset_id.clone(),
-                entry.aligned_ts,
-            )) else {
-                continue;
-            };
-            entry.frame.merge_other_leg_features_from(other_frame);
-        }
-
         let sibling_market_by_market: HashMap<String, String> = {
             let sibling_ws_state_read_guard = self.btc_updown_sibling_ws_state.read().await;
             let mut sibling_market_lookup = HashMap::new();
-            if let Some((five_market_id, fifteen_market_id)) =
-                sibling_ws_state_read_guard.paired_five_and_fifteen_market_ids()
-            {
+            if let Some((five_market_id, fifteen_market_id)) = sibling_ws_state_read_guard.paired_five_and_fifteen_market_ids() {
                 sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
                 sibling_market_lookup.insert(fifteen_market_id, five_market_id);
             }
             sibling_market_lookup
         };
 
-        for entry in &mut built_xframes {
-            let Some(sibling_market_id) = sibling_market_by_market.get(&entry.market_id) else {
-                continue;
-            };
-            let sibling_candidates = batch_assets_by_market
-                .get(sibling_market_id)
-                .cloned()
-                .unwrap_or_default();
-            let sibling_asset_id = match find_same_outcome_sibling_asset_id(
-                &entry.asset_id,
-                sibling_market_id.as_str(),
-                &btc_up_down_by_asset_id,
-                &sibling_candidates,
-            ) {
-                Ok(id) => id,
-                Err(err) => {
-                    eprintln!("find_same_outcome_sibling_asset_id: {err:#}");
-                    continue;
+        {
+            let xframes_stored = self.xframes_by_market.read().await;
+
+            for entry in &mut built_xframes {
+                let mut candidate_asset_ids: HashSet<String> = batch_assets_by_market
+                    .get(&entry.market_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(by_asset) = xframes_stored.get(&entry.market_id) {
+                    candidate_asset_ids.extend(by_asset.keys().cloned());
                 }
-            };
-            let Some(sibling_frame) = batch_frame_by_bucket.get(&(
-                sibling_market_id.clone(),
-                sibling_asset_id,
-                entry.aligned_ts,
-            )) else {
-                continue;
-            };
-            entry.frame.merge_sibling_market_features_from(sibling_frame);
+
+                let other_asset_id = match find_opposite_asset_id(
+                    &entry.asset_id,
+                    &btc_up_down_by_asset_id,
+                    &candidate_asset_ids,
+                ) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        eprintln!("find_opposite_asset_id: {err:#}");
+                        continue;
+                    }
+                };
+                let Some(other_frame) = lookup_frame_for_leg_merge(
+                    &entry.market_id,
+                    &other_asset_id,
+                    entry.aligned_ts,
+                    &batch_frame_by_bucket,
+                    &xframes_stored,
+                ) else {
+                    continue;
+                };
+                entry.frame.merge_other_leg_features_from(other_frame);
+            }
+
+            for entry in &mut built_xframes {
+                let Some(sibling_market_id) = sibling_market_by_market.get(&entry.market_id) else {
+                    continue;
+                };
+                let mut sibling_candidates: HashSet<String> = batch_assets_by_market
+                    .get(sibling_market_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(by_asset) = xframes_stored.get(sibling_market_id) {
+                    sibling_candidates.extend(by_asset.keys().cloned());
+                }
+                let sibling_asset_id = match find_same_outcome_sibling_asset_id(
+                    &entry.asset_id,
+                    sibling_market_id.as_str(),
+                    &btc_up_down_by_asset_id,
+                    &sibling_candidates,
+                ) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        eprintln!("find_same_outcome_sibling_asset_id: {err:#}");
+                        continue;
+                    }
+                };
+                let Some(sibling_frame) = lookup_frame_for_leg_merge(
+                    sibling_market_id.as_str(),
+                    &sibling_asset_id,
+                    entry.aligned_ts,
+                    &batch_frame_by_bucket,
+                    &xframes_stored,
+                ) else {
+                    continue;
+                };
+                entry.frame.merge_sibling_market_features_from(sibling_frame);
+            }
         }
 
         let mut xframes_by_market_lock = self.xframes_by_market.write().await;
@@ -388,6 +401,25 @@ impl ProjectManager {
         }
         drop(xframes_by_market_lock);
     }
+}
+
+/// Противоположная нога / sibling: кадр из текущего батча, иначе уже сохранённый с тем же `aligned_ts`, иначе последний с `aligned_ts` ≤ запрошенного.
+fn lookup_frame_for_leg_merge<'a>(
+    market_id: &str,
+    asset_id: &str,
+    aligned_ts: i64,
+    batch: &'a HashMap<(String, String, i64), XFrame<SIZE>>,
+    stored: &'a MarketFrames,
+) -> Option<&'a XFrame<SIZE>> {
+    if let Some(frame) = batch.get(&(market_id.to_string(), asset_id.to_string(), aligned_ts)) {
+        return Some(frame);
+    }
+    let by_asset = stored.get(market_id)?;
+    let by_ts = by_asset.get(asset_id)?;
+    if let Some(frame) = by_ts.get(&aligned_ts) {
+        return Some(frame);
+    }
+    by_ts.range(..=aligned_ts).next_back().map(|(_, frame)| frame)
 }
 
 /// `(price_to_beat - btc_spot) / price_to_beat * 100` — отклонение спота от уровня «beat» в процентах; знак «+», если спот ниже beat.

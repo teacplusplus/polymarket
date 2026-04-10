@@ -51,7 +51,7 @@ pub struct XFrame<const N: usize> {
     pub event_remaining_ms: i64,
     /// Лучшая цена bid на конец интервала / бакета снапшота.
     #[xfeature]
-    pub best_bid: f64,
+    pub best_bid: Option<f64>,
     /// Разность текущего `best_bid` и `best_bid` у `i`-го предыдущего кадра: индекс `0` — непосредственный предшественник по времени, далее глубже в прошлое; `None`, если такого кадра ещё не было.
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
@@ -59,7 +59,7 @@ pub struct XFrame<const N: usize> {
     pub delta_n_best_bid: [Option<f64>; N],
     /// Лучшая цена ask на конец интервала.
     #[xfeature]
-    pub best_ask: f64,
+    pub best_ask: Option<f64>,
     /// Разность текущего `best_ask` и `best_ask` у `i`-го предыдущего кадра (индексация как у `delta_n_best_bid`).
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
@@ -114,15 +114,13 @@ pub struct XFrame<const N: usize> {
     pub burstiness_transactions_count: Option<f64>,
     // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до burstiness. ---
     #[xfeature]
-    #[derivative(Default(value = "0.0"))]
-    pub other_best_bid: f64,
+    pub other_best_bid: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_best_bid: [Option<f64>; N],
     #[xfeature]
-    #[derivative(Default(value = "0.0"))]
-    pub other_best_ask: f64,
+    pub other_best_ask: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
@@ -175,15 +173,13 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "-1"))]
     pub sibling_event_remaining_ms: i64,
     #[xfeature]
-    #[derivative(Default(value = "0.0"))]
-    pub sibling_best_bid: f64,
+    pub sibling_best_bid: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_best_bid: [Option<f64>; N],
     #[xfeature]
-    #[derivative(Default(value = "0.0"))]
-    pub sibling_best_ask: f64,
+    pub sibling_best_ask: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
@@ -260,12 +256,10 @@ impl<const N: usize> XFrame<N> {
 
         let best_bid = snapshot
             .best_bid
-            .or(previous.map(|prior_frame| prior_frame.best_bid))
-            .unwrap_or(0.0);
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.best_bid));
         let best_ask = snapshot
             .best_ask
-            .or(previous.map(|prior_frame| prior_frame.best_ask))
-            .unwrap_or(0.0);
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.best_ask));
         let last_trade_price = snapshot
             .last_trade_price
             .or(previous.and_then(|prior_frame| prior_frame.last_trade_price));
@@ -401,8 +395,14 @@ impl<const N: usize> XFrame<N> {
 
     fn populate_deltas(&mut self, frames: &BTreeMap<i64, XFrame<N>>) {
         for (lag_index, prior_frame) in frames.values().rev().take(N).enumerate() {
-            self.delta_n_best_bid[lag_index] = Some(self.best_bid - prior_frame.best_bid);
-            self.delta_n_best_ask[lag_index] = Some(self.best_ask - prior_frame.best_ask);
+            self.delta_n_best_bid[lag_index] = match (self.best_bid, prior_frame.best_bid) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+            self.delta_n_best_ask[lag_index] = match (self.best_ask, prior_frame.best_ask) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
             self.delta_n_last_trade_price[lag_index] = match (
                 self.last_trade_price,
                 prior_frame.last_trade_price,
