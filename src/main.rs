@@ -8,6 +8,7 @@ pub mod market_snapshot;
 pub mod run_log;
 pub mod btcusdt_ws;
 pub mod data_ws;
+pub mod xframe_dump;
 
 use anyhow::Result;
 use project_manager::{ProjectManager, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
@@ -46,6 +47,8 @@ async fn run_btc_updown_interval(
 
         let mut ws_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut subscribed: Vec<String> = Vec::new();
+        let mut ws_session_market_id: Option<String> = None;
+        let mut ws_session_gamma_question: Option<String> = None;
 
         while current_timestamp_ms() < ws_end_sec * 1000 {
             let now_poly_ms = current_timestamp_ms();
@@ -120,14 +123,6 @@ async fn run_btc_updown_interval(
 
                 run_log::ws_start(slug_mid, &slug, &market_ids, &ids, remain_ms, wall_end_ms);
 
-                project_manager
-                    .on_btc_updown_ws_connected(
-                        period_sec,
-                        window_start_sec,
-                        &market_ids,
-                        gamma_question.as_deref(),
-                    ).await;
-
                 match data_ws::spawn_bounded_market_ws(
                     project_manager.clone(),
                     ids.clone(),
@@ -135,8 +130,20 @@ async fn run_btc_updown_interval(
                     xframe_interval_kind,
                 ) {
                     Ok(h) => {
+                        project_manager.on_btc_updown_ws_connected(
+                            period_sec,
+                            window_start_sec,
+                            &market_ids,
+                            gamma_question.as_deref()).await;
+
+                        project_manager
+                            .record_btc_updown_ws_connect(&market_ids)
+                            .await;
+
                         ws_handle = Some(h);
                         subscribed = ids.clone();
+                        ws_session_market_id = market_ids.first().cloned();
+                        ws_session_gamma_question = gamma_question.clone();
                     }
                     Err(e) => {
                         run_log::ws_spawn_err(slug_mid, &slug, &e);
@@ -153,6 +160,13 @@ async fn run_btc_updown_interval(
             run_log::ws_window_end_wait(slug_mid, &slug, subscribed.len());
             let _ = h.await;
             run_log::ws_task_joined(slug_mid, &slug);
+            if let Some(mid) = ws_session_market_id {
+                xframe_dump::spawn_dump_market_xframes_binary(
+                    project_manager.clone(),
+                    mid,
+                    ws_session_gamma_question,
+                );
+            }
         }
     }
 }

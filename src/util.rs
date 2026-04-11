@@ -83,6 +83,9 @@ pub async fn fetch_gamma_event_data_for_slug(
     if clob_token_ids.is_empty() {
         anyhow::bail!("ни одного clobTokenId в ответе Gamma для slug={slug:?}");
     }
+    if price_to_beat.is_none() {
+        anyhow::bail!("нет priceToBeat в events[0].eventMetadata в ответе Gamma для slug={slug:?}");
+    }
 
     Ok(GammaEventSlugData {
         clob_token_ids,

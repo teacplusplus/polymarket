@@ -1,6 +1,27 @@
 pub const WS_LOG_ENABLED: bool = true;
-pub const XFRAME_LOG_ENABLED: bool = false;
+pub const XFRAME_LOG_ENABLED: bool = true;
 pub const BTCUSDT_SEC_BAR_LOG_ENABLED: bool = false;
+pub const XFRAME_DUMP_LOG_ENABLED: bool = false;
+pub const BTC_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED: bool = false;
+
+/// Логирует, когда после обновления WS одновременно заполнены `fifteen_min` и `five_min`: впервые оба слота, или оба сменились на новые `market_id` / `window_start_sec`.
+pub fn btc_updown_sibling_slots_updated(
+    ts_ms: i64,
+    after_fifteen: Option<(String, i64)>,
+    after_five: Option<(String, i64)>,
+) {
+    if !BTC_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED {
+        return;
+    }
+    let after_both = after_fifteen.is_some() && after_five.is_some();
+    let pair_full = after_both;
+    if !pair_full {
+        return;
+    }
+    eprintln!(
+        "{ts_ms} btc_updown_sibling: оба слота выставлены | стало 15m={after_fifteen:?} 5m={after_five:?}"
+    );
+}
 
 pub fn gamma_fetch_err(slug_mid: &str, slug: &str, err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
@@ -74,15 +95,31 @@ pub fn market_ws_session_err(err: impl std::fmt::Display) {
     eprintln!("market ws session ended with error: {err}");
 }
 
-pub fn xframe_built(
-    market_id: &str,
-    asset_id: &str,
+/// Финальный кадр после merge other/sibling, непосредственно перед записью в `xframes_by_market`.
+pub fn xframe_stored(
+    frame: &crate::xframe::XFrame<{ crate::xframe::SIZE }>,
 ) {
     if !XFRAME_LOG_ENABLED {
         return;
     }
+    let frame_one_line = format!("{frame:?}").replace('\n', " ").replace('\r', "");
     eprintln!(
-        "xframe: built | market={market_id} | asset={asset_id}"
+        "{frame_one_line}"
+    );
+}
+
+pub fn xframe_dump_written(
+    path: &std::path::Path,
+    market_id: &str,
+    frame_count: usize,
+    bytes: usize,
+) {
+    if !XFRAME_DUMP_LOG_ENABLED {
+        return;
+    }
+    eprintln!(
+        "xframe_dump: wrote {bytes} bytes, {frame_count} frames | market_id={market_id} | path={}",
+        path.display()
     );
 }
 

@@ -17,9 +17,9 @@ const BTC_PRICE_ZSCORE_WINDOW_SEC: i64 = SIZE as i64;
 /// Минимум точек в окне для выборочного СКО.
 const BTC_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 
-/// Кадр признаков по одному ассету: состояние стакана и сделок на момент снапшота плюс лаги по последним `N` предыдущим кадрам (от ближайшего по времени к более ранним).
+/// Кадр признаков по одному ассету: состояние стакана и сделок на момент снапшота плюс лаги по последним `N` предыдущим кадрам (от ближайшего по времени к более ранним). `tick_size`, `spread` и поля `book_*` приходят из WS; глубина — топ-3 уровня bid/ask из снимка `book` (L1 — объёмы на лучших ценах, L2/L3 — цена и объём).
 ///
-/// Поля с атрибутом `#[xfeature]` попадают в вектор для обучения; `market_id`, `asset_id` и `bucket_flow_sign` — без `#[xfeature]` (идентификаторы и служебный знак направления сделки в бакете для окон buy/sell).
+/// Поля с атрибутом `#[xfeature]` попадают в вектор для обучения; `market_id`, `asset_id`, `bucket_flow_sign`, `stable` — без `#[xfeature]` (идентификаторы и служебные поля).
 ///
 /// `xframe_interval_type`: дискриминант [`XFrameIntervalKind`] ([XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]). `btc_up_down_outcome`: дискриминант [`BtcUpDownOutcome`] ([XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN]).
 /// Поля `other_*` — микроструктура противоположной ноги на тот же бакет; подмешиваются через [XFrame::merge_other_leg_features_from] в `ProjectManager` после вставки пары кадров.
@@ -33,6 +33,10 @@ pub struct XFrame<const N: usize> {
     pub market_id: String,
     /// Идентификатор токена в CLOB (`asset_id` / token id).
     pub asset_id: String,
+    /// `true`, если WS подключён у начала интервала (рядом с Gamma `start_ms`) или кадр не раньше чем через [`SIZE`] с после времени подключения при позднем старте; см. [`compute_xframe_stable`].
+    #[derivative(Default(value = "false"))]
+    #[serde(default)]
+    pub stable: bool,
     /// Тип окна BTC up/down: `0` — 15 мин ([XFRAME_INTERVAL_TYPE_15M]), `1` — 5 мин ([XFRAME_INTERVAL_TYPE_5M]).
     #[xfeature]
     #[derivative(Default(value = "0"))]
@@ -51,20 +55,95 @@ pub struct XFrame<const N: usize> {
     pub event_remaining_ms: i64,
     /// Лучшая цена bid на конец интервала / бакета снапшота.
     #[xfeature]
-    pub best_bid: Option<f64>,
-    /// Разность текущего `best_bid` и `best_bid` у `i`-го предыдущего кадра: индекс `0` — непосредственный предшественник по времени, далее глубже в прошлое; `None`, если такого кадра ещё не было.
+    pub book_bid_l1_price: Option<f64>,
+    /// Разность текущего `book_bid_l1_price` и значения у `i`-го предыдущего кадра: индекс `0` — непосредственный предшественник по времени, далее глубже в прошлое; `None`, если такого кадра ещё не было.
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
-    pub delta_n_best_bid: [Option<f64>; N],
-    /// Лучшая цена ask на конец интервала.
+    pub delta_n_book_bid_l1_price: [Option<f64>; N],
+    /// Лучший ask: цена L1 на конец интервала.
     #[xfeature]
-    pub best_ask: Option<f64>,
-    /// Разность текущего `best_ask` и `best_ask` у `i`-го предыдущего кадра (индексация как у `delta_n_best_bid`).
+    pub book_ask_l1_price: Option<f64>,
+    /// Разность текущего `book_ask_l1_price` и значения у `i`-го предыдущего кадра (индексация как у `delta_n_book_bid_l1_price`).
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
-    pub delta_n_best_ask: [Option<f64>; N],
+    pub delta_n_book_ask_l1_price: [Option<f64>; N],
+    /// Минимальный шаг цены из WS (`tick_size` / `new_tick_size`); прокидывается с предыдущего кадра.
+    #[xfeature]
+    pub tick_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_tick_size: [Option<f64>; N],
+    /// Спред из WS, если есть в сообщении.
+    #[xfeature]
+    pub spread: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_spread: [Option<f64>; N],
+    /// Объём на лучшем bid (из снимка `book`).
+    #[xfeature]
+    pub book_bid_l1_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_bid_l1_size: [Option<f64>; N],
+    #[xfeature]
+    pub book_ask_l1_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_ask_l1_size: [Option<f64>; N],
+    #[xfeature]
+    pub book_bid_l2_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_bid_l2_price: [Option<f64>; N],
+    #[xfeature]
+    pub book_bid_l2_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_bid_l2_size: [Option<f64>; N],
+    #[xfeature]
+    pub book_bid_l3_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_bid_l3_price: [Option<f64>; N],
+    #[xfeature]
+    pub book_bid_l3_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_bid_l3_size: [Option<f64>; N],
+    #[xfeature]
+    pub book_ask_l2_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_ask_l2_price: [Option<f64>; N],
+    #[xfeature]
+    pub book_ask_l2_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_ask_l2_size: [Option<f64>; N],
+    #[xfeature]
+    pub book_ask_l3_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_ask_l3_price: [Option<f64>; N],
+    #[xfeature]
+    pub book_ask_l3_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub delta_n_book_ask_l3_size: [Option<f64>; N],
     /// Цена последней известной сделки на бакете; прокидывается с предыдущего кадра, если в текущем нет обновления.
     #[xfeature]
     pub last_trade_price: Option<f64>,
@@ -114,17 +193,89 @@ pub struct XFrame<const N: usize> {
     pub burstiness_transactions_count: Option<f64>,
     // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до burstiness. ---
     #[xfeature]
-    pub other_best_bid: Option<f64>,
+    pub other_book_bid_l1_price: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
-    pub other_delta_n_best_bid: [Option<f64>; N],
+    pub other_delta_n_book_bid_l1_price: [Option<f64>; N],
     #[xfeature]
-    pub other_best_ask: Option<f64>,
+    pub other_book_ask_l1_price: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
-    pub other_delta_n_best_ask: [Option<f64>; N],
+    pub other_delta_n_book_ask_l1_price: [Option<f64>; N],
+    #[xfeature]
+    pub other_tick_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_tick_size: [Option<f64>; N],
+    #[xfeature]
+    pub other_spread: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_spread: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_bid_l1_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_bid_l1_size: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_ask_l1_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_ask_l1_size: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_bid_l2_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_bid_l2_price: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_bid_l2_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_bid_l2_size: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_bid_l3_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_bid_l3_price: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_bid_l3_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_bid_l3_size: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_ask_l2_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_ask_l2_price: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_ask_l2_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_ask_l2_size: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_ask_l3_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_ask_l3_price: [Option<f64>; N],
+    #[xfeature]
+    pub other_book_ask_l3_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub other_delta_n_book_ask_l3_size: [Option<f64>; N],
     #[xfeature]
     pub other_last_trade_price: Option<f64>,
     #[xfeature]
@@ -173,17 +324,89 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "-1"))]
     pub sibling_event_remaining_ms: i64,
     #[xfeature]
-    pub sibling_best_bid: Option<f64>,
+    pub sibling_book_bid_l1_price: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
-    pub sibling_delta_n_best_bid: [Option<f64>; N],
+    pub sibling_delta_n_book_bid_l1_price: [Option<f64>; N],
     #[xfeature]
-    pub sibling_best_ask: Option<f64>,
+    pub sibling_book_ask_l1_price: Option<f64>,
     #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
-    pub sibling_delta_n_best_ask: [Option<f64>; N],
+    pub sibling_delta_n_book_ask_l1_price: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_tick_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_tick_size: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_spread: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_spread: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_bid_l1_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_bid_l1_size: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_ask_l1_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_ask_l1_size: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_bid_l2_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_bid_l2_price: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_bid_l2_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_bid_l2_size: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_bid_l3_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_bid_l3_price: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_bid_l3_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_bid_l3_size: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_ask_l2_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_ask_l2_price: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_ask_l2_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_ask_l2_size: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_ask_l3_price: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_ask_l3_price: [Option<f64>; N],
+    #[xfeature]
+    pub sibling_book_ask_l3_size: Option<f64>,
+    #[xfeature]
+    #[derivative(Default(value = "[None; N]"))]
+    #[serde_as(as = "[_; N]")]
+    pub sibling_delta_n_book_ask_l3_size: [Option<f64>; N],
     #[xfeature]
     pub sibling_last_trade_price: Option<f64>,
     #[xfeature]
@@ -225,6 +448,62 @@ pub struct XFrame<const N: usize> {
     pub sibling_btc_price_vs_beat_pct: Option<f64>,
 }
 
+/// См. [`XFrame::stable`]. `event_start_ms` — [`crate::project_manager::MarketEventData::start_ms`] из Gamma; `ws_connect_wall_ms` — из [`crate::project_manager::ProjectManager::record_btc_updown_ws_connect`].
+pub fn compute_xframe_stable(
+    snapshot_timestamp_ms: i64,
+    event_start_ms: Option<i64>,
+    ws_connect_wall_ms: Option<i64>,
+) -> bool {
+    use crate::run_log::XFRAME_LOG_ENABLED;
+
+    let event_start = match event_start_ms {
+        Some(v) => v,
+        None => {
+            if XFRAME_LOG_ENABLED {
+                eprintln!(
+                    "compute_xframe_stable: stable=false — нет Gamma start_ms (event_start_ms)"
+                );
+            }
+            return false;
+        }
+    };
+    let ws_wall = match ws_connect_wall_ms {
+        Some(v) => v,
+        None => {
+            if XFRAME_LOG_ENABLED {
+                eprintln!(
+                    "compute_xframe_stable: stable=false — нет ws_connect_wall_ms (record_btc_updown_ws_connect не вызывался)"
+                );
+            }
+            return false;
+        }
+    };
+
+    // Порог «подключились в начале интервала», мс от Gamma `start_ms`.
+    const JOIN_START_MAX_DELAY_MS: i64 = 1000;
+    let joined_near_window_start = ws_wall >= event_start
+        && ws_wall.saturating_sub(event_start) <= JOIN_START_MAX_DELAY_MS;
+    if joined_near_window_start {
+        return true;
+    }
+
+    let threshold_ms = ws_wall + (SIZE as i64) * 1000;
+    if snapshot_timestamp_ms >= threshold_ms {
+        return true;
+    }
+
+    if XFRAME_LOG_ENABLED {
+        eprintln!(
+            "compute_xframe_stable: stable=false — поздний WS: задержка от start_ms={} ms; snapshot_ms={} < порог ws_connect+{}s={} ms",
+            ws_wall.saturating_sub(event_start),
+            snapshot_timestamp_ms,
+            SIZE,
+            threshold_ms,
+        );
+    }
+    false
+}
+
 pub fn compute_btc_up_down_delay_class(
     interval_kind: XFrameIntervalKind,
     gamma_question: Option<&str>,
@@ -249,17 +528,54 @@ impl<const N: usize> XFrame<N> {
         btc_price_z_score: Option<f64>,
         btc_price_vs_beat_pct: Option<f64>,
         window_ms: i64,
+        stable: bool,
     ) -> XFrame<N> {
         let previous = frames.values().next_back();
 
         let wall_ts_ms = snapshot.timestamp_ms;
 
-        let best_bid = snapshot
-            .best_bid
-            .or_else(|| previous.and_then(|prior_frame| prior_frame.best_bid));
-        let best_ask = snapshot
-            .best_ask
-            .or_else(|| previous.and_then(|prior_frame| prior_frame.best_ask));
+        let book_bid_l1_price = snapshot
+            .book_bid_l1_price
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bid_l1_price));
+        let book_ask_l1_price = snapshot
+            .book_ask_l1_price
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l1_price));
+        let tick_size = snapshot
+            .tick_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.tick_size));
+        let spread = snapshot
+            .spread
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.spread));
+        let book_bid_l1_size = snapshot
+            .book_bid_l1_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bid_l1_size));
+        let book_ask_l1_size = snapshot
+            .book_ask_l1_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l1_size));
+        let book_bid_l2_price = snapshot
+            .book_bid_l2_price
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bid_l2_price));
+        let book_bid_l2_size = snapshot
+            .book_bid_l2_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bid_l2_size));
+        let book_bid_l3_price = snapshot
+            .book_bid_l3_price
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bid_l3_price));
+        let book_bid_l3_size = snapshot
+            .book_bid_l3_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bid_l3_size));
+        let book_ask_l2_price = snapshot
+            .book_ask_l2_price
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l2_price));
+        let book_ask_l2_size = snapshot
+            .book_ask_l2_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l2_size));
+        let book_ask_l3_price = snapshot
+            .book_ask_l3_price
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l3_price));
+        let book_ask_l3_size = snapshot
+            .book_ask_l3_size
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l3_size));
         let last_trade_price = snapshot
             .last_trade_price
             .or(previous.and_then(|prior_frame| prior_frame.last_trade_price));
@@ -285,12 +601,25 @@ impl<const N: usize> XFrame<N> {
         let mut frame = XFrame::<N> {
             market_id: snapshot.market_id,
             asset_id: snapshot.asset_id,
+            stable,
             xframe_interval_type: snapshot.xframe_interval_kind.as_i32(),
             btc_up_down_outcome: snapshot.btc_up_down_outcome.as_i32(),
             btc_up_down_delay_class,
             event_remaining_ms,
-            best_bid,
-            best_ask,
+            book_bid_l1_price,
+            book_ask_l1_price,
+            tick_size,
+            spread,
+            book_bid_l1_size,
+            book_ask_l1_size,
+            book_bid_l2_price,
+            book_bid_l2_size,
+            book_bid_l3_price,
+            book_bid_l3_size,
+            book_ask_l2_price,
+            book_ask_l2_size,
+            book_ask_l3_price,
+            book_ask_l3_size,
             btc_price_z_score,
             btc_price_vs_beat_pct,
             last_trade_price,
@@ -306,10 +635,34 @@ impl<const N: usize> XFrame<N> {
 
     /// Подмешивает в `other_*` признаки стакана/сделок с кадра противоположной ноги (`Up`/`Down`) на тот же `aligned_ts` (тот же `market_id`, другой `asset_id`).
     pub fn merge_other_leg_features_from(&mut self, other: &XFrame<N>) {
-        self.other_best_bid = other.best_bid;
-        self.other_delta_n_best_bid = other.delta_n_best_bid;
-        self.other_best_ask = other.best_ask;
-        self.other_delta_n_best_ask = other.delta_n_best_ask;
+        self.other_book_bid_l1_price = other.book_bid_l1_price;
+        self.other_delta_n_book_bid_l1_price = other.delta_n_book_bid_l1_price;
+        self.other_book_ask_l1_price = other.book_ask_l1_price;
+        self.other_delta_n_book_ask_l1_price = other.delta_n_book_ask_l1_price;
+        self.other_tick_size = other.tick_size;
+        self.other_delta_n_tick_size = other.delta_n_tick_size;
+        self.other_spread = other.spread;
+        self.other_delta_n_spread = other.delta_n_spread;
+        self.other_book_bid_l1_size = other.book_bid_l1_size;
+        self.other_delta_n_book_bid_l1_size = other.delta_n_book_bid_l1_size;
+        self.other_book_ask_l1_size = other.book_ask_l1_size;
+        self.other_delta_n_book_ask_l1_size = other.delta_n_book_ask_l1_size;
+        self.other_book_bid_l2_price = other.book_bid_l2_price;
+        self.other_delta_n_book_bid_l2_price = other.delta_n_book_bid_l2_price;
+        self.other_book_bid_l2_size = other.book_bid_l2_size;
+        self.other_delta_n_book_bid_l2_size = other.delta_n_book_bid_l2_size;
+        self.other_book_bid_l3_price = other.book_bid_l3_price;
+        self.other_delta_n_book_bid_l3_price = other.delta_n_book_bid_l3_price;
+        self.other_book_bid_l3_size = other.book_bid_l3_size;
+        self.other_delta_n_book_bid_l3_size = other.delta_n_book_bid_l3_size;
+        self.other_book_ask_l2_price = other.book_ask_l2_price;
+        self.other_delta_n_book_ask_l2_price = other.delta_n_book_ask_l2_price;
+        self.other_book_ask_l2_size = other.book_ask_l2_size;
+        self.other_delta_n_book_ask_l2_size = other.delta_n_book_ask_l2_size;
+        self.other_book_ask_l3_price = other.book_ask_l3_price;
+        self.other_delta_n_book_ask_l3_price = other.delta_n_book_ask_l3_price;
+        self.other_book_ask_l3_size = other.book_ask_l3_size;
+        self.other_delta_n_book_ask_l3_size = other.delta_n_book_ask_l3_size;
         self.other_last_trade_price = other.last_trade_price;
         self.other_delta_n_last_trade_price = other.delta_n_last_trade_price;
         self.other_trade_size = other.trade_size;
@@ -326,10 +679,34 @@ impl<const N: usize> XFrame<N> {
     /// Копирует в `sibling_*` поля «своей» ноги с кадра парного рынка (тот же Up/Down, тот же бакет), см. [find_same_outcome_sibling_asset_id].
     pub fn merge_sibling_market_features_from(&mut self, sibling: &XFrame<N>) {
         self.sibling_event_remaining_ms = sibling.event_remaining_ms;
-        self.sibling_best_bid = sibling.best_bid;
-        self.sibling_delta_n_best_bid = sibling.delta_n_best_bid;
-        self.sibling_best_ask = sibling.best_ask;
-        self.sibling_delta_n_best_ask = sibling.delta_n_best_ask;
+        self.sibling_book_bid_l1_price = sibling.book_bid_l1_price;
+        self.sibling_delta_n_book_bid_l1_price = sibling.delta_n_book_bid_l1_price;
+        self.sibling_book_ask_l1_price = sibling.book_ask_l1_price;
+        self.sibling_delta_n_book_ask_l1_price = sibling.delta_n_book_ask_l1_price;
+        self.sibling_tick_size = sibling.tick_size;
+        self.sibling_delta_n_tick_size = sibling.delta_n_tick_size;
+        self.sibling_spread = sibling.spread;
+        self.sibling_delta_n_spread = sibling.delta_n_spread;
+        self.sibling_book_bid_l1_size = sibling.book_bid_l1_size;
+        self.sibling_delta_n_book_bid_l1_size = sibling.delta_n_book_bid_l1_size;
+        self.sibling_book_ask_l1_size = sibling.book_ask_l1_size;
+        self.sibling_delta_n_book_ask_l1_size = sibling.delta_n_book_ask_l1_size;
+        self.sibling_book_bid_l2_price = sibling.book_bid_l2_price;
+        self.sibling_delta_n_book_bid_l2_price = sibling.delta_n_book_bid_l2_price;
+        self.sibling_book_bid_l2_size = sibling.book_bid_l2_size;
+        self.sibling_delta_n_book_bid_l2_size = sibling.delta_n_book_bid_l2_size;
+        self.sibling_book_bid_l3_price = sibling.book_bid_l3_price;
+        self.sibling_delta_n_book_bid_l3_price = sibling.delta_n_book_bid_l3_price;
+        self.sibling_book_bid_l3_size = sibling.book_bid_l3_size;
+        self.sibling_delta_n_book_bid_l3_size = sibling.delta_n_book_bid_l3_size;
+        self.sibling_book_ask_l2_price = sibling.book_ask_l2_price;
+        self.sibling_delta_n_book_ask_l2_price = sibling.delta_n_book_ask_l2_price;
+        self.sibling_book_ask_l2_size = sibling.book_ask_l2_size;
+        self.sibling_delta_n_book_ask_l2_size = sibling.delta_n_book_ask_l2_size;
+        self.sibling_book_ask_l3_price = sibling.book_ask_l3_price;
+        self.sibling_delta_n_book_ask_l3_price = sibling.delta_n_book_ask_l3_price;
+        self.sibling_book_ask_l3_size = sibling.book_ask_l3_size;
+        self.sibling_delta_n_book_ask_l3_size = sibling.delta_n_book_ask_l3_size;
         self.sibling_last_trade_price = sibling.last_trade_price;
         self.sibling_delta_n_last_trade_price = sibling.delta_n_last_trade_price;
         self.sibling_trade_size = sibling.trade_size;
@@ -395,14 +772,74 @@ impl<const N: usize> XFrame<N> {
 
     fn populate_deltas(&mut self, frames: &BTreeMap<i64, XFrame<N>>) {
         for (lag_index, prior_frame) in frames.values().rev().take(N).enumerate() {
-            self.delta_n_best_bid[lag_index] = match (self.best_bid, prior_frame.best_bid) {
+            self.delta_n_book_bid_l1_price[lag_index] =
+                match (self.book_bid_l1_price, prior_frame.book_bid_l1_price) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_ask_l1_price[lag_index] =
+                match (self.book_ask_l1_price, prior_frame.book_ask_l1_price) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_tick_size[lag_index] = match (self.tick_size, prior_frame.tick_size) {
                 (Some(current), Some(prior)) => Some(current - prior),
                 _ => None,
             };
-            self.delta_n_best_ask[lag_index] = match (self.best_ask, prior_frame.best_ask) {
+            self.delta_n_spread[lag_index] = match (self.spread, prior_frame.spread) {
                 (Some(current), Some(prior)) => Some(current - prior),
                 _ => None,
             };
+            self.delta_n_book_bid_l1_size[lag_index] =
+                match (self.book_bid_l1_size, prior_frame.book_bid_l1_size) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_ask_l1_size[lag_index] =
+                match (self.book_ask_l1_size, prior_frame.book_ask_l1_size) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_bid_l2_price[lag_index] =
+                match (self.book_bid_l2_price, prior_frame.book_bid_l2_price) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_bid_l2_size[lag_index] =
+                match (self.book_bid_l2_size, prior_frame.book_bid_l2_size) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_bid_l3_price[lag_index] =
+                match (self.book_bid_l3_price, prior_frame.book_bid_l3_price) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_bid_l3_size[lag_index] =
+                match (self.book_bid_l3_size, prior_frame.book_bid_l3_size) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_ask_l2_price[lag_index] =
+                match (self.book_ask_l2_price, prior_frame.book_ask_l2_price) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_ask_l2_size[lag_index] =
+                match (self.book_ask_l2_size, prior_frame.book_ask_l2_size) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_ask_l3_price[lag_index] =
+                match (self.book_ask_l3_price, prior_frame.book_ask_l3_price) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
+            self.delta_n_book_ask_l3_size[lag_index] =
+                match (self.book_ask_l3_size, prior_frame.book_ask_l3_size) {
+                    (Some(current), Some(prior)) => Some(current - prior),
+                    _ => None,
+                };
             self.delta_n_last_trade_price[lag_index] = match (
                 self.last_trade_price,
                 prior_frame.last_trade_price,

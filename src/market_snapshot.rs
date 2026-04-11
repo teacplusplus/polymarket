@@ -9,8 +9,18 @@ pub struct MarketSnapshot {
     pub xframe_interval_kind: XFrameIntervalKind,
     pub btc_up_down_outcome: BtcUpDownOutcome,
     pub timestamp_ms: i64,
-    pub best_bid: Option<f64>,
-    pub best_ask: Option<f64>,
+    pub book_bid_l1_price: Option<f64>,
+    pub book_bid_l1_size: Option<f64>,
+    pub book_ask_l1_price: Option<f64>,
+    pub book_ask_l1_size: Option<f64>,
+    pub book_bid_l2_price: Option<f64>,
+    pub book_bid_l2_size: Option<f64>,
+    pub book_bid_l3_price: Option<f64>,
+    pub book_bid_l3_size: Option<f64>,
+    pub book_ask_l2_price: Option<f64>,
+    pub book_ask_l2_size: Option<f64>,
+    pub book_ask_l3_price: Option<f64>,
+    pub book_ask_l3_size: Option<f64>,
     pub tick_size: Option<f64>,
     pub spread: Option<f64>,
     pub last_trade_price: Option<f64>,
@@ -28,8 +38,18 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, timestamp_ms: i64) -> Optio
         xframe_interval_kind: first_event_snapshot.xframe_interval_kind,
         btc_up_down_outcome: first_event_snapshot.btc_up_down_outcome,
         timestamp_ms,
-        best_bid: None,
-        best_ask: None,
+        book_bid_l1_price: None,
+        book_bid_l1_size: None,
+        book_ask_l1_price: None,
+        book_ask_l1_size: None,
+        book_bid_l2_price: None,
+        book_bid_l2_size: None,
+        book_bid_l3_price: None,
+        book_bid_l3_size: None,
+        book_ask_l2_price: None,
+        book_ask_l2_size: None,
+        book_ask_l3_price: None,
+        book_ask_l3_size: None,
         tick_size: None,
         spread: None,
         last_trade_price: None,
@@ -43,11 +63,41 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, timestamp_ms: i64) -> Optio
 
     for event_market_snapshot in events {
         aggregated_market_snapshot.btc_up_down_outcome = event_market_snapshot.btc_up_down_outcome;
-        if event_market_snapshot.best_bid.is_some() {
-            aggregated_market_snapshot.best_bid = event_market_snapshot.best_bid;
+        if event_market_snapshot.book_bid_l1_price.is_some() {
+            aggregated_market_snapshot.book_bid_l1_price = event_market_snapshot.book_bid_l1_price;
         }
-        if event_market_snapshot.best_ask.is_some() {
-            aggregated_market_snapshot.best_ask = event_market_snapshot.best_ask;
+        if event_market_snapshot.book_ask_l1_price.is_some() {
+            aggregated_market_snapshot.book_ask_l1_price = event_market_snapshot.book_ask_l1_price;
+        }
+        if event_market_snapshot.book_bid_l1_size.is_some() {
+            aggregated_market_snapshot.book_bid_l1_size = event_market_snapshot.book_bid_l1_size;
+        }
+        if event_market_snapshot.book_ask_l1_size.is_some() {
+            aggregated_market_snapshot.book_ask_l1_size = event_market_snapshot.book_ask_l1_size;
+        }
+        if event_market_snapshot.book_bid_l2_price.is_some() {
+            aggregated_market_snapshot.book_bid_l2_price = event_market_snapshot.book_bid_l2_price;
+        }
+        if event_market_snapshot.book_bid_l2_size.is_some() {
+            aggregated_market_snapshot.book_bid_l2_size = event_market_snapshot.book_bid_l2_size;
+        }
+        if event_market_snapshot.book_bid_l3_price.is_some() {
+            aggregated_market_snapshot.book_bid_l3_price = event_market_snapshot.book_bid_l3_price;
+        }
+        if event_market_snapshot.book_bid_l3_size.is_some() {
+            aggregated_market_snapshot.book_bid_l3_size = event_market_snapshot.book_bid_l3_size;
+        }
+        if event_market_snapshot.book_ask_l2_price.is_some() {
+            aggregated_market_snapshot.book_ask_l2_price = event_market_snapshot.book_ask_l2_price;
+        }
+        if event_market_snapshot.book_ask_l2_size.is_some() {
+            aggregated_market_snapshot.book_ask_l2_size = event_market_snapshot.book_ask_l2_size;
+        }
+        if event_market_snapshot.book_ask_l3_price.is_some() {
+            aggregated_market_snapshot.book_ask_l3_price = event_market_snapshot.book_ask_l3_price;
+        }
+        if event_market_snapshot.book_ask_l3_size.is_some() {
+            aggregated_market_snapshot.book_ask_l3_size = event_market_snapshot.book_ask_l3_size;
         }
         if event_market_snapshot.tick_size.is_some() {
             aggregated_market_snapshot.tick_size = event_market_snapshot.tick_size;

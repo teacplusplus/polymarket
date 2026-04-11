@@ -13,8 +13,8 @@ use crate::data_ws::{
     MarketSnapshotBufferMut, Ws,
 };
 use crate::xframe::{
-    btc_price_z_score_from_sec_history, find_opposite_asset_id, find_same_outcome_sibling_asset_id,
-    XFrame, SIZE,
+    btc_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
+    find_same_outcome_sibling_asset_id, XFrame, SIZE,
 };
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
@@ -49,6 +49,7 @@ pub struct ProjectManager {
     pub ws_buffer_by_market: Arc<RwLock<MarketSnapshotBuffer>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, BtcUpDownOutcome>>>,
+    pub ws_connect_wall_ms_by_market: Arc<RwLock<HashMap<String, i64>>>,
     pub btc_updown_sibling_ws_state: Arc<RwLock<BtcUpdownSiblingWsState>>,
     pub rtds_btc_latest: Arc<RwLock<Option<RtdsBtcLatest>>>,
     pub rtds_btc_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
@@ -76,6 +77,7 @@ impl ProjectManager {
             ws_buffer_by_market: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             btc_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, BtcUpDownOutcome>::new())),
+            ws_connect_wall_ms_by_market: Arc::new(RwLock::new(HashMap::new())),
             btc_updown_sibling_ws_state: Arc::new(RwLock::new(BtcUpdownSiblingWsState::default())),
             rtds_btc_latest: Arc::new(RwLock::new(None)),
             rtds_btc_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
@@ -152,16 +154,23 @@ impl ProjectManager {
         interval_sec: i64,
         slug_window_start_unix_sec: i64,
         market_ids: &[String],
-        gamma_question: Option<&str>,
-    ) {
+        gamma_question: Option<&str>) {
         on_btc_updown_ws_connected(
             self.btc_updown_sibling_ws_state.clone(),
             interval_sec,
             slug_window_start_unix_sec,
             market_ids,
             gamma_question,
-        )
-        .await;
+        ).await;
+    }
+
+    /// Вызывать сразу после успешного `spawn_bounded_market_ws`: фиксирует wall-time подключения WS по `market_id` для [`crate::xframe::XFrame::stable`].
+    pub async fn record_btc_updown_ws_connect(&self, market_ids: &[String]) {
+        let now_ms = current_timestamp_ms();
+        let mut lock = self.ws_connect_wall_ms_by_market.write().await;
+        for id in market_ids {
+            lock.insert(id.clone(), now_ms);
+        }
     }
 
     pub async fn ingest_snapshot(&self, mut snapshot: MarketSnapshot) -> anyhow::Result<()> {
@@ -256,12 +265,23 @@ impl ProjectManager {
             let event_end_ms = event_data.and_then(|t| t.end_ms);
             let price_to_beat = event_data.and_then(|t| t.price_to_beat);
             let gamma_question_owned = event_data.and_then(|t| t.gamma_question.clone());
+            let event_start_ms = event_data.and_then(|t| t.start_ms);
             drop(event_guard);
+
+            let ws_connect_wall_ms = {
+                let ws_connect_wall_ms_map_guard = self.ws_connect_wall_ms_by_market.read().await;
+                ws_connect_wall_ms_map_guard.get(&market_id).copied()
+            };
 
             let btc_price_vs_beat_pct =
                 btc_price_vs_price_to_beat_pct(price_to_beat, btc_spot_usd);
 
             let window_ms = FRAME_BUILD_INTERVAL_SEC as i64 * 1000;
+            let stable = compute_xframe_stable(
+                snapshot.timestamp_ms,
+                event_start_ms,
+                ws_connect_wall_ms,
+            );
             let frame = XFrame::<SIZE>::new(
                 snapshot,
                 &frames_history,
@@ -270,9 +290,8 @@ impl ProjectManager {
                 btc_price_z_score,
                 btc_price_vs_beat_pct,
                 window_ms,
+                stable,
             );
-
-            run_log::xframe_built(&market_id, &asset_id);
 
             built_xframes.push(BuiltXframeEntry {
                 market_id,
@@ -338,7 +357,10 @@ impl ProjectManager {
                 ) {
                     Ok(id) => id,
                     Err(err) => {
-                        eprintln!("find_opposite_asset_id: {err:#}");
+                        eprintln!(
+                            "{} find_opposite_asset_id: {err:#}",
+                            current_timestamp_ms()
+                        );
                         continue;
                     }
                 };
@@ -373,7 +395,10 @@ impl ProjectManager {
                 ) {
                     Ok(id) => id,
                     Err(err) => {
-                        eprintln!("find_same_outcome_sibling_asset_id: {err:#}");
+                        eprintln!(
+                            "{} find_same_outcome_sibling_asset_id: {err:#}",
+                            current_timestamp_ms()
+                        );
                         continue;
                     }
                 };
@@ -392,6 +417,9 @@ impl ProjectManager {
 
         let mut xframes_by_market_lock = self.xframes_by_market.write().await;
         for entry in built_xframes {
+            if entry.frame.stable {
+                run_log::xframe_stored(&entry.frame);
+            }
             xframes_by_market_lock
                 .entry(entry.market_id)
                 .or_insert_with(HashMap::new)

@@ -265,7 +265,7 @@ fn parse_single_snapshot(
     let btc_up_down_outcome = *btc_up_down_by_asset_id.get(&asset_id)?;
 
     let timestamp_ms = parse_i64(value.get("timestamp")).unwrap_or_else(current_timestamp_ms);
-    let (best_bid, best_ask) = parse_book_best_bid_ask(value);
+    let book = parse_book_top3(value);
 
     Some(MarketSnapshot {
         market_id,
@@ -273,8 +273,18 @@ fn parse_single_snapshot(
         xframe_interval_kind,
         btc_up_down_outcome,
         timestamp_ms,
-        best_bid,
-        best_ask,
+        book_bid_l1_price: book.book_bid_l1_price,
+        book_ask_l1_price: book.book_ask_l1_price,
+        book_bid_l1_size: book.book_bid_l1_size,
+        book_ask_l1_size: book.book_ask_l1_size,
+        book_bid_l2_price: book.book_bid_l2_price,
+        book_bid_l2_size: book.book_bid_l2_size,
+        book_bid_l3_price: book.book_bid_l3_price,
+        book_bid_l3_size: book.book_bid_l3_size,
+        book_ask_l2_price: book.book_ask_l2_price,
+        book_ask_l2_size: book.book_ask_l2_size,
+        book_ask_l3_price: book.book_ask_l3_price,
+        book_ask_l3_size: book.book_ask_l3_size,
         tick_size: parse_f64(value.get("new_tick_size")).or(parse_f64(value.get("tick_size"))),
         spread: parse_f64(value.get("spread")),
         // WS trade event uses `price` for last trade value.
@@ -325,8 +335,18 @@ fn parse_price_change_snapshots(
             xframe_interval_kind,
             btc_up_down_outcome,
             timestamp_ms,
-            best_bid: parse_f64(change.get("best_bid")),
-            best_ask: parse_f64(change.get("best_ask")),
+            book_bid_l1_price: parse_f64(change.get("best_bid")),
+            book_ask_l1_price: parse_f64(change.get("best_ask")),
+            book_bid_l1_size: None,
+            book_ask_l1_size: None,
+            book_bid_l2_price: None,
+            book_bid_l2_size: None,
+            book_bid_l3_price: None,
+            book_bid_l3_size: None,
+            book_ask_l2_price: None,
+            book_ask_l2_size: None,
+            book_ask_l3_price: None,
+            book_ask_l3_size: None,
             tick_size: None,
             spread: None,
             last_trade_price: None,
@@ -374,8 +394,18 @@ fn parse_new_market_snapshots(
             xframe_interval_kind,
             btc_up_down_outcome,
             timestamp_ms,
-            best_bid: None,
-            best_ask: None,
+            book_bid_l1_price: None,
+            book_ask_l1_price: None,
+            book_bid_l1_size: None,
+            book_ask_l1_size: None,
+            book_bid_l2_price: None,
+            book_bid_l2_size: None,
+            book_bid_l3_price: None,
+            book_bid_l3_size: None,
+            book_ask_l2_price: None,
+            book_ask_l2_size: None,
+            book_ask_l3_price: None,
+            book_ask_l3_size: None,
             tick_size,
             spread: None,
             last_trade_price: None,
@@ -388,33 +418,82 @@ fn parse_new_market_snapshots(
     snapshots
 }
 
-fn parse_best_price_from_side(levels: Option<&Vec<Value>>, is_bid: bool) -> Option<f64> {
+#[derive(Default)]
+struct ParsedBookTop3 {
+    book_bid_l1_price: Option<f64>,
+    book_ask_l1_price: Option<f64>,
+    book_bid_l1_size: Option<f64>,
+    book_ask_l1_size: Option<f64>,
+    book_bid_l2_price: Option<f64>,
+    book_bid_l2_size: Option<f64>,
+    book_bid_l3_price: Option<f64>,
+    book_bid_l3_size: Option<f64>,
+    book_ask_l2_price: Option<f64>,
+    book_ask_l2_size: Option<f64>,
+    book_ask_l3_price: Option<f64>,
+    book_ask_l3_size: Option<f64>,
+}
+
+fn parse_side_levels_sorted(levels: Option<&Vec<Value>>, bids: bool) -> Vec<(f64, f64)> {
     let Some(orderbook_levels) = levels else {
-        return None;
+        return Vec::new();
     };
-    let mut best_price_so_far: Option<f64> = None;
+    let mut out: Vec<(f64, f64)> = Vec::new();
     for level in orderbook_levels {
         let Some(price) = parse_f64(level.get("price")) else {
             continue;
         };
-        let is_better = match best_price_so_far {
-            None => true,
-            Some(previous_best) if is_bid => price > previous_best,
-            Some(previous_best) => price < previous_best,
-        };
-        if is_better {
-            best_price_so_far = Some(price);
-        }
+        let size = parse_f64(level.get("size")).unwrap_or(0.0);
+        out.push((price, size));
     }
-    best_price_so_far
+    if bids {
+        out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    out
 }
 
-fn parse_book_best_bid_ask(value: &Value) -> (Option<f64>, Option<f64>) {
+/// Топ-3 уровня bid/ask из `bids`/`asks` (`book`); при отсутствии массивов — только поля `best_bid`/`best_ask` в корне JSON.
+fn parse_book_top3(value: &Value) -> ParsedBookTop3 {
     let bids = value.get("bids").and_then(Value::as_array);
     let asks = value.get("asks").and_then(Value::as_array);
-    let best_bid = parse_best_price_from_side(bids, true).or(parse_f64(value.get("best_bid")));
-    let best_ask = parse_best_price_from_side(asks, false).or(parse_f64(value.get("best_ask")));
-    (best_bid, best_ask)
+    let bid_levels = parse_side_levels_sorted(bids, true);
+    let ask_levels = parse_side_levels_sorted(asks, false);
+
+    let mut out = ParsedBookTop3::default();
+
+    if !bid_levels.is_empty() {
+        out.book_bid_l1_price = Some(bid_levels[0].0);
+        out.book_bid_l1_size = Some(bid_levels[0].1);
+        if bid_levels.len() > 1 {
+            out.book_bid_l2_price = Some(bid_levels[1].0);
+            out.book_bid_l2_size = Some(bid_levels[1].1);
+        }
+        if bid_levels.len() > 2 {
+            out.book_bid_l3_price = Some(bid_levels[2].0);
+            out.book_bid_l3_size = Some(bid_levels[2].1);
+        }
+    } else {
+        out.book_bid_l1_price = parse_f64(value.get("best_bid"));
+    }
+
+    if !ask_levels.is_empty() {
+        out.book_ask_l1_price = Some(ask_levels[0].0);
+        out.book_ask_l1_size = Some(ask_levels[0].1);
+        if ask_levels.len() > 1 {
+            out.book_ask_l2_price = Some(ask_levels[1].0);
+            out.book_ask_l2_size = Some(ask_levels[1].1);
+        }
+        if ask_levels.len() > 2 {
+            out.book_ask_l3_price = Some(ask_levels[2].0);
+            out.book_ask_l3_size = Some(ask_levels[2].1);
+        }
+    } else {
+        out.book_ask_l1_price = parse_f64(value.get("best_ask"));
+    }
+
+    out
 }
 
 fn parse_trade_side(json_field: Option<&Value>) -> Option<TradeSide> {

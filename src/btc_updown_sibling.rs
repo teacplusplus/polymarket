@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use crate::constants::{BtcUpdownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use crate::gamma_question::btc_updown_question_window_start_unix_sec;
+use crate::run_log;
+use crate::util::current_timestamp_ms;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
@@ -81,12 +83,14 @@ pub async fn on_btc_updown_ws_connected(
     let mut btc_updown_sibling_ws_state_lock = btc_updown_sibling_ws_state.write().await;
     match horizon {
         BtcUpdownInterval::FifteenMin => {
-            if let Some(ref five_slot) = btc_updown_sibling_ws_state_lock.five_min {
-                if !five_min_belongs_to_fifteen_window(five_slot.window_start_sec, parsed_start_unix)
-                {
-                    eprintln!("btc_updown_sibling: сброшен 5m market_id={} window_unix={} — не из блока 15m window_unix={parsed_start_unix}", five_slot.market_id, five_slot.window_start_sec);
-                    btc_updown_sibling_ws_state_lock.five_min = None;
-                }
+            let prev_fifteen_start = btc_updown_sibling_ws_state_lock
+                .fifteen_min
+                .as_ref()
+                .map(|s| s.window_start_sec);
+            if btc_updown_sibling_ws_state_lock.five_min.is_some()
+                && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev)
+            {
+                btc_updown_sibling_ws_state_lock.five_min = None;
             }
             btc_updown_sibling_ws_state_lock.fifteen_min = Some(BtcUpdownSiblingSlot {
                 market_id: condition_id,
@@ -95,11 +99,7 @@ pub async fn on_btc_updown_ws_connected(
         }
         BtcUpdownInterval::FiveMin => {
             if let Some(ref fifteen_slot) = btc_updown_sibling_ws_state_lock.fifteen_min {
-                if !five_min_belongs_to_fifteen_window(
-                    parsed_start_unix,
-                    fifteen_slot.window_start_sec,
-                ) {
-                    eprintln!("btc_updown_sibling: отклонён 5m market_id={condition_id} window_unix={parsed_start_unix} — не принадлежит 15m window_unix={}", fifteen_slot.window_start_sec);
+                if !five_min_belongs_to_fifteen_window(parsed_start_unix, fifteen_slot.window_start_sec) {
                     return;
                 }
             }
@@ -109,4 +109,17 @@ pub async fn on_btc_updown_ws_connected(
             });
         }
     }
+    let after_fifteen = btc_updown_sibling_ws_state_lock
+        .fifteen_min
+        .as_ref()
+        .map(|s| (s.market_id.clone(), s.window_start_sec));
+    let after_five = btc_updown_sibling_ws_state_lock
+        .five_min
+        .as_ref()
+        .map(|s| (s.market_id.clone(), s.window_start_sec));
+    run_log::btc_updown_sibling_slots_updated(
+        current_timestamp_ms(),
+        after_fifteen,
+        after_five,
+    );
 }
