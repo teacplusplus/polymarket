@@ -6,7 +6,9 @@ use serde_with::serde_as;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use xframe_features::FeatureLen;
 use xframe_features_derive::XFeatures;
-pub use crate::constants::{CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind};
+pub use crate::constants::{
+    CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind,
+};
 use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
 
 pub const SIZE: usize = 13;
@@ -24,7 +26,7 @@ const CURRENCY_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 /// `xframe_interval_type`: дискриминант [`XFrameIntervalKind`] ([XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]). `currency_up_down_outcome`: дискриминант [`CurrencyUpDownOutcome`] ([XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN]).
 /// Поля `other_*` — микроструктура противоположной ноги на тот же бакет; подмешиваются через [XFrame::merge_other_leg_features_from] в `ProjectManager` после вставки пары кадров.
 ///
-/// Поля `sibling_*` — кадр токена **того же** исхода Up/Down на **парном** `market_id` (другой горизонт 5m↔15m), тот же `aligned_ts`; подмешиваются через [XFrame::merge_sibling_market_features_from]. Без валидной пары в [crate::project_manager::ProjectManager::currency_updown_sibling_ws_state] (см. [crate::currency_updown_sibling::CurrencyUpDownSiblingWsState::paired_five_and_fifteen_market_ids]) остаются значения по умолчанию.
+/// Поля `sibling_*` — кадр токена **того же** исхода Up/Down на **парном** `market_id` (другой горизонт 5m↔15m), тот же `aligned_ts`; подмешиваются через [XFrame::merge_sibling_market_features_from]. Без валидной пары в [crate::project_manager::ProjectManager::currency_updown_sibling_state] (см. [crate::currency_updown_sibling::CurrencyUpDownSiblingState::paired_five_and_fifteen_market_ids]) остаются значения по умолчанию.
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Derivative, Clone, XFeatures)]
 #[derivative(Default)]
@@ -33,7 +35,7 @@ pub struct XFrame<const N: usize> {
     pub market_id: String,
     /// Идентификатор токена в CLOB (`asset_id` / token id).
     pub asset_id: String,
-    /// `true`, если WS подключён у начала интервала (рядом с Gamma `start_ms`) или кадр не раньше чем через [`SIZE`] с после времени подключения при позднем старте; см. [`compute_xframe_stable`].
+    /// `true`, если WS у начала интервала по Gamma `start_ms`, либо кадр не раньше чем через [`SIZE`] с после `ws_connect`; см. [`compute_xframe_stable`].
     #[derivative(Default(value = "false"))]
     #[serde(default)]
     pub stable: bool,
@@ -443,57 +445,47 @@ pub struct XFrame<const N: usize> {
     pub sibling_currency_price_vs_beat_pct: Option<f64>,
 }
 
-/// См. [`XFrame::stable`]. `event_start_ms` — [`crate::project_manager::MarketEventData::start_ms`] из Gamma; `ws_connect_wall_ms` — из [`crate::project_manager::ProjectManager::record_market_ws_connect_wall_ms`].
+/// См. [`XFrame::stable`]. `market_id` — `condition_id` рынка (для логов). `event_start_ms` — Gamma `start_ms` в [`crate::project_manager::MarketEventData`]; `ws_connect_wall_ms` — [`crate::project_manager::ProjectManager::record_market_ws_connect_wall_ms`].
 pub fn compute_xframe_stable(
+    market_id: &str,
     snapshot_timestamp_ms: i64,
     event_start_ms: Option<i64>,
     ws_connect_wall_ms: Option<i64>,
 ) -> bool {
     use crate::run_log::XFRAME_LOG_ENABLED;
 
-    let event_start = match event_start_ms {
-        Some(v) => v,
+    let ws_connect_wall_ms = match ws_connect_wall_ms {
+        Some(ws_connect_wall_ms) => ws_connect_wall_ms,
         None => {
             if XFRAME_LOG_ENABLED {
                 eprintln!(
-                    "compute_xframe_stable: stable=false — нет Gamma start_ms (event_start_ms)"
-                );
-            }
-            return false;
-        }
-    };
-    let ws_wall = match ws_connect_wall_ms {
-        Some(v) => v,
-        None => {
-            if XFRAME_LOG_ENABLED {
-                eprintln!(
-                    "compute_xframe_stable: stable=false — нет ws_connect_wall_ms (record_market_ws_connect_wall_ms не вызывался)"
+                    "compute_xframe_stable: stable=false — market_id={market_id} — нет ws_connect_wall_ms (record_market_ws_connect_wall_ms не вызывался)",
                 );
             }
             return false;
         }
     };
 
-    // Порог «подключились в начале интервала», мс от Gamma `start_ms`.
     const JOIN_START_MAX_DELAY_MS: i64 = 2000;
-    let joined_near_window_start = ws_wall >= event_start
-        && ws_wall.saturating_sub(event_start) <= JOIN_START_MAX_DELAY_MS;
-    if joined_near_window_start {
-        return true;
+
+    if let Some(event_start) = event_start_ms {
+        let d_gamma = ws_connect_wall_ms - event_start;
+        if (-JOIN_START_MAX_DELAY_MS..=JOIN_START_MAX_DELAY_MS).contains(&d_gamma) {
+            return true;
+        }
     }
 
-    let threshold_ms = ws_wall + (SIZE as i64) * 1000;
+    let threshold_ms = ws_connect_wall_ms + (SIZE as i64) * 1000;
     if snapshot_timestamp_ms >= threshold_ms {
         return true;
     }
 
     if XFRAME_LOG_ENABLED {
+        let event_start_part = event_start_ms
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "нет".to_string());
         eprintln!(
-            "compute_xframe_stable: stable=false — поздний WS: задержка от start_ms={} ms; snapshot_ms={} < порог ws_connect+{}s={} ms",
-            ws_wall.saturating_sub(event_start),
-            snapshot_timestamp_ms,
-            SIZE,
-            threshold_ms,
+            "compute_xframe_stable: stable=false — market_id={market_id} — поздний WS: event_start_ms={event_start_part}; ws_connect_wall_ms={ws_connect_wall_ms}; snapshot_ms={snapshot_timestamp_ms} < ws_connect+{SIZE}s={threshold_ms} ms",
         );
     }
     false

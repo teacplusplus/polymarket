@@ -119,6 +119,9 @@ async fn run_persistent_interval_market_ws_inner(
     active_asset_ids.clone_from(&initial_subscription.asset_ids);
     let mut active_market_ws_command: Option<MarketWsSubscription> = Some(initial_subscription);
 
+    // Уже был хотя бы один успешный subscribe по этому таску (лог: реконнект vs первое соединение).
+    let mut had_prior_successful_market_subscription = false;
+
     loop {
         let (websocket_stream, _http_response) = match connect_async(POLYMARKET_MARKET_WS_URL).await {
             Ok(stream_and_response) => stream_and_response,
@@ -141,18 +144,26 @@ async fn run_persistent_interval_market_ws_inner(
             continue;
         }
 
-        if let Some(ref active_market_ws_command) = active_market_ws_command {
+        if let Some(ref cmd) = active_market_ws_command {
+            run_log::ws_subscribe_applied(
+                cmd.period,
+                &cmd.slug,
+                &cmd.market_ids,
+                &active_asset_ids,
+                had_prior_successful_market_subscription,
+            );
             update_currency_updown_sibling_slots(
-                project_manager.currency_updown_sibling_ws_state.clone(),
-                active_market_ws_command.period_sec,
-                active_market_ws_command.window_start_sec,
-                &active_market_ws_command.market_ids,
-                active_market_ws_command.gamma_question.as_deref(),
+                project_manager.currency_updown_sibling_state.clone(),
+                cmd.period_sec,
+                cmd.window_start_sec,
+                &cmd.market_ids,
+                cmd.gamma_question.as_deref(),
             )
             .await;
             project_manager
-                .record_market_ws_connect_wall_ms(&active_market_ws_command.market_ids)
+                .record_market_ws_connect_wall_ms(&cmd.market_ids)
                 .await;
+            had_prior_successful_market_subscription = true;
         }
 
         let mut ping = interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
@@ -247,7 +258,7 @@ async fn run_persistent_interval_market_ws_inner(
                         active_asset_ids.clone_from(&next_command.asset_ids);
                         active_market_ws_command = Some(next_command.clone());
                         update_currency_updown_sibling_slots(
-                            project_manager.currency_updown_sibling_ws_state.clone(),
+                            project_manager.currency_updown_sibling_state.clone(),
                             next_command.period_sec,
                             next_command.window_start_sec,
                             &next_command.market_ids,
@@ -261,11 +272,22 @@ async fn run_persistent_interval_market_ws_inner(
                         continue;
                     }
 
+                    if let Some(ref prev) = active_market_ws_command {
+                        run_log::ws_subscription_rotated(
+                            next_command.period,
+                            &next_command.slug,
+                            &prev.market_ids,
+                            &old_asset_ids,
+                            &next_command.market_ids,
+                            &next_command.asset_ids,
+                        );
+                    }
+
                     active_asset_ids.clone_from(&next_command.asset_ids);
                     active_market_ws_command = Some(next_command.clone());
 
                     update_currency_updown_sibling_slots(
-                        project_manager.currency_updown_sibling_ws_state.clone(),
+                        project_manager.currency_updown_sibling_state.clone(),
                         next_command.period_sec,
                         next_command.window_start_sec,
                         &next_command.market_ids,

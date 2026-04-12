@@ -9,7 +9,7 @@ use crate::util::{
 };
 use crate::xframe_dump;
 pub use crate::currency_updown_sibling::{
-    five_min_belongs_to_fifteen_window, CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingWsState,
+    five_min_belongs_to_fifteen_window, CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingState,
 };
 pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use crate::data_ws::{
@@ -56,9 +56,10 @@ pub struct ProjectManager {
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub currency_up_down_by_asset_id: Arc<RwLock<HashMap<String, CurrencyUpDownOutcome>>>,
     pub ws_connect_wall_ms_by_market: Arc<RwLock<HashMap<String, i64>>>,
-    pub currency_updown_sibling_ws_state: Arc<RwLock<CurrencyUpDownSiblingWsState>>,
+    pub currency_updown_sibling_state: Arc<RwLock<CurrencyUpDownSiblingState>>,
     pub rtds_currency_latest: Arc<RwLock<Option<RtdsCurrencyLatest>>>,
     pub rtds_currency_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
+    pub market_asset_ids_by_market: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     pub ws: Arc<Ws>,
     pub http: Arc<reqwest::Client>,
     pub gamma: Arc<gamma::Client>,
@@ -92,11 +93,10 @@ impl ProjectManager {
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, CurrencyUpDownOutcome>::new())),
             ws_connect_wall_ms_by_market: Arc::new(RwLock::new(HashMap::new())),
-            currency_updown_sibling_ws_state: Arc::new(RwLock::new(
-                CurrencyUpDownSiblingWsState::default(),
-            )),
+            currency_updown_sibling_state: Arc::new(RwLock::new(CurrencyUpDownSiblingState::default())),
             rtds_currency_latest: Arc::new(RwLock::new(None)),
             rtds_currency_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
+            market_asset_ids_by_market: Arc::new(RwLock::new(HashMap::new())),
             ws,
             http,
             gamma,
@@ -156,9 +156,13 @@ impl ProjectManager {
         gamma_question: Option<String>,
         currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
     ) {
-        let mut lock = self.event_data_by_market.write().await;
+        let mut market_ids_touched: HashSet<String> = HashSet::new();
+        market_ids_touched.extend(starts.keys().cloned());
+        market_ids_touched.extend(ends.keys().cloned());
+
+        let mut event_data_by_market_lock = self.event_data_by_market.write().await;
         for (market_id, start_ms) in starts {
-            let entry = lock.entry(market_id).or_default();
+            let entry = event_data_by_market_lock.entry(market_id).or_default();
             entry.start_ms = start_ms;
             if let Some(p) = price_to_beat {
                 entry.price_to_beat = Some(p);
@@ -168,7 +172,7 @@ impl ProjectManager {
             }
         }
         for (market_id, end_ms) in ends {
-            let entry = lock.entry(market_id).or_default();
+            let entry = event_data_by_market_lock.entry(market_id).or_default();
             entry.end_ms = end_ms;
             if let Some(p) = price_to_beat {
                 entry.price_to_beat = Some(p);
@@ -177,12 +181,20 @@ impl ProjectManager {
                 entry.gamma_question = Some(q.clone());
             }
         }
-        drop(lock);
+        drop(event_data_by_market_lock);
 
         if !currency_up_down_by_asset_id.is_empty() {
-            let mut map = self.currency_up_down_by_asset_id.write().await;
-            for (asset_id, code) in currency_up_down_by_asset_id {
-                map.insert(asset_id, code);
+            let mut currency_up_down_by_asset_id_lock = self.currency_up_down_by_asset_id.write().await;
+            for (asset_id, code) in currency_up_down_by_asset_id.iter() {
+                currency_up_down_by_asset_id_lock.insert(asset_id.clone(), *code);
+            }
+            drop(currency_up_down_by_asset_id_lock);
+            let mut market_asset_ids_lock = self.market_asset_ids_by_market.write().await;
+            for market_id_touched in market_ids_touched {
+                market_asset_ids_lock
+                    .entry(market_id_touched)
+                    .or_default()
+                    .extend(currency_up_down_by_asset_id.keys().cloned());
             }
         }
     }
@@ -301,6 +313,7 @@ impl ProjectManager {
 
             let window_ms = FRAME_BUILD_INTERVAL_SEC as i64 * 1000;
             let stable = compute_xframe_stable(
+                market_id.as_str(),
                 snapshot.timestamp_ms,
                 event_start_ms,
                 ws_connect_wall_ms,
@@ -351,17 +364,20 @@ impl ProjectManager {
             guard.clone()
         };
 
-        let sibling_market_by_market: HashMap<String, String> = {
-            let sibling_ws_state_read_guard = self.currency_updown_sibling_ws_state.read().await;
-            let mut sibling_market_lookup = HashMap::new();
-            if let Some((five_market_id, fifteen_market_id)) = sibling_ws_state_read_guard.paired_five_and_fifteen_market_ids() {
-                sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
-                sibling_market_lookup.insert(fifteen_market_id, five_market_id);
-            }
-            sibling_market_lookup
-        };
-
         {
+            let sibling_state = self.currency_updown_sibling_state.read().await;
+            let market_asset_ids = self.market_asset_ids_by_market.read().await;
+            let sibling_market_by_market: HashMap<String, String> = {
+                let mut sibling_market_lookup = HashMap::new();
+                if let Some((five_market_id, fifteen_market_id)) =
+                    sibling_state.paired_five_and_fifteen_market_ids()
+                {
+                    sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
+                    sibling_market_lookup.insert(fifteen_market_id, five_market_id);
+                }
+                sibling_market_lookup
+            };
+
             let xframes_stored = self.xframes_by_market.read().await;
 
             for entry in &mut built_xframes {
@@ -407,8 +423,8 @@ impl ProjectManager {
                     .get(sibling_market_id)
                     .cloned()
                     .unwrap_or_default();
-                if let Some(by_asset) = xframes_stored.get(sibling_market_id) {
-                    sibling_candidates.extend(by_asset.keys().cloned());
+                if let Some(ids) = market_asset_ids.get(sibling_market_id) {
+                    sibling_candidates.extend(ids.iter().cloned());
                 }
                 let sibling_asset_id = match find_same_outcome_sibling_asset_id(
                     &entry.asset_id,

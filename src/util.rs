@@ -283,9 +283,15 @@ pub async fn fetch_gamma_event_data_for_slug(
             .get("events")
             .and_then(Value::as_array)
             .and_then(|a| a.first());
-        let start_ms = gamma_json_date_ms(v.get("startDate"))
+        // Старт окна: в первую очередь `eventStartTime` (маркет, затем `events[0]`), далее `startTime` / `startDate`.
+        let start_ms = gamma_json_date_ms(v.get("eventStartTime"))
+            .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("eventStartTime"))))
+            .or_else(|| gamma_json_date_ms(v.get("startTime")))
+            .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("startTime"))))
+            .or_else(|| gamma_json_date_ms(v.get("startDate")))
             .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("startDate"))));
         market_event_start_ms.insert(cid.clone(), start_ms);
+        // Конец окна: в Gamma нет `eventEndTime`; `endDate` (UTC RFC3339) — граница окна, не путать с `umaEndDate` (UMA).
         let end_ms = gamma_json_date_ms(v.get("endDate"))
             .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("endDate"))));
         market_event_end_ms.insert(cid, end_ms);
@@ -343,6 +349,7 @@ fn parse_outcomes_from_gamma_market(v: &Value) -> anyhow::Result<Vec<String>> {
     }
 }
 
+/// RFC3339 с `Z` или оффсетом — в миллисекунды UTC ([`DateTime::timestamp_millis`]).
 fn gamma_json_date_ms(v: Option<&Value>) -> Option<i64> {
     let s = v?.as_str()?;
     DateTime::parse_from_rfc3339(s)

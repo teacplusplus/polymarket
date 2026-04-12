@@ -70,6 +70,74 @@ pub fn ws_start(
     );
 }
 
+/// TCP к CLOB market channel установлен, начальный `subscribe` с `assets_ids` ушёл на сервер (или то же после реконнекта).
+pub fn ws_subscribe_applied(
+    period: &str,
+    slug: &str,
+    market_ids: &[String],
+    asset_ids: &[String],
+    after_reconnect: bool,
+) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    let phase = if after_reconnect {
+        "реконнект: подписка применена"
+    } else {
+        "подписка применена (первое соединение)"
+    };
+    let markets = if market_ids.is_empty() {
+        String::from("(нет condition_id)")
+    } else {
+        market_ids.join(", ")
+    };
+    let assets = if asset_ids.is_empty() {
+        String::from("(нет)")
+    } else {
+        asset_ids.join(", ")
+    };
+    eprintln!(
+        "[{period}] ws: {phase} | slug={slug} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}]"
+    );
+}
+
+/// После `subscribe` на новые токены и `unsubscribe` от прежних — смена рынка на сокете без разрыва TCP.
+pub fn ws_subscription_rotated(
+    period: &str,
+    slug: &str,
+    prev_market_ids: &[String],
+    prev_asset_ids: &[String],
+    new_market_ids: &[String],
+    new_asset_ids: &[String],
+) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    let pm = if prev_market_ids.is_empty() {
+        "(нет)".into()
+    } else {
+        prev_market_ids.join(", ")
+    };
+    let pa = if prev_asset_ids.is_empty() {
+        "(нет)".into()
+    } else {
+        prev_asset_ids.join(", ")
+    };
+    let nm = if new_market_ids.is_empty() {
+        "(нет)".into()
+    } else {
+        new_market_ids.join(", ")
+    };
+    let na = if new_asset_ids.is_empty() {
+        "(нет)".into()
+    } else {
+        new_asset_ids.join(", ")
+    };
+    eprintln!(
+        "[{period}] ws: смена подписки на сокете | slug={slug} | было market=[{pm}] asset=[{pa}] | стало market=[{nm}] asset=[{na}]"
+    );
+}
+
 pub fn ws_spawn_err(period: &str, slug: &str, err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
         return;
@@ -102,7 +170,7 @@ pub fn market_ws_session_err(err: impl std::fmt::Display) {
 
 /// Финальный кадр после merge other/sibling, непосредственно перед записью в `xframes_by_market`.
 pub fn xframe_stored(
-    frame: &crate::xframe::XFrame<{ crate::xframe::SIZE }>,
+    _frame: &crate::xframe::XFrame<{ crate::xframe::SIZE }>,
 ) {
     if !XFRAME_LOG_ENABLED {
         return;
