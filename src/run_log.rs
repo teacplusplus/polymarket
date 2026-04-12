@@ -1,16 +1,16 @@
 pub const WS_LOG_ENABLED: bool = true;
 pub const XFRAME_LOG_ENABLED: bool = true;
-pub const BTCUSDT_SEC_BAR_LOG_ENABLED: bool = false;
+pub const RTDS_CURRENCY_SEC_BAR_LOG_ENABLED: bool = false;
 pub const XFRAME_DUMP_LOG_ENABLED: bool = false;
-pub const BTC_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED: bool = false;
+pub const CURRENCY_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED: bool = false;
 
 /// Логирует, когда после обновления WS одновременно заполнены `fifteen_min` и `five_min`: впервые оба слота, или оба сменились на новые `market_id` / `window_start_sec`.
-pub fn btc_updown_sibling_slots_updated(
+pub fn currency_updown_sibling_slots_updated(
     ts_ms: i64,
     after_fifteen: Option<(String, i64)>,
     after_five: Option<(String, i64)>,
 ) {
-    if !BTC_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED {
+    if !CURRENCY_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED {
         return;
     }
     let after_both = after_fifteen.is_some() && after_five.is_some();
@@ -19,7 +19,7 @@ pub fn btc_updown_sibling_slots_updated(
         return;
     }
     eprintln!(
-        "{ts_ms} btc_updown_sibling: оба слота выставлены | стало 15m={after_fifteen:?} 5m={after_five:?}"
+        "{ts_ms} currency_updown_sibling: оба слота выставлены | стало 15m={after_fifteen:?} 5m={after_five:?}"
     );
 }
 
@@ -66,7 +66,7 @@ pub fn ws_start(
         asset_ids.join(", ")
     };
     eprintln!(
-        "[{slug_mid}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | slug={slug} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
+        "[{slug_mid}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
     );
 }
 
@@ -107,10 +107,10 @@ pub fn xframe_stored(
     if !XFRAME_LOG_ENABLED {
         return;
     }
-    let frame_one_line = format!("{frame:?}").replace('\n', " ").replace('\r', "");
-    eprintln!(
-        "{frame_one_line}"
-    );
+    // let frame_one_line = format!("{frame:?}").replace('\n', " ").replace('\r', "");
+    // eprintln!(
+    //     "{frame_one_line}"
+    // );
 }
 
 pub fn xframe_dump_written(
@@ -128,17 +128,18 @@ pub fn xframe_dump_written(
     );
 }
 
-pub fn btcusdt_sec_bar_inserted(
+pub fn rtds_currency_sec_bar_inserted(
+    pair_symbol: &str,
     bucket_sec: i64,
     price: f64,
     price_timestamp_ms: i64,
     message_timestamp_ms: i64,
     bars_in_history: usize,
 ) {
-    if !BTCUSDT_SEC_BAR_LOG_ENABLED {
+    if !RTDS_CURRENCY_SEC_BAR_LOG_ENABLED {
         return;
     }
     eprintln!(
-        "btcusdt sec bar: bucket_sec={bucket_sec} price={price} price_ts_ms={price_timestamp_ms} rtds_msg_ts_ms={message_timestamp_ms} bars_in_history={bars_in_history}"
+        "rtds sec bar ({pair_symbol}): bucket_sec={bucket_sec} price={price} price_ts_ms={price_timestamp_ms} rtds_msg_ts_ms={message_timestamp_ms} bars_in_history={bars_in_history}"
     );
 }

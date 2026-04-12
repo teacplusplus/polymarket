@@ -32,7 +32,7 @@ pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
     }
 }
 
-/// Асинхронно пишет дамп в `xframes/{count_features}/{YYYY-MM-DD}/{name}.bin` (не блокирует остановку WS).
+/// Асинхронно пишет дамп в `xframes/{currency}/{count_features}/{YYYY-MM-DD}/{name}.bin` (не блокирует остановку WS).
 pub fn spawn_dump_market_xframes_binary(
     project_manager: Arc<ProjectManager>,
     market_id: String,
@@ -81,6 +81,7 @@ async fn dump_market_xframes_binary_inner(
     let feature_count = XFrame::<SIZE>::count_features();
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let base: PathBuf = Path::new("xframes")
+        .join(&project_manager.currency)
         .join(format!("{feature_count}"))
         .join(&date);
     tokio::fs::create_dir_all(&base).await?;

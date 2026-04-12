@@ -1,19 +1,26 @@
 use crate::market_snapshot::aggregate_events;
 use anyhow::bail;
-use crate::btcusdt_ws::RtdsBtcLatest;
+use crate::currency_ws::RtdsCurrencyLatest;
+use crate::constants::XFrameIntervalKind;
+use crate::data_ws::spawn_bounded_market_ws;
 use crate::run_log;
-use crate::util::current_timestamp_ms;
-
-pub use crate::btc_updown_sibling::{
-    five_min_belongs_to_fifteen_window, BtcUpdownSiblingSlot, BtcUpdownSiblingWsState,
+use crate::util::{
+    current_timestamp_ms, fetch_gamma_event_data_for_slug,
+    fetch_price_to_beat_from_polymarket_event_page, CurrencyEventSlugData,
 };
-pub use crate::constants::{BtcUpdownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
+use crate::xframe_dump;
+use std::time::Instant;
+
+pub use crate::currency_updown_sibling::{
+    five_min_belongs_to_fifteen_window, CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingWsState,
+};
+pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use crate::data_ws::{
-    make_ws_channel, BtcUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer,
+    make_ws_channel, CurrencyUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer,
     MarketSnapshotBufferMut, Ws,
 };
 use crate::xframe::{
-    btc_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
+    currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
     find_same_outcome_sibling_asset_id, XFrame, SIZE,
 };
 use polymarket_client_sdk::clob;
@@ -22,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
-use crate::btc_updown_sibling::on_btc_updown_ws_connected;
+use crate::currency_updown_sibling::on_currency_updown_ws_connected;
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
 
@@ -45,14 +52,15 @@ pub struct MarketEventData {
 }
 
 pub struct ProjectManager {
+    pub currency: String,
     pub xframes_by_market: Arc<RwLock<MarketFrames>>,
     pub ws_buffer_by_market: Arc<RwLock<MarketSnapshotBuffer>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
-    pub btc_up_down_by_asset_id: Arc<RwLock<HashMap<String, BtcUpDownOutcome>>>,
+    pub currency_up_down_by_asset_id: Arc<RwLock<HashMap<String, CurrencyUpDownOutcome>>>,
     pub ws_connect_wall_ms_by_market: Arc<RwLock<HashMap<String, i64>>>,
-    pub btc_updown_sibling_ws_state: Arc<RwLock<BtcUpdownSiblingWsState>>,
-    pub rtds_btc_latest: Arc<RwLock<Option<RtdsBtcLatest>>>,
-    pub rtds_btc_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
+    pub currency_updown_sibling_ws_state: Arc<RwLock<CurrencyUpDownSiblingWsState>>,
+    pub rtds_currency_latest: Arc<RwLock<Option<RtdsCurrencyLatest>>>,
+    pub rtds_currency_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
     pub ws: Arc<Ws>,
     pub http: Arc<reqwest::Client>,
     pub gamma: Arc<gamma::Client>,
@@ -60,7 +68,7 @@ pub struct ProjectManager {
 }
 
 impl ProjectManager {
-    pub fn new() -> Arc<Self> {
+    pub fn new(currency: String) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
         let http = Arc::new(
@@ -73,21 +81,24 @@ impl ProjectManager {
         let clob = Arc::new(clob::Client::new("https://clob.polymarket.com", clob::Config::default()).expect("failed to create Polymarket CLOB client"));
 
         let project_manager = Arc::new(Self {
+            currency,
             xframes_by_market: Arc::new(RwLock::new(HashMap::new())),
             ws_buffer_by_market: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
-            btc_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, BtcUpDownOutcome>::new())),
+            currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, CurrencyUpDownOutcome>::new())),
             ws_connect_wall_ms_by_market: Arc::new(RwLock::new(HashMap::new())),
-            btc_updown_sibling_ws_state: Arc::new(RwLock::new(BtcUpdownSiblingWsState::default())),
-            rtds_btc_latest: Arc::new(RwLock::new(None)),
-            rtds_btc_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
+            currency_updown_sibling_ws_state: Arc::new(RwLock::new(
+                CurrencyUpDownSiblingWsState::default(),
+            )),
+            rtds_currency_latest: Arc::new(RwLock::new(None)),
+            rtds_currency_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
             ws,
             http,
             gamma,
             clob,
         });
 
-        crate::btcusdt_ws::spawn_rtds_btc_pipeline(project_manager.clone());
+        crate::currency_ws::spawn_rtds_currency_pipeline(project_manager.clone());
         let project_manager_cloned = project_manager.clone();
         tokio::spawn(async move {
             while let Some(snapshot_arc) = ws_snapshot_receiver.recv().await {
@@ -105,6 +116,17 @@ impl ProjectManager {
             project_manager_cloned.run_frame_builder_loop().await;
         });
 
+        let pm_5m = project_manager.clone();
+        tokio::spawn(async move {
+            pm_5m.run_currency_updown_interval(FIVE_MIN_SEC, "5m").await;
+        });
+        let pm_15m = project_manager.clone();
+        tokio::spawn(async move {
+            pm_15m
+                .run_currency_updown_interval(FIFTEEN_MIN_SEC, "15m")
+                .await;
+        });
+
         project_manager
     }
 
@@ -114,7 +136,7 @@ impl ProjectManager {
         ends: HashMap<String, Option<i64>>,
         price_to_beat: Option<f64>,
         gamma_question: Option<String>,
-        btc_up_down_by_asset_id: HashMap<String, BtcUpDownOutcome>,
+        currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
     ) {
         let mut lock = self.event_data_by_market.write().await;
         for (market_id, start_ms) in starts {
@@ -139,24 +161,24 @@ impl ProjectManager {
         }
         drop(lock);
 
-        if !btc_up_down_by_asset_id.is_empty() {
-            let mut map = self.btc_up_down_by_asset_id.write().await;
-            for (asset_id, code) in btc_up_down_by_asset_id {
+        if !currency_up_down_by_asset_id.is_empty() {
+            let mut map = self.currency_up_down_by_asset_id.write().await;
+            for (asset_id, code) in currency_up_down_by_asset_id {
                 map.insert(asset_id, code);
             }
         }
     }
 
     /// Вызывать при перезапуске подписки, сразу после лога старта WS и до `spawn_bounded_market_ws` (`btc-updown-5m-*` / `btc-updown-15m-*`).
-    /// Обновляет [`Self::btc_updown_sibling_ws_state`]; пару для sibling-признаков читает [`BtcUpdownSiblingWsState::paired_five_and_fifteen_market_ids`].
-    pub async fn on_btc_updown_ws_connected(
+    /// Обновляет [`Self::currency_updown_sibling_ws_state`]; пару для sibling-признаков читает [`CurrencyUpDownSiblingWsState::paired_five_and_fifteen_market_ids`].
+    pub async fn on_currency_updown_ws_connected(
         &self,
         interval_sec: i64,
         slug_window_start_unix_sec: i64,
         market_ids: &[String],
         gamma_question: Option<&str>) {
-        on_btc_updown_ws_connected(
-            self.btc_updown_sibling_ws_state.clone(),
+        on_currency_updown_ws_connected(
+            self.currency_updown_sibling_ws_state.clone(),
             interval_sec,
             slug_window_start_unix_sec,
             market_ids,
@@ -165,7 +187,7 @@ impl ProjectManager {
     }
 
     /// Вызывать сразу после успешного `spawn_bounded_market_ws`: фиксирует wall-time подключения WS по `market_id` для [`crate::xframe::XFrame::stable`].
-    pub async fn record_btc_updown_ws_connect(&self, market_ids: &[String]) {
+    pub async fn record_currency_updown_ws_connect(&self, market_ids: &[String]) {
         let now_ms = current_timestamp_ms();
         let mut lock = self.ws_connect_wall_ms_by_market.write().await;
         for id in market_ids {
@@ -175,7 +197,7 @@ impl ProjectManager {
 
     pub async fn ingest_snapshot(&self, mut snapshot: MarketSnapshot) -> anyhow::Result<()> {
         let Some(code) = self
-            .btc_up_down_by_asset_id
+            .currency_up_down_by_asset_id
             .read()
             .await
             .get(&snapshot.asset_id)
@@ -186,7 +208,7 @@ impl ProjectManager {
                 snapshot.asset_id
             );
         };
-        snapshot.btc_up_down_outcome = code;
+        snapshot.currency_up_down_outcome = code;
         let mut ws_buffer_by_market_write_lock = self.ws_buffer_by_market.write().await;
         ws_buffer_by_market_write_lock.push_snapshot(snapshot);
         Ok(())
@@ -226,16 +248,16 @@ impl ProjectManager {
             by_bucket.entry(key).or_default().push(snapshot);
         }
 
-        let btc_ref_sec = current_timestamp_ms() / 1000;
-        let (btc_price_z_score, btc_spot_usd) = {
-            let hist = self.rtds_btc_prices_by_sec.read().await;
-            let btc_price_z_score =
-                btc_price_z_score_from_sec_history(&hist, btc_ref_sec);
-            let btc_spot_usd = hist
-                .range(..=btc_ref_sec)
+        let currency_ref_sec = current_timestamp_ms() / 1000;
+        let (currency_price_z_score, currency_spot_usd) = {
+            let hist = self.rtds_currency_prices_by_sec.read().await;
+            let currency_price_z_score =
+                currency_price_z_score_from_sec_history(&hist, currency_ref_sec);
+            let currency_spot_usd = hist
+                .range(..=currency_ref_sec)
                 .next_back()
                 .map(|(_, price)| *price);
-            (btc_price_z_score, btc_spot_usd)
+            (currency_price_z_score, currency_spot_usd)
         };
 
         let mut built_xframes: Vec<BuiltXframeEntry> = Vec::new();
@@ -273,8 +295,8 @@ impl ProjectManager {
                 ws_connect_wall_ms_map_guard.get(&market_id).copied()
             };
 
-            let btc_price_vs_beat_pct =
-                btc_price_vs_price_to_beat_pct(price_to_beat, btc_spot_usd);
+            let currency_price_vs_beat_pct =
+                currency_price_vs_price_to_beat_pct(price_to_beat, currency_spot_usd);
 
             let window_ms = FRAME_BUILD_INTERVAL_SEC as i64 * 1000;
             let stable = compute_xframe_stable(
@@ -287,8 +309,8 @@ impl ProjectManager {
                 &frames_history,
                 event_end_ms,
                 gamma_question_owned.as_deref(),
-                btc_price_z_score,
-                btc_price_vs_beat_pct,
+                currency_price_z_score,
+                currency_price_vs_beat_pct,
                 window_ms,
                 stable,
             );
@@ -323,13 +345,13 @@ impl ProjectManager {
             })
             .collect();
 
-        let btc_up_down_by_asset_id: HashMap<String, BtcUpDownOutcome> = {
-            let guard = self.btc_up_down_by_asset_id.read().await;
+        let currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome> = {
+            let guard = self.currency_up_down_by_asset_id.read().await;
             guard.clone()
         };
 
         let sibling_market_by_market: HashMap<String, String> = {
-            let sibling_ws_state_read_guard = self.btc_updown_sibling_ws_state.read().await;
+            let sibling_ws_state_read_guard = self.currency_updown_sibling_ws_state.read().await;
             let mut sibling_market_lookup = HashMap::new();
             if let Some((five_market_id, fifteen_market_id)) = sibling_ws_state_read_guard.paired_five_and_fifteen_market_ids() {
                 sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
@@ -352,7 +374,7 @@ impl ProjectManager {
 
                 let other_asset_id = match find_opposite_asset_id(
                     &entry.asset_id,
-                    &btc_up_down_by_asset_id,
+                    &currency_up_down_by_asset_id,
                     &candidate_asset_ids,
                 ) {
                     Ok(id) => id,
@@ -390,7 +412,7 @@ impl ProjectManager {
                 let sibling_asset_id = match find_same_outcome_sibling_asset_id(
                     &entry.asset_id,
                     sibling_market_id.as_str(),
-                    &btc_up_down_by_asset_id,
+                    &currency_up_down_by_asset_id,
                     &sibling_candidates,
                 ) {
                     Ok(id) => id,
@@ -431,6 +453,197 @@ impl ProjectManager {
         }
         drop(xframes_by_market_lock);
     }
+
+    pub async fn run_currency_updown_interval(self: Arc<Self>, period_sec: i64, slug_mid: &'static str) {
+        let xframe_interval_kind = match period_sec {
+            ps if ps == FIVE_MIN_SEC => XFrameIntervalKind::FiveMin,
+            ps if ps == FIFTEEN_MIN_SEC => XFrameIntervalKind::FifteenMin,
+            _ => XFrameIntervalKind::FifteenMin,
+        };
+
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tick.tick().await;
+            let now_ms = current_timestamp_ms();
+            let poly_sec = now_ms / 1000;
+            let window_start_sec = (poly_sec / period_sec) * period_sec;
+            let ws_end_sec = window_start_sec + period_sec;
+
+            if now_ms >= ws_end_sec * 1000 {
+                continue;
+            }
+
+            let mut ws_handle: Option<tokio::task::JoinHandle<()>> = None;
+            let mut subscribed: Vec<String> = Vec::new();
+            let mut ws_session_market_id: Option<String> = None;
+            let mut ws_session_gamma_question: Option<String> = None;
+
+            while current_timestamp_ms() < ws_end_sec * 1000 {
+                let now_poly_ms = current_timestamp_ms();
+                if now_poly_ms >= ws_end_sec * 1000 {
+                    break;
+                }
+
+                let slug = format!(
+                    "{}-updown-{slug_mid}-{window_start_sec}",
+                    self.currency.to_lowercase(),
+                );
+                let http_gamma = self.http.clone();
+                let http_price = self.http.clone();
+                let slug_gamma = slug.clone();
+                let slug_price = slug.clone();
+                let currency = self.currency.clone();
+
+                let (gamma_join_res, price_join_res) = tokio::join!(
+                    tokio::spawn(async move {
+                        fetch_gamma_event_data_for_slug(http_gamma.as_ref(), &slug_gamma).await
+                    }),
+                    tokio::spawn(async move {
+                        fetch_price_to_beat_from_polymarket_event_page(
+                            http_price.as_ref(),
+                            &slug_price,
+                            &currency,
+                        )
+                        .await
+                    }),
+                );
+
+                let (
+                    ids,
+                    market_event_start_ms,
+                    market_event_end_ms,
+                    gamma_question,
+                    currency_up_down_by_asset_id,
+                ) = match gamma_join_res {
+                    Ok(Ok(CurrencyEventSlugData {
+                        clob_token_ids,
+                        currency_up_down_by_asset_id,
+                        market_event_start_ms,
+                        market_event_end_ms,
+                        gamma_question,
+                    })) => (
+                        clob_token_ids,
+                        market_event_start_ms,
+                        market_event_end_ms,
+                        gamma_question,
+                        currency_up_down_by_asset_id,
+                    ),
+                    Ok(Err(e)) => {
+                        run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                        continue;
+                    }
+                    Err(e) => {
+                        run_log::gamma_fetch_err(slug_mid, &slug, &format!("join gamma: {e}"));
+                        continue;
+                    }
+                };
+
+                let price_to_beat = match price_join_res {
+                    Ok(Ok(price_to_beat)) => Some(price_to_beat),
+                    Ok(Err(e)) => {
+                        run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                        continue;
+                    }
+                    Err(e) => {
+                        run_log::gamma_fetch_err(
+                            slug_mid,
+                            &slug,
+                            &format!("join price_to_beat: {e}"),
+                        );
+                        continue;
+                    }
+                };
+
+                let wall_end_ms = market_event_end_ms
+                    .values()
+                    .copied()
+                    .flatten()
+                    .max()
+                    .unwrap_or(ws_end_sec * 1000);
+
+                let market_ids: Vec<String> = market_event_end_ms.keys().cloned().collect();
+
+                self.merge_market_event_data(
+                    market_event_start_ms,
+                    market_event_end_ms,
+                    price_to_beat,
+                    gamma_question.clone(),
+                    currency_up_down_by_asset_id,
+                )
+                .await;
+
+                let should_restart_ws = ids != subscribed;
+
+                if should_restart_ws {
+                    if let Some(h) = ws_handle.take() {
+                        run_log::ws_stop_replace(slug_mid, &slug, subscribed.len());
+                        h.abort();
+                    }
+
+                    let remain_ms = (wall_end_ms - current_timestamp_ms()).max(0) as u64;
+                    let session_deadline = Instant::now() + Duration::from_millis(remain_ms);
+
+                    run_log::ws_start(
+                        slug_mid,
+                        &slug,
+                        price_to_beat,
+                        &market_ids,
+                        &ids,
+                        remain_ms,
+                        wall_end_ms,
+                    );
+
+                    self.on_currency_updown_ws_connected(
+                        period_sec,
+                        window_start_sec,
+                        &market_ids,
+                        gamma_question.as_deref(),
+                    ).await;
+
+                    match spawn_bounded_market_ws(
+                        self.clone(),
+                        ids.clone(),
+                        session_deadline,
+                        xframe_interval_kind,
+                    ) {
+                        Ok(h) => {
+
+                            self.record_currency_updown_ws_connect(&market_ids).await;
+                            ws_handle = Some(h);
+                            subscribed = ids.clone();
+                            ws_session_market_id = market_ids.first().cloned();
+                            ws_session_gamma_question = gamma_question.clone();
+                        }
+                        Err(e) => {
+                            run_log::ws_spawn_err(slug_mid, &slug, &e);
+                            continue;
+                        }
+                    }
+                }
+
+                tick.tick().await;
+            }
+
+            if let Some(h) = ws_handle.take() {
+                let slug = format!(
+                    "{}-updown-{slug_mid}-{window_start_sec}",
+                    self.currency.to_lowercase(),
+                );
+                run_log::ws_window_end_wait(slug_mid, &slug, subscribed.len());
+                let _ = h.await;
+                run_log::ws_task_joined(slug_mid, &slug);
+                if let Some(mid) = ws_session_market_id {
+                    xframe_dump::spawn_dump_market_xframes_binary(
+                        self.clone(),
+                        mid,
+                        ws_session_gamma_question,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Противоположная нога / sibling: кадр из текущего батча, иначе уже сохранённый с тем же `aligned_ts`, иначе последний с `aligned_ts` ≤ запрошенного.
@@ -452,17 +665,17 @@ fn lookup_frame_for_leg_merge<'a>(
     by_ts.range(..=aligned_ts).next_back().map(|(_, frame)| frame)
 }
 
-/// `(price_to_beat - btc_spot) / price_to_beat * 100` — отклонение спота от уровня «beat» в процентах; знак «+», если спот ниже beat.
-fn btc_price_vs_price_to_beat_pct(
+/// `(price_to_beat - currency_spot) / price_to_beat * 100` — отклонение спота от уровня «beat» в процентах; знак «+», если спот ниже beat.
+fn currency_price_vs_price_to_beat_pct(
     price_to_beat: Option<f64>,
-    btc_spot_usd: Option<f64>,
+    currency_spot_usd: Option<f64>,
 ) -> Option<f64> {
     const MIN_BEAT: f64 = 1e-6;
     let beat = price_to_beat?;
     if !beat.is_finite() || beat.abs() <= MIN_BEAT {
         return None;
     }
-    let spot = btc_spot_usd?;
+    let spot = currency_spot_usd?;
     if !spot.is_finite() {
         return None;
     }

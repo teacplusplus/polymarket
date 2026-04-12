@@ -1,18 +1,18 @@
-//! Общие константы времени Polymarket BTC up/down и дискриминанты для снапшотов / XFrame.
+//! Общие константы времени Polymarket up/down по валюте и дискриминанты для снапшотов / XFrame.
 
 /// Длительность пятиминутного окна в секундах (slug `btc-updown-5m-*`).
 pub const FIVE_MIN_SEC: i64 = 300;
 /// Длительность пятнадцатиминутного окна в секундах (slug `btc-updown-15m-*`).
 pub const FIFTEEN_MIN_SEC: i64 = 900;
 
-/// Горизонт BTC up/down по Polymarket (`btc-updown-5m-*` / `btc-updown-15m-*`).
+/// Горизонт up/down по валюте на Polymarket (`btc-updown-5m-*` / `btc-updown-15m-*` в slug).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BtcUpdownInterval {
+pub enum CurrencyUpDownInterval {
     FiveMin,
     FifteenMin,
 }
 
-impl BtcUpdownInterval {
+impl CurrencyUpDownInterval {
     pub const fn interval_sec(self) -> i64 {
         match self {
             Self::FiveMin => FIVE_MIN_SEC,
@@ -43,7 +43,7 @@ pub enum TradeSide {
     Sell,
 }
 
-/// Тип окна BTC up/down (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
+/// Тип окна up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[repr(i32)]
 pub enum XFrameIntervalKind {
@@ -68,16 +68,16 @@ impl XFrameIntervalKind {
     }
 }
 
-/// Исход токена BTC up/down (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
+/// Исход токена up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[repr(i32)]
-pub enum BtcUpDownOutcome {
+pub enum CurrencyUpDownOutcome {
     #[default]
     Down = 0,
     Up = 1,
 }
 
-impl BtcUpDownOutcome {
+impl CurrencyUpDownOutcome {
     #[inline]
     pub const fn as_i32(self) -> i32 {
         self as i32
@@ -101,10 +101,10 @@ impl BtcUpDownOutcome {
     }
 }
 
-/// Класс сдвига / номер пятиминутки в 15m-блоке (в [`crate::xframe::XFrame`] хранится как `i32`).
+/// Класс сдвига / номер пятиминутки в 15m-блоке для up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
 #[repr(i32)]
-pub enum BtcUpDownDelayClass {
+pub enum CurrencyUpDownDelayClass {
     /// 15m-рынок или первая пятиминутка в блоке.
     #[default]
     Aligned = 0,
@@ -114,7 +114,7 @@ pub enum BtcUpDownDelayClass {
     Delay10Min = 2,
 }
 
-impl BtcUpDownDelayClass {
+impl CurrencyUpDownDelayClass {
     #[inline]
     pub const fn as_i32(self) -> i32 {
         self as i32

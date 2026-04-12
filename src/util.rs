@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::constants::BtcUpDownOutcome;
+use crate::constants::CurrencyUpDownOutcome;
 
 pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,9 +14,9 @@ pub fn current_timestamp_ms() -> i64 {
     now.as_millis() as i64
 }
 
-pub struct GammaEventSlugData {
+pub struct CurrencyEventSlugData {
     pub clob_token_ids: Vec<String>,
-    pub btc_up_down_by_asset_id: HashMap<String, BtcUpDownOutcome>,
+    pub currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
     pub market_event_start_ms: HashMap<String, Option<i64>>,
     pub market_event_end_ms: HashMap<String, Option<i64>>,
     pub gamma_question: Option<String>,
@@ -24,14 +24,17 @@ pub struct GammaEventSlugData {
 
 /// `priceToBeat` из JSON скрипта `#__NEXT_DATA__` на [`https://polymarket.com/event/{slug}`](https://polymarket.com/event/).
 ///
+/// `currency` — тикер как в [`crate::project_manager::ProjectManager::currency`] (например `eth`); в кэшах React Query сравнивается в **верхнем** регистре.
+///
 /// В `props.pageProps.dehydratedState.queries`:
 /// 1. Кэш `["/api/event/slug", slug]` → `state.data.eventMetadata.priceToBeat`.
-/// 2. Иначе кэш `["crypto-prices", "price", "BTC", …]` → `state.data.openPrice`.
-/// 3. Иначе кэш `["past-results", "BTC", "fiveminute"|"fifteen", <ISO начала окна UTC>]`
+/// 2. Иначе кэш `["crypto-prices", "price", <CURRENCY_UPPER>, …]` → `state.data.openPrice`.
+/// 3. Иначе кэш `["past-results", <CURRENCY_UPPER>, "fiveminute"|"fifteen", <ISO начала окна UTC>]`
 ///    → последний `closePrice` в `state.data.data.results` (актуальная вёрстка без `crypto-prices` в SSR).
 pub async fn fetch_price_to_beat_from_polymarket_event_page(
     http: &reqwest::Client,
     slug: &str,
+    currency: &str,
 ) -> anyhow::Result<f64> {
     let url = format!("https://polymarket.com/event/{slug}");
     let response = http
@@ -59,7 +62,7 @@ pub async fn fetch_price_to_beat_from_polymarket_event_page(
         let v: Value = serde_json::from_str(json_str).with_context(|| {
             format!("нет priceToBeat: JSON __NEXT_DATA__ не разобрать для slug={slug:?}")
         })?;
-        let price = price_to_beat_from_next_data(&v, slug).ok_or_else(|| {
+        let price = price_to_beat_from_next_data(&v, slug, currency).ok_or_else(|| {
             anyhow::anyhow!(
                 "нет priceToBeat: ни eventMetadata.priceToBeat, ни openPrice (crypto-prices), ни past-results[].closePrice в __NEXT_DATA__ на polymarket.com/event для slug={slug:?}"
             )
@@ -102,14 +105,18 @@ fn json_f64(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-fn price_to_beat_from_next_data(next_data: &Value, slug: &str) -> Option<f64> {
+fn price_to_beat_from_next_data(next_data: &Value, slug: &str, currency: &str) -> Option<f64> {
     price_to_beat_from_event_slug_query(next_data, slug)
-        .or_else(|| price_to_beat_from_crypto_prices_open_price(next_data))
-        .or_else(|| price_to_beat_from_past_results_close(next_data, slug))
+        .or_else(|| price_to_beat_from_currency_open_price_crypto_prices(next_data, currency))
+        .or_else(|| price_to_beat_from_currency_past_results_close(next_data, slug, currency))
 }
 
-fn price_to_beat_from_past_results_close(next_data: &Value, slug: &str) -> Option<f64> {
-    let (window_sec, variant) = btc_updown_slug_window_sec_and_variant(slug)?;
+fn price_to_beat_from_currency_past_results_close(
+    next_data: &Value,
+    slug: &str,
+    currency: &str,
+) -> Option<f64> {
+    let (window_sec, variant) = currency_updown_slug_window_sec_and_variant(currency, slug)?;
     let iso = window_start_iso_utc_z(window_sec)?;
     let queries = next_data
         .get("props")?
@@ -117,6 +124,7 @@ fn price_to_beat_from_past_results_close(next_data: &Value, slug: &str) -> Optio
         .get("dehydratedState")?
         .get("queries")?
         .as_array()?;
+    let currency_upper = currency.to_uppercase();
     for q in queries {
         let key = q.get("queryKey")?.as_array()?;
         if key.len() != 4 {
@@ -125,7 +133,7 @@ fn price_to_beat_from_past_results_close(next_data: &Value, slug: &str) -> Optio
         if key[0].as_str() != Some("past-results") {
             continue;
         }
-        if key[1].as_str() != Some("BTC") {
+        if key[1].as_str() != Some(currency_upper.as_str()) {
             continue;
         }
         if key[2].as_str() != Some(variant) {
@@ -147,8 +155,12 @@ fn price_to_beat_from_past_results_close(next_data: &Value, slug: &str) -> Optio
     None
 }
 
-fn btc_updown_slug_window_sec_and_variant(slug: &str) -> Option<(i64, &'static str)> {
-    let rest = slug.strip_prefix("btc-updown-")?;
+fn currency_updown_slug_window_sec_and_variant(
+    currency: &str,
+    slug: &str,
+) -> Option<(i64, &'static str)> {
+    let prefix = format!("{}-updown-", currency.to_lowercase());
+    let rest = slug.strip_prefix(prefix.as_str())?;
     let (mid, sec_str) = rest.rsplit_once('-')?;
     let window_sec: i64 = sec_str.parse().ok()?;
     let variant = match mid {
@@ -193,14 +205,18 @@ fn price_to_beat_from_event_slug_query(next_data: &Value, slug: &str) -> Option<
     None
 }
 
-/// Кэш React Query `crypto-prices` / окно BTC — `openPrice` на странице события (в т.ч. когда у slug нет `eventMetadata`).
-fn price_to_beat_from_crypto_prices_open_price(next_data: &Value) -> Option<f64> {
+/// Кэш React Query `crypto-prices` — `openPrice` на странице события для тикера `currency` (в т.ч. когда у slug нет `eventMetadata`).
+fn price_to_beat_from_currency_open_price_crypto_prices(
+    next_data: &Value,
+    currency: &str,
+) -> Option<f64> {
     let queries = next_data
         .get("props")?
         .get("pageProps")?
         .get("dehydratedState")?
         .get("queries")?
         .as_array()?;
+    let currency_upper = currency.to_uppercase();
     for q in queries {
         let key = q.get("queryKey")?.as_array()?;
         if key.len() < 5 {
@@ -212,7 +228,7 @@ fn price_to_beat_from_crypto_prices_open_price(next_data: &Value) -> Option<f64>
         if key[1].as_str() != Some("price") {
             continue;
         }
-        if key[2].as_str() != Some("BTC") {
+        if key[2].as_str() != Some(currency_upper.as_str()) {
             continue;
         }
         let variant = key[4].as_str()?;
@@ -228,7 +244,7 @@ fn price_to_beat_from_crypto_prices_open_price(next_data: &Value) -> Option<f64>
 pub async fn fetch_gamma_event_data_for_slug(
     http: &reqwest::Client,
     slug: &str,
-) -> anyhow::Result<GammaEventSlugData> {
+) -> anyhow::Result<CurrencyEventSlugData> {
     let url = format!("https://gamma-api.polymarket.com/markets/slug/{slug}");
     let response = http
         .get(&url)
@@ -247,7 +263,7 @@ pub async fn fetch_gamma_event_data_for_slug(
         .with_context(|| format!("clobTokenIds slug={slug}"))?;
     let outcomes = parse_outcomes_from_gamma_market(&v)
         .with_context(|| format!("outcomes slug={slug}"))?;
-    let btc_up_down_by_asset_id = if outcomes.is_empty() {
+    let currency_up_down_by_asset_id = if outcomes.is_empty() {
         HashMap::new()
     } else {
         zip_outcomes_clob_to_up_code(&outcomes, &clob_token_ids)
@@ -279,19 +295,19 @@ pub async fn fetch_gamma_event_data_for_slug(
         anyhow::bail!("ни одного clobTokenId в ответе Gamma для slug={slug:?}");
     }
 
-    Ok(GammaEventSlugData {
+    Ok(CurrencyEventSlugData {
         clob_token_ids,
-        btc_up_down_by_asset_id,
+        currency_up_down_by_asset_id,
         market_event_start_ms,
         market_event_end_ms,
         gamma_question,
     })
 }
 
-fn gamma_outcome_label_to_btc_kind(label: &str) -> Option<BtcUpDownOutcome> {
+fn gamma_outcome_label_to_currency_kind(label: &str) -> Option<CurrencyUpDownOutcome> {
     match label.trim().to_ascii_lowercase().as_str() {
-        "up" => Some(BtcUpDownOutcome::Up),
-        "down" => Some(BtcUpDownOutcome::Down),
+        "up" => Some(CurrencyUpDownOutcome::Up),
+        "down" => Some(CurrencyUpDownOutcome::Down),
         _ => None,
     }
 }
@@ -299,7 +315,7 @@ fn gamma_outcome_label_to_btc_kind(label: &str) -> Option<BtcUpDownOutcome> {
 fn zip_outcomes_clob_to_up_code(
     outcomes: &[String],
     clob_ids: &[String],
-) -> anyhow::Result<HashMap<String, BtcUpDownOutcome>> {
+) -> anyhow::Result<HashMap<String, CurrencyUpDownOutcome>> {
     if outcomes.len() != clob_ids.len() {
         anyhow::bail!(
             "Gamma: len(outcomes)={} != len(clobTokenIds)={}",
@@ -309,7 +325,7 @@ fn zip_outcomes_clob_to_up_code(
     }
     let mut map = HashMap::new();
     for (label, token_id) in outcomes.iter().zip(clob_ids.iter()) {
-        if let Some(code) = gamma_outcome_label_to_btc_kind(label) {
+        if let Some(code) = gamma_outcome_label_to_currency_kind(label) {
             map.insert(token_id.clone(), code);
         }
     }

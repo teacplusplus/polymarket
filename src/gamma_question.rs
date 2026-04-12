@@ -1,13 +1,15 @@
-//! Разбор поля `question` Gamma для BTC Up/Down (окно времени в ET).
+//! Разбор поля `question` Gamma для up/down по валюте (окно времени в ET).
 
 use chrono::{Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::America::New_York;
 
-use crate::constants::BtcUpDownDelayClass;
+use crate::constants::CurrencyUpDownDelayClass;
 
 /// Парсит `question` Gamma в духе `Bitcoin Up or Down - April 8, 3:35PM-3:40PM ET`:  
 /// если окно ровно 5 минут, возвращает класс пятиминутки внутри 15-минутного блока.
-pub fn btc_up_down_five_min_slot_from_gamma_question(question: &str) -> Option<BtcUpDownDelayClass> {
+pub fn currency_up_down_five_min_slot_from_gamma_question(
+    question: &str,
+) -> Option<CurrencyUpDownDelayClass> {
     let (_, market_info) = question.split_once(" - ")?;
     let (_, time_part) = market_info.split_once(", ")?;
     let (start_time, end_with_tz) = time_part.split_once('-')?;
@@ -31,7 +33,7 @@ pub fn btc_up_down_five_min_slot_from_gamma_question(question: &str) -> Option<B
     if rem % 5 != 0 {
         return None;
     }
-    BtcUpDownDelayClass::from_i32(rem / 5)
+    CurrencyUpDownDelayClass::from_i32(rem / 5)
 }
 
 fn english_month_abbrev_or_full(month_token: &str) -> Option<u32> {
@@ -55,7 +57,7 @@ fn english_month_abbrev_or_full(month_token: &str) -> Option<u32> {
 /// Старт окна из `question` Gamma в духе `Bitcoin Up or Down - April 8, 3:35PM-3:40PM ET` (интерпретация в America/New_York).
 /// `reference_unix_sec` задаёт календарный год и границы DST (обычно `window_start` из slug).
 /// Возвращает `(unix_start_sec, duration_min)` для окна ровно 5 или 15 минут.
-pub fn btc_updown_question_window_start_unix_sec(
+pub fn currency_updown_question_window_start_unix_sec(
     question: &str,
     reference_unix_sec: i64,
 ) -> Option<(i64, i64)> {
