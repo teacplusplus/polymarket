@@ -1,15 +1,14 @@
+use crate::currency_updown_sibling::update_currency_updown_sibling_slots;
 use crate::project_manager::ProjectManager;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub use crate::market_snapshot::{
@@ -20,7 +19,22 @@ use crate::market_snapshot::aggregate_events;
 
 const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const WS_RECONNECT_DELAY_SECS: u64 = 3;
+/// Документация Polymarket: клиентский heartbeat для market channel.
+const WS_PING_INTERVAL_SECS: u64 = 10;
 const BUFFER: usize = 4096;
+
+/// Команда на подписку для одного из двух долгоживущих market WS (5m / 15m).
+#[derive(Debug, Clone)]
+pub struct MarketWsSubscription {
+    /// Сегмент горизонта в slug Polymarket: `"5m"` или `"15m"` (см. `format!("{{}}-updown-{{period}}-…")`).
+    pub period: &'static str,
+    pub slug: String,
+    pub asset_ids: Vec<String>,
+    pub market_ids: Vec<String>,
+    pub period_sec: i64,
+    pub window_start_sec: i64,
+    pub gamma_question: Option<String>,
+}
 
 pub struct Ws {
     pub market_snapshot_sender: mpsc::Sender<Arc<MarketSnapshot>>,
@@ -72,106 +86,206 @@ pub fn make_ws_channel() -> (Arc<Ws>, mpsc::Receiver<Arc<MarketSnapshot>>) {
     )
 }
 
-/// WebSocket до `session_deadline`: при обрыве — реконнект с паузой, после дедлайна — выход без реконнекта.
-pub fn spawn_bounded_market_ws(
+/// Один долгоживущий market WS на горизонт (5m или 15m): начальная подписка и смена рынка через
+/// [update subscription](https://docs.polymarket.com/api-reference/wss/market) без разрыва TCP.
+pub fn spawn_persistent_interval_market_ws(
     project_manager: Arc<ProjectManager>,
-    asset_ids: Vec<String>,
-    session_deadline: Instant,
+    cmd_rx: mpsc::Receiver<MarketWsSubscription>,
     xframe_interval_kind: XFrameIntervalKind,
-) -> Result<JoinHandle<()>> {
-    if asset_ids.is_empty() {
-        return Err(anyhow!("asset_ids cannot be empty"));
-    }
-
-    let handle = tokio::spawn(async move {
-        loop {
-            if Instant::now() >= session_deadline {
-                return;
-            }
-            match run_single_market_ws_session_until(
-                project_manager.clone(),
-                asset_ids.clone(),
-                session_deadline,
-                xframe_interval_kind,
-            )
-            .await
-            {
-                Ok(()) => return,
-                Err(err) => {
-                    run_log::market_ws_session_err(&err);
-                    if Instant::now() >= session_deadline {
-                        return;
-                    }
-                    sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
-                }
-            }
-        }
+) {
+    tokio::spawn(async move {
+        run_persistent_interval_market_ws_inner(project_manager, cmd_rx, xframe_interval_kind).await;
     });
-
-    Ok(handle)
 }
 
-async fn run_single_market_ws_session_until(
+async fn run_persistent_interval_market_ws_inner(
     project_manager: Arc<ProjectManager>,
-    asset_ids: Vec<String>,
-    session_deadline: Instant,
+    mut cmd_rx: mpsc::Receiver<MarketWsSubscription>,
     xframe_interval_kind: XFrameIntervalKind,
-) -> Result<()> {
-    let (websocket_stream, _) = connect_async(POLYMARKET_MARKET_WS_URL)
-        .await
-        .context("connect to polymarket market websocket")?;
-    let (mut websocket_writer, mut websocket_reader) = websocket_stream.split();
+) {
+    let mut active_asset_ids: Vec<String> = Vec::new();
 
-    let subscribe = json!({
-        "assets_ids": asset_ids,
-        "type": "market",
-        "custom_feature_enabled": true
-    });
-    websocket_writer
-        .send(Message::Text(subscribe.to_string()))
-        .await
-        .context("send subscription message")?;
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(session_deadline)) => {
-                return Ok(());
-            }
-            message = websocket_reader.next() => {
-                let Some(message) = message else {
-                    return Err(anyhow!("websocket stream ended"));
-                };
-                let message = message.context("read websocket message")?;
-                match message {
-                    Message::Text(text) => {
-                        if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
-                            ingest_json_event(&project_manager, &json_value, xframe_interval_kind)
-                                .await?;
-                        }
-                    }
-                    Message::Binary(binary) => {
-                        if let Ok(text) = String::from_utf8(binary.to_vec()) {
-                            if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
-                                ingest_json_event(
-                                    &project_manager,
-                                    &json_value,
-                                    xframe_interval_kind,
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    Message::Ping(payload) => {
-                        websocket_writer
-                            .send(Message::Pong(payload))
-                            .await?;
-                    }
-                    Message::Close(_) => return Err(anyhow!("websocket closed")),
-                    _ => {}
+    // Ждём первую непустую команду подписки (пока `asset_ids` пусты — пропускаем и ждём дальше).
+    let initial_subscription = loop {
+        match cmd_rx.recv().await {
+            None => return,
+            Some(initial_subscription) => {
+                if !initial_subscription.asset_ids.is_empty() {
+                    break initial_subscription;
                 }
             }
         }
+    };
+    active_asset_ids.clone_from(&initial_subscription.asset_ids);
+    let mut active_market_ws_command: Option<MarketWsSubscription> = Some(initial_subscription);
+
+    loop {
+        let (websocket_stream, _http_response) = match connect_async(POLYMARKET_MARKET_WS_URL).await {
+            Ok(stream_and_response) => stream_and_response,
+            Err(connect_err) => {
+                run_log::market_ws_session_err(&connect_err);
+                sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+                continue;
+            }
+        };
+        let (mut write, mut read) = websocket_stream.split();
+
+        let subscribe = json!({
+            "assets_ids": &active_asset_ids,
+            "type": "market",
+            "custom_feature_enabled": true
+        });
+        if let Err(e) = write.send(Message::Text(subscribe.to_string())).await {
+            run_log::market_ws_session_err(&e);
+            sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+            continue;
+        }
+
+        if let Some(ref active_market_ws_command) = active_market_ws_command {
+            update_currency_updown_sibling_slots(
+                project_manager.currency_updown_sibling_ws_state.clone(),
+                active_market_ws_command.period_sec,
+                active_market_ws_command.window_start_sec,
+                &active_market_ws_command.market_ids,
+                active_market_ws_command.gamma_question.as_deref(),
+            )
+            .await;
+            project_manager
+                .record_market_ws_connect_wall_ms(&active_market_ws_command.market_ids)
+                .await;
+        }
+
+        let mut ping = interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
+        ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let mut disconnect = false;
+        while !disconnect {
+            tokio::select! {
+                biased;
+                _ = ping.tick() => {
+                    if write.send(Message::Text("PING".into())).await.is_err() {
+                        run_log::market_ws_session_err("market ws PING send failed");
+                        disconnect = true;
+                    }
+                }
+                message = read.next() => {
+                    match message {
+                        None => {
+                            run_log::market_ws_session_err("websocket stream ended");
+                            disconnect = true;
+                        }
+                        Some(Err(read_err)) => {
+                            run_log::market_ws_session_err(&format!("websocket read: {read_err}"));
+                            disconnect = true;
+                        }
+                        Some(Ok(message)) => match message {
+                            Message::Text(text) => {
+                                if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
+                                    let _ = ingest_json_event(
+                                        &project_manager,
+                                        &json_value,
+                                        xframe_interval_kind,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Message::Binary(binary) => {
+                                if let Ok(text) = String::from_utf8(binary.to_vec())
+                                    && let Ok(json_value) = serde_json::from_str::<Value>(&text)
+                                {
+                                    let _ = ingest_json_event(
+                                        &project_manager,
+                                        &json_value,
+                                        xframe_interval_kind,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Message::Ping(payload) => {
+                                let _ = write.send(Message::Pong(payload)).await;
+                            }
+                            Message::Close(_) => {
+                                run_log::market_ws_session_err("websocket closed");
+                                disconnect = true;
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+                cmd_opt = cmd_rx.recv() => {
+                    let Some(next_command) = cmd_opt else {
+                        return;
+                    };
+                    if next_command.asset_ids.is_empty() {
+                        continue;
+                    }
+                    if next_command.asset_ids == active_asset_ids {
+                        active_market_ws_command = Some(next_command);
+                        continue;
+                    }
+
+                    // Сначала подписка на новый рынок — без «дыры» без данных; затем отписка от старого.
+                    let old_asset_ids = active_asset_ids.clone();
+
+                    let sub = json!({
+                        "operation": "subscribe",
+                        "assets_ids": &next_command.asset_ids,
+                        "custom_feature_enabled": true
+                    });
+                    if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+                        run_log::market_ws_session_err(&format!("subscribe update: {e}"));
+                        disconnect = true;
+                        continue;
+                    }
+
+                    let unsub = json!({
+                        "operation": "unsubscribe",
+                        "assets_ids": &old_asset_ids,
+                    });
+                    if let Err(e) = write.send(Message::Text(unsub.to_string())).await {
+                        run_log::market_ws_session_err(&format!("unsubscribe: {e}"));
+                        active_asset_ids.clone_from(&next_command.asset_ids);
+                        active_market_ws_command = Some(next_command.clone());
+                        update_currency_updown_sibling_slots(
+                            project_manager.currency_updown_sibling_ws_state.clone(),
+                            next_command.period_sec,
+                            next_command.window_start_sec,
+                            &next_command.market_ids,
+                            next_command.gamma_question.as_deref(),
+                        )
+                        .await;
+                        project_manager
+                            .record_market_ws_connect_wall_ms(&next_command.market_ids)
+                            .await;
+                        disconnect = true;
+                        continue;
+                    }
+
+                    active_asset_ids.clone_from(&next_command.asset_ids);
+                    active_market_ws_command = Some(next_command.clone());
+
+                    update_currency_updown_sibling_slots(
+                        project_manager.currency_updown_sibling_ws_state.clone(),
+                        next_command.period_sec,
+                        next_command.window_start_sec,
+                        &next_command.market_ids,
+                        next_command.gamma_question.as_deref(),
+                    )
+                    .await;
+                    project_manager
+                        .record_market_ws_connect_wall_ms(&next_command.market_ids)
+                        .await;
+                }
+            }
+        }
+
+        while let Ok(queued_command) = cmd_rx.try_recv() {
+            if !queued_command.asset_ids.is_empty() {
+                active_asset_ids.clone_from(&queued_command.asset_ids);
+                active_market_ws_command = Some(queued_command);
+            }
+        }
+        sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
     }
 }
 

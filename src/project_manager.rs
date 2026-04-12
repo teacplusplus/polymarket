@@ -2,22 +2,19 @@ use crate::market_snapshot::aggregate_events;
 use anyhow::bail;
 use crate::currency_ws::RtdsCurrencyLatest;
 use crate::constants::XFrameIntervalKind;
-use crate::data_ws::spawn_bounded_market_ws;
 use crate::run_log;
 use crate::util::{
     current_timestamp_ms, fetch_gamma_event_data_for_slug,
     fetch_price_to_beat_from_polymarket_event_page, CurrencyEventSlugData,
 };
 use crate::xframe_dump;
-use std::time::Instant;
-
 pub use crate::currency_updown_sibling::{
     five_min_belongs_to_fifteen_window, CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingWsState,
 };
 pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use crate::data_ws::{
-    make_ws_channel, CurrencyUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer,
-    MarketSnapshotBufferMut, Ws,
+    make_ws_channel, spawn_persistent_interval_market_ws, CurrencyUpDownOutcome, MarketSnapshot,
+    MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws,
 };
 use crate::xframe::{
     currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
@@ -27,9 +24,8 @@ use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{self, Duration};
-use crate::currency_updown_sibling::on_currency_updown_ws_connected;
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
 
@@ -42,6 +38,8 @@ struct BuiltXframeEntry {
 }
 
 const FRAME_BUILD_INTERVAL_SEC: u64 = 1;
+/// Размер очереди команд смены подписки на долгоживущих market WS (5m / 15m).
+const MARKET_WS_SUBSCRIPTION_CHANNEL_CAP: usize = 8;
 
 #[derive(Debug, Clone, Default)]
 pub struct MarketEventData {
@@ -65,6 +63,8 @@ pub struct ProjectManager {
     pub http: Arc<reqwest::Client>,
     pub gamma: Arc<gamma::Client>,
     pub clob: Arc<clob::Client>,
+    pub market_ws_tx_5m: mpsc::Sender<MarketWsSubscription>,
+    pub market_ws_tx_15m: mpsc::Sender<MarketWsSubscription>,
 }
 
 impl ProjectManager {
@@ -79,6 +79,11 @@ impl ProjectManager {
         );
         let gamma = Arc::new(gamma::Client::default());
         let clob = Arc::new(clob::Client::new("https://clob.polymarket.com", clob::Config::default()).expect("failed to create Polymarket CLOB client"));
+
+        let (market_ws_tx_5m, market_ws_rx_5m) =
+            mpsc::channel::<MarketWsSubscription>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
+        let (market_ws_tx_15m, market_ws_rx_15m) =
+            mpsc::channel::<MarketWsSubscription>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
 
         let project_manager = Arc::new(Self {
             currency,
@@ -96,7 +101,20 @@ impl ProjectManager {
             http,
             gamma,
             clob,
+            market_ws_tx_5m,
+            market_ws_tx_15m,
         });
+
+        spawn_persistent_interval_market_ws(
+            project_manager.clone(),
+            market_ws_rx_5m,
+            XFrameIntervalKind::FiveMin,
+        );
+        spawn_persistent_interval_market_ws(
+            project_manager.clone(),
+            market_ws_rx_15m,
+            XFrameIntervalKind::FifteenMin,
+        );
 
         crate::currency_ws::spawn_rtds_currency_pipeline(project_manager.clone());
         let project_manager_cloned = project_manager.clone();
@@ -169,25 +187,8 @@ impl ProjectManager {
         }
     }
 
-    /// Вызывать при перезапуске подписки, сразу после лога старта WS и до `spawn_bounded_market_ws` (`btc-updown-5m-*` / `btc-updown-15m-*`).
-    /// Обновляет [`Self::currency_updown_sibling_ws_state`]; пару для sibling-признаков читает [`CurrencyUpDownSiblingWsState::paired_five_and_fifteen_market_ids`].
-    pub async fn on_currency_updown_ws_connected(
-        &self,
-        interval_sec: i64,
-        slug_window_start_unix_sec: i64,
-        market_ids: &[String],
-        gamma_question: Option<&str>) {
-        on_currency_updown_ws_connected(
-            self.currency_updown_sibling_ws_state.clone(),
-            interval_sec,
-            slug_window_start_unix_sec,
-            market_ids,
-            gamma_question,
-        ).await;
-    }
-
-    /// Вызывать сразу после успешного `spawn_bounded_market_ws`: фиксирует wall-time подключения WS по `market_id` для [`crate::xframe::XFrame::stable`].
-    pub async fn record_currency_updown_ws_connect(&self, market_ids: &[String]) {
+    /// Вызывать после успешной подписки на CLOB market WS: записывает `ws_connect_wall_ms` по каждому `market_id` (condition_id) для [`crate::xframe::compute_xframe_stable`].
+    pub async fn record_market_ws_connect_wall_ms(&self, market_ids: &[String]) {
         let now_ms = current_timestamp_ms();
         let mut lock = self.ws_connect_wall_ms_by_market.write().await;
         for id in market_ids {
@@ -454,13 +455,7 @@ impl ProjectManager {
         drop(xframes_by_market_lock);
     }
 
-    pub async fn run_currency_updown_interval(self: Arc<Self>, period_sec: i64, slug_mid: &'static str) {
-        let xframe_interval_kind = match period_sec {
-            ps if ps == FIVE_MIN_SEC => XFrameIntervalKind::FiveMin,
-            ps if ps == FIFTEEN_MIN_SEC => XFrameIntervalKind::FifteenMin,
-            _ => XFrameIntervalKind::FifteenMin,
-        };
-
+    pub async fn run_currency_updown_interval(self: Arc<Self>, period_sec: i64, period: &'static str) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -475,7 +470,6 @@ impl ProjectManager {
                 continue;
             }
 
-            let mut ws_handle: Option<tokio::task::JoinHandle<()>> = None;
             let mut subscribed: Vec<String> = Vec::new();
             let mut ws_session_market_id: Option<String> = None;
             let mut ws_session_gamma_question: Option<String> = None;
@@ -487,7 +481,7 @@ impl ProjectManager {
                 }
 
                 let slug = format!(
-                    "{}-updown-{slug_mid}-{window_start_sec}",
+                    "{}-updown-{period}-{window_start_sec}",
                     self.currency.to_lowercase(),
                 );
                 let http_gamma = self.http.clone();
@@ -531,11 +525,11 @@ impl ProjectManager {
                         currency_up_down_by_asset_id,
                     ),
                     Ok(Err(e)) => {
-                        run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                        run_log::gamma_fetch_err(period, &slug, &e);
                         continue;
                     }
                     Err(e) => {
-                        run_log::gamma_fetch_err(slug_mid, &slug, &format!("join gamma: {e}"));
+                        run_log::gamma_fetch_err(period, &slug, &format!("join gamma: {e}"));
                         continue;
                     }
                 };
@@ -543,12 +537,12 @@ impl ProjectManager {
                 let price_to_beat = match price_join_res {
                     Ok(Ok(price_to_beat)) => Some(price_to_beat),
                     Ok(Err(e)) => {
-                        run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                        run_log::gamma_fetch_err(period, &slug, &e);
                         continue;
                     }
                     Err(e) => {
                         run_log::gamma_fetch_err(
-                            slug_mid,
+                            period,
                             &slug,
                             &format!("join price_to_beat: {e}"),
                         );
@@ -577,16 +571,10 @@ impl ProjectManager {
                 let should_restart_ws = ids != subscribed;
 
                 if should_restart_ws {
-                    if let Some(h) = ws_handle.take() {
-                        run_log::ws_stop_replace(slug_mid, &slug, subscribed.len());
-                        h.abort();
-                    }
-
                     let remain_ms = (wall_end_ms - current_timestamp_ms()).max(0) as u64;
-                    let session_deadline = Instant::now() + Duration::from_millis(remain_ms);
 
                     run_log::ws_start(
-                        slug_mid,
+                        period,
                         &slug,
                         price_to_beat,
                         &market_ids,
@@ -595,52 +583,44 @@ impl ProjectManager {
                         wall_end_ms,
                     );
 
-                    self.on_currency_updown_ws_connected(
+                    let cmd = MarketWsSubscription {
+                        period,
+                        slug: slug.clone(),
+                        asset_ids: ids.clone(),
+                        market_ids: market_ids.clone(),
                         period_sec,
                         window_start_sec,
-                        &market_ids,
-                        gamma_question.as_deref(),
-                    ).await;
-
-                    match spawn_bounded_market_ws(
-                        self.clone(),
-                        ids.clone(),
-                        session_deadline,
-                        xframe_interval_kind,
-                    ) {
-                        Ok(h) => {
-
-                            self.record_currency_updown_ws_connect(&market_ids).await;
-                            ws_handle = Some(h);
-                            subscribed = ids.clone();
-                            ws_session_market_id = market_ids.first().cloned();
-                            ws_session_gamma_question = gamma_question.clone();
-                        }
-                        Err(e) => {
-                            run_log::ws_spawn_err(slug_mid, &slug, &e);
-                            continue;
-                        }
+                        gamma_question: gamma_question.clone(),
+                    };
+                    let tx = match period_sec {
+                        FIVE_MIN_SEC => &self.market_ws_tx_5m,
+                        FIFTEEN_MIN_SEC => &self.market_ws_tx_15m,
+                        _ => &self.market_ws_tx_15m,
+                    };
+                    if tx.send(cmd).await.is_err() {
+                        run_log::ws_spawn_err(period, &slug, "market ws command channel closed");
+                        continue;
                     }
+
+                    subscribed = ids.clone();
+                    ws_session_market_id = market_ids.first().cloned();
+                    ws_session_gamma_question = gamma_question.clone();
                 }
 
                 tick.tick().await;
             }
 
-            if let Some(h) = ws_handle.take() {
-                let slug = format!(
-                    "{}-updown-{slug_mid}-{window_start_sec}",
-                    self.currency.to_lowercase(),
+            let slug = format!(
+                "{}-updown-{period}-{window_start_sec}",
+                self.currency.to_lowercase(),
+            );
+            run_log::ws_window_end_wait(period, &slug, subscribed.len());
+            if let Some(ws_session_market_id) = ws_session_market_id {
+                xframe_dump::spawn_dump_market_xframes_binary(
+                    self.clone(),
+                    ws_session_market_id,
+                    ws_session_gamma_question,
                 );
-                run_log::ws_window_end_wait(slug_mid, &slug, subscribed.len());
-                let _ = h.await;
-                run_log::ws_task_joined(slug_mid, &slug);
-                if let Some(mid) = ws_session_market_id {
-                    xframe_dump::spawn_dump_market_xframes_binary(
-                        self.clone(),
-                        mid,
-                        ws_session_gamma_question,
-                    );
-                }
             }
         }
     }

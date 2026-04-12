@@ -14,7 +14,7 @@ pub struct CurrencyUpDownSiblingSlot {
     pub window_start_sec: i64,
 }
 
-/// Активные маркеты по WS: один слот 15m и один 5m; [`on_currency_updown_ws_connected`] обновляет слот перед запуском WS.
+/// Активные маркеты по WS: один слот 15m и один 5m; [`update_currency_updown_sibling_slots`] заполняет слот после подписки на market WS.
 #[derive(Debug, Default)]
 pub struct CurrencyUpDownSiblingWsState {
     pub fifteen_min: Option<CurrencyUpDownSiblingSlot>,
@@ -44,11 +44,11 @@ pub fn five_min_belongs_to_fifteen_window(five_start_unix: i64, fifteen_start_un
         && offset_from_fifteen_start_sec.rem_euclid(FIVE_MIN_SEC) == 0
 }
 
-/// Вызывать при перезапуске подписки, сразу после лога старта WS и до `spawn_bounded_market_ws` (`btc-updown-5m-*` / `btc-updown-15m-*`).
-/// `slug_window_start_unix_sec` — секунда из slug (только как reference для года/DST при разборе `question`).
-/// В слотах сохраняется старт окна из [`crate::gamma_question::currency_updown_question_window_start_unix_sec`].
-/// Согласованную пару для merge sibling-признаков читает [`CurrencyUpDownSiblingWsState::paired_five_and_fifteen_market_ids`].
-pub async fn on_currency_updown_ws_connected(
+/// Вызывать после успешной подписки на CLOB market WS для окна up/down по валюте: пишет в слот 5m или 15m `market_id` и окно из Gamma `question`.
+/// `slug_window_start_unix_sec` — секунда из slug (опора для года/DST при разборе `question`).
+/// Старт окна в слоте — из [`crate::gamma_question::currency_updown_question_window_start_unix_sec`].
+/// Пару для merge sibling-признаков читает [`CurrencyUpDownSiblingWsState::paired_five_and_fifteen_market_ids`].
+pub async fn update_currency_updown_sibling_slots(
     currency_updown_sibling_ws_state: Arc<RwLock<CurrencyUpDownSiblingWsState>>,
     interval_sec: i64,
     slug_window_start_unix_sec: i64,
@@ -88,8 +88,7 @@ pub async fn on_currency_updown_ws_connected(
                 .as_ref()
                 .map(|s| s.window_start_sec);
             if currency_updown_sibling_ws_state_lock.five_min.is_some()
-                && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev)
-            {
+                && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev) {
                 currency_updown_sibling_ws_state_lock.five_min = None;
             }
             currency_updown_sibling_ws_state_lock.fifteen_min = Some(CurrencyUpDownSiblingSlot {

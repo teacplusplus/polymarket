@@ -443,7 +443,7 @@ pub struct XFrame<const N: usize> {
     pub sibling_currency_price_vs_beat_pct: Option<f64>,
 }
 
-/// См. [`XFrame::stable`]. `event_start_ms` — [`crate::project_manager::MarketEventData::start_ms`] из Gamma; `ws_connect_wall_ms` — из [`crate::project_manager::ProjectManager::record_currency_updown_ws_connect`].
+/// См. [`XFrame::stable`]. `event_start_ms` — [`crate::project_manager::MarketEventData::start_ms`] из Gamma; `ws_connect_wall_ms` — из [`crate::project_manager::ProjectManager::record_market_ws_connect_wall_ms`].
 pub fn compute_xframe_stable(
     snapshot_timestamp_ms: i64,
     event_start_ms: Option<i64>,
@@ -467,7 +467,7 @@ pub fn compute_xframe_stable(
         None => {
             if XFRAME_LOG_ENABLED {
                 eprintln!(
-                    "compute_xframe_stable: stable=false — нет ws_connect_wall_ms (record_currency_updown_ws_connect не вызывался)"
+                    "compute_xframe_stable: stable=false — нет ws_connect_wall_ms (record_market_ws_connect_wall_ms не вызывался)"
                 );
             }
             return false;

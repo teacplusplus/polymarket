@@ -23,24 +23,24 @@ pub fn currency_updown_sibling_slots_updated(
     );
 }
 
-pub fn gamma_fetch_err(slug_mid: &str, slug: &str, err: impl std::fmt::Display) {
+pub fn gamma_fetch_err(period: &str, slug: &str, err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{slug_mid}] Gamma slug={slug}: {err}");
+    eprintln!("[{period}] Gamma slug={slug}: {err}");
 }
 
-pub fn ws_stop_replace(slug_mid: &str, slug: &str, prev_token_count: usize) {
+pub fn ws_stop_replace(period: &str, slug: &str, prev_token_count: usize) {
     if !WS_LOG_ENABLED {
         return;
     }
     eprintln!(
-        "[{slug_mid}] ws: останавливаю прежнее подключение (смена подписки), slug={slug}, было {prev_token_count} clob token id"
+        "[{period}] ws: останавливаю прежнее подключение (смена подписки), slug={slug}, было {prev_token_count} clob token id"
     );
 }
 
 pub fn ws_start(
-    slug_mid: &str,
+    period: &str,
     slug: &str,
     price_to_beat: Option<f64>,
     market_ids: &[String],
@@ -66,31 +66,31 @@ pub fn ws_start(
         asset_ids.join(", ")
     };
     eprintln!(
-        "[{slug_mid}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
+        "[{period}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
     );
 }
 
-pub fn ws_spawn_err(slug_mid: &str, slug: &str, err: impl std::fmt::Display) {
+pub fn ws_spawn_err(period: &str, slug: &str, err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{slug_mid}] ws: ошибка spawn для slug={slug}: {err}");
+    eprintln!("[{period}] ws: ошибка spawn для slug={slug}: {err}");
 }
 
-pub fn ws_window_end_wait(slug_mid: &str, slug: &str, token_count: usize) {
+pub fn ws_window_end_wait(period: &str, slug: &str, token_count: usize) {
     if !WS_LOG_ENABLED {
         return;
     }
     eprintln!(
-        "[{slug_mid}] ws: конец окна по времени, жду завершение task | slug={slug} | {token_count} clob token id"
+        "[{period}] ws: конец окна по времени (market ws остаётся открытым) | slug={slug} | {token_count} clob token id"
     );
 }
 
-pub fn ws_task_joined(slug_mid: &str, slug: &str) {
+pub fn ws_task_joined(period: &str, slug: &str) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{slug_mid}] ws: task market ws завершён | slug={slug}");
+    eprintln!("[{period}] ws: task market ws завершён | slug={slug}");
 }
 
 pub fn market_ws_session_err(err: impl std::fmt::Display) {
