@@ -188,10 +188,7 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub delta_n_sell_count_window: [Option<i64>; N],
-    /// «Burstiness» интервалов между сделками в окне: `(std − mean) / (std + mean)` по мс-зазорам между временными метками сделок; `None`, если сделок меньше двух или знаменатель невалиден.
-    #[xfeature]
-    pub burstiness_transactions_count: Option<f64>,
-    // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до burstiness. ---
+    // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до `btc_price_z_score`. ---
     #[xfeature]
     pub other_book_bid_l1_price: Option<f64>,
     #[xfeature]
@@ -441,8 +438,6 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_sell_count_window: [Option<i64>; N],
-    #[xfeature]
-    pub sibling_burstiness_transactions_count: Option<f64>,
     /// `(price_to_beat_sibling - btc_spot) / price_to_beat_sibling * 100` на парном маркете; тот же спот, другой beat из Gamma.
     #[xfeature]
     pub sibling_btc_price_vs_beat_pct: Option<f64>,
@@ -673,7 +668,6 @@ impl<const N: usize> XFrame<N> {
         self.other_delta_n_buy_count_window = other.delta_n_buy_count_window;
         self.other_sell_count_window = other.sell_count_window;
         self.other_delta_n_sell_count_window = other.delta_n_sell_count_window;
-        self.other_burstiness_transactions_count = other.burstiness_transactions_count;
     }
 
     /// Копирует в `sibling_*` поля «своей» ноги с кадра парного рынка (тот же Up/Down, тот же бакет), см. [find_same_outcome_sibling_asset_id].
@@ -717,7 +711,6 @@ impl<const N: usize> XFrame<N> {
         self.sibling_delta_n_buy_count_window = sibling.delta_n_buy_count_window;
         self.sibling_sell_count_window = sibling.sell_count_window;
         self.sibling_delta_n_sell_count_window = sibling.delta_n_sell_count_window;
-        self.sibling_burstiness_transactions_count = sibling.burstiness_transactions_count;
         self.sibling_btc_price_vs_beat_pct = sibling.btc_price_vs_beat_pct;
     }
 
@@ -728,7 +721,6 @@ impl<const N: usize> XFrame<N> {
         window_ms: i64,
     ) {
         let window_start = wall_ts_ms.saturating_sub(window_ms.max(0));
-        let mut trade_timestamps = Vec::new();
         let mut buy_count_window = if self.bucket_flow_sign > 0 {
             1
         } else {
@@ -740,30 +732,18 @@ impl<const N: usize> XFrame<N> {
             0
         };
 
-        if Self::frame_has_trade(self) {
-            trade_timestamps.push(wall_ts_ms);
-        }
-
-        for (&aligned_timestamp_ms, prior_xframe) in frames.range(window_start..=wall_ts_ms) {
+        for (&_aligned_timestamp_ms, prior_xframe) in frames.range(window_start..=wall_ts_ms) {
             if Self::frame_has_trade(prior_xframe) {
                 if prior_xframe.bucket_flow_sign > 0 {
                     buy_count_window += 1;
                 } else if prior_xframe.bucket_flow_sign < 0 {
                     sell_count_window += 1;
                 }
-                trade_timestamps.push(aligned_timestamp_ms);
             }
         }
 
-        trade_timestamps.sort_unstable();
-        let inter_trade_gaps: Vec<f64> = trade_timestamps
-            .windows(2)
-            .map(|adjacent_pair| (adjacent_pair[1] - adjacent_pair[0]) as f64)
-            .collect();
-
         self.buy_count_window = buy_count_window;
         self.sell_count_window = sell_count_window;
-        self.burstiness_transactions_count = Self::burstiness_from_gaps(&inter_trade_gaps);
     }
 
     fn frame_has_trade(frame: &XFrame<N>) -> bool {
@@ -854,31 +834,6 @@ impl<const N: usize> XFrame<N> {
                 Some(self.buy_count_window as i64 - prior_frame.buy_count_window as i64);
             self.delta_n_sell_count_window[lag_index] =
                 Some(self.sell_count_window as i64 - prior_frame.sell_count_window as i64);
-        }
-    }
-
-    fn burstiness_from_gaps(gaps: &[f64]) -> Option<f64> {
-        if gaps.len() < 2 {
-            return None;
-        }
-        let mean = gaps.iter().sum::<f64>() / gaps.len() as f64;
-        if mean <= 0.0 {
-            return None;
-        }
-        let variance = gaps
-            .iter()
-            .map(|gap_seconds| {
-                let deviation_from_mean = gap_seconds - mean;
-                deviation_from_mean * deviation_from_mean
-            })
-            .sum::<f64>()
-            / gaps.len() as f64;
-        let std_dev = variance.sqrt();
-        let denom = std_dev + mean;
-        if denom > 0.0 {
-            Some((std_dev - mean) / denom)
-        } else {
-            None
         }
     }
 }

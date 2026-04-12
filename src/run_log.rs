@@ -42,6 +42,7 @@ pub fn ws_stop_replace(slug_mid: &str, slug: &str, prev_token_count: usize) {
 pub fn ws_start(
     slug_mid: &str,
     slug: &str,
+    price_to_beat: Option<f64>,
     market_ids: &[String],
     asset_ids: &[String],
     remain_ms: u64,
@@ -50,6 +51,10 @@ pub fn ws_start(
     if !WS_LOG_ENABLED {
         return;
     }
+    let polymarket_event_url = format!("https://polymarket.com/event/{slug}");
+    let price_to_beat_str = price_to_beat
+        .map(|p| format!("{p}"))
+        .unwrap_or_else(|| "—".to_string());
     let markets = if market_ids.is_empty() {
         String::from("(нет condition_id в Gamma)")
     } else {
@@ -61,7 +66,7 @@ pub fn ws_start(
         asset_ids.join(", ")
     };
     eprintln!(
-        "[{slug_mid}] ws: запускаю market ws | slug={slug} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
+        "[{slug_mid}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | slug={slug} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
     );
 }
 

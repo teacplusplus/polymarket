@@ -16,7 +16,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::util::{
-    current_timestamp_ms, fetch_gamma_event_data_for_slug, GammaEventSlugData,
+    current_timestamp_ms, fetch_gamma_event_data_for_slug,
+    fetch_price_to_beat_from_polymarket_event_page, GammaEventSlugData,
 };
 use crate::constants::XFrameIntervalKind;
 
@@ -57,36 +58,58 @@ async fn run_btc_updown_interval(
             }
 
             let slug = format!("btc-updown-{slug_mid}-{window_start_sec}");
+            let http_gamma = project_manager.http.clone();
+            let http_price = project_manager.http.clone();
+            let slug_gamma = slug.clone();
+            let slug_price = slug.clone();
+
+            let (gamma_join_res, price_join_res) = tokio::join!(
+                tokio::spawn(async move {
+                    fetch_gamma_event_data_for_slug(http_gamma.as_ref(), &slug_gamma).await
+                }),
+                tokio::spawn(async move {
+                    fetch_price_to_beat_from_polymarket_event_page(http_price.as_ref(), &slug_price).await
+                }),
+            );
+
             let (
                 ids,
                 market_event_start_ms,
                 market_event_end_ms,
-                price_to_beat,
                 gamma_question,
                 btc_up_down_by_asset_id,
-            ) = match fetch_gamma_event_data_for_slug(
-                project_manager.http.as_ref(),
-                &slug,
-            )
-            .await
-            {
-                Ok(GammaEventSlugData {
+            ) = match gamma_join_res {
+                Ok(Ok(GammaEventSlugData {
                     clob_token_ids,
                     btc_up_down_by_asset_id,
                     market_event_start_ms,
                     market_event_end_ms,
-                    price_to_beat,
                     gamma_question,
-                }) => (
+                })) => (
                     clob_token_ids,
                     market_event_start_ms,
                     market_event_end_ms,
-                    price_to_beat,
                     gamma_question,
                     btc_up_down_by_asset_id,
                 ),
-                Err(e) => {
+                Ok(Err(e)) => {
                     run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                    continue;
+                }
+                Err(e) => {
+                    run_log::gamma_fetch_err(slug_mid, &slug, &format!("join gamma: {e}"));
+                    continue;
+                }
+            };
+
+            let price_to_beat = match price_join_res {
+                Ok(Ok(price_to_beat)) => Some(price_to_beat),
+                Ok(Err(e)) => {
+                    run_log::gamma_fetch_err(slug_mid, &slug, &e);
+                    continue;
+                }
+                Err(e) => {
+                    run_log::gamma_fetch_err(slug_mid, &slug, &format!("join price_to_beat: {e}"));
                     continue;
                 }
             };
@@ -121,7 +144,15 @@ async fn run_btc_updown_interval(
                 let remain_ms = (wall_end_ms - current_timestamp_ms()).max(0) as u64;
                 let session_deadline = Instant::now() + Duration::from_millis(remain_ms);
 
-                run_log::ws_start(slug_mid, &slug, &market_ids, &ids, remain_ms, wall_end_ms);
+                run_log::ws_start(
+                    slug_mid,
+                    &slug,
+                    price_to_beat,
+                    &market_ids,
+                    &ids,
+                    remain_ms,
+                    wall_end_ms,
+                );
 
                 match data_ws::spawn_bounded_market_ws(
                     project_manager.clone(),

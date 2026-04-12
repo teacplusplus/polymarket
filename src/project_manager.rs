@@ -395,10 +395,12 @@ impl ProjectManager {
                 ) {
                     Ok(id) => id,
                     Err(err) => {
-                        eprintln!(
-                            "{} find_same_outcome_sibling_asset_id: {err:#}",
-                            current_timestamp_ms()
-                        );
+                        if entry.frame.stable {
+                            eprintln!(
+                                "{} find_same_outcome_sibling_asset_id: {err:#}",
+                                current_timestamp_ms()
+                            );
+                        }
                         continue;
                     }
                 };
