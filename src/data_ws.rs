@@ -5,7 +5,7 @@ use crate::util::current_timestamp_ms;
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
@@ -23,7 +23,7 @@ const WS_RECONNECT_DELAY_SECS: u64 = 3;
 const WS_PING_INTERVAL_SECS: u64 = 10;
 const BUFFER: usize = 4096;
 
-/// Команда на подписку для одного из двух долгоживущих market WS (5m / 15m).
+/// Метаданные активного окна — передаётся внутри [`WsCommand::ActivateWindow`].
 #[derive(Debug, Clone)]
 pub struct MarketWsSubscription {
     /// Сегмент горизонта в slug Polymarket: `"5m"` или `"15m"` (см. `format!("{{}}-updown-{{period}}-…")`).
@@ -34,6 +34,17 @@ pub struct MarketWsSubscription {
     pub period_sec: i64,
     pub window_start_sec: i64,
     pub gamma_question: Option<String>,
+}
+
+/// Команды для долгоживущего market WS.
+#[derive(Debug)]
+pub enum WsCommand {
+    /// Новое окно стало активным; asset_ids уже могут быть подписаны заранее через [`PrefetchSubscribe`].
+    ActivateWindow(MarketWsSubscription),
+    /// Предзагруженные asset_ids будущего окна — подписать заранее, без переконнекта.
+    PrefetchSubscribe { asset_ids: Vec<String> },
+    /// Окно завершилось — отписаться от устаревших asset_ids.
+    PruneStaleIds { stale_ids: Vec<String> },
 }
 
 pub struct Ws {
@@ -90,7 +101,7 @@ pub fn make_ws_channel() -> (Arc<Ws>, mpsc::Receiver<Arc<MarketSnapshot>>) {
 /// [update subscription](https://docs.polymarket.com/api-reference/wss/market) без разрыва TCP.
 pub fn spawn_persistent_interval_market_ws(
     project_manager: Arc<ProjectManager>,
-    cmd_rx: mpsc::Receiver<MarketWsSubscription>,
+    cmd_rx: mpsc::Receiver<WsCommand>,
     xframe_interval_kind: XFrameIntervalKind,
 ) {
     tokio::spawn(async move {
@@ -100,23 +111,32 @@ pub fn spawn_persistent_interval_market_ws(
 
 async fn run_persistent_interval_market_ws_inner(
     project_manager: Arc<ProjectManager>,
-    mut cmd_rx: mpsc::Receiver<MarketWsSubscription>,
+    mut cmd_rx: mpsc::Receiver<WsCommand>,
     xframe_interval_kind: XFrameIntervalKind,
 ) {
-    let mut active_asset_ids: Vec<String> = Vec::new();
+    // Все подписанные asset_ids: текущее окно + предзагруженные будущие.
+    let mut active_asset_ids: HashSet<String> = HashSet::new();
 
-    // Ждём первую непустую команду подписки (пока `asset_ids` пусты — пропускаем и ждём дальше).
+    // Ждём первый ActivateWindow с непустыми IDs; PrefetchSubscribe до него накапливаем сразу в active_asset_ids.
     let initial_subscription = loop {
         match cmd_rx.recv().await {
             None => return,
-            Some(initial_subscription) => {
+            Some(WsCommand::ActivateWindow(initial_subscription)) => {
                 if !initial_subscription.asset_ids.is_empty() {
                     break initial_subscription;
                 }
             }
+            Some(WsCommand::PrefetchSubscribe { asset_ids }) => {
+                for asset_id in asset_ids {
+                    active_asset_ids.insert(asset_id);
+                }
+            }
+            Some(WsCommand::PruneStaleIds { .. }) => {}
         }
     };
-    active_asset_ids.clone_from(&initial_subscription.asset_ids);
+    for asset_id in &initial_subscription.asset_ids {
+        active_asset_ids.insert(asset_id.clone());
+    }
     let mut active_market_ws_command: Option<MarketWsSubscription> = Some(initial_subscription);
 
     // Уже был хотя бы один успешный subscribe по этому таску (лог: реконнект vs первое соединение).
@@ -149,7 +169,7 @@ async fn run_persistent_interval_market_ws_inner(
                 cmd.period,
                 &cmd.slug,
                 &cmd.market_ids,
-                &active_asset_ids,
+                &active_asset_ids.iter().cloned().collect::<Vec<_>>(),
                 had_prior_successful_market_subscription,
             );
             update_currency_updown_sibling_slots(
@@ -160,9 +180,8 @@ async fn run_persistent_interval_market_ws_inner(
                 cmd.gamma_question.as_deref(),
             )
             .await;
-            project_manager
-                .record_market_ws_connect_wall_ms(&cmd.market_ids)
-                .await;
+            let all_asset_ids: Vec<String> = active_asset_ids.iter().cloned().collect();
+            project_manager.record_ws_connect_wall_ms_for_asset_ids(&all_asset_ids).await;
             had_prior_successful_market_subscription = true;
         }
 
@@ -224,87 +243,126 @@ async fn run_persistent_interval_market_ws_inner(
                     }
                 }
                 cmd_opt = cmd_rx.recv() => {
-                    let Some(next_command) = cmd_opt else {
-                        return;
-                    };
-                    if next_command.asset_ids.is_empty() {
-                        continue;
-                    }
-                    if next_command.asset_ids == active_asset_ids {
-                        active_market_ws_command = Some(next_command);
-                        continue;
-                    }
-
-                    // Сначала подписка на новый рынок — без «дыры» без данных; затем отписка от старого.
-                    let old_asset_ids = active_asset_ids.clone();
-
-                    let sub = json!({
-                        "operation": "subscribe",
-                        "assets_ids": &next_command.asset_ids,
-                        "custom_feature_enabled": true
-                    });
-                    if let Err(e) = write.send(Message::Text(sub.to_string())).await {
-                        run_log::market_ws_session_err(&format!("subscribe update: {e}"));
-                        disconnect = true;
-                        continue;
-                    }
-
-                    let unsub = json!({
-                        "operation": "unsubscribe",
-                        "assets_ids": &old_asset_ids,
-                    });
-                    if let Err(e) = write.send(Message::Text(unsub.to_string())).await {
-                        run_log::market_ws_session_err(&format!("unsubscribe: {e}"));
-                        active_asset_ids.clone_from(&next_command.asset_ids);
-                        active_market_ws_command = Some(next_command.clone());
-                        update_currency_updown_sibling_slots(
-                            project_manager.currency_updown_sibling_state.clone(),
-                            next_command.period_sec,
-                            next_command.window_start_sec,
-                            &next_command.market_ids,
-                            next_command.gamma_question.as_deref(),
-                        )
-                        .await;
-                        project_manager
-                            .record_market_ws_connect_wall_ms(&next_command.market_ids)
+                    let Some(cmd) = cmd_opt else { return; };
+                    match cmd {
+                        WsCommand::ActivateWindow(next_command) => {
+                            if next_command.asset_ids.is_empty() {
+                                continue;
+                            }
+                            // Подписываем только те IDs, которых ещё нет в active_asset_ids.
+                            let new_asset_ids: HashSet<String> = next_command.asset_ids.iter()
+                                .filter(|id| !active_asset_ids.contains(*id))
+                                .cloned()
+                                .collect();
+                            if !new_asset_ids.is_empty() {
+                                let sub = json!({
+                                    "operation": "subscribe",
+                                    "assets_ids": &new_asset_ids,
+                                    "custom_feature_enabled": true
+                                });
+                                // Добавляем в active_asset_ids независимо от успеха отправки
+                                // (на реконнекте будут переподписаны).
+                                active_asset_ids.extend(new_asset_ids.iter().cloned());
+                                if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+                                    run_log::market_ws_session_err(&format!("activate subscribe: {e}"));
+                                    active_market_ws_command = Some(next_command);
+                                    disconnect = true;
+                                    continue;
+                                }
+                            }
+                            if let Some(ref prev) = active_market_ws_command {
+                                if prev.slug != next_command.slug {
+                                    run_log::ws_subscription_rotated(
+                                        next_command.period,
+                                        &next_command.slug,
+                                        &prev.market_ids,
+                                        &prev.asset_ids,
+                                        &next_command.market_ids,
+                                        &next_command.asset_ids,
+                                    );
+                                }
+                            }
+                            update_currency_updown_sibling_slots(
+                                project_manager.currency_updown_sibling_state.clone(),
+                                next_command.period_sec,
+                                next_command.window_start_sec,
+                                &next_command.market_ids,
+                                next_command.gamma_question.as_deref(),
+                            )
                             .await;
-                        disconnect = true;
-                        continue;
+                            if !new_asset_ids.is_empty() {
+                                let ids: Vec<String> = new_asset_ids.iter().cloned().collect();
+                                project_manager.record_ws_connect_wall_ms_for_asset_ids(&ids).await;
+                            }
+                            active_market_ws_command = Some(next_command);
+                        }
+                        WsCommand::PrefetchSubscribe { asset_ids } => {
+                            let new_asset_ids: HashSet<String> = asset_ids.into_iter()
+                                .filter(|id| !active_asset_ids.contains(id))
+                                .collect();
+                            if new_asset_ids.is_empty() {
+                                continue;
+                            }
+                            let sub = json!({
+                                "operation": "subscribe",
+                                "assets_ids": &new_asset_ids,
+                                "custom_feature_enabled": true
+                            });
+                            active_asset_ids.extend(new_asset_ids.iter().cloned());
+                            if let Err(e) = write.send(Message::Text(sub.to_string())).await {
+                                run_log::market_ws_session_err(&format!("prefetch subscribe: {e}"));
+                                disconnect = true;
+                            } else {
+                                let ids: Vec<String> = new_asset_ids.into_iter().collect();
+                                project_manager.record_ws_connect_wall_ms_for_asset_ids(&ids).await;
+                            }
+                        }
+                        WsCommand::PruneStaleIds { stale_ids } => {
+                            let to_remove: Vec<String> = stale_ids.iter()
+                                .filter(|id| active_asset_ids.contains(*id))
+                                .cloned()
+                                .collect();
+                            if to_remove.is_empty() {
+                                continue;
+                            }
+                            for id in &to_remove {
+                                active_asset_ids.remove(id);
+                            }
+                            let unsub = json!({
+                                "operation": "unsubscribe",
+                                "assets_ids": &to_remove,
+                            });
+                            if let Err(e) = write.send(Message::Text(unsub.to_string())).await {
+                                run_log::market_ws_session_err(&format!("prune unsubscribe: {e}"));
+                                disconnect = true;
+                            }
+                        }
                     }
-
-                    if let Some(ref prev) = active_market_ws_command {
-                        run_log::ws_subscription_rotated(
-                            next_command.period,
-                            &next_command.slug,
-                            &prev.market_ids,
-                            &old_asset_ids,
-                            &next_command.market_ids,
-                            &next_command.asset_ids,
-                        );
-                    }
-
-                    active_asset_ids.clone_from(&next_command.asset_ids);
-                    active_market_ws_command = Some(next_command.clone());
-
-                    update_currency_updown_sibling_slots(
-                        project_manager.currency_updown_sibling_state.clone(),
-                        next_command.period_sec,
-                        next_command.window_start_sec,
-                        &next_command.market_ids,
-                        next_command.gamma_question.as_deref(),
-                    )
-                    .await;
-                    project_manager
-                        .record_market_ws_connect_wall_ms(&next_command.market_ids)
-                        .await;
                 }
             }
         }
 
-        while let Ok(queued_command) = cmd_rx.try_recv() {
-            if !queued_command.asset_ids.is_empty() {
-                active_asset_ids.clone_from(&queued_command.asset_ids);
-                active_market_ws_command = Some(queued_command);
+        // Дренируем очередь команд перед реконнектом — применяем к active_asset_ids.
+        while let Ok(queued_cmd) = cmd_rx.try_recv() {
+            match queued_cmd {
+                WsCommand::ActivateWindow(cmd) => {
+                    if !cmd.asset_ids.is_empty() {
+                        for id in &cmd.asset_ids {
+                            active_asset_ids.insert(id.clone());
+                        }
+                        active_market_ws_command = Some(cmd);
+                    }
+                }
+                WsCommand::PrefetchSubscribe { asset_ids } => {
+                    for id in asset_ids {
+                        active_asset_ids.insert(id);
+                    }
+                }
+                WsCommand::PruneStaleIds { stale_ids } => {
+                    for id in &stale_ids {
+                        active_asset_ids.remove(id);
+                    }
+                }
             }
         }
         sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;

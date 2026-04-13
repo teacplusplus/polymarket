@@ -13,7 +13,7 @@ pub use crate::currency_updown_sibling::{
 pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
 use crate::data_ws::{
     make_ws_channel, spawn_persistent_interval_market_ws, CurrencyUpDownOutcome, MarketSnapshot,
-    MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws,
+    MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws, WsCommand,
 };
 use crate::xframe::{
     currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
@@ -55,7 +55,7 @@ pub struct ProjectManager {
     pub slug_to_market_id: Arc<RwLock<HashMap<String, String>>>,
     pub price_to_beat_by_market: Arc<RwLock<HashMap<String, f64>>>,
     pub currency_up_down_by_asset_id: Arc<RwLock<HashMap<String, CurrencyUpDownOutcome>>>,
-    pub ws_connect_wall_ms_by_market: Arc<RwLock<HashMap<String, i64>>>,
+    pub ws_connect_wall_ms_by_asset_id: Arc<RwLock<HashMap<String, i64>>>,
     pub currency_updown_sibling_state: Arc<RwLock<CurrencyUpDownSiblingState>>,
     pub rtds_currency_prices_by_ms: Arc<RwLock<BTreeMap<i64, f64>>>,
     pub rtds_currency_prices_by_sec: Arc<RwLock<BTreeMap<i64, f64>>>,
@@ -64,8 +64,8 @@ pub struct ProjectManager {
     pub http: Arc<reqwest::Client>,
     pub gamma: Arc<gamma::Client>,
     pub clob: Arc<clob::Client>,
-    pub market_ws_tx_5m: mpsc::Sender<MarketWsSubscription>,
-    pub market_ws_tx_15m: mpsc::Sender<MarketWsSubscription>,
+    pub market_ws_tx_5m: mpsc::Sender<WsCommand>,
+    pub market_ws_tx_15m: mpsc::Sender<WsCommand>,
 }
 
 impl ProjectManager {
@@ -82,9 +82,9 @@ impl ProjectManager {
         let clob = Arc::new(clob::Client::new("https://clob.polymarket.com", clob::Config::default()).expect("failed to create Polymarket CLOB client"));
 
         let (market_ws_tx_5m, market_ws_rx_5m) =
-            mpsc::channel::<MarketWsSubscription>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
+            mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
         let (market_ws_tx_15m, market_ws_rx_15m) =
-            mpsc::channel::<MarketWsSubscription>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
+            mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
 
         let project_manager = Arc::new(Self {
             currency: Arc::new(currency),
@@ -94,7 +94,7 @@ impl ProjectManager {
             slug_to_market_id: Arc::new(RwLock::new(HashMap::new())),
             price_to_beat_by_market: Arc::new(RwLock::new(HashMap::new())),
             currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, CurrencyUpDownOutcome>::new())),
-            ws_connect_wall_ms_by_market: Arc::new(RwLock::new(HashMap::new())),
+            ws_connect_wall_ms_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             currency_updown_sibling_state: Arc::new(RwLock::new(CurrencyUpDownSiblingState::default())),
             rtds_currency_prices_by_ms: Arc::new(RwLock::new(BTreeMap::new())),
             rtds_currency_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
@@ -325,12 +325,12 @@ impl ProjectManager {
         }
     }
 
-    /// Вызывать после успешной подписки на CLOB market WS: записывает `ws_connect_wall_ms` по каждому `market_id` (condition_id) для [`crate::xframe::compute_xframe_stable`].
-    pub async fn record_market_ws_connect_wall_ms(&self, market_ids: &[String]) {
+    /// Вызывать после успешной подписки на CLOB market WS: записывает `ws_connect_wall_ms` по каждому `asset_id` для [`crate::xframe::compute_xframe_stable`].
+    pub async fn record_ws_connect_wall_ms_for_asset_ids(&self, asset_ids: &[String]) {
         let now_ms = current_timestamp_ms();
-        let mut lock = self.ws_connect_wall_ms_by_market.write().await;
-        for id in market_ids {
-            lock.insert(id.clone(), now_ms);
+        let mut ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.write().await;
+        for asset_id in asset_ids {
+            ws_connect_wall_ms_by_asset_id_lock.insert(asset_id.clone(), now_ms);
         }
     }
 
@@ -434,8 +434,8 @@ impl ProjectManager {
             };
 
             let ws_connect_wall_ms = {
-                let ws_connect_wall_ms_map_guard = self.ws_connect_wall_ms_by_market.read().await;
-                ws_connect_wall_ms_map_guard.get(&market_id).copied()
+                let ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.read().await;
+                ws_connect_wall_ms_by_asset_id_lock.get(&asset_id).copied()
             };
 
             let currency_price_vs_beat_pct =
@@ -645,12 +645,20 @@ impl ProjectManager {
                         if project_manager_cloned.slug_currency_event_fully_cached(&prefetch_slug).await {
                             continue;
                         }
-                        if project_manager_cloned
-                            .fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period)
-                            .await
-                            .is_some()
+                        if let Some((_, _, _, currency_up_down_by_asset_id)) = project_manager_cloned.fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period).await
                         {
                             run_log::gamma_event_prefetch_fetched(period, &prefetch_slug);
+                            let mut asset_ids: Vec<String> = currency_up_down_by_asset_id.keys().cloned().collect();
+                            asset_ids.sort_unstable();
+                            let tx = match period_sec {
+                                FIVE_MIN_SEC => &project_manager_cloned.market_ws_tx_5m,
+                                FIFTEEN_MIN_SEC => &project_manager_cloned.market_ws_tx_15m,
+                                _ => &project_manager_cloned.market_ws_tx_15m,
+                            };
+                            match tx.send(WsCommand::PrefetchSubscribe { asset_ids }).await {
+                                Ok(()) => {}
+                                Err(_) => run_log::ws_spawn_err(period, &prefetch_slug, "market ws command channel closed"),
+                            }
                         }
                     }
                 });
@@ -701,7 +709,7 @@ impl ProjectManager {
                 let market_ids_cloned = market_ids.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    const MAX_ATTEMPTS: u32 = 5;
+                    const MAX_ATTEMPTS: u32 = 10;
                     for attempt in 1..=MAX_ATTEMPTS {
                         match fetch_price_to_beat_from_polymarket_event_page(
                             project_manager_cloned.http.as_ref(),
@@ -792,7 +800,7 @@ impl ProjectManager {
                         market_end_ms,
                     );
 
-                    let cmd = MarketWsSubscription {
+                    let cmd = WsCommand::ActivateWindow(MarketWsSubscription {
                         period,
                         slug: slug.clone(),
                         asset_ids: ids.clone(),
@@ -800,7 +808,7 @@ impl ProjectManager {
                         period_sec,
                         window_start_sec,
                         gamma_question: gamma_question.clone(),
-                    };
+                    });
                     let tx = match period_sec {
                         FIVE_MIN_SEC => &self.market_ws_tx_5m,
                         FIFTEEN_MIN_SEC => &self.market_ws_tx_15m,
@@ -820,6 +828,17 @@ impl ProjectManager {
             }
 
             run_log::ws_window_end_wait(period, &slug, subscribed.len());
+            if !ids.is_empty() {
+                let tx = match period_sec {
+                    FIVE_MIN_SEC => &self.market_ws_tx_5m,
+                    FIFTEEN_MIN_SEC => &self.market_ws_tx_15m,
+                    _ => &self.market_ws_tx_15m,
+                };
+                match tx.send(WsCommand::PruneStaleIds { stale_ids: ids.clone() }).await {
+                    Ok(()) => {}
+                    Err(_) => run_log::ws_spawn_err(period, &slug, "market ws command channel closed"),
+                }
+            }
             if let Some(prev_market_id) = prev_market_id.as_ref() {
                 xframe_dump::spawn_dump_market_xframes_binary(
                     self.clone(),

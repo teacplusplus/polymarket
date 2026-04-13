@@ -458,9 +458,9 @@ pub fn compute_xframe_stable(
         Some(ws_connect_wall_ms) => ws_connect_wall_ms,
         None => {
             if XFRAME_LOG_ENABLED {
-                // eprintln!(
-                //     "compute_xframe_stable: stable=false — market_id={market_id} — нет ws_connect_wall_ms (record_market_ws_connect_wall_ms не вызывался)",
-                // );
+                eprintln!(
+                    "compute_xframe_stable: stable=false — market_id={market_id} — нет ws_connect_wall_ms (record_market_ws_connect_wall_ms не вызывался)",
+                );
             }
             return false;
         }
@@ -481,12 +481,12 @@ pub fn compute_xframe_stable(
     }
 
     if XFRAME_LOG_ENABLED {
-        // let event_start_part = event_start_ms
-        //     .map(|v| v.to_string())
-        //     .unwrap_or_else(|| "нет".to_string());
-        // eprintln!(
-        //     "compute_xframe_stable: stable=false — market_id={market_id} — поздний WS: event_start_ms={event_start_part}; ws_connect_wall_ms={ws_connect_wall_ms}; snapshot_ms={snapshot_timestamp_ms} < ws_connect+{SIZE}s={threshold_ms} ms",
-        // );
+        let event_start_part = event_start_ms
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "нет".to_string());
+        eprintln!(
+            "compute_xframe_stable: stable=false — market_id={market_id} — поздний WS: event_start_ms={event_start_part}; ws_connect_wall_ms={ws_connect_wall_ms}; snapshot_ms={snapshot_timestamp_ms} < ws_connect+{SIZE}s={threshold_ms} ms",
+        );
     }
     false
 }
