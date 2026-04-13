@@ -88,8 +88,7 @@ pub async fn update_currency_updown_sibling_slots(
                 .fifteen_min
                 .as_ref()
                 .map(|s| s.window_start_sec);
-            if sibling_state_lock.five_min.is_some()
-                && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev)
+            if sibling_state_lock.five_min.is_some() && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev)
             {
                 sibling_state_lock.five_min = None;
             }

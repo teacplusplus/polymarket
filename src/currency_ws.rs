@@ -8,19 +8,11 @@ use std::sync::Arc;
 use tokio::time::{interval, Duration, MissedTickBehavior};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-/// Последний тик спота (Binance) из RTDS; обновляется при каждом сообщении WS.
-#[derive(Clone, Debug)]
-pub struct RtdsCurrencyLatest {
-    pub value: f64,
-    pub price_timestamp_ms: i64,
-    pub message_timestamp_ms: i64,
-}
-
 /// Аналог market CLOB WS — endpoint RTDS.
 const POLYMARKET_RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 const RTDS_RECONNECT_DELAY_SECS: u64 = 3;
 const RTDS_PING_INTERVAL_SECS: u64 = 5;
-const MAX_CURRENCY_PRICE_BUCKETS: usize = 86_400;
+const RTDS_PAYLOAD_TS_HISTORY_MS: i64 = 20 * 60 * 1000;
 
 /// Символ подписки RTDS `crypto_prices`: `{currency}` в нижнем регистре + `usdt` (как у Binance spot), например `eth` → `ethusdt`.
 pub fn rtds_spot_pair_symbol(currency: &str) -> String {
@@ -38,21 +30,28 @@ async fn run_spot_second_sampler(project_manager: Arc<ProjectManager>) {
     loop {
         tick.tick().await;
         let bucket_sec = current_timestamp_ms() / 1000;
-        let latest = project_manager.rtds_currency_latest.read().await.clone();
-        if let Some(sample) = latest {
+        let tail = {
+            let rtds_currency_prices_by_ms_lock = project_manager
+                .rtds_currency_prices_by_ms
+                .read()
+                .await;
+            rtds_currency_prices_by_ms_lock.iter().next_back().map(|(&ts_ms, &price)| (ts_ms, price))
+        };
+        if let Some((price_ts_ms, price)) = tail {
             let mut map = project_manager.rtds_currency_prices_by_sec.write().await;
-            map.insert(bucket_sec, sample.value);
+            map.insert(bucket_sec, price);
             let bars_in_history = map.len();
-            let pair_symbol = rtds_spot_pair_symbol(&project_manager.currency);
+            let pair_symbol = rtds_spot_pair_symbol(project_manager.currency.as_str());
+            let wall_ms = current_timestamp_ms();
             run_log::rtds_currency_sec_bar_inserted(
                 &pair_symbol,
                 bucket_sec,
-                sample.value,
-                sample.price_timestamp_ms,
-                sample.message_timestamp_ms,
+                price,
+                price_ts_ms,
+                wall_ms,
                 bars_in_history,
             );
-            while map.len() > MAX_CURRENCY_PRICE_BUCKETS {
+            while map.len() > (RTDS_PAYLOAD_TS_HISTORY_MS / 1000) as usize {
                 let Some(first_key) = map.keys().next().copied() else {
                     break;
                 };
@@ -65,7 +64,7 @@ async fn run_spot_second_sampler(project_manager: Arc<ProjectManager>) {
 async fn run_rtds_spot_ws_loop(project_manager: Arc<ProjectManager>) {
     loop {
         if let Err(err) = run_rtds_spot_session(&project_manager).await {
-            let pair = rtds_spot_pair_symbol(&project_manager.currency);
+            let pair = rtds_spot_pair_symbol(project_manager.currency.as_str());
             eprintln!("rtds ({pair}): сессия завершилась: {err}");
         }
         tokio::time::sleep(Duration::from_secs(RTDS_RECONNECT_DELAY_SECS)).await;
@@ -78,7 +77,7 @@ async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<
         .context("rtds connect_async")?;
     let (mut write, mut read) = ws_stream.split();
 
-    let pair_symbol = rtds_spot_pair_symbol(&project_manager.currency);
+    let pair_symbol = rtds_spot_pair_symbol(project_manager.currency.as_str());
     let filters = serde_json::json!({ "symbol": pair_symbol }).to_string();
     let subscribe = serde_json::json!({
         "action": "subscribe",
@@ -113,23 +112,17 @@ async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<
                             continue;
                         }
                         if let Ok(parsed) = serde_json::from_str::<Value>(&text) {
-                            ingest_rtds_spot_update(project_manager, &parsed, pair_symbol.as_str())
-                                .await;
+                            ingest_rtds_spot_update(project_manager, &parsed, pair_symbol.as_str()).await;
                         }
                     }
                     Message::Binary(binary) => {
                         if let Ok(text) = String::from_utf8(binary.to_vec())
-                            && let Ok(parsed) = serde_json::from_str::<Value>(&text)
-                        {
-                            ingest_rtds_spot_update(project_manager, &parsed, pair_symbol.as_str())
-                                .await;
+                            && let Ok(parsed) = serde_json::from_str::<Value>(&text) {
+                            ingest_rtds_spot_update(project_manager, &parsed, pair_symbol.as_str()).await;
                         }
                     }
                     Message::Ping(ping_payload) => {
-                        write
-                            .send(Message::Pong(ping_payload))
-                            .await
-                            .context("rtds Pong")?;
+                        write.send(Message::Pong(ping_payload)).await.context("rtds Pong")?;
                     }
                     Message::Close(_) => return Err(anyhow::anyhow!("rtds: close")),
                     _ => {}
@@ -187,23 +180,26 @@ async fn ingest_rtds_spot_update_item(
         return;
     };
 
-    let envelope_ts = rtds_message
-        .get("timestamp")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let price_ts = payload
-        .get("timestamp")
-        .and_then(Value::as_i64)
-        .unwrap_or(envelope_ts);
-
-    let sample = RtdsCurrencyLatest {
-        value: price_value,
-        price_timestamp_ms: price_ts,
-        message_timestamp_ms: envelope_ts,
+    let Some(payload_ts_ms) = payload.get("timestamp").and_then(Value::as_i64) else {
+        return;
     };
 
-    let mut lock = project_manager.rtds_currency_latest.write().await;
-    *lock = Some(sample);
+    {
+        let now_ms = current_timestamp_ms();
+        let cutoff = now_ms.saturating_sub(RTDS_PAYLOAD_TS_HISTORY_MS);
+        let mut rtds_currency_prices_by_ms_lock = project_manager
+            .rtds_currency_prices_by_ms
+            .write()
+            .await;
+            rtds_currency_prices_by_ms_lock.insert(payload_ts_ms, price_value);
+        while let Some(&k) = rtds_currency_prices_by_ms_lock.keys().next() {
+            if k < cutoff {
+                rtds_currency_prices_by_ms_lock.remove(&k);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 fn json_as_f64(json: &Value) -> Option<f64> {

@@ -30,6 +30,60 @@ pub fn gamma_fetch_err(period: &str, slug: &str, err: impl std::fmt::Display) {
     eprintln!("[{period}] Gamma slug={slug}: {err}");
 }
 
+pub fn gamma_event_data_from_cache(period: &str, slug: &str) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    eprintln!("[{period}] Gamma slug={slug}: данные из кеша");
+}
+
+pub fn gamma_event_prefetch_fetched(period: &str, slug: &str) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    eprintln!("[{period}] Gamma slug={slug}: prefetch — данные получены из Gamma");
+}
+
+pub fn price_to_beat_from_rtds(
+    period: &str,
+    slug: &str,
+    market_ids: &[String],
+    start_ms: i64,
+    price: f64,
+) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    let markets = if market_ids.is_empty() {
+        String::from("(нет)")
+    } else {
+        market_ids.join(", ")
+    };
+    eprintln!(
+        "[{period}] price_to_beat из rtds_currency_prices_by_ms: slug={slug} market_id=[{markets}] start_ms={start_ms} price={price}"
+    );
+}
+
+/// `fetch_price_to_beat_from_polymarket_event_page`: сразу или отложенное обновление после rtds.
+pub fn price_to_beat_from_event_page(
+    period: &str,
+    slug: &str,
+    price: f64,
+    delayed_after_secs: Option<u64>,
+) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    match delayed_after_secs {
+        Some(s) => eprintln!(
+            "[{period}] price_to_beat со страницы polymarket event (через {s} с после rtds): slug={slug} price={price}"
+        ),
+        None => eprintln!(
+            "[{period}] price_to_beat со страницы polymarket event: slug={slug} price={price}"
+        ),
+    }
+}
+
 pub fn ws_stop_replace(period: &str, slug: &str, prev_token_count: usize) {
     if !WS_LOG_ENABLED {
         return;

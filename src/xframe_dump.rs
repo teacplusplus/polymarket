@@ -81,7 +81,7 @@ async fn dump_market_xframes_binary_inner(
     let feature_count = XFrame::<SIZE>::count_features();
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let base: PathBuf = Path::new("xframes")
-        .join(&project_manager.currency)
+        .join(project_manager.currency.as_str())
         .join(format!("{feature_count}"))
         .join(&date);
     tokio::fs::create_dir_all(&base).await?;
