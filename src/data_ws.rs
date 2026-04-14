@@ -21,6 +21,11 @@ const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.c
 const WS_RECONNECT_DELAY_SECS: u64 = 3;
 /// Документация Polymarket: клиентский heartbeat для market channel.
 const WS_PING_INTERVAL_SECS: u64 = 10;
+/// Как часто watchdog проверяет входящий трафик (не чаще раза в 10 секунд).
+const WS_WATCHDOG_INTERVAL_SECS: u64 = 10;
+/// Если от сервера не пришло ни одного сообщения за это время — форсируем реконнект.
+/// Клиент шлёт PING раз в 10s, сервер отвечает PONG — значит 15s тишины гарантированно ненормально.
+const WS_STALE_MAX_AGE_MS: i64 = 15_000;
 const BUFFER: usize = 4096;
 
 /// Метаданные активного окна — передаётся внутри [`WsCommand::ActivateWindow`].
@@ -188,6 +193,14 @@ async fn run_persistent_interval_market_ws_inner(
         let mut ping = interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        let mut watchdog = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(WS_WATCHDOG_INTERVAL_SECS),
+            Duration::from_secs(WS_WATCHDOG_INTERVAL_SECS),
+        );
+        watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        let mut last_message_wall_ms = current_timestamp_ms();
+
         let mut disconnect = false;
         while !disconnect {
             tokio::select! {
@@ -195,6 +208,15 @@ async fn run_persistent_interval_market_ws_inner(
                 _ = ping.tick() => {
                     if write.send(Message::Text("PING".into())).await.is_err() {
                         run_log::market_ws_session_err("market ws PING send failed");
+                        disconnect = true;
+                    }
+                }
+                _ = watchdog.tick() => {
+                    let age_ms = current_timestamp_ms() - last_message_wall_ms;
+                    if age_ms > WS_STALE_MAX_AGE_MS {
+                        run_log::market_ws_session_err(&format!(
+                            "market ws watchdog: нет сообщений от сервера {age_ms}ms — реконнект"
+                        ));
                         disconnect = true;
                     }
                 }
@@ -208,7 +230,9 @@ async fn run_persistent_interval_market_ws_inner(
                             run_log::market_ws_session_err(&format!("websocket read: {read_err}"));
                             disconnect = true;
                         }
-                        Some(Ok(message)) => match message {
+                        Some(Ok(message)) => {
+                            last_message_wall_ms = current_timestamp_ms();
+                            match message {
                             Message::Text(text) => {
                                 if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
                                     let _ = ingest_json_event(
@@ -239,6 +263,7 @@ async fn run_persistent_interval_market_ws_inner(
                                 disconnect = true;
                             }
                             _ => {}
+                        }
                         },
                     }
                 }

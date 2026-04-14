@@ -473,6 +473,10 @@ pub fn compute_xframe_stable(
         if (-JOIN_START_MAX_DELAY_MS..=JOIN_START_MAX_DELAY_MS).contains(&d_gamma) {
             return true;
         }
+        // Prefetch: подписались задолго до старта окна — к event_start уже прошло SIZE секунд буфера.
+        if ws_connect_wall_ms + (SIZE as i64) * 1000 <= event_start {
+            return true;
+        }
     }
 
     let threshold_ms = ws_connect_wall_ms + (SIZE as i64) * 1000;

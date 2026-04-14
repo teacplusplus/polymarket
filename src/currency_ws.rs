@@ -13,6 +13,10 @@ const POLYMARKET_RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 const RTDS_RECONNECT_DELAY_SECS: u64 = 3;
 const RTDS_PING_INTERVAL_SECS: u64 = 5;
 const RTDS_PAYLOAD_TS_HISTORY_MS: i64 = 20 * 60 * 1000;
+/// Как часто watchdog проверяет свежесть данных (не чаще раза в 10 секунд).
+const RTDS_WATCHDOG_INTERVAL_SECS: u64 = 10;
+/// Максимальный возраст последнего payload_ts_ms: если последние данные старше — форсируем реконнект.
+const RTDS_STALE_PRICE_MAX_AGE_MS: i64 = 10_000;
 
 /// Символ подписки RTDS `crypto_prices`: `{currency}` в нижнем регистре + `usdt` (как у Binance spot), например `eth` → `ethusdt`.
 pub fn rtds_spot_pair_symbol(currency: &str) -> String {
@@ -93,6 +97,11 @@ async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<
         .context("rtds subscribe")?;
 
     let mut ping = interval(Duration::from_secs(RTDS_PING_INTERVAL_SECS));
+    let mut watchdog = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(RTDS_WATCHDOG_INTERVAL_SECS),
+        Duration::from_secs(RTDS_WATCHDOG_INTERVAL_SECS),
+    );
+    watchdog.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -100,6 +109,24 @@ async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<
                 write.send(Message::Text("PING".into()))
                     .await
                     .context("rtds PING")?;
+            }
+            _ = watchdog.tick() => {
+                let latest = {
+                    let rtds_currency_prices_by_ms_lock = project_manager.rtds_currency_prices_by_ms.read().await;
+                    rtds_currency_prices_by_ms_lock.iter().next_back().map(|(&ts_ms, &price)| (ts_ms, price))
+                };
+                let now_ms = current_timestamp_ms();
+                match latest {
+                    None => {
+                        run_log::rtds_watchdog_reconnect(&pair_symbol, None, now_ms);
+                        return Err(anyhow::anyhow!("rtds watchdog: нет данных за последние {RTDS_WATCHDOG_INTERVAL_SECS}s"));
+                    }
+                    Some((latest_ts_ms, _)) if now_ms - latest_ts_ms > RTDS_STALE_PRICE_MAX_AGE_MS => {
+                        run_log::rtds_watchdog_reconnect(&pair_symbol, Some(latest_ts_ms), now_ms);
+                        return Err(anyhow::anyhow!("rtds watchdog: данные устарели на {}ms", now_ms - latest_ts_ms));
+                    }
+                    _ => {}
+                }
             }
             opt = read.next() => {
                 let Some(ws_message) = opt else {

@@ -656,8 +656,8 @@ impl ProjectManager {
                                 _ => &project_manager_cloned.market_ws_tx_15m,
                             };
                             match tx.send(WsCommand::PrefetchSubscribe { asset_ids }).await {
-                                Ok(()) => {}
                                 Err(_) => run_log::ws_spawn_err(period, &prefetch_slug, "market ws command channel closed"),
+                                _ => {}
                             }
                         }
                     }
@@ -711,12 +711,7 @@ impl ProjectManager {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                     const MAX_ATTEMPTS: u32 = 10;
                     for attempt in 1..=MAX_ATTEMPTS {
-                        match fetch_price_to_beat_from_polymarket_event_page(
-                            project_manager_cloned.http.as_ref(),
-                            &slug_cloned,
-                            currency.as_str())
-                        .await
-                        {
+                        match fetch_price_to_beat_from_polymarket_event_page(project_manager_cloned.http.as_ref(), &slug_cloned, currency.as_str()).await {
                             Ok(price_to_beat) => {
                                 run_log::price_to_beat_from_event_page(
                                     period,
@@ -724,11 +719,8 @@ impl ProjectManager {
                                     price_to_beat,
                                     Some(10),
                                 );
-                                let market_ids_for_ptb: HashSet<String> =
-                                    market_ids_cloned.iter().cloned().collect();
-                                project_manager_cloned
-                                    .merge_market_price_to_beat(price_to_beat, &market_ids_for_ptb)
-                                    .await;
+                                let market_ids_for_ptb: HashSet<String> = market_ids_cloned.iter().cloned().collect();
+                                project_manager_cloned.merge_market_price_to_beat(price_to_beat, &market_ids_for_ptb).await;
                                 break;
                             }
                             Err(err) => {
@@ -747,21 +739,16 @@ impl ProjectManager {
                 const MAX_ATTEMPTS: u32 = 5;
                 let mut fetched: Option<f64> = None;
                 for attempt in 1..=MAX_ATTEMPTS {
-                    match fetch_price_to_beat_from_polymarket_event_page(
-                        self.http.as_ref(),
-                        &slug,
-                        currency.as_str(),
-                    )
-                    .await
-                    {
+                    match fetch_price_to_beat_from_polymarket_event_page(self.http.as_ref(), &slug, currency.as_str()).await {
                         Ok(price_to_beat) => {
                             run_log::price_to_beat_from_event_page(period, &slug, price_to_beat, None);
                             fetched = Some(price_to_beat);
                             break;
                         }
                         Err(e) => {
-                            run_log::gamma_fetch_err(period, &slug, &e);
-                            if attempt < MAX_ATTEMPTS {
+                            if attempt >= MAX_ATTEMPTS {
+                                run_log::gamma_fetch_err(period, &slug, &e);
+                            } else {
                                 tokio::time::sleep(Duration::from_secs(5)).await;
                             }
                         }

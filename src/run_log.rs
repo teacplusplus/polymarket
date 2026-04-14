@@ -250,6 +250,16 @@ pub fn xframe_dump_written(
     );
 }
 
+pub fn rtds_watchdog_reconnect(pair_symbol: &str, latest_ts_ms: Option<i64>, now_ms: i64) {
+    match latest_ts_ms {
+        None => eprintln!("rtds watchdog ({pair_symbol}): нет данных — форсируем реконнект"),
+        Some(ts) => eprintln!(
+            "rtds watchdog ({pair_symbol}): данные устарели на {}ms (latest_ts_ms={ts}, now={now_ms}) — форсируем реконнект",
+            now_ms - ts,
+        ),
+    }
+}
+
 pub fn rtds_currency_sec_bar_inserted(
     pair_symbol: &str,
     bucket_sec: i64,
