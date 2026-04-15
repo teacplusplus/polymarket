@@ -275,6 +275,38 @@ impl ProjectManager {
         asset_ids.iter().all(|aid| cu.contains_key(aid))
     }
 
+    /// Удаляет все данные, накопленные для завершённого маркета, из всех кешей `ProjectManager`.
+    async fn cleanup_stale_market_data(&self, market_id: &str) {
+        let asset_ids: HashSet<String> = self
+            .market_asset_ids_by_market
+            .write()
+            .await
+            .remove(market_id)
+            .unwrap_or_default();
+
+        self.xframes_by_market.write().await.remove(market_id);
+        self.ws_buffer_by_market.write().await.remove(market_id);
+        self.event_data_by_market.write().await.remove(market_id);
+        self.price_to_beat_by_market.write().await.remove(market_id);
+
+        {
+            let mut currency_up_down_by_asset_id_lock = self.currency_up_down_by_asset_id.write().await;
+            for asset_id in &asset_ids {
+                currency_up_down_by_asset_id_lock.remove(asset_id);
+            }
+        }
+        {
+            let mut ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.write().await;
+            for asset_id in &asset_ids {
+                ws_connect_wall_ms_by_asset_id_lock.remove(asset_id);
+            }
+        }
+        {
+            let mut slugs = self.slug_to_market_id.write().await;
+            slugs.retain(|_, v| v != market_id);
+        }
+    }
+
     /// Загружает данные окна из Gamma, вызывает [`Self::merge_market_event_data`] и возвращает те же поля, что [`Self::try_restore_currency_event_from_slug_cache`].
     async fn fetch_currency_event_from_gamma_and_merge(
         &self,
@@ -709,7 +741,7 @@ impl ProjectManager {
                 let market_ids_cloned = market_ids.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    const MAX_ATTEMPTS: u32 = 10;
+                    const MAX_ATTEMPTS: u32 = 15;
                     for attempt in 1..=MAX_ATTEMPTS {
                         match fetch_price_to_beat_from_polymarket_event_page(project_manager_cloned.http.as_ref(), &slug_cloned, currency.as_str()).await {
                             Ok(price_to_beat) => {
@@ -736,7 +768,7 @@ impl ProjectManager {
 
                 Some(price_to_beat)
             } else {
-                const MAX_ATTEMPTS: u32 = 5;
+                const MAX_ATTEMPTS: u32 = 15;
                 let mut fetched: Option<f64> = None;
                 for attempt in 1..=MAX_ATTEMPTS {
                     match fetch_price_to_beat_from_polymarket_event_page(self.http.as_ref(), &slug, currency.as_str()).await {
@@ -832,6 +864,7 @@ impl ProjectManager {
                     prev_market_id.clone(),
                     prev_gamma_question.clone(),
                 );
+                self.cleanup_stale_market_data(prev_market_id).await;
             }
         }
     }

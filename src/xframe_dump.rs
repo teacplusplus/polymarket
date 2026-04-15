@@ -3,14 +3,17 @@
 use crate::project_manager::ProjectManager;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
-use crate::xframe::{XFrame, SIZE};
+use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MarketXFramesDump {
-    pub frames: Vec<XFrame<SIZE>>,
+    /// Кадры токена с исходом Up, упорядоченные по `aligned_ts`.
+    pub frames_up: Vec<XFrame<SIZE>>,
+    /// Кадры токена с исходом Down, упорядоченные по `aligned_ts`.
+    pub frames_down: Vec<XFrame<SIZE>>,
 }
 
 /// Имя файла из текста Gamma `question`: безопасные символы и ограничение длины.
@@ -52,8 +55,8 @@ async fn dump_market_xframes_binary_inner(
     gamma_question: Option<String>,
 ) -> anyhow::Result<()> {
     let by_asset = {
-        let guard = project_manager.xframes_by_market.read().await;
-        guard.get(&market_id).cloned()
+        let xframes_by_market_lock = project_manager.xframes_by_market.read().await;
+        xframes_by_market_lock.get(&market_id).cloned()
     };
     let Some(by_asset) = by_asset else {
         return Ok(());
@@ -65,18 +68,27 @@ async fn dump_market_xframes_binary_inner(
             flat.push((asset_id.clone(), *aligned_ts, frame.clone()));
         }
     }
-    flat.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let frames: Vec<XFrame<SIZE>> = flat
-        .into_iter()
-        .map(|(_, _, f)| f)
-        .filter(|f| f.stable)
-        .collect();
+    flat.sort_by_key(|(_, aligned_ts, _)| *aligned_ts);
 
-    if frames.is_empty() {
+    let mut frames_up: Vec<XFrame<SIZE>> = Vec::new();
+    let mut frames_down: Vec<XFrame<SIZE>> = Vec::new();
+    for (_, _, frame) in flat {
+        if !frame.stable {
+            continue;
+        }
+        match CurrencyUpDownOutcome::from_i32(frame.currency_up_down_outcome) {
+            Some(CurrencyUpDownOutcome::Up) => frames_up.push(frame),
+            Some(CurrencyUpDownOutcome::Down) => frames_down.push(frame),
+            None => {}
+        }
+    }
+
+    if frames_up.is_empty() && frames_down.is_empty() {
         return Ok(());
     }
 
-    let dump = MarketXFramesDump { frames };
+    let frame_count = frames_up.len() + frames_down.len();
+    let dump = MarketXFramesDump { frames_up, frames_down };
 
     let feature_count = XFrame::<SIZE>::count_features();
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -89,7 +101,6 @@ async fn dump_market_xframes_binary_inner(
     let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
     let fname = format!("{stem}__{}.bin", current_timestamp_ms());
     let path = base.join(&fname);
-    let frame_count = dump.frames.len();
     let bytes = bincode::serialize(&dump)?;
     let byte_len = bytes.len();
     tokio::fs::write(&path, bytes).await?;

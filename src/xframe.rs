@@ -946,21 +946,20 @@ pub fn currency_price_z_score_from_sec_history(
 }
 
 
+pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05; 
+pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03; 
 pub fn calc_y_train(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
     let current_prob = x_frames.get(index)?.currency_implied_prob?;
-    let mut best_delta: f64 = 0.0;
-    let mut worst_delta: f64 = 0.0;
     for i in 1..=n {
         let future_prob = x_frames.get(index + i)?.currency_implied_prob?;
         let delta = future_prob - current_prob;
-        if delta > best_delta { best_delta = delta; }
-        if delta < worst_delta { worst_delta = delta; }
+        if delta >= Y_TRAIN_TAKE_PROFIT_PP {
+            return Some(1.0);
+        } else if delta <= Y_TRAIN_STOP_LOSS_PP {
+            return Some(0.0);
+        }
     }
-    let total = best_delta + worst_delta.abs();
-    if total < 1e-9 {
-        return Some(0.5); 
-    }
-    Some((best_delta / total).clamp(0.0, 1.0) as f32)
+    Some(0.0) 
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.
