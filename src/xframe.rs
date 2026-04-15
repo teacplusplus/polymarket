@@ -14,6 +14,7 @@ use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
 pub const SIZE: usize = 13;
 
 const MIN_POSITIVE_ASK: f64 = 1e-12;
+
 /// Окно секундных цен спота для μ и σ в z-score (≈ 60 мин). Ключи `prices_by_sec` — Unix-секунды.
 const CURRENCY_PRICE_ZSCORE_WINDOW_SEC: i64 = SIZE as i64;
 /// Минимум точек в окне для выборочного СКО.
@@ -23,7 +24,8 @@ const CURRENCY_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 ///
 /// Поля с атрибутом `#[xfeature]` попадают в вектор для обучения; `market_id`, `asset_id`, `bucket_flow_sign`, `stable` — без `#[xfeature]` (идентификаторы и служебные поля).
 ///
-/// `xframe_interval_type`: дискриминант [`XFrameIntervalKind`] ([XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]). `currency_up_down_outcome`: дискриминант [`CurrencyUpDownOutcome`] ([XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN]).
+/// `xframe_interval_type`: дискриминант [`XFrameIntervalKind`] ([XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]). `currency_up_down_outcome`: дискриминант [`CurrencyUpDownOutcome`] ([`CurrencyUpDownOutcome::Up`] / [`CurrencyUpDownOutcome::Down`] как `i32`).
+/// `currency_implied_prob` — как отображаемая на Polymarket вероятность исхода **этого** токена: mid L1 при спреде ≤ 10¢, иначе last trade (см. `currency_implied_prob_polymarket_style`).
 /// Поля `other_*` — микроструктура противоположной ноги на тот же бакет; подмешиваются через [XFrame::merge_other_leg_features_from] в `ProjectManager` после вставки пары кадров.
 ///
 /// Поля `sibling_*` — кадр токена **того же** исхода Up/Down на **парном** `market_id` (другой горизонт 5m↔15m), тот же `aligned_ts`; подмешиваются через [XFrame::merge_sibling_market_features_from]. Без валидной пары в [crate::project_manager::ProjectManager::currency_updown_sibling_state] (см. [crate::currency_updown_sibling::CurrencyUpDownSiblingState::paired_five_and_fifteen_market_ids]) остаются значения по умолчанию.
@@ -51,6 +53,9 @@ pub struct XFrame<const N: usize> {
     #[xfeature]
     #[derivative(Default(value = "0"))]
     pub currency_up_down_delay_class: i32,
+    /// Рыночная оценка вероятности исхода для **этого** токена (см. [`Self::currency_up_down_outcome`]): mid L1 при спреде ≤ 10¢, при широком спреде — last trade, как в UI Polymarket.
+    #[xfeature]
+    pub currency_implied_prob: Option<f64>,
     /// Сколько миллисекунд осталось до конца события рынка: `event_end_ms - timestamp_ms` снапшота; при `event_end_ms <= timestamp` — `0`. Если конец события неизвестен — `0`.
     #[xfeature]
     #[derivative(Default(value = "-1"))]
@@ -311,6 +316,9 @@ pub struct XFrame<const N: usize> {
     pub other_delta_n_sell_count_window: [Option<i64>; N],
     #[xfeature]
     pub other_burstiness_transactions_count: Option<f64>,
+    /// Как [`Self::currency_implied_prob`], для противоположной ноги (`other` кадр).
+    #[xfeature]
+    pub other_currency_implied_prob: Option<f64>,
     /// Z-score цены спота: `(p - mu) / sigma`; история — `ProjectManager::rtds_currency_prices_by_sec` (ключ Unix-секунда); `p` — последняя точка в окне, `mu`/`sigma` — по всем ценам окна.
     #[xfeature]
     pub currency_price_z_score: Option<f64>,
@@ -440,6 +448,9 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_sell_count_window: [Option<i64>; N],
+    /// Как [`Self::currency_implied_prob`], для токена парного маркета (`sibling` кадр).
+    #[xfeature]
+    pub sibling_currency_implied_prob: Option<f64>,
     /// `(price_to_beat_sibling - spot) / price_to_beat_sibling * 100` на парном маркете; тот же спот, другой beat из Gamma.
     #[xfeature]
     pub sibling_currency_price_vs_beat_pct: Option<f64>,
@@ -590,6 +601,13 @@ impl<const N: usize> XFrame<N> {
         )
         .as_i32();
 
+        let currency_implied_prob = currency_implied_prob_polymarket_style(
+            book_bid_l1_price,
+            book_ask_l1_price,
+            spread,
+            last_trade_price,
+        );
+
         let mut frame = XFrame::<N> {
             market_id: snapshot.market_id,
             asset_id: snapshot.asset_id,
@@ -597,6 +615,7 @@ impl<const N: usize> XFrame<N> {
             xframe_interval_type: snapshot.xframe_interval_kind.as_i32(),
             currency_up_down_outcome: snapshot.currency_up_down_outcome.as_i32(),
             currency_up_down_delay_class,
+            currency_implied_prob,
             event_remaining_ms,
             book_bid_l1_price,
             book_ask_l1_price,
@@ -665,6 +684,12 @@ impl<const N: usize> XFrame<N> {
         self.other_delta_n_buy_count_window = other.delta_n_buy_count_window;
         self.other_sell_count_window = other.sell_count_window;
         self.other_delta_n_sell_count_window = other.delta_n_sell_count_window;
+        self.other_currency_implied_prob = currency_implied_prob_polymarket_style(
+            other.book_bid_l1_price,
+            other.book_ask_l1_price,
+            other.spread,
+            other.last_trade_price,
+        );
     }
 
     /// Копирует в `sibling_*` поля «своей» ноги с кадра парного рынка (тот же Up/Down, тот же бакет), см. [find_same_outcome_sibling_asset_id].
@@ -708,6 +733,12 @@ impl<const N: usize> XFrame<N> {
         self.sibling_delta_n_buy_count_window = sibling.delta_n_buy_count_window;
         self.sibling_sell_count_window = sibling.sell_count_window;
         self.sibling_delta_n_sell_count_window = sibling.delta_n_sell_count_window;
+        self.sibling_currency_implied_prob = currency_implied_prob_polymarket_style(
+            sibling.book_bid_l1_price,
+            sibling.book_ask_l1_price,
+            sibling.spread,
+            sibling.last_trade_price,
+        );
         self.sibling_currency_price_vs_beat_pct = sibling.currency_price_vs_beat_pct;
     }
 
@@ -912,4 +943,57 @@ pub fn currency_price_z_score_from_sec_history(
         return None;
     }
     Some((current_price - mu) / sigma)
+}
+
+
+pub fn calc_y_train(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
+    let current_prob = x_frames.get(index)?.currency_implied_prob?;
+    let mut best_delta: f64 = 0.0;
+    let mut worst_delta: f64 = 0.0;
+    for i in 1..=n {
+        let future_prob = x_frames.get(index + i)?.currency_implied_prob?;
+        let delta = future_prob - current_prob;
+        if delta > best_delta { best_delta = delta; }
+        if delta < worst_delta { worst_delta = delta; }
+    }
+    let total = best_delta + worst_delta.abs();
+    if total < 1e-9 {
+        return Some(0.5); 
+    }
+    Some((best_delta / total).clamp(0.0, 1.0) as f32)
+}
+
+/// Mid L1: (лучший bid + лучший ask) / 2.
+fn book_l1_mid_price(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64> {
+    match (best_bid, best_ask) {
+        (Some(b), Some(a)) if b.is_finite() && a.is_finite() => Some((b + a) * 0.5),
+        _ => None,
+    }
+}
+
+/// Порог как в UI Polymarket: при спреде **> 10¢** показывают last trade, иначе mid.
+const POLYMARKET_WIDE_SPREAD_USD: f64 = 0.10;
+
+/// Оценка «отображаемой» цены/вероятности: при узком спреде — mid L1; при широком (`> 10¢`) — [`last_trade_price`], если есть, иначе mid.
+fn currency_implied_prob_polymarket_style(
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    spread_reported: Option<f64>,
+    last_trade_price: Option<f64>,
+) -> Option<f64> {
+    let mid = book_l1_mid_price(best_bid, best_ask);
+    let spread_effective = spread_reported
+        .filter(|s| s.is_finite())
+        .or_else(|| match (best_bid, best_ask) {
+            (Some(b), Some(a)) if b.is_finite() && a.is_finite() => Some((a - b).max(0.0)),
+            _ => None,
+        });
+
+    if spread_effective.map(|s| s > POLYMARKET_WIDE_SPREAD_USD) == Some(true) {
+        last_trade_price
+            .filter(|p| p.is_finite())
+            .or(mid)
+    } else {
+        mid
+    }
 }
