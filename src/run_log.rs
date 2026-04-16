@@ -84,6 +84,21 @@ pub fn price_to_beat_from_event_page(
     }
 }
 
+/// RTDS `crypto_prices`: последний ключ `rtds_currency_prices_by_ms` слишком старый — кадры помечаются `stable=false`.
+pub fn rtds_currency_prices_lagging_for_xframe(
+    wall_now_ms: i64,
+    last_key_ms: Option<i64>,
+    max_lag_ms: i64,
+) {
+    if !WS_LOG_ENABLED {
+        return;
+    }
+    let lag = last_key_ms.map(|k| wall_now_ms.saturating_sub(k));
+    eprintln!(
+        "rtds_currency_prices: отстаёт для stable — wall_now_ms={wall_now_ms} last_key_ms={last_key_ms:?} lag_ms={lag:?} (порог {max_lag_ms} ms) → XFrame.stable=false"
+    );
+}
+
 pub fn ws_stop_replace(period: &str, slug: &str, prev_token_count: usize) {
     if !WS_LOG_ENABLED {
         return;

@@ -16,7 +16,9 @@ const RTDS_PAYLOAD_TS_HISTORY_MS: i64 = 20 * 60 * 1000;
 /// Как часто watchdog проверяет свежесть данных (не чаще раза в 10 секунд).
 const RTDS_WATCHDOG_INTERVAL_SECS: u64 = 10;
 /// Максимальный возраст последнего payload_ts_ms: если последние данные старше — форсируем реконнект.
-const RTDS_STALE_PRICE_MAX_AGE_MS: i64 = 10_000;
+const RTDS_STALE_PRICE_MAX_AGE_MS: i64 = 30_000;
+/// Если последний ключ [`ProjectManager::rtds_currency_prices_by_ms`] старше стены более чем на это — [`crate::xframe::XFrame::stable`] = `false`.
+pub const RTDS_MS_MAX_LAG_FOR_STABLE_FRAME: i64 = 30000;
 
 /// Символ подписки RTDS `crypto_prices`: `{currency}` в нижнем регистре + `usdt` (как у Binance spot), например `eth` → `ethusdt`.
 pub fn rtds_spot_pair_symbol(currency: &str) -> String {

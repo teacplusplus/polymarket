@@ -11,6 +11,7 @@ pub use crate::currency_updown_sibling::{
     five_min_belongs_to_fifteen_window, CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingState,
 };
 pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
+use crate::currency_ws::RTDS_MS_MAX_LAG_FOR_STABLE_FRAME;
 use crate::data_ws::{
     make_ws_channel, spawn_persistent_interval_market_ws, CurrencyUpDownOutcome, MarketSnapshot,
     MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws, WsCommand,
@@ -37,7 +38,7 @@ struct BuiltXframeEntry {
 }
 
 const FRAME_BUILD_INTERVAL_SEC: u64 = 1;
-/// Размер очереди команд смены подписки на долгоживущих market WS (5m / 15m).
+/// Размер очереди команд смены подписки на единый market WS (5m и 15m вместе).
 const MARKET_WS_SUBSCRIPTION_CHANNEL_CAP: usize = 8;
 
 #[derive(Debug, Clone, Default)]
@@ -64,8 +65,8 @@ pub struct ProjectManager {
     pub http: Arc<reqwest::Client>,
     pub gamma: Arc<gamma::Client>,
     pub clob: Arc<clob::Client>,
-    pub market_ws_tx_5m: mpsc::Sender<WsCommand>,
-    pub market_ws_tx_15m: mpsc::Sender<WsCommand>,
+    pub market_ws_tx: mpsc::Sender<WsCommand>,
+    pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
 }
 
 impl ProjectManager {
@@ -81,9 +82,7 @@ impl ProjectManager {
         let gamma = Arc::new(gamma::Client::default());
         let clob = Arc::new(clob::Client::new("https://clob.polymarket.com", clob::Config::default()).expect("failed to create Polymarket CLOB client"));
 
-        let (market_ws_tx_5m, market_ws_rx_5m) =
-            mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
-        let (market_ws_tx_15m, market_ws_rx_15m) =
+        let (market_ws_tx, market_ws_rx) =
             mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
 
         let project_manager = Arc::new(Self {
@@ -103,20 +102,11 @@ impl ProjectManager {
             http,
             gamma,
             clob,
-            market_ws_tx_5m,
-            market_ws_tx_15m,
+            market_ws_tx,
+            xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
         });
 
-        spawn_persistent_interval_market_ws(
-            project_manager.clone(),
-            market_ws_rx_5m,
-            XFrameIntervalKind::FiveMin,
-        );
-        spawn_persistent_interval_market_ws(
-            project_manager.clone(),
-            market_ws_rx_15m,
-            XFrameIntervalKind::FifteenMin,
-        );
+        spawn_persistent_interval_market_ws(project_manager.clone(), market_ws_rx);
 
         crate::currency_ws::spawn_rtds_currency_pipeline(project_manager.clone());
         let project_manager_cloned = project_manager.clone();
@@ -302,6 +292,12 @@ impl ProjectManager {
             }
         }
         {
+            let mut interval_by_asset = self.xframe_interval_kind_by_asset_id.write().await;
+            for asset_id in &asset_ids {
+                interval_by_asset.remove(asset_id);
+            }
+        }
+        {
             let mut slugs = self.slug_to_market_id.write().await;
             slugs.retain(|_, v| v != market_id);
         }
@@ -419,7 +415,8 @@ impl ProjectManager {
             by_bucket.entry(key).or_default().push(snapshot);
         }
 
-        let currency_ref_sec = current_timestamp_ms() / 1000;
+        let now_ms = current_timestamp_ms();
+        let currency_ref_sec = now_ms / 1000;
         let (currency_price_z_score, currency_spot_usd) = {
             let hist = self.rtds_currency_prices_by_sec.read().await;
             let currency_price_z_score =
@@ -430,6 +427,23 @@ impl ProjectManager {
                 .map(|(_, price)| *price);
             (currency_price_z_score, currency_spot_usd)
         };
+
+        let (rtds_ms_fresh, rtds_last_key_ms) = {
+            let g = self.rtds_currency_prices_by_ms.read().await;
+            let last_key = g.iter().next_back().map(|(&ts, _)| ts);
+            let fresh = match last_key {
+                None => false,
+                Some(ts) => now_ms.saturating_sub(ts) <= RTDS_MS_MAX_LAG_FOR_STABLE_FRAME,
+            };
+            (fresh, last_key)
+        };
+        if !rtds_ms_fresh {
+            run_log::rtds_currency_prices_lagging_for_xframe(
+                now_ms,
+                rtds_last_key_ms,
+                RTDS_MS_MAX_LAG_FOR_STABLE_FRAME,
+            );
+        }
 
         let mut built_xframes: Vec<BuiltXframeEntry> = Vec::new();
 
@@ -479,7 +493,7 @@ impl ProjectManager {
                 snapshot.timestamp_ms,
                 event_start_ms,
                 ws_connect_wall_ms,
-            );
+            ) && rtds_ms_fresh;
             let frame = XFrame::<SIZE>::new(
                 snapshot,
                 &frames_history,
@@ -665,29 +679,48 @@ impl ProjectManager {
                     continue;
                 };
 
+            {
+                let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
+                let mut xframe_interval_kind_by_asset_id_lock = self.xframe_interval_kind_by_asset_id.write().await;
+                for asset_id in currency_up_down_by_asset_id.keys() {
+                    xframe_interval_kind_by_asset_id_lock.insert(asset_id.clone(), interval_kind);
+                }
+            }
+
             if next_window_start_sec != Some(window_start_sec) {
                 next_window_start_sec = Some(window_start_sec);
                 let project_manager_cloned = self.clone();
                 let currency_lower = self.currency.to_lowercase();
+                let prefetch_period_sec = period_sec;
                 tokio::spawn(async move {
+                    let prefetch_interval_kind = XFrameIntervalKind::from_period_sec(prefetch_period_sec);
                     const PREFETCH_UPCOMING_WINDOW_SLUGS: i64 = 3;
                     for k in 1_i64..=PREFETCH_UPCOMING_WINDOW_SLUGS {
-                        let next_window_start_sec = window_start_sec.saturating_add(period_sec.saturating_mul(k));
+                        let next_window_start_sec = window_start_sec.saturating_add(prefetch_period_sec.saturating_mul(k));
                         let prefetch_slug = format!("{currency_lower}-updown-{period}-{next_window_start_sec}");
                         if project_manager_cloned.slug_currency_event_fully_cached(&prefetch_slug).await {
                             continue;
                         }
-                        if let Some((_, _, _, currency_up_down_by_asset_id)) = project_manager_cloned.fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period).await
+                        if let Some((_, _, _, ref currency_up_down_by_asset_id)) =
+                            project_manager_cloned.fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period).await
                         {
                             run_log::gamma_event_prefetch_fetched(period, &prefetch_slug);
+                            {
+                                let mut xframe_interval_kind_by_asset_id_lock = project_manager_cloned
+                                    .xframe_interval_kind_by_asset_id
+                                    .write()
+                                    .await;
+                                for asset_id in currency_up_down_by_asset_id.keys() {
+                                    xframe_interval_kind_by_asset_id_lock.insert(asset_id.clone(), prefetch_interval_kind);
+                                }
+                            }
                             let mut asset_ids: Vec<String> = currency_up_down_by_asset_id.keys().cloned().collect();
                             asset_ids.sort_unstable();
-                            let tx = match period_sec {
-                                FIVE_MIN_SEC => &project_manager_cloned.market_ws_tx_5m,
-                                FIFTEEN_MIN_SEC => &project_manager_cloned.market_ws_tx_15m,
-                                _ => &project_manager_cloned.market_ws_tx_15m,
-                            };
-                            match tx.send(WsCommand::PrefetchSubscribe { asset_ids }).await {
+                            match project_manager_cloned
+                                .market_ws_tx
+                                .send(WsCommand::PrefetchSubscribe { asset_ids })
+                                .await
+                            {
                                 Err(_) => run_log::ws_spawn_err(period, &prefetch_slug, "market ws command channel closed"),
                                 _ => {}
                             }
@@ -828,12 +861,7 @@ impl ProjectManager {
                         window_start_sec,
                         gamma_question: gamma_question.clone(),
                     });
-                    let tx = match period_sec {
-                        FIVE_MIN_SEC => &self.market_ws_tx_5m,
-                        FIFTEEN_MIN_SEC => &self.market_ws_tx_15m,
-                        _ => &self.market_ws_tx_15m,
-                    };
-                    if tx.send(cmd).await.is_err() {
+                    if self.market_ws_tx.send(cmd).await.is_err() {
                         run_log::ws_spawn_err(period, &slug, "market ws command channel closed");
                         continue;
                     }
@@ -848,12 +876,11 @@ impl ProjectManager {
 
             run_log::ws_window_end_wait(period, &slug, subscribed.len());
             if !ids.is_empty() {
-                let tx = match period_sec {
-                    FIVE_MIN_SEC => &self.market_ws_tx_5m,
-                    FIFTEEN_MIN_SEC => &self.market_ws_tx_15m,
-                    _ => &self.market_ws_tx_15m,
-                };
-                match tx.send(WsCommand::PruneStaleIds { stale_ids: ids.clone() }).await {
+                match self
+                    .market_ws_tx
+                    .send(WsCommand::PruneStaleIds { stale_ids: ids.clone() })
+                    .await
+                {
                     Ok(()) => {}
                     Err(_) => run_log::ws_spawn_err(period, &slug, "market ws command channel closed"),
                 }

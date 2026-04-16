@@ -102,22 +102,21 @@ pub fn make_ws_channel() -> (Arc<Ws>, mpsc::Receiver<Arc<MarketSnapshot>>) {
     )
 }
 
-/// Один долгоживущий market WS на горизонт (5m или 15m): начальная подписка и смена рынка через
+/// Один долгоживущий market WS на все горизонты (5m и 15m): начальная подписка и смена рынка через
 /// [update subscription](https://docs.polymarket.com/api-reference/wss/market) без разрыва TCP.
+/// Тип интервала для каждого снимка берётся из [`ProjectManager::xframe_interval_kind_by_asset_id`].
 pub fn spawn_persistent_interval_market_ws(
     project_manager: Arc<ProjectManager>,
     cmd_rx: mpsc::Receiver<WsCommand>,
-    xframe_interval_kind: XFrameIntervalKind,
 ) {
     tokio::spawn(async move {
-        run_persistent_interval_market_ws_inner(project_manager, cmd_rx, xframe_interval_kind).await;
+        run_persistent_interval_market_ws_inner(project_manager, cmd_rx).await;
     });
 }
 
 async fn run_persistent_interval_market_ws_inner(
     project_manager: Arc<ProjectManager>,
     mut cmd_rx: mpsc::Receiver<WsCommand>,
-    xframe_interval_kind: XFrameIntervalKind,
 ) {
     // Все подписанные asset_ids: текущее окно + предзагруженные будущие.
     let mut active_asset_ids: HashSet<String> = HashSet::new();
@@ -235,24 +234,14 @@ async fn run_persistent_interval_market_ws_inner(
                             match message {
                             Message::Text(text) => {
                                 if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
-                                    let _ = ingest_json_event(
-                                        &project_manager,
-                                        &json_value,
-                                        xframe_interval_kind,
-                                    )
-                                    .await;
+                                    let _ = ingest_json_event(&project_manager, &json_value).await;
                                 }
                             }
                             Message::Binary(binary) => {
                                 if let Ok(text) = String::from_utf8(binary.to_vec())
                                     && let Ok(json_value) = serde_json::from_str::<Value>(&text)
                                 {
-                                    let _ = ingest_json_event(
-                                        &project_manager,
-                                        &json_value,
-                                        xframe_interval_kind,
-                                    )
-                                    .await;
+                                    let _ = ingest_json_event(&project_manager, &json_value).await;
                                 }
                             }
                             Message::Ping(payload) => {
@@ -397,21 +386,19 @@ async fn run_persistent_interval_market_ws_inner(
 async fn ingest_json_event(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
-    xframe_interval_kind: XFrameIntervalKind,
 ) -> Result<()> {
     if let Some(events) = value.as_array() {
         for event in events {
-            ingest_single(project_manager, event, xframe_interval_kind).await?;
+            ingest_single(project_manager, event).await?;
         }
         return Ok(());
     }
-    ingest_single(project_manager, value, xframe_interval_kind).await
+    ingest_single(project_manager, value).await
 }
 
 async fn ingest_single(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
-    xframe_interval_kind: XFrameIntervalKind,
 ) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
@@ -420,10 +407,14 @@ async fn ingest_single(
         .currency_up_down_by_asset_id
         .read()
         .await;
+    let interval_by_asset = project_manager
+        .xframe_interval_kind_by_asset_id
+        .read()
+        .await;
     let snapshots = parse_snapshots_from_event(
         value,
         event_type,
-        xframe_interval_kind,
+        &interval_by_asset,
         &currency_up_down_by_asset_id,
     );
     for snapshot in snapshots {
@@ -440,7 +431,7 @@ async fn ingest_single(
 pub fn parse_snapshots_from_event(
     value: &Value,
     event_type: &str,
-    xframe_interval_kind: XFrameIntervalKind,
+    interval_by_asset: &HashMap<String, XFrameIntervalKind>,
     currency_up_down_by_asset_id: &HashMap<String, CurrencyUpDownOutcome>,
 ) -> Vec<MarketSnapshot> {
     match event_type {
@@ -448,26 +439,36 @@ pub fn parse_snapshots_from_event(
             parse_single_snapshot(
                 value,
                 event_type,
-                xframe_interval_kind,
+                interval_by_asset,
                 currency_up_down_by_asset_id,
             )
             .into_iter()
             .collect()
         }
         "price_change" => {
-            parse_price_change_snapshots(value, xframe_interval_kind, currency_up_down_by_asset_id)
+            parse_price_change_snapshots(value, interval_by_asset, currency_up_down_by_asset_id)
         }
         "new_market" => {
-            parse_new_market_snapshots(value, xframe_interval_kind, currency_up_down_by_asset_id)
+            parse_new_market_snapshots(value, interval_by_asset, currency_up_down_by_asset_id)
         }
         _ => Vec::new(),
     }
 }
 
+fn xframe_interval_kind_for_asset(
+    interval_by_asset: &HashMap<String, XFrameIntervalKind>,
+    asset_id: &str,
+) -> XFrameIntervalKind {
+    interval_by_asset
+        .get(asset_id)
+        .copied()
+        .unwrap_or(XFrameIntervalKind::FifteenMin)
+}
+
 fn parse_single_snapshot(
     value: &Value,
     event_type: &str,
-    xframe_interval_kind: XFrameIntervalKind,
+    interval_by_asset: &HashMap<String, XFrameIntervalKind>,
     currency_up_down_by_asset_id: &HashMap<String, CurrencyUpDownOutcome>,
 ) -> Option<MarketSnapshot> {
     let asset_id = value
@@ -485,6 +486,8 @@ fn parse_single_snapshot(
         return None;
     }
     let currency_up_down_outcome = *currency_up_down_by_asset_id.get(&asset_id)?;
+
+    let xframe_interval_kind = xframe_interval_kind_for_asset(interval_by_asset, &asset_id);
 
     let timestamp_ms = parse_i64(value.get("timestamp")).unwrap_or_else(current_timestamp_ms);
     let book = parse_book_top3(value);
@@ -520,7 +523,7 @@ fn parse_single_snapshot(
 
 fn parse_price_change_snapshots(
     value: &Value,
-    xframe_interval_kind: XFrameIntervalKind,
+    interval_by_asset: &HashMap<String, XFrameIntervalKind>,
     currency_up_down_by_asset_id: &HashMap<String, CurrencyUpDownOutcome>,
 ) -> Vec<MarketSnapshot> {
     let market_id = value
@@ -551,6 +554,7 @@ fn parse_price_change_snapshots(
         let Some(&currency_up_down_outcome) = currency_up_down_by_asset_id.get(&asset_id) else {
             continue;
         };
+        let xframe_interval_kind = xframe_interval_kind_for_asset(interval_by_asset, &asset_id);
         snapshots.push(MarketSnapshot {
             market_id: market_id.clone(),
             asset_id,
@@ -583,7 +587,7 @@ fn parse_price_change_snapshots(
 
 fn parse_new_market_snapshots(
     value: &Value,
-    xframe_interval_kind: XFrameIntervalKind,
+    interval_by_asset: &HashMap<String, XFrameIntervalKind>,
     currency_up_down_by_asset_id: &HashMap<String, CurrencyUpDownOutcome>,
 ) -> Vec<MarketSnapshot> {
     let market_id = value
@@ -601,10 +605,7 @@ fn parse_new_market_snapshots(
         return Vec::new();
     };
 
-    eprintln!(
-        "data_ws ({xframe_interval_kind:?}): new_market market_id={market_id} assets={}",
-        asset_ids.len()
-    );
+    eprintln!("data_ws: new_market market_id={market_id} assets={}", asset_ids.len());
 
     let mut snapshots = Vec::with_capacity(asset_ids.len());
     for asset_id_json in asset_ids {
@@ -615,6 +616,7 @@ fn parse_new_market_snapshots(
         let Some(&currency_up_down_outcome) = currency_up_down_by_asset_id.get(&asset_id) else {
             continue;
         };
+        let xframe_interval_kind = xframe_interval_kind_for_asset(interval_by_asset, &asset_id);
         snapshots.push(MarketSnapshot {
             market_id: market_id.clone(),
             asset_id,
