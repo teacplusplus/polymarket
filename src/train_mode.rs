@@ -15,11 +15,13 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 50;
-/// Число раундов бустинга при финальном обучении.
-const BOOST_ROUNDS: u32 = 200;
+const OPTIMIZER_TRIALS: usize = 100;
+/// Максимальное число раундов бустинга при финальном обучении.
+const BOOST_ROUNDS: u32 = 500;
+/// Число раундов без улучшения AUC до остановки (early stopping).
+const EARLY_STOPPING_PATIENCE: u32 = 20;
 /// Число раундов бустинга при каждом шаге оптимизатора (быстрее).
-const EVAL_BOOST_ROUNDS: u32 = 50;
+const EVAL_BOOST_ROUNDS: u32 = 80;
 /// Горизонт предсказания: через сколько кадров оцениваем изменение вероятности.
 const Y_TRAIN_HORIZON_FRAMES: usize = 10;
 /// Доля тестовой выборки.
@@ -191,7 +193,7 @@ fn train_and_save(
     let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS)?;
     println!("[train] лучшие параметры: {params:?}");
 
-    let booster = fit_booster(&params, &dtrain, &eval_sets, BOOST_ROUNDS)?;
+    let booster = fit_booster_with_early_stopping(&params, &dtrain, &dtest)?;
 
     print_eval_metrics(&booster);
     print_y_distribution(&y_train, &y_test);
@@ -320,7 +322,7 @@ fn tune_xgboost_optimizer(
             subsample: trial.suggest_float("subsample", 0.5, 1.0)? as f32,
             colsample_bytree: trial.suggest_float("colsample_bytree", 0.5, 1.0)? as f32,
             lambda: trial.suggest_float("lambda", 0.0, 20.0)? as f32,
-            alpha: trial.suggest_float("alpha", 0.0, 20.0)? as f32,
+            alpha: trial.suggest_float("alpha", 0.0, 30.0)? as f32,
             scale_pos_weight: trial.suggest_float("scale_pos_weight", 5.0, 20.0)? as f32,
         };
         let score = eval_xgboost(&params, eval_sets, dtrain)
@@ -350,12 +352,65 @@ fn eval_xgboost(
     Ok(auc)
 }
 
-fn fit_booster(
+/// Обучение с early stopping: останавливается, когда AUC на тесте не улучшается
+/// `EARLY_STOPPING_PATIENCE` раундов подряд; возвращает booster с лучшим AUC.
+fn fit_booster_with_early_stopping(
     params: &XgbParams,
     dtrain: &DMatrix,
-    eval_sets: &[(&DMatrix, &str); 2],
-    rounds: u32,
+    dtest: &DMatrix,
 ) -> anyhow::Result<Booster> {
+    let booster_params = build_booster_params(params)?;
+    let cached = [dtrain, dtest];
+    let mut bst = Booster::new_with_cached_dmats(&booster_params, &cached)?;
+
+    let mut best_auc: f32 = 0.0;
+    let mut best_snapshot: Vec<u8> = Vec::new();
+    let mut best_round: u32 = 0;
+    let mut rounds_without_improvement: u32 = 0;
+    // Метрики на момент лучшего раунда: metric -> {split -> val}.
+    // Сохраняем здесь, а не переоцениваем после load_buffer —
+    // так как load_buffer не восстанавливает eval_metric параметры booster'а.
+    let mut best_eval_results: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f32>> =
+        Default::default();
+
+    for round in 0..BOOST_ROUNDS {
+        bst.update(dtrain, round as i32)?;
+
+        let test_metrics = bst.evaluate(dtest)?;
+        let auc = test_metrics.get("auc").copied().unwrap_or(0.0);
+
+        if auc > best_auc {
+            best_auc = auc;
+            best_round = round;
+            rounds_without_improvement = 0;
+            best_snapshot = bst.save_buffer(true)?;
+
+            // Сохраняем метрики train и test в момент лучшего AUC
+            best_eval_results.clear();
+            let train_metrics = bst.evaluate(dtrain)?;
+            for (metric, val) in train_metrics {
+                best_eval_results.entry(metric).or_default().insert("train".to_string(), val);
+            }
+            for (metric, val) in test_metrics {
+                best_eval_results.entry(metric).or_default().insert("test".to_string(), val);
+            }
+        } else {
+            rounds_without_improvement += 1;
+            if rounds_without_improvement >= EARLY_STOPPING_PATIENCE {
+                println!(
+                    "[train] early stopping на раунде {round}: лучший AUC={best_auc:.6} на раунде {best_round}"
+                );
+                break;
+            }
+        }
+    }
+
+    let mut result_bst = Booster::load_buffer(&best_snapshot)?;
+    result_bst.eval_dmat_results = best_eval_results;
+    Ok(result_bst)
+}
+
+fn build_booster_params(params: &XgbParams) -> anyhow::Result<xgb::parameters::BoosterParameters> {
     let learning_params = LearningTaskParametersBuilder::default()
         .objective(Objective::BinaryLogistic)
         .eval_metrics(Metrics::Custom(vec![
@@ -377,11 +432,20 @@ fn fit_booster(
         .tree_method(TreeMethod::Hist)
         .build()?;
 
-    let booster_params = BoosterParametersBuilder::default()
+    Ok(BoosterParametersBuilder::default()
         .learning_params(learning_params)
         .booster_type(BoosterType::Tree(tree_params))
         .verbose(false)
-        .build()?;
+        .build()?)
+}
+
+fn fit_booster(
+    params: &XgbParams,
+    dtrain: &DMatrix,
+    eval_sets: &[(&DMatrix, &str); 2],
+    rounds: u32,
+) -> anyhow::Result<Booster> {
+    let booster_params = build_booster_params(params)?;
 
     let training_params = TrainingParametersBuilder::default()
         .dtrain(dtrain)

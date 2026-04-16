@@ -10,6 +10,7 @@ pub mod currency_ws;
 pub mod data_ws;
 pub mod xframe_dump;
 pub mod train_mode;
+pub mod history_sim;
 
 use anyhow::Result;
 use project_manager::ProjectManager;
@@ -21,13 +22,16 @@ enum AppMode {
     Default,
     /// Однократное обучение XGBoost по накопленным дампам и завершение.
     Train,
+    /// Историческая симуляция торговли по накопленным дампам с подсчётом P&L.
+    HistorySim,
 }
 
 impl AppMode {
     fn from_env() -> Self {
         match std::env::var("STATUS").as_deref() {
-            Ok("train") => AppMode::Train,
-            _ => AppMode::Default,
+            Ok("train")         => AppMode::Train,
+            Ok("history_sim")   => AppMode::HistorySim,
+            _                   => AppMode::Default,
         }
     }
 }
@@ -42,6 +46,9 @@ async fn main() -> Result<()> {
     match mode {
         AppMode::Train => {
             train_mode::run_train_mode()?;
+        }
+        AppMode::HistorySim => {
+            history_sim::run_sim_mode()?;
         }
         AppMode::Default => {
             rustls::crypto::ring::default_provider()
