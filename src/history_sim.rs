@@ -31,14 +31,17 @@ use std::path::{Path, PathBuf};
 use xgb::{Booster, DMatrix};
 
 /// Порог предсказания модели (0.0–1.0) для входа в позицию.
-pub const SIM_BUY_THRESHOLD: f32 = 0.65;
+pub const SIM_BUY_THRESHOLD: f32 = 0.90;
 /// Размер виртуальной позиции в USDC.
 pub const POSITION_SIZE_USD: f64 = 10.0;
-/// Taker fee rate для категории Crypto: `fee = C × TAKER_FEE_RATE × p × (1 − p)`.
-pub const TAKER_FEE_RATE: f64 = 0.072;
 /// Максимальное число кадров удержания позиции без TP/SL до принудительного выхода.
 /// Если за `SIM_TIMEOUT_FRAMES` кадров цена не достигла ни TP, ни SL — позиция закрывается по рынку.
 pub const SIM_TIMEOUT_FRAMES: usize = 30;
+
+/// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
+/// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
+/// См. [Polymarket: Fees](https://docs.polymarket.com/trading/fees).
+pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
 
 // ─── Типы ─────────────────────────────────────────────────────────────────────
 
@@ -110,39 +113,57 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 continue;
             }
 
-            let model_path = version_path.join("model.ubj");
-            if !model_path.exists() {
-                println!("[sim] {currency}/{version}: model.ubj не найден, пропуск");
-                continue;
-            }
-
-            let booster = Booster::load(&model_path)?;
-            println!(
-                "[sim] {currency}/{version}: модель загружена \
-                 | threshold={SIM_BUY_THRESHOLD} | position={POSITION_SIZE_USD}$ | fee_rate={TAKER_FEE_RATE}"
-            );
-
-            let mut stats = SimStats::default();
-
-            for date_path in fs_sorted_dirs(&version_path)? {
-                if !date_path.is_dir() {
+            for interval in ["5m", "15m"] {
+                let interval_path = version_path.join(interval);
+                if !interval_path.is_dir() {
                     continue;
                 }
-                for file_path in fs_sorted_dirs(&date_path)? {
-                    if file_path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+
+                let model_up_path   = version_path.join(format!("model_{interval}_up.ubj"));
+                let model_down_path = version_path.join(format!("model_{interval}_down.ubj"));
+
+                let booster_up = match load_booster(&model_up_path) {
+                    Some(b) => b,
+                    None => {
+                        println!("[sim] {currency}/{version}/{interval}: model_up не найдена, пропуск");
                         continue;
                     }
-                    match load_dump(&file_path) {
-                        Ok(dump) => {
-                            simulate_event(&dump, &booster, &mut stats);
-                            stats.events += 1;
+                };
+                let booster_down = match load_booster(&model_down_path) {
+                    Some(b) => b,
+                    None => {
+                        println!("[sim] {currency}/{version}/{interval}: model_down не найдена, пропуск");
+                        continue;
+                    }
+                };
+
+                println!(
+                    "[sim] {currency}/{version}/{interval}: модели загружены \
+                     | threshold={SIM_BUY_THRESHOLD} | position={POSITION_SIZE_USD}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}"
+                );
+
+                let mut stats = SimStats::default();
+
+                for date_path in fs_sorted_dirs(&interval_path)? {
+                    if !date_path.is_dir() {
+                        continue;
+                    }
+                    for file_path in fs_sorted_dirs(&date_path)? {
+                        if file_path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+                            continue;
                         }
-                        Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
+                        match load_dump(&file_path) {
+                            Ok(dump) => {
+                                simulate_event(&dump, &booster_up, &booster_down, &mut stats);
+                                stats.events += 1;
+                            }
+                            Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
+                        }
                     }
                 }
-            }
 
-            print_stats(&currency, &version, &stats);
+                print_stats(&currency, &version, interval, &stats);
+            }
         }
     }
 
@@ -155,7 +176,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 ///
 /// UP и DOWN — зеркальные токены одного события: при 50/50 шансах
 /// `prob_up ≈ 1 − prob_down`. Итерируем по `min(len_up, len_down)` стабильным кадрам.
-fn simulate_event(dump: &MarketXFramesDump, booster: &Booster, stats: &mut SimStats) {
+fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: &Booster, stats: &mut SimStats) {
     let frames_up: Vec<&XFrame<SIZE>> = dump.frames_up.iter().filter(|f| f.stable).collect();
     let frames_down: Vec<&XFrame<SIZE>> = dump.frames_down.iter().filter(|f| f.stable).collect();
 
@@ -165,8 +186,8 @@ fn simulate_event(dump: &MarketXFramesDump, booster: &Booster, stats: &mut SimSt
     }
 
     let last_idx = len - 1;
-    let mut pos_up: Option<OpenPosition> = None;
-    let mut pos_down: Option<OpenPosition> = None;
+    let mut positions_up: Vec<OpenPosition>   = Vec::new();
+    let mut positions_down: Vec<OpenPosition> = Vec::new();
 
     for idx in 0..len {
         let frame_up = frames_up[idx];
@@ -206,12 +227,11 @@ fn simulate_event(dump: &MarketXFramesDump, booster: &Booster, stats: &mut SimSt
             (prob_up, prob_down, false)
         };
 
-        // ── Управление позицией UP ────────────────────────────────────────────
-        if let Some(ref mut pos_up) = pos_up {
-            pos_up.frames_held += 1;
-        }
-        let close_up = if let Some(ref pos_up) = pos_up {
-            if is_last {
+        // ── Управление позициями UP ───────────────────────────────────────────
+        for pos in positions_up.iter_mut() { pos.frames_held += 1; }
+        let mut remaining_up: Vec<OpenPosition> = Vec::new();
+        for pos in positions_up.drain(..) {
+            let close = if is_last {
                 let reason = if is_resolution {
                     CloseReason::Resolution { won: exit_prob_up > 0.5 }
                 } else {
@@ -219,34 +239,31 @@ fn simulate_event(dump: &MarketXFramesDump, booster: &Booster, stats: &mut SimSt
                 };
                 Some((exit_prob_up, reason))
             } else {
-                let delta = prob_up - pos_up.entry_prob;
+                let delta = prob_up - pos.entry_prob;
                 if delta >= Y_TRAIN_TAKE_PROFIT_PP {
                     Some((prob_up, CloseReason::TakeProfit))
                 } else if delta <= Y_TRAIN_STOP_LOSS_PP {
                     Some((prob_up, CloseReason::StopLoss))
-                } else if pos_up.frames_held >= SIM_TIMEOUT_FRAMES {
+                } else if pos.frames_held >= SIM_TIMEOUT_FRAMES {
                     Some((prob_up, CloseReason::Timeout))
                 } else {
                     None
                 }
-            }
-        } else {
-            None
-        };
-        if let Some((exit_price, reason)) = close_up {
-            if let Some(ref pos_up) = pos_up {
-                let pnl = close_position(pos_up, exit_price, &reason, frame_up, stats);
+            };
+            if let Some((exit_price, reason)) = close {
+                let pnl = close_position(&pos, exit_price, &reason, frame_up, stats);
                 stats.pnl_usd += pnl;
+            } else {
+                remaining_up.push(pos);
             }
-            pos_up = None;
         }
+        positions_up = remaining_up;
 
-        // ── Управление позицией DOWN ──────────────────────────────────────────
-        if let Some(ref mut pos_down) = pos_down {
-            pos_down.frames_held += 1;
-        }
-        let close_down = if let Some(ref pos_down) = pos_down {
-            if is_last {
+        // ── Управление позициями DOWN ─────────────────────────────────────────
+        for pos in positions_down.iter_mut() { pos.frames_held += 1; }
+        let mut remaining_down: Vec<OpenPosition> = Vec::new();
+        for pos in positions_down.drain(..) {
+            let close = if is_last {
                 let reason = if is_resolution {
                     CloseReason::Resolution { won: exit_prob_down > 0.5 }
                 } else {
@@ -254,42 +271,36 @@ fn simulate_event(dump: &MarketXFramesDump, booster: &Booster, stats: &mut SimSt
                 };
                 Some((exit_prob_down, reason))
             } else {
-                let delta = prob_down - pos_down.entry_prob;
+                let delta = prob_down - pos.entry_prob;
                 if delta >= Y_TRAIN_TAKE_PROFIT_PP {
                     Some((prob_down, CloseReason::TakeProfit))
                 } else if delta <= Y_TRAIN_STOP_LOSS_PP {
                     Some((prob_down, CloseReason::StopLoss))
-                } else if pos_down.frames_held >= SIM_TIMEOUT_FRAMES {
+                } else if pos.frames_held >= SIM_TIMEOUT_FRAMES {
                     Some((prob_down, CloseReason::Timeout))
                 } else {
                     None
                 }
-            }
-        } else {
-            None
-        };
-        if let Some((exit_price, reason)) = close_down {
-            if let Some(ref pos_down) = pos_down {
-                let pnl = close_position(pos_down, exit_price, &reason, frame_down, stats);
+            };
+            if let Some((exit_price, reason)) = close {
+                let pnl = close_position(&pos, exit_price, &reason, frame_down, stats);
                 stats.pnl_usd += pnl;
+            } else {
+                remaining_down.push(pos);
             }
-            pos_down = None;
         }
+        positions_down = remaining_down;
 
         // ── Открытие новых позиций (не на последнем кадре) ───────────────────
         if !is_last {
-            if pos_up.is_none() {
-                if let Some(pred) = predict_frame(booster, frame_up) {
-                    if pred >= SIM_BUY_THRESHOLD {
-                        pos_up = Some(open_position(frame_up, stats));
-                    }
+            if let Some(pred) = predict_frame(booster_up, frame_up) {
+                if pred >= SIM_BUY_THRESHOLD {
+                    positions_up.push(open_position(frame_up, stats));
                 }
             }
-            if pos_down.is_none() {
-                if let Some(pred) = predict_frame(booster, frame_down) {
-                    if pred >= SIM_BUY_THRESHOLD {
-                        pos_down = Some(open_position(frame_down, stats));
-                    }
+            if let Some(pred) = predict_frame(booster_down, frame_down) {
+                if pred >= SIM_BUY_THRESHOLD {
+                    positions_down.push(open_position(frame_down, stats));
                 }
             }
         }
@@ -308,7 +319,7 @@ fn open_position(frame: &XFrame<SIZE>, stats: &mut SimStats) -> OpenPosition {
     let (buy_price, nominal_shares) = book_fill_buy(frame);
     let buy_price = buy_price.clamp(0.001, 0.999);
 
-    let fee_usdc = nominal_shares * TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
+    let fee_usdc = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
     let fee_shares = fee_usdc / buy_price;
     let actual_shares = nominal_shares - fee_shares;
 
@@ -347,7 +358,7 @@ fn close_position(
             } else {
                 exit_price.clamp(0.001, 0.999)
             };
-            let fee_usdc = pos.shares_held * TAKER_FEE_RATE * sell_price * (1.0 - sell_price);
+            let fee_usdc = pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price);
             stats.fees_paid += fee_usdc;
             gross_usdc - fee_usdc
         }
@@ -464,9 +475,9 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>) -> Option<f32> {
 
 // ─── Вывод статистики ─────────────────────────────────────────────────────────
 
-fn print_stats(currency: &str, version: &str, stats: &SimStats) {
+fn print_stats(currency: &str, version: &str, interval: &str, stats: &SimStats) {
     if stats.trades == 0 {
-        println!("[sim] {currency}/{version}: нет сделок ({} событий)", stats.events);
+        println!("[sim] {currency}/{version}/{interval}: нет сделок ({} событий)", stats.events);
         return;
     }
 
@@ -474,7 +485,7 @@ fn print_stats(currency: &str, version: &str, stats: &SimStats) {
     let avg_pnl = stats.pnl_usd / stats.trades as f64;
 
     println!(
-        "[sim] {currency}/{version} \
+        "[sim] {currency}/{version}/{interval} \
          | events={} (событий) trades={} (сделок) win={:.1}% (винрейт) \
          | pnl={:+.2}$ (итог) avg={:+.4}$/trade (среднее) fees={:.4}$ (комиссии)",
         stats.events, stats.trades, win_rate, stats.pnl_usd, avg_pnl, stats.fees_paid,
@@ -490,6 +501,19 @@ fn print_stats(currency: &str, version: &str, stats: &SimStats) {
 }
 
 // ─── Утилиты ──────────────────────────────────────────────────────────────────
+
+fn load_booster(path: &Path) -> Option<Booster> {
+    if !path.exists() {
+        return None;
+    }
+    match Booster::load(path) {
+        Ok(b) => Some(b),
+        Err(err) => {
+            eprintln!("[sim] не удалось загрузить модель {}: {err}", path.display());
+            None
+        }
+    }
+}
 
 fn load_dump(path: &Path) -> anyhow::Result<MarketXFramesDump> {
     let bytes = fs::read(path)?;

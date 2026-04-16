@@ -66,6 +66,16 @@ impl XFrameIntervalKind {
             _ => None,
         }
     }
+
+    /// Возвращает вариант по длительности периода в секундах; fallback — `FifteenMin`.
+    #[inline]
+    pub const fn from_period_sec(sec: i64) -> Self {
+        match sec {
+            FIVE_MIN_SEC    => Self::FiveMin,
+            FIFTEEN_MIN_SEC => Self::FifteenMin,
+            _ => Self::FifteenMin,
+        }
+    }
 }
 
 /// Исход токена up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).

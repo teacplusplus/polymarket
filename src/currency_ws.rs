@@ -95,6 +95,7 @@ async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<
         .send(Message::Text(subscribe.to_string()))
         .await
         .context("rtds subscribe")?;
+    eprintln!("rtds ({pair_symbol}): подключились");
 
     let mut ping = interval(Duration::from_secs(RTDS_PING_INTERVAL_SECS));
     let mut watchdog = tokio::time::interval_at(

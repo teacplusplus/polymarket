@@ -276,7 +276,7 @@ impl ProjectManager {
     }
 
     /// Удаляет все данные, накопленные для завершённого маркета, из всех кешей `ProjectManager`.
-    async fn cleanup_stale_market_data(&self, market_id: &str) {
+    pub async fn cleanup_stale_market_data(&self, market_id: &str) {
         let asset_ids: HashSet<String> = self
             .market_asset_ids_by_market
             .write()
@@ -859,12 +859,13 @@ impl ProjectManager {
                 }
             }
             if let Some(prev_market_id) = prev_market_id.as_ref() {
+                let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
                 xframe_dump::spawn_dump_market_xframes_binary(
                     self.clone(),
                     prev_market_id.clone(),
                     prev_gamma_question.clone(),
+                    interval_kind,
                 );
-                self.cleanup_stale_market_data(prev_market_id).await;
             }
         }
     }

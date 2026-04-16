@@ -40,25 +40,45 @@ struct XgbParams {
     scale_pos_weight: f32,
 }
 
+/// Нога токена: обучение ведётся раздельно по Up и Down фреймам.
+#[derive(Debug, Clone, Copy)]
+enum FrameSide {
+    Up,
+    Down,
+}
+
+impl FrameSide {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Up   => "up",
+            Self::Down => "down",
+        }
+    }
+
+    fn frames<'a>(&self, dump: &'a MarketXFramesDump) -> &'a [XFrame<SIZE>] {
+        match self {
+            Self::Up   => &dump.frames_up,
+            Self::Down => &dump.frames_down,
+        }
+    }
+}
+
 /// Точка входа в режим обучения. Ищет валюты в `xframes/`, для каждой версии
-/// (подпапка с числом признаков) собирает все `.bin` файлы, обучает модель
-/// и сохраняет её в `xframes/{currency}/{version}/model.ubj`.
+/// обучает 4 модели: `model_{5m|15m}_{up|down}.ubj`.
 pub fn run_train_mode() -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     if !xframes_root.exists() {
         anyhow::bail!("Папка xframes/ не найдена — сначала запустите сбор данных (STATUS=default)");
     }
 
-    for currency_entry in fs_read_dirs(xframes_root)? {
-        let currency_path = currency_entry;
+    for currency_path in fs_read_dirs(xframes_root)? {
         let currency = currency_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
 
-        for version_entry in fs_read_dirs(&currency_path)? {
-            let version_path = version_entry;
+        for version_path in fs_read_dirs(&currency_path)? {
             let version_str = version_path
                 .file_name()
                 .unwrap_or_default()
@@ -70,29 +90,37 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                 continue;
             }
 
-            println!("[train] {currency} / version={version_str}: загрузка дампов...");
-            let (x_train, y_train) = collect_dataset(&version_path)?;
+            for interval in ["5m", "15m"] {
+                let interval_path = version_path.join(interval);
+                if !interval_path.is_dir() {
+                    continue;
+                }
 
-            if y_train.is_empty() {
-                println!("[train] {currency} / version={version_str}: нет данных, пропуск");
-                continue;
-            }
+                for side in [FrameSide::Up, FrameSide::Down] {
+                    let tag = format!("{currency}/{version_str}/{interval}/{}", side.label());
 
-            println!(
-                "[train] {currency} / version={version_str}: {} строк, {} признаков",
-                y_train.len(),
-                XFrame::<SIZE>::count_features(),
-            );
+                    println!("[train] {tag}: загрузка дампов...");
+                    let (x_all, y_all) = collect_dataset(&interval_path, side)?;
 
-            let model_path = version_path.join("model.ubj");
-            match train_and_save(&x_train, &y_train, &model_path) {
-                Ok(()) => println!(
-                    "[train] {currency} / version={version_str}: модель сохранена → {}",
-                    model_path.display()
-                ),
-                Err(err) => eprintln!(
-                    "[train] {currency} / version={version_str}: ошибка обучения: {err:#}"
-                ),
+                    if y_all.is_empty() {
+                        println!("[train] {tag}: нет данных, пропуск");
+                        continue;
+                    }
+
+                    println!(
+                        "[train] {tag}: {} строк, {} признаков",
+                        y_all.len(),
+                        XFrame::<SIZE>::count_features(),
+                    );
+
+                    let model_name = format!("model_{}_{}.ubj", interval, side.label());
+                    let model_path = version_path.join(&model_name);
+
+                    match train_and_save(&x_all, &y_all, &model_path, &tag) {
+                        Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
+                        Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
+                    }
+                }
             }
         }
     }
@@ -100,15 +128,14 @@ pub fn run_train_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Рекурсивно обходит подпапки версии (`{date}/`), читает все `.bin` файлы
-/// и склеивает кадры из `frames_up` и `frames_down` в единые векторы `x` и `y`.
-fn collect_dataset(version_path: &Path) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+/// Обходит подпапки `{interval_path}/{date}/`, читает все `.bin` файлы
+/// и собирает кадры только выбранной ноги (`side`) в векторы `x` и `y`.
+fn collect_dataset(interval_path: &Path, side: FrameSide) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
     let feature_count = XFrame::<SIZE>::count_features();
     let mut x_all: Vec<f32> = Vec::new();
     let mut y_all: Vec<f32> = Vec::new();
 
-    for date_entry in fs_read_dirs(version_path)? {
-        let date_path = date_entry;
+    for date_path in fs_read_dirs(interval_path)? {
         if !date_path.is_dir() {
             continue;
         }
@@ -130,8 +157,7 @@ fn collect_dataset(version_path: &Path) -> anyhow::Result<(Vec<f32>, Vec<f32>)> 
                     continue;
                 }
             };
-            append_frames(&dump.frames_up, feature_count, &mut x_all, &mut y_all);
-            append_frames(&dump.frames_down, feature_count, &mut x_all, &mut y_all);
+            append_frames(side.frames(&dump), feature_count, &mut x_all, &mut y_all);
         }
     }
 
@@ -161,10 +187,12 @@ fn append_frames(
 
 /// Разбивает датасет на train/test, запускает `tune_xgboost_optimizer`, проводит
 /// финальное обучение с оптимальными параметрами и сохраняет модель.
+/// `tag` используется во всех строках лога для идентификации запуска.
 fn train_and_save(
     x_all: &[f32],
     y_all: &[f32],
     model_path: &Path,
+    tag: &str,
 ) -> anyhow::Result<()> {
     let feature_count = XFrame::<SIZE>::count_features();
     let num_rows = y_all.len();
@@ -188,16 +216,16 @@ fn train_and_save(
     let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dtest, "test")];
 
     println!(
-        "[train] оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
+        "[train] {tag}: оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
     );
-    let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS)?;
-    println!("[train] лучшие параметры: {params:?}");
+    let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS, tag)?;
+    println!("[train] {tag}: лучшие параметры: {params:?}");
 
-    let booster = fit_booster_with_early_stopping(&params, &dtrain, &dtest)?;
+    let booster = fit_booster_with_early_stopping(&params, &dtrain, &dtest, tag)?;
 
-    print_eval_metrics(&booster);
-    print_y_distribution(&y_train, &y_test);
-    print_contributions(&booster, &dtest);
+    print_eval_metrics(&booster, tag);
+    print_y_distribution(&y_train, &y_test, tag);
+    print_contributions(&booster, &dtest, tag);
 
     if let Some(parent) = model_path.parent() {
         fs::create_dir_all(parent)?;
@@ -207,7 +235,7 @@ fn train_and_save(
 }
 
 /// Печатает финальные метрики logloss и AUC на train и test выборках.
-fn print_eval_metrics(booster: &Booster) {
+fn print_eval_metrics(booster: &Booster, tag: &str) {
     let results = &booster.eval_dmat_results;
     let get = |metric: &str, split: &str| -> String {
         results
@@ -217,7 +245,7 @@ fn print_eval_metrics(booster: &Booster) {
             .unwrap_or_else(|| "—".to_string())
     };
     println!(
-        "[train] метрики: train-logloss:{:>8}  test-logloss:{:>8}  train-auc:{:>8}  test-auc:{:>8}",
+        "[train] {tag}: метрики: train-logloss:{:>8}  test-logloss:{:>8}  train-auc:{:>8}  test-auc:{:>8}",
         get("logloss", "train"),
         get("logloss", "test"),
         get("auc", "train"),
@@ -227,9 +255,9 @@ fn print_eval_metrics(booster: &Booster) {
 
 /// Вычисляет и печатает SHAP-вклад каждой фичи на первой строке тестовой выборки,
 /// отсортированный по убыванию абсолютного вклада.
-fn print_contributions(booster: &Booster, dtest: &DMatrix) {
+fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str) {
     let Ok((shap_values, (num_rows, num_cols))) = booster.predict_contributions(dtest) else {
-        eprintln!("[train] не удалось вычислить SHAP contributions");
+        eprintln!("[train] {tag}: не удалось вычислить SHAP contributions");
         return;
     };
     if num_rows == 0 {
@@ -258,7 +286,7 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix) {
         pct_b.partial_cmp(pct_a).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    println!("[train] SHAP contributions (первая строка теста, топ-20):");
+    println!("[train] {tag}: SHAP contributions (первая строка теста, топ-20):");
     for (name, shap, percent) in contributions.iter().take(20) {
         println!("  {:>8.4}  {:>6.2}%  {name}", shap, percent);
     }
@@ -267,7 +295,7 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix) {
 }
 
 /// Печатает распределение меток в train и test выборках.
-fn print_y_distribution(y_train: &[f32], y_test: &[f32]) {
+fn print_y_distribution(y_train: &[f32], y_test: &[f32], tag: &str) {
     fn count_values(labels: &[f32]) -> std::collections::BTreeMap<String, usize> {
         let mut counts = std::collections::BTreeMap::new();
         for &val in labels {
@@ -277,10 +305,10 @@ fn print_y_distribution(y_train: &[f32], y_test: &[f32]) {
         counts
     }
 
-    let print_counts = |label: &str, labels: &[f32]| {
+    let print_counts = |split: &str, labels: &[f32]| {
         let counts = count_values(labels);
         let total = labels.len();
-        println!("[train] распределение y ({label}, всего={total}):");
+        println!("[train] {tag}: распределение y ({split}, всего={total}):");
         for (val, count) in &counts {
             let percent = *count as f64 / total as f64 * 100.0;
             println!("  y={val}: {count:>6}  ({percent:>5.1}%)");
@@ -302,11 +330,12 @@ fn gather_rows(x: &[f32], y: &[f32], indices: &[usize], feature_count: usize) ->
     (x_out, y_out)
 }
 
-/// Байесовская оптимизация гиперпараметров XGBoost (минимизация logloss на тесте).
+/// Байесовская оптимизация гиперпараметров XGBoost (максимизация AUC на тесте).
 fn tune_xgboost_optimizer(
     eval_sets: &[(&DMatrix, &str); 2],
     dtrain: &DMatrix,
     trials: usize,
+    tag: &str,
 ) -> anyhow::Result<XgbParams> {
     let sampler = TpeSampler::new();
     // Максимизируем AUC на тестовой выборке: для торговой модели с дисбалансом классов
@@ -315,24 +344,24 @@ fn tune_xgboost_optimizer(
 
     study.optimize_with_sampler(trials, |trial| {
         let params = XgbParams {
-            eta: trial.suggest_float("eta", 0.01, 0.3)? as f32,
+            eta: trial.suggest_float("eta", 0.005, 0.3)? as f32,
             max_depth: trial.suggest_int("max_depth", 2, 8)? as u32,
             min_child_weight: trial.suggest_float("min_child_weight", 1.0, 20.0)? as f32,
             gamma: trial.suggest_float("gamma", 0.0, 10.0)? as f32,
             subsample: trial.suggest_float("subsample", 0.5, 1.0)? as f32,
             colsample_bytree: trial.suggest_float("colsample_bytree", 0.5, 1.0)? as f32,
             lambda: trial.suggest_float("lambda", 0.0, 20.0)? as f32,
-            alpha: trial.suggest_float("alpha", 0.0, 30.0)? as f32,
-            scale_pos_weight: trial.suggest_float("scale_pos_weight", 5.0, 20.0)? as f32,
+            alpha: trial.suggest_float("alpha", 0.0, 80.0)? as f32,
+            scale_pos_weight: trial.suggest_float("scale_pos_weight", 5.0, 30.0)? as f32,
         };
         let score = eval_xgboost(&params, eval_sets, dtrain)
             .map_err(|_err| optimizer::Error::InvalidStep)?;
-        println!("[train] trial #{}: auc={score:.6}", trial.id());
+        println!("[train] {tag} trial #{}: auc={score:.6}", trial.id());
         Ok::<f64, optimizer::Error>(score)
     })?;
 
     let best = study.best_trial()?;
-    println!("[train] лучший trial: value={} params={:?}", best.value, best.params);
+    println!("[train] {tag}: лучший trial: value={} params={:?}", best.value, best.params);
     Ok(params_from_map(&best.params))
 }
 
@@ -358,6 +387,7 @@ fn fit_booster_with_early_stopping(
     params: &XgbParams,
     dtrain: &DMatrix,
     dtest: &DMatrix,
+    tag: &str,
 ) -> anyhow::Result<Booster> {
     let booster_params = build_booster_params(params)?;
     let cached = [dtrain, dtest];
@@ -398,7 +428,7 @@ fn fit_booster_with_early_stopping(
             rounds_without_improvement += 1;
             if rounds_without_improvement >= EARLY_STOPPING_PATIENCE {
                 println!(
-                    "[train] early stopping на раунде {round}: лучший AUC={best_auc:.6} на раунде {best_round}"
+                    "[train] {tag}: early stopping на раунде {round}: лучший AUC={best_auc:.6} на раунде {best_round}"
                 );
                 break;
             }

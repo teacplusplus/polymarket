@@ -1,5 +1,6 @@
 //! Сохранение накопленных [`crate::xframe::XFrame`] в бинарный файл при пересоздании WS.
 
+use crate::constants::XFrameIntervalKind;
 use crate::project_manager::ProjectManager;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
@@ -35,17 +36,21 @@ pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
     }
 }
 
-/// Асинхронно пишет дамп в `xframes/{currency}/{count_features}/{YYYY-MM-DD}/{name}.bin` (не блокирует остановку WS).
+/// Асинхронно пишет дамп в `xframes/{currency}/{count_features}/{interval}/{YYYY-MM-DD}/{name}.bin`,
+/// а после завершения (успех или ошибка) вызывает `cleanup_stale_market_data`
+/// чтобы освободить память, занятую данными завершённого маркета.
 pub fn spawn_dump_market_xframes_binary(
     project_manager: Arc<ProjectManager>,
     market_id: String,
     gamma_question: Option<String>,
+    interval_kind: XFrameIntervalKind,
 ) {
     tokio::spawn(async move {
         if let Err(err) =
-            dump_market_xframes_binary_inner(project_manager, market_id, gamma_question).await {
+            dump_market_xframes_binary_inner(project_manager.clone(), market_id.clone(), gamma_question, interval_kind).await {
             eprintln!("xframe_dump: {err:#}");
         }
+        project_manager.cleanup_stale_market_data(&market_id).await;
     });
 }
 
@@ -53,6 +58,7 @@ async fn dump_market_xframes_binary_inner(
     project_manager: Arc<ProjectManager>,
     market_id: String,
     gamma_question: Option<String>,
+    interval_kind: XFrameIntervalKind,
 ) -> anyhow::Result<()> {
     let by_asset = {
         let xframes_by_market_lock = project_manager.xframes_by_market.read().await;
@@ -87,14 +93,21 @@ async fn dump_market_xframes_binary_inner(
         return Ok(());
     }
 
+    let interval_label = match interval_kind {
+        XFrameIntervalKind::FiveMin    => "5m",
+        XFrameIntervalKind::FifteenMin => "15m",
+    };
+
     let frame_count = frames_up.len() + frames_down.len();
     let dump = MarketXFramesDump { frames_up, frames_down };
 
     let feature_count = XFrame::<SIZE>::count_features();
+
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let base: PathBuf = Path::new("xframes")
         .join(project_manager.currency.as_str())
         .join(format!("{feature_count}"))
+        .join(interval_label)
         .join(&date);
     tokio::fs::create_dir_all(&base).await?;
 

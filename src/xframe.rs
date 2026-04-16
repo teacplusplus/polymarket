@@ -9,6 +9,7 @@ use xframe_features_derive::XFeatures;
 pub use crate::constants::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind,
 };
+pub use crate::history_sim::POLYMARKET_CRYPTO_TAKER_FEE_RATE;
 use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
 
 pub const SIZE: usize = 13;
@@ -946,20 +947,50 @@ pub fn currency_price_z_score_from_sec_history(
 }
 
 
-pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05; 
-pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03; 
+/// Минимальная чистая доходность (после комиссий) для метки y=1 (Take Profit).
+/// Например, 0.05 означает: вложенный 1 USDC должен принести ≥ 1.05 USDC нетто.
+pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
+/// Максимальная чистая доходность для метки y=0 (Stop Loss).
+pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
+/// Вычисляет метку y для обучения XGBoost с учётом комиссий Polymarket ([`POLYMARKET_CRYPTO_TAKER_FEE_RATE`]).
+///
+/// Симулирует покупку 1 USDC токена по цене `p_buy = current_prob`:
+/// 1. `nominal_shares = 1 / p_buy`
+/// 2. `fee_buy  = nominal_shares × rate × p_buy × (1 − p_buy)`  (USDC)
+/// 3. `actual_shares = nominal_shares − fee_buy / p_buy`
+///
+/// Затем для каждого из `n` будущих кадров симулирует продажу по `p_sell = future_prob`:
+/// 4. `gross    = actual_shares × p_sell`
+/// 5. `fee_sell = actual_shares × rate × p_sell × (1 − p_sell)` (USDC)
+/// 6. `net_ret  = (gross − fee_sell) − 1.0`                      (return на 1 USDC)
+///
+/// Возвращает `1.0` если `net_ret ≥ Y_TRAIN_TAKE_PROFIT_PP`,
+///            `0.0` если `net_ret ≤ Y_TRAIN_STOP_LOSS_PP`,
+///            `0.0` если за n кадров ни один порог не достигнут.
 pub fn calc_y_train(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
-    let current_prob = x_frames.get(index)?.currency_implied_prob?;
+    let p_buy = x_frames.get(index)?.currency_implied_prob?.clamp(0.001, 0.999);
+
+    // Сколько шерсов получаем за 1 USDC после вычета buy-комиссии
+    let nominal_shares = 1.0 / p_buy;
+    let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
+    let fee_buy_shares = fee_buy_usdc / p_buy;
+    let actual_shares  = nominal_shares - fee_buy_shares;
+
     for i in 1..=n {
-        let future_prob = x_frames.get(index + i)?.currency_implied_prob?;
-        let delta = future_prob - current_prob;
-        if delta >= Y_TRAIN_TAKE_PROFIT_PP {
+        let p_sell = x_frames.get(index + i)?.currency_implied_prob?.clamp(0.001, 0.999);
+
+        // Продаём actual_shares по p_sell, вычитаем sell-комиссию в USDC
+        let gross_usdc    = actual_shares * p_sell;
+        let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
+        let net_ret       = (gross_usdc - fee_sell_usdc) - 1.0;
+
+        if net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
             return Some(1.0);
-        } else if delta <= Y_TRAIN_STOP_LOSS_PP {
+        } else if net_ret <= Y_TRAIN_STOP_LOSS_PP {
             return Some(0.0);
         }
     }
-    Some(0.0) 
+    Some(0.0)
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.
