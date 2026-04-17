@@ -605,8 +605,6 @@ fn parse_new_market_snapshots(
         return Vec::new();
     };
 
-    eprintln!("data_ws: new_market market_id={market_id} assets={}", asset_ids.len());
-
     let mut snapshots = Vec::with_capacity(asset_ids.len());
     for asset_id_json in asset_ids {
         let asset_id = asset_id_json.as_str().unwrap_or_default().to_string();

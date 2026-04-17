@@ -24,19 +24,16 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train`) или при окончании события.
 
-use crate::xframe::{XFrame, SIZE, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
+use crate::xframe::{XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use std::fs;
 use std::path::{Path, PathBuf};
 use xgb::{Booster, DMatrix};
 
 /// Порог предсказания модели (0.0–1.0) для входа в позицию.
-pub const SIM_BUY_THRESHOLD: f32 = 0.90;
+pub const SIM_BUY_THRESHOLD: f32 = 0.85;
 /// Размер виртуальной позиции в USDC.
 pub const POSITION_SIZE_USD: f64 = 10.0;
-/// Максимальное число кадров удержания позиции без TP/SL до принудительного выхода.
-/// Если за `SIM_TIMEOUT_FRAMES` кадров цена не достигла ни TP, ни SL — позиция закрывается по рынку.
-pub const SIM_TIMEOUT_FRAMES: usize = 30;
 
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
 /// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
@@ -65,7 +62,7 @@ enum CloseReason {
     StopLoss,
     /// Событие закончилось, токен погашён по итогу (1.0 или 0.0).
     Resolution { won: bool },
-    /// Позиция удерживалась больше `SIM_TIMEOUT_FRAMES` кадров без TP/SL — боковик, выход по рынку.
+    /// Позиция удерживалась больше [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL — боковик, выход по рынку.
     Timeout,
 }
 
@@ -92,7 +89,7 @@ struct SimStats {
     resolution_win: usize,
     /// Число сгораний проигравшего токена при резолюции события (exit = 0.0).
     resolution_loss: usize,
-    /// Число выходов по таймауту: позиция удерживалась >= `SIM_TIMEOUT_FRAMES` кадров без TP/SL.
+    /// Число выходов по таймауту: позиция удерживалась >= [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL.
     timeout_count: usize,
 }
 
@@ -244,7 +241,7 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
                     Some((prob_up, CloseReason::TakeProfit))
                 } else if delta <= Y_TRAIN_STOP_LOSS_PP {
                     Some((prob_up, CloseReason::StopLoss))
-                } else if pos.frames_held >= SIM_TIMEOUT_FRAMES {
+                } else if pos.frames_held >= Y_TRAIN_HORIZON_FRAMES {
                     Some((prob_up, CloseReason::Timeout))
                 } else {
                     None
@@ -276,7 +273,7 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
                     Some((prob_down, CloseReason::TakeProfit))
                 } else if delta <= Y_TRAIN_STOP_LOSS_PP {
                     Some((prob_down, CloseReason::StopLoss))
-                } else if pos.frames_held >= SIM_TIMEOUT_FRAMES {
+                } else if pos.frames_held >= Y_TRAIN_HORIZON_FRAMES {
                     Some((prob_down, CloseReason::Timeout))
                 } else {
                     None

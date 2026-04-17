@@ -12,7 +12,7 @@ pub use crate::constants::{
 pub use crate::history_sim::POLYMARKET_CRYPTO_TAKER_FEE_RATE;
 use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
 
-pub const SIZE: usize = 13;
+pub const SIZE: usize = 15;
 
 const MIN_POSITIVE_ASK: f64 = 1e-12;
 
@@ -952,6 +952,9 @@ pub fn currency_price_z_score_from_sec_history(
 pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
 /// Максимальная чистая доходность для метки y=0 (Stop Loss).
 pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
+/// Горизонт [`calc_y_train`]: сколько следующих кадров смотреть на TP/SL/резолюцию.
+/// В [`crate::history_sim`] то же значение используется как лимит кадров до таймаут-выхода (`frames_held`).
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
 /// Вычисляет метку y для обучения XGBoost с учётом комиссий Polymarket ([`POLYMARKET_CRYPTO_TAKER_FEE_RATE`]).
 ///
 /// Симулирует покупку 1 USDC токена по цене `p_buy = current_prob`:
@@ -959,10 +962,13 @@ pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
 /// 2. `fee_buy  = nominal_shares × rate × p_buy × (1 − p_buy)`  (USDC)
 /// 3. `actual_shares = nominal_shares − fee_buy / p_buy`
 ///
-/// Затем для каждого из `n` будущих кадров симулирует продажу по `p_sell = future_prob`:
-/// 4. `gross    = actual_shares × p_sell`
-/// 5. `fee_sell = actual_shares × rate × p_sell × (1 − p_sell)` (USDC)
-/// 6. `net_ret  = (gross − fee_sell) − 1.0`                      (return на 1 USDC)
+/// Затем для каждого из `n` будущих кадров:
+/// - если событие ещё идёт (`event_remaining_ms > 0`) — симулирует **taker-продажу** по `p_sell = future_prob`;
+/// - если окно завершилось (`event_remaining_ms ≤ 0`) — **резолюция** как в [`crate::history_sim`]: победивший токен
+///   погашается по $1/шер без комиссии, проигравший — $0.
+///
+/// Рыночный выход: `gross = actual_shares × p_sell`, `fee_sell = actual_shares × rate × p_sell × (1 − p_sell)`,
+/// `net_ret = (gross − fee_sell) − 1.0`.
 ///
 /// Возвращает `1.0` если `net_ret ≥ Y_TRAIN_TAKE_PROFIT_PP`,
 ///            `0.0` если `net_ret ≤ Y_TRAIN_STOP_LOSS_PP`,
@@ -977,12 +983,22 @@ pub fn calc_y_train(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option
     let actual_shares  = nominal_shares - fee_buy_shares;
 
     for i in 1..=n {
-        let p_sell = x_frames.get(index + i)?.currency_implied_prob?.clamp(0.001, 0.999);
+        let future = x_frames.get(index + i)?;
 
-        // Продаём actual_shares по p_sell, вычитаем sell-комиссию в USDC
-        let gross_usdc    = actual_shares * p_sell;
-        let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
-        let net_ret       = (gross_usdc - fee_sell_usdc) - 1.0;
+        let net_ret = if future.event_remaining_ms <= 0 {
+            // Исход маркета: как `history_sim` — `pct ≤ 0` ⇒ UP wins; для ноги Down — победа при `pct > 0`.
+            let won = y_train_resolution_token_won(future);
+            if won {
+                actual_shares - 1.0
+            } else {
+                -1.0
+            }
+        } else {
+            let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
+            let gross_usdc    = actual_shares * p_sell;
+            let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
+            (gross_usdc - fee_sell_usdc) - 1.0
+        };
 
         if net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
             return Some(1.0);
@@ -991,6 +1007,23 @@ pub fn calc_y_train(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option
         }
     }
     Some(0.0)
+}
+
+/// Тот же критерий победы токена, что при резолюции в [`crate::history_sim`]: UP — `pct ≤ 0`, Down — `pct > 0`;
+/// при отсутствии `currency_price_vs_beat_pct` — fallback на `currency_implied_prob` этой ноги vs 0.5.
+fn y_train_resolution_token_won(frame: &XFrame<SIZE>) -> bool {
+    let prob = frame.currency_implied_prob.unwrap_or(0.5);
+    match CurrencyUpDownOutcome::from_i32(frame.currency_up_down_outcome) {
+        Some(CurrencyUpDownOutcome::Up) => frame
+            .currency_price_vs_beat_pct
+            .map(|pct| pct <= 0.0)
+            .unwrap_or(prob >= 0.5),
+        Some(CurrencyUpDownOutcome::Down) => frame
+            .currency_price_vs_beat_pct
+            .map(|pct| pct > 0.0)
+            .unwrap_or(prob >= 0.5),
+        None => prob >= 0.5,
+    }
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.

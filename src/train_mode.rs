@@ -2,7 +2,9 @@
 //! строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
 //! и сохраняет модель рядом с папкой версии.
 
-use crate::xframe::{calc_y_train, XFrame, SIZE, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
+use crate::xframe::{
+    calc_y_train, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
+};
 use crate::xframe_dump::MarketXFramesDump;
 use optimizer::sampler::tpe::TpeSampler;
 use optimizer::{Direction, ParamValue, Study};
@@ -22,8 +24,6 @@ const BOOST_ROUNDS: u32 = 500;
 const EARLY_STOPPING_PATIENCE: u32 = 20;
 /// Число раундов бустинга при каждом шаге оптимизатора (быстрее).
 const EVAL_BOOST_ROUNDS: u32 = 80;
-/// Горизонт предсказания: через сколько кадров оцениваем изменение вероятности.
-const Y_TRAIN_HORIZON_FRAMES: usize = 10;
 /// Доля тестовой выборки.
 const TEST_FRACTION: f64 = 0.1;
 
