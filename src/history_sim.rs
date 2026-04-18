@@ -202,13 +202,9 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
         // Если событие завершилось (event_remaining_ms ≤ 0), токены погашаются
         // по двоичному исходу: победитель → 1.0, проигравший → 0.0.
         let (exit_prob_up, exit_prob_down, is_resolution) = if is_last {
-            let up_won = frame_up
-                .currency_price_vs_beat_pct
-                .map(|pct| pct <= 0.0)
-                .unwrap_or(prob_up >= 0.5);
             (
-                if up_won { 1.0_f64 } else { 0.0_f64 },
-                if up_won { 0.0_f64 } else { 1.0_f64 },
+                if dump.up_won { 1.0_f64 } else { 0.0_f64 },
+                if dump.up_won { 0.0_f64 } else { 1.0_f64 },
                 true,
             )
         } else {

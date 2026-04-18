@@ -200,7 +200,7 @@ fn collect_dataset(step_path: &Path, side: FrameSide, model_type: ModelType) -> 
                     continue;
                 }
             };
-            append_frames(side.frames(&dump), feature_count, model_type, &mut x_all, &mut y_all);
+            append_frames(side.frames(&dump), feature_count, model_type, dump.up_won, &mut x_all, &mut y_all);
         }
     }
 
@@ -213,13 +213,14 @@ fn append_frames(
     frames: &[XFrame<SIZE>],
     feature_count: usize,
     model_type: ModelType,
+    up_won: bool,
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
 ) {
     for index in 0..frames.len() {
         let label = match model_type {
-            ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index),
-            ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index),
+            ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index, up_won),
+            ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, up_won),
         };
         let Some(label) = label else {
             continue;

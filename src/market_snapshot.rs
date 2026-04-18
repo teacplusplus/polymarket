@@ -30,8 +30,16 @@ pub struct MarketSnapshot {
     pub market_resolved: bool,
 }
 
-pub fn aggregate_events(events: Vec<MarketSnapshot>, timestamp_ms: i64) -> Option<MarketSnapshot> {
+/// `bucket_start_ms` — начало интервала агрегации (ключ бакета); в результате [`MarketSnapshot::timestamp_ms`]
+/// — время **последнего** события в бакете (`max` по входным меткам), чтобы `event_remaining_ms` и скользящие
+/// окна в [`crate::xframe::XFrame`] соответствовали моменту фактического состояния стакана/сделок.
+pub fn aggregate_events(events: Vec<MarketSnapshot>, bucket_start_ms: i64) -> Option<MarketSnapshot> {
     let first_event_snapshot = events.first()?;
+    let timestamp_ms = events
+        .iter()
+        .map(|e| e.timestamp_ms)
+        .max()
+        .unwrap_or(bucket_start_ms);
     let mut aggregated_market_snapshot = MarketSnapshot {
         market_id: first_event_snapshot.market_id.clone(),
         asset_id: first_event_snapshot.asset_id.clone(),

@@ -57,7 +57,7 @@ pub struct XFrame<const N: usize> {
     /// Рыночная оценка вероятности исхода для **этого** токена (см. [`Self::currency_up_down_outcome`]): mid L1 при спреде ≤ 10¢, при широком спреде — last trade, как в UI Polymarket.
     #[xfeature]
     pub currency_implied_prob: Option<f64>,
-    /// Сколько миллисекунд осталось до конца события рынка: `event_end_ms - timestamp_ms` снапшота; при `event_end_ms <= timestamp` — `0`. Если конец события неизвестен — `0`.
+    /// Сколько миллисекунд осталось до конца события рынка: `event_end_ms - timestamp_ms` снапшота; при `event_end_ms <= timestamp` — `0`. Если конец события неизвестен — `0`. Для live-кадров после [`crate::market_snapshot::aggregate_events`] `timestamp_ms` — момент последнего события в бакете (не начало интервала).
     #[xfeature]
     #[derivative(Default(value = "-1"))]
     pub event_remaining_ms: i64,
@@ -973,10 +973,10 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
 /// Возвращает `1.0` если `net_ret ≥ Y_TRAIN_TAKE_PROFIT_PP`,
 ///            `0.0` если `net_ret ≤ Y_TRAIN_STOP_LOSS_PP`,
 ///            `0.0` если за n кадров ни один порог не достигнут.
-pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
+/// `up_won` — фактический исход рынка из [`crate::xframe_dump::MarketXFramesDump::up_won`].
+pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, up_won: bool) -> Option<f32> {
     let p_buy = x_frames.get(index)?.currency_implied_prob?.clamp(0.001, 0.999);
 
-    // Сколько шерсов получаем за 1 USDC после вычета buy-комиссии
     let nominal_shares = 1.0 / p_buy;
     let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
     let fee_buy_shares = fee_buy_usdc / p_buy;
@@ -986,8 +986,7 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Op
         let future = x_frames.get(index + i)?;
 
         let net_ret = if future.event_remaining_ms <= 0 {
-            // Исход маркета: как `history_sim` — `pct ≤ 0` ⇒ UP wins; для ноги Down — победа при `pct > 0`.
-            let won = y_train_resolution_token_won(future);
+            let won = y_train_resolution_token_won(future, up_won);
             if won {
                 actual_shares - 1.0
             } else {
@@ -1009,52 +1008,44 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Op
     Some(0.0)
 }
 
-/// Тот же критерий победы токена, что при резолюции в [`crate::history_sim`]: UP — `pct ≤ 0`, Down — `pct > 0`;
-/// при отсутствии `currency_price_vs_beat_pct` — fallback на `currency_implied_prob` этой ноги vs 0.5.
-fn y_train_resolution_token_won(frame: &XFrame<SIZE>) -> bool {
-    let prob = frame.currency_implied_prob.unwrap_or(0.5);
+/// Победил ли **этот** токен по итогу рынка.
+///
+/// Победил ли **этот** токен по итогу рынка.
+///
+/// Для Up-токена `won == up_won`, для Down-токена `won == !up_won`.
+fn y_train_resolution_token_won(frame: &XFrame<SIZE>, up_won: bool) -> bool {
     match CurrencyUpDownOutcome::from_i32(frame.currency_up_down_outcome) {
-        Some(CurrencyUpDownOutcome::Up) => frame
-            .currency_price_vs_beat_pct
-            .map(|pct| pct <= 0.0)
-            .unwrap_or(prob >= 0.5),
-        Some(CurrencyUpDownOutcome::Down) => frame
-            .currency_price_vs_beat_pct
-            .map(|pct| pct > 0.0)
-            .unwrap_or(prob >= 0.5),
-        None => prob >= 0.5,
+        Some(CurrencyUpDownOutcome::Up) => up_won,
+        Some(CurrencyUpDownOutcome::Down) => !up_won,
+        None => up_won,
     }
 }
 
-/// Мягкая метка y для обучения XGBoost по исходу события (resolution).
+/// Метка y по исходу события (resolution). `up_won` — из [`crate::xframe_dump::MarketXFramesDump::up_won`].
 ///
 /// Сканирует до `n` будущих кадров в поисках резолюции (`event_remaining_ms ≤ 0`).
 /// Если резолюция не найдена в горизонте — возвращает `None` (сэмпл пропускается при обучении).
-///
-/// Для Up-токена «выигрыш» — `currency_price_vs_beat_pct ≤ 0` (цена упала ниже beat),
-/// для Down-токена — `currency_price_vs_beat_pct > 0`.
-/// `win_margin` домножается на [`Y_TRAIN_RESOLUTION_PCT_MULTIPLIER`] и clamped в \[0, 1\].
-pub fn calc_y_train_resolution(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
+pub fn calc_y_train_resolution(n: usize, x_frames: &[XFrame<SIZE>], index: usize, up_won: bool) -> Option<f32> {
     let current = x_frames.get(index)?;
     let last_idx = x_frames.len().saturating_sub(1);
 
-    let mut resolved = None;
+    let mut resolved = false;
     for i in 1..=n {
         let Some(future) = x_frames.get(index + i) else { break };
         if future.event_remaining_ms <= 0 || index + i == last_idx {
-            resolved = Some(future);
+            resolved = true;
             break;
         }
     }
+    if !resolved {
+        return None;
+    }
 
-    let pct = resolved?.currency_price_vs_beat_pct?;
-
-    let win_margin = match CurrencyUpDownOutcome::from_i32(current.currency_up_down_outcome)? {
-        CurrencyUpDownOutcome::Up => -pct,
-        CurrencyUpDownOutcome::Down => pct,
+    let won = match CurrencyUpDownOutcome::from_i32(current.currency_up_down_outcome)? {
+        CurrencyUpDownOutcome::Up => up_won,
+        CurrencyUpDownOutcome::Down => !up_won,
     };
-
-    Some(if win_margin > 0.0 { 1.0 } else { 0.0 })
+    Some(if won { 1.0 } else { 0.0 })
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.
