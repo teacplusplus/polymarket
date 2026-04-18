@@ -1,7 +1,7 @@
 //! Сохранение накопленных [`crate::xframe::XFrame`] в бинарный файл при пересоздании WS.
 
 use crate::constants::XFrameIntervalKind;
-use crate::project_manager::ProjectManager;
+use crate::project_manager::{ProjectManager, FRAME_BUILD_INTERVALS_SEC};
 use crate::run_log;
 use crate::util::current_timestamp_ms;
 use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
@@ -36,7 +36,7 @@ pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
     }
 }
 
-/// Асинхронно пишет дамп в `xframes/{currency}/{count_features}/{interval}/{YYYY-MM-DD}/{name}.bin`,
+/// Асинхронно пишет дамп **каждого лейна** в `xframes/{currency}/{count_features}/{interval}/{step}s/{YYYY-MM-DD}/{name}.bin`,
 /// а после завершения (успех или ошибка) вызывает `cleanup_stale_market_data`
 /// чтобы освободить память, занятую данными завершённого маркета.
 pub fn spawn_dump_market_xframes_binary(
@@ -46,22 +46,34 @@ pub fn spawn_dump_market_xframes_binary(
     interval_kind: XFrameIntervalKind,
 ) {
     tokio::spawn(async move {
-        if let Err(err) =
-            dump_market_xframes_binary_inner(project_manager.clone(), market_id.clone(), gamma_question, interval_kind).await {
-            eprintln!("xframe_dump: {err:#}");
+        let max_step = *FRAME_BUILD_INTERVALS_SEC.iter().max().unwrap_or(&1);
+        tokio::time::sleep(std::time::Duration::from_secs(max_step)).await;
+        for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
+            if let Err(err) =
+                dump_market_xframes_binary_lane(
+                    project_manager.clone(),
+                    market_id.clone(),
+                    gamma_question.clone(),
+                    interval_kind,
+                    lane,
+                ).await
+            {
+                eprintln!("xframe_dump lane={lane}: {err:#}");
+            }
         }
         project_manager.cleanup_stale_market_data(&market_id).await;
     });
 }
 
-async fn dump_market_xframes_binary_inner(
+pub async fn dump_market_xframes_binary_lane(
     project_manager: Arc<ProjectManager>,
     market_id: String,
     gamma_question: Option<String>,
     interval_kind: XFrameIntervalKind,
+    lane: usize,
 ) -> anyhow::Result<()> {
     let by_asset = {
-        let xframes_by_market_lock = project_manager.xframes_by_market.read().await;
+        let xframes_by_market_lock = project_manager.xframes_by_market[lane].read().await;
         xframes_by_market_lock.get(&market_id).cloned()
     };
     let Some(by_asset) = by_asset else {
@@ -98,6 +110,8 @@ async fn dump_market_xframes_binary_inner(
         XFrameIntervalKind::FifteenMin => "15m",
     };
 
+    let step_secs = FRAME_BUILD_INTERVALS_SEC[lane];
+
     let frame_count = frames_up.len() + frames_down.len();
     let dump = MarketXFramesDump { frames_up, frames_down };
 
@@ -108,6 +122,7 @@ async fn dump_market_xframes_binary_inner(
         .join(project_manager.currency.as_str())
         .join(format!("{feature_count}"))
         .join(interval_label)
+        .join(format!("{step_secs}s"))
         .join(&date);
     tokio::fs::create_dir_all(&base).await?;
 

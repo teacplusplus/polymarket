@@ -30,11 +30,13 @@ pub struct CurrencyEventSlugData {
 ///    `ISO конца` = начало окна + 300 с (5m) или + 900 с (15m); при дублях — запись с max `dataUpdatedAt`.
 /// 2. `["past-results", …, <ISO начала окна>]` — в `results` строка с `endTime` = начало окна (RFC3339),
 ///    берём `closePrice` (не «последнюю» строку массива — там другие свечи).
+/// Возвращает `Ok((price, exact))`: `exact = true` — точное совпадение свечи, `false` — использован fallback (ближайший `closePrice`).
 pub async fn fetch_price_to_beat_from_polymarket_event_page(
     http: &reqwest::Client,
     slug: &str,
     currency: &str,
-) -> anyhow::Result<f64> {
+    fallback_to_latest: bool,
+) -> anyhow::Result<(f64, bool)> {
     let url = format!("https://polymarket.com/event/{slug}");
     let response = http
         .get(&url)
@@ -52,7 +54,7 @@ pub async fn fetch_price_to_beat_from_polymarket_event_page(
         .await
         .with_context(|| format!("polymarket event page body {url}"))?;
 
-    let price_result: anyhow::Result<f64> = (|| -> anyhow::Result<f64> {
+    let price_result: anyhow::Result<(f64, bool)> = (|| -> anyhow::Result<(f64, bool)> {
         let json_str = extract_next_data_json(&html).ok_or_else(|| {
             anyhow::anyhow!(
                 "нет priceToBeat: не найден скрипт __NEXT_DATA__ на polymarket.com/event для slug={slug:?}"
@@ -61,7 +63,7 @@ pub async fn fetch_price_to_beat_from_polymarket_event_page(
         let v: Value = serde_json::from_str(json_str).with_context(|| {
             format!("нет priceToBeat: JSON __NEXT_DATA__ не разобрать для slug={slug:?}")
         })?;
-        let price = price_to_beat_from_next_data(&v, slug, currency).ok_or_else(|| {
+        let (price, exact) = price_to_beat_from_next_data(&v, slug, currency, fallback_to_latest).ok_or_else(|| {
             anyhow::anyhow!(
                 "нет priceToBeat: в __NEXT_DATA__ для slug={slug:?} нет подходящего crypto-prices (openPrice + конец свечи) ни строки past-results с endTime=start окна"
             )
@@ -71,7 +73,7 @@ pub async fn fetch_price_to_beat_from_polymarket_event_page(
                 "нет priceToBeat: некорректное значение {price} в __NEXT_DATA__ для slug={slug:?}"
             );
         }
-        Ok(price)
+        Ok((price, exact))
     })();
 
     if price_result.is_err() {
@@ -104,16 +106,20 @@ fn json_f64(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }
 
-fn price_to_beat_from_next_data(next_data: &Value, slug: &str, currency: &str) -> Option<f64> {
-    price_to_beat_from_currency_open_price_crypto_prices(next_data, slug, currency)
-        .or_else(|| price_to_beat_from_currency_past_results_close(next_data, slug, currency))
+/// Возвращает `(price, exact)`: `exact = true` — точное совпадение, `false` — fallback.
+fn price_to_beat_from_next_data(next_data: &Value, slug: &str, currency: &str, fallback_to_latest: bool) -> Option<(f64, bool)> {
+    if let Some(p) = price_to_beat_from_currency_open_price_crypto_prices(next_data, slug, currency) {
+        return Some((p, true));
+    }
+    price_to_beat_from_currency_past_results_close(next_data, slug, currency, fallback_to_latest)
 }
 
 fn price_to_beat_from_currency_past_results_close(
     next_data: &Value,
     slug: &str,
     currency: &str,
-) -> Option<f64> {
+    fallback_to_latest: bool,
+) -> Option<(f64, bool)> {
     let (window_sec, variant) = currency_updown_slug_window_sec_and_variant(currency, slug)?;
     let iso = window_start_iso_utc_z(window_sec)?;
     let queries = next_data
@@ -151,15 +157,17 @@ fn price_to_beat_from_currency_past_results_close(
         else {
             continue;
         };
-        if let Some(p) = price_from_past_results_for_window_start(results, window_sec) {
-            return Some(p);
+        if let Some(result) = price_from_past_results_for_window_start(results, window_sec, fallback_to_latest) {
+            return Some(result);
         }
     }
     None
 }
 
 /// Свеча с `endTime` = началу окна: `closePrice` = цена на открытии окна (price to beat). Иначе строка с `startTime` = началу → `openPrice`.
-fn price_from_past_results_for_window_start(results: &[Value], window_sec: i64) -> Option<f64> {
+/// При `fallback_to_latest = true`: если точного совпадения нет, берём `closePrice` свечи с максимальным `endTime ≤ window_sec`.
+/// Возвращает `(price, exact)`: `exact = true` — точное совпадение, `false` — fallback.
+fn price_from_past_results_for_window_start(results: &[Value], window_sec: i64, fallback_to_latest: bool) -> Option<(f64, bool)> {
     for row in results {
         let Some(end) = row.get("endTime").and_then(|v| v.as_str()) else {
             continue;
@@ -169,7 +177,7 @@ fn price_from_past_results_for_window_start(results: &[Value], window_sec: i64) 
         };
         if end_sec == window_sec {
             if let Some(p) = row.get("closePrice").and_then(json_f64) {
-                return Some(p);
+                return Some((p, true));
             }
         }
     }
@@ -182,9 +190,30 @@ fn price_from_past_results_for_window_start(results: &[Value], window_sec: i64) 
         };
         if start_sec == window_sec {
             if let Some(p) = row.get("openPrice").and_then(json_f64) {
-                return Some(p);
+                return Some((p, true));
             }
         }
+    }
+    if fallback_to_latest {
+        let mut best: Option<(i64, f64)> = None;
+        for row in results {
+            let Some(end) = row.get("endTime").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(end_sec) = parse_iso_time_to_unix_sec(end) else {
+                continue;
+            };
+            if end_sec > window_sec {
+                continue;
+            }
+            let Some(p) = row.get("closePrice").and_then(json_f64) else {
+                continue;
+            };
+            if best.map_or(true, |(prev_end, _)| end_sec > prev_end) {
+                best = Some((end_sec, p));
+            }
+        }
+        return best.map(|(_, p)| (p, false));
     }
     None
 }

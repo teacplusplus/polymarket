@@ -22,7 +22,7 @@
 //!
 //! Один синхронный цикл по парным кадрам (UP[i], DOWN[i]).
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
-//! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train`) или при окончании события.
+//! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
 use crate::xframe::{XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
@@ -202,24 +202,15 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
         // Если событие завершилось (event_remaining_ms ≤ 0), токены погашаются
         // по двоичному исходу: победитель → 1.0, проигравший → 0.0.
         let (exit_prob_up, exit_prob_down, is_resolution) = if is_last {
-            if frame_up.event_remaining_ms <= 0 {
-                // Победитель определяется по currency_price_vs_beat_pct:
-                // pct = (price_to_beat − spot) / price_to_beat × 100
-                // pct ≤ 0  →  spot ≥ price_to_beat  →  UP wins
-                // pct > 0  →  spot < price_to_beat   →  DOWN wins
-                // Если поле недоступно — fallback на prob_up ≥ 0.5
-                let up_won = frame_up
-                    .currency_price_vs_beat_pct
-                    .map(|pct| pct <= 0.0)
-                    .unwrap_or(prob_up >= 0.5);
-                (
-                    if up_won { 1.0_f64 } else { 0.0_f64 },
-                    if up_won { 0.0_f64 } else { 1.0_f64 },
-                    true,
-                )
-            } else {
-                (prob_up, prob_down, false)
-            }
+            let up_won = frame_up
+                .currency_price_vs_beat_pct
+                .map(|pct| pct <= 0.0)
+                .unwrap_or(prob_up >= 0.5);
+            (
+                if up_won { 1.0_f64 } else { 0.0_f64 },
+                if up_won { 0.0_f64 } else { 1.0_f64 },
+                true,
+            )
         } else {
             (prob_up, prob_down, false)
         };

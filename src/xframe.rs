@@ -29,7 +29,7 @@ const CURRENCY_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 /// `currency_implied_prob` — как отображаемая на Polymarket вероятность исхода **этого** токена: mid L1 при спреде ≤ 10¢, иначе last trade (см. `currency_implied_prob_polymarket_style`).
 /// Поля `other_*` — микроструктура противоположной ноги на тот же бакет; подмешиваются через [XFrame::merge_other_leg_features_from] в `ProjectManager` после вставки пары кадров.
 ///
-/// Поля `sibling_*` — кадр токена **того же** исхода Up/Down на **парном** `market_id` (другой горизонт 5m↔15m), тот же `aligned_ts`; подмешиваются через [XFrame::merge_sibling_market_features_from]. Без валидной пары в [crate::project_manager::ProjectManager::currency_updown_sibling_state] (см. [crate::currency_updown_sibling::CurrencyUpDownSiblingState::paired_five_and_fifteen_market_ids]) остаются значения по умолчанию.
+/// Поля `sibling_*` — кадр токена **того же** исхода Up/Down на **парном** `market_id` (другой горизонт 5m↔15m); момент снапшота тот же, бакет — по сетке интервала sibling-лейна ([`crate::project_manager::FRAME_BUILD_INTERVALS_SEC`]); подмешиваются через [XFrame::merge_sibling_market_features_from]. Без валидной пары в [crate::project_manager::ProjectManager::currency_updown_sibling_state] (см. [crate::currency_updown_sibling::CurrencyUpDownSiblingState::paired_five_and_fifteen_market_ids]) остаются значения по умолчанию.
 #[serde_as]
 #[derive(Debug, Serialize, Deserialize, Derivative, Clone, XFeatures)]
 #[derivative(Default)]
@@ -952,7 +952,7 @@ pub fn currency_price_z_score_from_sec_history(
 pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
 /// Максимальная чистая доходность для метки y=0 (Stop Loss).
 pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
-/// Горизонт [`calc_y_train`]: сколько следующих кадров смотреть на TP/SL/резолюцию.
+/// Горизонт [`calc_y_train_pnl`] / [`calc_y_train_resolution`]: сколько следующих кадров смотреть.
 /// В [`crate::history_sim`] то же значение используется как лимит кадров до таймаут-выхода (`frames_held`).
 pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
 /// Вычисляет метку y для обучения XGBoost с учётом комиссий Polymarket ([`POLYMARKET_CRYPTO_TAKER_FEE_RATE`]).
@@ -973,7 +973,7 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
 /// Возвращает `1.0` если `net_ret ≥ Y_TRAIN_TAKE_PROFIT_PP`,
 ///            `0.0` если `net_ret ≤ Y_TRAIN_STOP_LOSS_PP`,
 ///            `0.0` если за n кадров ни один порог не достигнут.
-pub fn calc_y_train(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
+pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
     let p_buy = x_frames.get(index)?.currency_implied_prob?.clamp(0.001, 0.999);
 
     // Сколько шерсов получаем за 1 USDC после вычета buy-комиссии
@@ -1024,6 +1024,37 @@ fn y_train_resolution_token_won(frame: &XFrame<SIZE>) -> bool {
             .unwrap_or(prob >= 0.5),
         None => prob >= 0.5,
     }
+}
+
+/// Мягкая метка y для обучения XGBoost по исходу события (resolution).
+///
+/// Сканирует до `n` будущих кадров в поисках резолюции (`event_remaining_ms ≤ 0`).
+/// Если резолюция не найдена в горизонте — возвращает `None` (сэмпл пропускается при обучении).
+///
+/// Для Up-токена «выигрыш» — `currency_price_vs_beat_pct ≤ 0` (цена упала ниже beat),
+/// для Down-токена — `currency_price_vs_beat_pct > 0`.
+/// `win_margin` домножается на [`Y_TRAIN_RESOLUTION_PCT_MULTIPLIER`] и clamped в \[0, 1\].
+pub fn calc_y_train_resolution(n: usize, x_frames: &[XFrame<SIZE>], index: usize) -> Option<f32> {
+    let current = x_frames.get(index)?;
+    let last_idx = x_frames.len().saturating_sub(1);
+
+    let mut resolved = None;
+    for i in 1..=n {
+        let Some(future) = x_frames.get(index + i) else { break };
+        if future.event_remaining_ms <= 0 || index + i == last_idx {
+            resolved = Some(future);
+            break;
+        }
+    }
+
+    let pct = resolved?.currency_price_vs_beat_pct?;
+
+    let win_margin = match CurrencyUpDownOutcome::from_i32(current.currency_up_down_outcome)? {
+        CurrencyUpDownOutcome::Up => -pct,
+        CurrencyUpDownOutcome::Down => pct,
+    };
+
+    Some(if win_margin > 0.0 { 1.0 } else { 0.0 })
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.

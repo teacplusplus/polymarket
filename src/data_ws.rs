@@ -15,7 +15,6 @@ pub use crate::market_snapshot::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, MarketSnapshot, TradeSide, XFrameIntervalKind,
 };
 
-use crate::market_snapshot::aggregate_events;
 
 const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const WS_RECONNECT_DELAY_SECS: u64 = 3;
@@ -61,33 +60,20 @@ pub type MarketSnapshotBuffer = HashMap<String, HashMap<String, Vec<MarketSnapsh
 /// Мутации буфера — на `RwLockWriteGuard<MarketSnapshotBuffer>`.
 pub trait MarketSnapshotBufferMut {
     fn push_snapshot(&mut self, snapshot: MarketSnapshot);
-    fn drain_aggregated_snapshots(&mut self, timestamp_ms: i64) -> Vec<MarketSnapshot>;
+    fn drain_all(&mut self) -> MarketSnapshotBuffer;
 }
 
 impl MarketSnapshotBufferMut for MarketSnapshotBuffer {
     fn push_snapshot(&mut self, snapshot: MarketSnapshot) {
-        let bucket = self
-            .entry(snapshot.market_id.clone())
+        self.entry(snapshot.market_id.clone())
             .or_default()
             .entry(snapshot.asset_id.clone())
-            .or_default();
-        bucket.push(snapshot);
+            .or_default()
+            .push(snapshot);
     }
 
-    fn drain_aggregated_snapshots(&mut self, timestamp_ms: i64) -> Vec<MarketSnapshot> {
-        let mut collected = Vec::new();
-        for by_asset in self.values_mut() {
-            for events in by_asset.values_mut() {
-                if events.is_empty() {
-                    continue;
-                }
-                let drained = std::mem::take(events);
-                if let Some(aggregated_snapshot) = aggregate_events(drained, timestamp_ms) {
-                    collected.push(aggregated_snapshot);
-                }
-            }
-        }
-        collected
+    fn drain_all(&mut self) -> MarketSnapshotBuffer {
+        std::mem::take(self)
     }
 }
 

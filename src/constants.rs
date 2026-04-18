@@ -76,6 +76,7 @@ impl XFrameIntervalKind {
             _ => Self::FifteenMin,
         }
     }
+
 }
 
 /// Исход токена up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).

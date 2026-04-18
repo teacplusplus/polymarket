@@ -2,8 +2,10 @@
 //! строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
 //! и сохраняет модель рядом с папкой версии.
 
+use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::xframe::{
-    calc_y_train, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
+    calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES,
+    Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
 };
 use crate::xframe_dump::MarketXFramesDump;
 use optimizer::sampler::tpe::TpeSampler;
@@ -63,8 +65,28 @@ impl FrameSide {
     }
 }
 
+/// Тип модели: определяет какую y-метку использовать при обучении.
+#[derive(Debug, Clone, Copy)]
+enum ModelType {
+    /// PnL-метка ([`calc_y_train_pnl`]): бинарная, учитывает комиссии, TP/SL.
+    /// Обучается только для step=1s.
+    Pnl,
+    /// Resolution-метка ([`calc_y_train_resolution`]): бинарная по исходу события.
+    /// Обучается для всех step-интервалов.
+    Resolution,
+}
+
+impl ModelType {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pnl => "pnl",
+            Self::Resolution => "resolution",
+        }
+    }
+}
+
 /// Точка входа в режим обучения. Ищет валюты в `xframes/`, для каждой версии
-/// обучает 4 модели: `model_{5m|15m}_{up|down}.ubj`.
+/// обучает модели по всем комбинациям interval × step × model_type × side.
 pub fn run_train_mode() -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     if !xframes_root.exists() {
@@ -96,29 +118,50 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     continue;
                 }
 
-                for side in [FrameSide::Up, FrameSide::Down] {
-                    let tag = format!("{currency}/{version_str}/{interval}/{}", side.label());
-
-                    println!("[train] {tag}: загрузка дампов...");
-                    let (x_all, y_all) = collect_dataset(&interval_path, side)?;
-
-                    if y_all.is_empty() {
-                        println!("[train] {tag}: нет данных, пропуск");
+                for &step_sec in &FRAME_BUILD_INTERVALS_SEC {
+                    let step_path = interval_path.join(format!("{step_sec}s"));
+                    if !step_path.is_dir() {
                         continue;
                     }
 
-                    println!(
-                        "[train] {tag}: {} строк, {} признаков",
-                        y_all.len(),
-                        XFrame::<SIZE>::count_features(),
-                    );
+                    for model_type in [ModelType::Pnl, ModelType::Resolution] {
+                        if matches!(model_type, ModelType::Pnl) && step_sec != 1 {
+                            continue;
+                        }
 
-                    let model_name = format!("model_{}_{}.ubj", interval, side.label());
-                    let model_path = version_path.join(&model_name);
+                        for side in [FrameSide::Up, FrameSide::Down] {
+                            let tag = format!(
+                                "{currency}/{version_str}/{interval}/{step_sec}s/{}/{}",
+                                model_type.label(),
+                                side.label(),
+                            );
 
-                    match train_and_save(&x_all, &y_all, &model_path, &tag) {
-                        Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
-                        Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
+                            println!("[train] {tag}: загрузка дампов...");
+                            let (x_all, y_all) = collect_dataset(&step_path, side, model_type)?;
+
+                            if y_all.is_empty() {
+                                println!("[train] {tag}: нет данных, пропуск");
+                                continue;
+                            }
+
+                            println!(
+                                "[train] {tag}: {} строк, {} признаков",
+                                y_all.len(),
+                                XFrame::<SIZE>::count_features(),
+                            );
+
+                            let model_name = format!(
+                                "model_{interval}_{step_sec}s_{}_{}.ubj",
+                                model_type.label(),
+                                side.label(),
+                            );
+                            let model_path = version_path.join(&model_name);
+
+                            match train_and_save(&x_all, &y_all, &model_path, &tag) {
+                                Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
+                                Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
+                            }
+                        }
                     }
                 }
             }
@@ -128,14 +171,14 @@ pub fn run_train_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Обходит подпапки `{interval_path}/{date}/`, читает все `.bin` файлы
+/// Обходит подпапки `{step_path}/{date}/`, читает все `.bin` файлы
 /// и собирает кадры только выбранной ноги (`side`) в векторы `x` и `y`.
-fn collect_dataset(interval_path: &Path, side: FrameSide) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
+fn collect_dataset(step_path: &Path, side: FrameSide, model_type: ModelType) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
     let feature_count = XFrame::<SIZE>::count_features();
     let mut x_all: Vec<f32> = Vec::new();
     let mut y_all: Vec<f32> = Vec::new();
 
-    for date_path in fs_read_dirs(interval_path)? {
+    for date_path in fs_read_dirs(step_path)? {
         if !date_path.is_dir() {
             continue;
         }
@@ -157,23 +200,28 @@ fn collect_dataset(interval_path: &Path, side: FrameSide) -> anyhow::Result<(Vec
                     continue;
                 }
             };
-            append_frames(side.frames(&dump), feature_count, &mut x_all, &mut y_all);
+            append_frames(side.frames(&dump), feature_count, model_type, &mut x_all, &mut y_all);
         }
     }
 
     Ok((x_all, y_all))
 }
 
-/// Для каждого кадра в `frames` вычисляет метку `calc_y_train` и, если она есть,
+/// Для каждого кадра в `frames` вычисляет метку по `model_type` и, если она есть,
 /// добавляет признаки и метку в `x_out` / `y_out`.
 fn append_frames(
     frames: &[XFrame<SIZE>],
     feature_count: usize,
+    model_type: ModelType,
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
 ) {
     for index in 0..frames.len() {
-        let Some(label) = calc_y_train(Y_TRAIN_HORIZON_FRAMES, frames, index) else {
+        let label = match model_type {
+            ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index),
+            ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index),
+        };
+        let Some(label) = label else {
             continue;
         };
         let row = frames[index].to_x_train();
@@ -197,6 +245,12 @@ fn train_and_save(
     let feature_count = XFrame::<SIZE>::count_features();
     let num_rows = y_all.len();
     assert_eq!(x_all.len(), num_rows * feature_count, "несовпадение размеров датасета");
+
+    let has_pos = y_all.iter().any(|&v| v > 0.0);
+    let has_neg = y_all.iter().any(|&v| v <= 0.0);
+    if !has_pos || !has_neg {
+        anyhow::bail!("датасет содержит только один класс (AUC невозможен), пропуск");
+    }
 
     // Хронологический сплит: train — первые (1 - TEST_FRACTION) кадров по времени,
     // test — последние TEST_FRACTION. Рандомный shuffle недопустим для временных рядов:
@@ -435,6 +489,9 @@ fn fit_booster_with_early_stopping(
         }
     }
 
+    if best_snapshot.is_empty() {
+        anyhow::bail!("не удалось получить ни одного валидного раунда бустинга");
+    }
     let mut result_bst = Booster::load_buffer(&best_snapshot)?;
     result_bst.eval_dmat_results = best_eval_results;
     Ok(result_bst)
