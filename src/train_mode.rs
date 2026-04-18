@@ -157,7 +157,7 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                             );
                             let model_path = version_path.join(&model_name);
 
-                            match train_and_save(&x_all, &y_all, &model_path, &tag) {
+                            match train_and_save(&x_all, &y_all, &model_path, &tag, model_type) {
                                 Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                                 Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
                             }
@@ -241,6 +241,7 @@ fn train_and_save(
     y_all: &[f32],
     model_path: &Path,
     tag: &str,
+    model_type: ModelType,
 ) -> anyhow::Result<()> {
     let feature_count = XFrame::<SIZE>::count_features();
     let num_rows = y_all.len();
@@ -269,9 +270,14 @@ fn train_and_save(
 
     let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dtest, "test")];
 
-    println!(
-        "[train] {tag}: оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
-    );
+    match model_type {
+        ModelType::Pnl => println!(
+            "[train] {tag}: оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
+        ),
+        ModelType::Resolution => println!(
+            "[train] {tag}: оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций)…"
+        ),
+    }
     let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS, tag)?;
     println!("[train] {tag}: лучшие параметры: {params:?}");
 
