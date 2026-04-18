@@ -1021,11 +1021,23 @@ fn y_train_resolution_token_won(frame: &XFrame<SIZE>, up_won: bool) -> bool {
     }
 }
 
-/// Метка y по исходу события (resolution). `up_won` — из [`crate::xframe_dump::MarketXFramesDump::up_won`].
+/// Метка y по исходу события (resolution).
+///
+/// Из `currency_price_vs_beat_pct` текущего кадра восстанавливает спотовую цену,
+/// затем сравнивает с `final_price` (цена закрытия окна):
+/// - Up-токен: `won = final_price >= current_spot`
+/// - Down-токен: `won = final_price < current_spot`
 ///
 /// Сканирует до `n` будущих кадров в поисках резолюции (`event_remaining_ms ≤ 0`).
-/// Если резолюция не найдена в горизонте — возвращает `None` (сэмпл пропускается при обучении).
-pub fn calc_y_train_resolution(n: usize, x_frames: &[XFrame<SIZE>], index: usize, up_won: bool) -> Option<f32> {
+/// Если резолюция не найдена в горизонте или `currency_price_vs_beat_pct` отсутствует —
+/// возвращает `None` (сэмпл пропускается при обучении).
+pub fn calc_y_train_resolution(
+    n: usize,
+    x_frames: &[XFrame<SIZE>],
+    index: usize,
+    price_to_beat: f64,
+    final_price: f64,
+) -> Option<f32> {
     let current = x_frames.get(index)?;
     let last_idx = x_frames.len().saturating_sub(1);
 
@@ -1041,9 +1053,13 @@ pub fn calc_y_train_resolution(n: usize, x_frames: &[XFrame<SIZE>], index: usize
         return None;
     }
 
+
+    let currency_price_vs_beat_pct = current.currency_price_vs_beat_pct?;
+    let current_spot = price_to_beat * (1.0 - currency_price_vs_beat_pct / 100.0);
+
     let won = match CurrencyUpDownOutcome::from_i32(current.currency_up_down_outcome)? {
-        CurrencyUpDownOutcome::Up => up_won,
-        CurrencyUpDownOutcome::Down => !up_won,
+        CurrencyUpDownOutcome::Up => final_price >= current_spot,
+        CurrencyUpDownOutcome::Down => final_price < current_spot,
     };
     Some(if won { 1.0 } else { 0.0 })
 }

@@ -29,6 +29,15 @@ use tokio::time::{self, Duration};
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
 
+/// Состояние предыдущего маркета: передаётся в [`spawn_bg_price_to_beat_refine`],
+/// чтобы при получении exact `price_to_beat` текущего окна вычислить `up_won` и записать дамп.
+#[derive(Clone)]
+struct PrevMarket {
+    market_id: Option<String>,
+    gamma_question: Option<String>,
+    price_to_beat: Option<f64>,
+}
+
 /// Кадр, собранный в этом тике `build_frames_from_buffer_lane_once`, до записи в соответствующий лейн `xframes_by_market`.
 struct BuiltXframeEntry {
     market_id: String,
@@ -669,8 +678,7 @@ impl ProjectManager {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
-        let mut prev_market_id: Option<String>;
-        let mut prev_gamma_question: Option<String>;
+        let mut prev_market: Option<PrevMarket> = None;
         let mut next_window_start_sec: Option<i64> = None;
 
         loop {
@@ -794,32 +802,54 @@ impl ProjectManager {
                     market_ids.clone(),
                     currency.clone(),
                     period,
-                    Some(10),
+                    prev_market.clone(),
+                    period_sec,
                 );
                 Some(price_to_beat)
             } else {
                 match fetch_price_to_beat_from_polymarket_event_page(self.http.as_ref(), &slug, currency.as_str(), true).await {
                     Ok((price_to_beat, exact)) => {
-                        run_log::price_to_beat_from_event_page(period, &slug, price_to_beat, None);
-                        if !exact {
+                        run_log::price_to_beat_from_event_page(period, &slug, price_to_beat);
+                        if exact {
+                            if let Some(prev_market) = prev_market.clone() {
+                                if let (Some(prev_market_id), Some(prev_price_to_beat)) = (prev_market.market_id, prev_market.price_to_beat) {
+                                    xframe_dump::spawn_dump_market_xframes_binary(
+                                        self.clone(),
+                                        prev_market_id,
+                                        prev_market.gamma_question,
+                                        period_sec,
+                                        prev_price_to_beat,
+                                        price_to_beat,
+                                    );
+                                }
+                            }
+                        } else {
                             spawn_bg_price_to_beat_refine(
                                 project_manager_cloned,
                                 slug.clone(),
                                 market_ids.clone(),
                                 currency.clone(),
                                 period,
-                                None,
+                                prev_market.clone(),
+                                period_sec,
                             );
                         }
                         Some(price_to_beat)
                     }
                     Err(e) => {
                         run_log::gamma_fetch_err(period, &slug, &e);
+                        if let Some(ref prev_market) = prev_market {
+                            if let Some(ref market_id) = prev_market.market_id {
+                                eprintln!(
+                                    "xframe_dump: market_id={market_id}: fetch_price_to_beat failed, дамп пропущен",
+                                );
+                                self.cleanup_stale_market_data(market_id).await;
+                            }
+                        }
                         continue;
                     }
                 }
             };
-
 
             if let Some(price_to_beat) = price_to_beat {
                 let market_ids_for_ptb: HashSet<String> = market_ids.iter().cloned().collect();
@@ -853,8 +883,11 @@ impl ProjectManager {
                     continue;
                 }
 
-                prev_market_id = market_ids.first().cloned();
-                prev_gamma_question = gamma_question.clone();
+                prev_market = Some(PrevMarket {
+                    market_id: market_ids.first().cloned(),
+                    gamma_question: gamma_question.clone(),
+                    price_to_beat,
+                });
             }
 
             let sleep_until_ms = ws_end_sec * 1000;
@@ -874,47 +907,45 @@ impl ProjectManager {
                     Err(_) => run_log::ws_spawn_err(period, &slug, "market ws command channel closed"),
                 }
             }
-            if let Some(prev_market_id) = prev_market_id.as_ref() {
-                let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
-                xframe_dump::spawn_dump_market_xframes_binary(
-                    self.clone(),
-                    prev_market_id.clone(),
-                    prev_gamma_question.clone(),
-                    interval_kind,
-                );
-            }
+            
         }
     }
 }
 
 /// Фоновый retry точного `price_to_beat` со страницы Polymarket (без fallback).
+/// Если передан `prev`, при успешном получении exact цены вычисляет `up_won`
+/// и запускает запись дампа предыдущего маркета.
 fn spawn_bg_price_to_beat_refine(
-    pm: Arc<ProjectManager>,
+    project_manager: Arc<ProjectManager>,
     slug: String,
     market_ids: Vec<String>,
     currency: Arc<String>,
     period: &'static str,
-    initial_delay_secs: Option<u64>,
+    prev_market: Option<PrevMarket>,
+    period_sec: i64,
 ) {
     tokio::spawn(async move {
-        if let Some(delay) = initial_delay_secs {
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-        }
         const MAX_ATTEMPTS: u32 = 15;
         for attempt in 1..=MAX_ATTEMPTS {
-            match fetch_price_to_beat_from_polymarket_event_page(
-                pm.http.as_ref(),
-                &slug,
-                currency.as_str(),
-                false,
-            )
-            .await
-            {
-                Ok((price_to_beat, _exact)) => {
-                    run_log::price_to_beat_from_event_page(period, &slug, price_to_beat, initial_delay_secs);
+            match fetch_price_to_beat_from_polymarket_event_page(project_manager.http.as_ref(), &slug, currency.as_str(), false).await {
+                Ok((price_to_beat, _)) => {
+                    run_log::price_to_beat_from_event_page(period, &slug, price_to_beat);
                     let market_ids_for_ptb: HashSet<String> = market_ids.iter().cloned().collect();
-                    pm.merge_market_price_to_beat(price_to_beat, &market_ids_for_ptb).await;
-                    break;
+                    project_manager.merge_market_price_to_beat(price_to_beat, &market_ids_for_ptb).await;
+
+                    if let Some(ref prev_market) = prev_market {
+                        if let (Some(prev_market_id), Some(prev_price_to_beat)) = (&prev_market.market_id, prev_market.price_to_beat) {
+                            xframe_dump::spawn_dump_market_xframes_binary(
+                                project_manager.clone(),
+                                prev_market_id.clone(),
+                                prev_market.gamma_question.clone(),
+                                period_sec,
+                                prev_price_to_beat,
+                                price_to_beat,
+                            );
+                        }
+                    }
+                    return;
                 }
                 Err(err) => {
                     if attempt >= MAX_ATTEMPTS {
@@ -923,6 +954,14 @@ fn spawn_bg_price_to_beat_refine(
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
+            }
+        }
+        if let Some(prev_market) = prev_market {
+            if let Some(ref market_id) = prev_market.market_id {
+                eprintln!(
+                    "xframe_dump: market_id={market_id}: не удалось получить exact price_to_beat, дамп пропущен",
+                );
+                project_manager.cleanup_stale_market_data(market_id).await;
             }
         }
     });

@@ -26,7 +26,7 @@ const BOOST_ROUNDS: u32 = 500;
 const EARLY_STOPPING_PATIENCE: u32 = 20;
 /// Число раундов бустинга при каждом шаге оптимизатора (быстрее).
 const EVAL_BOOST_ROUNDS: u32 = 80;
-/// Доля тестовой выборки.
+/// Доля тестовой выборки (по кадрам для Pnl, по маркетам для Resolution).
 const TEST_FRACTION: f64 = 0.1;
 
 #[derive(Debug, Clone)]
@@ -124,45 +124,16 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    for model_type in [ModelType::Pnl, ModelType::Resolution] {
-                        if matches!(model_type, ModelType::Pnl) && step_sec != 1 {
-                            continue;
-                        }
-
-                        for side in [FrameSide::Up, FrameSide::Down] {
-                            let tag = format!(
-                                "{currency}/{version_str}/{interval}/{step_sec}s/{}/{}",
-                                model_type.label(),
-                                side.label(),
-                            );
-
-                            println!("[train] {tag}: загрузка дампов...");
-                            let (x_all, y_all) = collect_dataset(&step_path, side, model_type)?;
-
-                            if y_all.is_empty() {
-                                println!("[train] {tag}: нет данных, пропуск");
-                                continue;
-                            }
-
-                            println!(
-                                "[train] {tag}: {} строк, {} признаков",
-                                y_all.len(),
-                                XFrame::<SIZE>::count_features(),
-                            );
-
-                            let model_name = format!(
-                                "model_{interval}_{step_sec}s_{}_{}.ubj",
-                                model_type.label(),
-                                side.label(),
-                            );
-                            let model_path = version_path.join(&model_name);
-
-                            match train_and_save(&x_all, &y_all, &model_path, &tag, model_type) {
-                                Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
-                                Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
-                            }
-                        }
+                    let tag_prefix = format!("{currency}/{version_str}/{interval}/{step_sec}s");
+                    println!("[train] {tag_prefix}: загрузка дампов...");
+                    let dumps = load_dumps(&step_path)?;
+                    if dumps.is_empty() {
+                        println!("[train] {tag_prefix}: нет дампов, пропуск");
+                        continue;
                     }
+                    println!("[train] {tag_prefix}: загружено {} дампов", dumps.len());
+
+                    train_all_variants(&dumps, &version_path, &tag_prefix, interval, step_sec)?;
                 }
             }
         }
@@ -171,12 +142,66 @@ pub fn run_train_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Обходит подпапки `{step_path}/{date}/`, читает все `.bin` файлы
-/// и собирает кадры только выбранной ноги (`side`) в векторы `x` и `y`.
-fn collect_dataset(step_path: &Path, side: FrameSide, model_type: ModelType) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
-    let feature_count = XFrame::<SIZE>::count_features();
-    let mut x_all: Vec<f32> = Vec::new();
-    let mut y_all: Vec<f32> = Vec::new();
+/// Данные одного маркета (дамп-файла): признаки и метки.
+struct MarketDataset {
+    x: Vec<f32>,
+    y: Vec<f32>,
+}
+
+/// Обучает модели для всех комбинаций model_type × side на загруженных дампах.
+fn train_all_variants(
+    dumps: &[MarketXFramesDump],
+    version_path: &Path,
+    tag_prefix: &str,
+    interval: &str,
+    step_sec: u64,
+) -> anyhow::Result<()> {
+    for model_type in [ModelType::Pnl, ModelType::Resolution] {
+        if matches!(model_type, ModelType::Pnl) && step_sec != 1 {
+            continue;
+        }
+
+        for side in [FrameSide::Up, FrameSide::Down] {
+            let tag = format!(
+                "{tag_prefix}/{}/{}",
+                model_type.label(),
+                side.label(),
+            );
+
+            let markets = build_market_datasets(dumps, side, model_type);
+
+            if markets.is_empty() {
+                println!("[train] {tag}: нет данных, пропуск");
+                continue;
+            }
+
+            println!(
+                "[train] {tag}: {} маркетов, {} строк, {} признаков",
+                markets.len(),
+                markets.iter().map(|m| m.y.len()).sum::<usize>(),
+                XFrame::<SIZE>::count_features(),
+            );
+
+            let model_name = format!(
+                "model_{interval}_{step_sec}s_{}_{}.ubj",
+                model_type.label(),
+                side.label(),
+            );
+            let model_path = version_path.join(&model_name);
+
+            match train_and_save(&markets, &model_path, &tag, model_type) {
+                Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
+                Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Обходит подпапки `{step_path}/{date}/`, читает и десериализует все `.bin` файлы.
+/// Возвращает дампы в хронологическом порядке (отсортированы по пути).
+fn load_dumps(step_path: &Path) -> anyhow::Result<Vec<MarketXFramesDump>> {
+    let mut dumps = Vec::new();
 
     for date_path in fs_read_dirs(step_path)? {
         if !date_path.is_dir() {
@@ -193,18 +218,33 @@ fn collect_dataset(step_path: &Path, side: FrameSide, model_type: ModelType) -> 
                     continue;
                 }
             };
-            let dump: MarketXFramesDump = match bincode::deserialize(&bytes) {
-                Ok(dump) => dump,
+            match bincode::deserialize(&bytes) {
+                Ok(dump) => dumps.push(dump),
                 Err(err) => {
                     eprintln!("[train] ошибка десериализации {}: {err}", file.display());
-                    continue;
                 }
             };
-            append_frames(side.frames(&dump), feature_count, model_type, dump.up_won, &mut x_all, &mut y_all);
         }
     }
 
-    Ok((x_all, y_all))
+    Ok(dumps)
+}
+
+/// Формирует `MarketDataset` для каждого дампа по заданной ноге и типу модели.
+fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_type: ModelType) -> Vec<MarketDataset> {
+    let feature_count = XFrame::<SIZE>::count_features();
+    let mut markets = Vec::new();
+
+    for dump in dumps {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        append_frames(side.frames(dump), feature_count, model_type, dump.price_to_beat, dump.final_price, &mut x, &mut y);
+        if !y.is_empty() {
+            markets.push(MarketDataset { x, y });
+        }
+    }
+
+    markets
 }
 
 /// Для каждого кадра в `frames` вычисляет метку по `model_type` и, если она есть,
@@ -213,14 +253,16 @@ fn append_frames(
     frames: &[XFrame<SIZE>],
     feature_count: usize,
     model_type: ModelType,
-    up_won: bool,
+    price_to_beat: f64,
+    final_price: f64,
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
 ) {
+    let up_won = final_price >= price_to_beat;
     for index in 0..frames.len() {
         let label = match model_type {
             ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index, up_won),
-            ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, up_won),
+            ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
         };
         let Some(label) = label else {
             continue;
@@ -234,35 +276,77 @@ fn append_frames(
     }
 }
 
+/// Сливает список маркет-датасетов в один плоский `(x, y)`.
+fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
+    let total_rows: usize = markets.iter().map(|m| m.y.len()).sum();
+    let feature_count = XFrame::<SIZE>::count_features();
+    let mut x = Vec::with_capacity(total_rows * feature_count);
+    let mut y = Vec::with_capacity(total_rows);
+    for m in markets {
+        x.extend_from_slice(&m.x);
+        y.extend_from_slice(&m.y);
+    }
+    (x, y)
+}
+
 /// Разбивает датасет на train/test, запускает `tune_xgboost_optimizer`, проводит
 /// финальное обучение с оптимальными параметрами и сохраняет модель.
 /// `tag` используется во всех строках лога для идентификации запуска.
+///
+/// Для **Resolution** — сплит по маркетам: первые (1 − TEST_FRACTION) маркетов → train,
+/// остальные → test. Каждый маркет целиком попадает в одну из групп, что устраняет
+/// инверсию распределения меток между train и test.
+///
+/// Для **Pnl** — хронологический сплит по кадрам (как раньше).
 fn train_and_save(
-    x_all: &[f32],
-    y_all: &[f32],
+    markets: &[MarketDataset],
     model_path: &Path,
     tag: &str,
     model_type: ModelType,
 ) -> anyhow::Result<()> {
     let feature_count = XFrame::<SIZE>::count_features();
-    let num_rows = y_all.len();
-    assert_eq!(x_all.len(), num_rows * feature_count, "несовпадение размеров датасета");
 
-    let has_pos = y_all.iter().any(|&v| v > 0.0);
-    let has_neg = y_all.iter().any(|&v| v <= 0.0);
+    let (x_train, y_train, x_test, y_test) = match model_type {
+        ModelType::Resolution => {
+            let n = markets.len();
+            let train_count = n.saturating_sub(((n as f64) * TEST_FRACTION).ceil() as usize);
+            let (train_markets, test_markets) = markets.split_at(train_count);
+            println!(
+                "[train] {tag}: сплит по маркетам: {train_count} train / {} test (всего {n})",
+                test_markets.len(),
+            );
+            let (x_train, y_train) = flatten_markets(train_markets);
+            let (x_test, y_test) = flatten_markets(test_markets);
+            (x_train, y_train, x_test, y_test)
+        }
+        ModelType::Pnl => {
+            let (x_all, y_all) = flatten_markets(markets);
+            let num_rows = y_all.len();
+            let train_size = num_rows - ((num_rows as f64) * TEST_FRACTION) as usize;
+            let train_idx: Vec<usize> = (0..train_size).collect();
+            let test_idx: Vec<usize> = (train_size..num_rows).collect();
+            let (x_train, y_train) = gather_rows(&x_all, &y_all, &train_idx, feature_count);
+            let (x_test, y_test) = gather_rows(&x_all, &y_all, &test_idx, feature_count);
+            (x_train, y_train, x_test, y_test)
+        }
+    };
+
+    let total_rows = y_train.len() + y_test.len();
+    assert_eq!(
+        (y_train.len() + y_test.len()) * feature_count,
+        x_train.len() + x_test.len(),
+        "несовпадение размеров датасета"
+    );
+
+    if total_rows == 0 {
+        anyhow::bail!("датасет пуст, пропуск");
+    }
+
+    let has_pos = y_train.iter().chain(y_test.iter()).any(|&v| v > 0.0);
+    let has_neg = y_train.iter().chain(y_test.iter()).any(|&v| v <= 0.0);
     if !has_pos || !has_neg {
         anyhow::bail!("датасет содержит только один класс (AUC невозможен), пропуск");
     }
-
-    // Хронологический сплит: train — первые (1 - TEST_FRACTION) кадров по времени,
-    // test — последние TEST_FRACTION. Рандомный shuffle недопустим для временных рядов:
-    // будущие кадры попали бы в train, прошлые — в test, что даёт data leakage.
-    let train_size = num_rows - ((num_rows as f64) * TEST_FRACTION) as usize;
-    let train_idx: Vec<usize> = (0..train_size).collect();
-    let test_idx: Vec<usize> = (train_size..num_rows).collect();
-
-    let (x_train, y_train) = gather_rows(x_all, y_all, &train_idx, feature_count);
-    let (x_test, y_test) = gather_rows(x_all, y_all, &test_idx, feature_count);
 
     let mut dtrain = DMatrix::from_dense(&x_train, y_train.len())?;
     dtrain.set_labels(&y_train)?;

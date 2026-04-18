@@ -3,7 +3,7 @@
 use crate::constants::XFrameIntervalKind;
 use crate::project_manager::{ProjectManager, FRAME_BUILD_INTERVALS_SEC};
 use crate::run_log;
-use crate::util::{current_timestamp_ms, fetch_market_resolution_up_won};
+use crate::util::current_timestamp_ms;
 use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -15,10 +15,18 @@ pub struct MarketXFramesDump {
     pub frames_up: Vec<XFrame<SIZE>>,
     /// Кадры токена с исходом Down, упорядоченные по `aligned_ts`.
     pub frames_down: Vec<XFrame<SIZE>>,
-    /// Фактический исход рынка из Gamma API после резолюции: `true` — победил Up, `false` — Down.
-    /// Старые дампы без этого поля десериализуются как `false`.
+    /// Цена `price_to_beat` (открытие окна).
     #[serde(default)]
-    pub up_won: bool,
+    pub price_to_beat: f64,
+    /// Финальная цена (закрытие окна / открытие следующего).
+    #[serde(default)]
+    pub final_price: f64,
+}
+
+impl MarketXFramesDump {
+    pub fn up_won(&self) -> bool {
+        self.final_price >= self.price_to_beat
+    }
 }
 
 /// Имя файла из текста Gamma `question`: безопасные символы и ограничение длины.
@@ -47,21 +55,17 @@ pub fn spawn_dump_market_xframes_binary(
     project_manager: Arc<ProjectManager>,
     market_id: String,
     gamma_question: Option<String>,
-    interval_kind: XFrameIntervalKind,
+    period_sec: i64,
+    price_to_beat: f64,
+    final_price: f64,
 ) {
     tokio::spawn(async move {
+        let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
         let max_step = *FRAME_BUILD_INTERVALS_SEC.iter().max().unwrap_or(&1);
         tokio::time::sleep(std::time::Duration::from_secs(max_step)).await;
 
-        let up_won = match fetch_market_resolution_up_won(project_manager.gamma.as_ref(), &market_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("xframe_dump: market_id={market_id} resolution: {e:#}, дамп пропущен");
-                project_manager.cleanup_stale_market_data(&market_id).await;
-                return;
-            }
-        };
-        eprintln!("xframe_dump: market_id={market_id} resolution: up_won={up_won}");
+        let up_won = final_price >= price_to_beat;
+        eprintln!("xframe_dump: market_id={market_id} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}");
 
         for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
             if let Err(err) =
@@ -71,7 +75,8 @@ pub fn spawn_dump_market_xframes_binary(
                     gamma_question.clone(),
                     interval_kind,
                     lane,
-                    up_won,
+                    price_to_beat,
+                    final_price,
                 ).await
             {
                 eprintln!("xframe_dump lane={lane}: {err:#}");
@@ -87,7 +92,8 @@ pub async fn dump_market_xframes_binary_lane(
     gamma_question: Option<String>,
     interval_kind: XFrameIntervalKind,
     lane: usize,
-    up_won: bool,
+    price_to_beat: f64,
+    final_price: f64,
 ) -> anyhow::Result<()> {
     let by_asset = {
         let xframes_by_market_lock = project_manager.xframes_by_market[lane].read().await;
@@ -130,7 +136,7 @@ pub async fn dump_market_xframes_binary_lane(
     let step_secs = FRAME_BUILD_INTERVALS_SEC[lane];
 
     let frame_count = frames_up.len() + frames_down.len();
-    let dump = MarketXFramesDump { frames_up, frames_down, up_won };
+    let dump = MarketXFramesDump { frames_up, frames_down, price_to_beat, final_price };
 
     let feature_count = XFrame::<SIZE>::count_features();
 

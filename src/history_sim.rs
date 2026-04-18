@@ -203,8 +203,8 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
         // по двоичному исходу: победитель → 1.0, проигравший → 0.0.
         let (exit_prob_up, exit_prob_down, is_resolution) = if is_last {
             (
-                if dump.up_won { 1.0_f64 } else { 0.0_f64 },
-                if dump.up_won { 0.0_f64 } else { 1.0_f64 },
+                if dump.up_won() { 1.0_f64 } else { 0.0_f64 },
+                if dump.up_won() { 0.0_f64 } else { 1.0_f64 },
                 true,
             )
         } else {

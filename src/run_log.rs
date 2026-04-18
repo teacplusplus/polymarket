@@ -69,19 +69,13 @@ pub fn price_to_beat_from_event_page(
     period: &str,
     slug: &str,
     price: f64,
-    delayed_after_secs: Option<u64>,
 ) {
     if !WS_LOG_ENABLED {
         return;
     }
-    match delayed_after_secs {
-        Some(s) => eprintln!(
-            "[{period}] price_to_beat со страницы polymarket event (через {s} с после rtds): slug={slug} price={price}"
-        ),
-        None => eprintln!(
-            "[{period}] price_to_beat со страницы polymarket event: slug={slug} price={price}"
-        ),
-    }
+    eprintln!(
+        "[{period}] price_to_beat со страницы polymarket event: slug={slug} price={price}"
+    )
 }
 
 /// RTDS `crypto_prices`: последний ключ `rtds_currency_prices_by_ms` слишком старый — кадры помечаются `stable=false`.

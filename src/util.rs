@@ -3,7 +3,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use std::str::FromStr;
+
 
 use crate::constants::CurrencyUpDownOutcome;
 
@@ -391,66 +391,6 @@ pub async fn fetch_gamma_event_data_for_slug(
         market_event_end_ms,
         gamma_question,
     })
-}
-
-/// Запрашивает у Gamma API исход рынка по `market_id` (condition_id) после резолюции.
-/// Возвращает `true` если победил Up, `false` если Down.
-/// До 10 попыток с паузой 5 секунд между ними.
-pub async fn fetch_market_resolution_up_won(
-    gamma: &polymarket_client_sdk::gamma::Client,
-    market_id: &str,
-) -> anyhow::Result<bool> {
-    const MAX_ATTEMPTS: u32 = 10;
-    let mut last_err = anyhow::anyhow!("no attempts made");
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        match try_fetch_market_resolution(gamma, market_id).await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                last_err = e;
-                if attempt < MAX_ATTEMPTS {
-                    eprintln!(
-                        "fetch_market_resolution_up_won: попытка {attempt}/{MAX_ATTEMPTS} не удалась для market_id={market_id}: {last_err:#}, повтор через 5с"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            }
-        }
-    }
-    Err(last_err.context(format!(
-        "fetch_market_resolution_up_won: все {MAX_ATTEMPTS} попыток не удались для market_id={market_id}"
-    )))
-}
-
-async fn try_fetch_market_resolution(
-    gamma: &polymarket_client_sdk::gamma::Client,
-    market_id: &str,
-) -> anyhow::Result<bool> {
-    use polymarket_client_sdk::gamma::types::request::MarketsRequest;
-
-    let cid = polymarket_client_sdk::types::B256::from_str(market_id)
-        .map_err(|e| anyhow::anyhow!("невалидный market_id={market_id}: {e}"))?;
-    let request = MarketsRequest::builder()
-        .condition_ids(vec![cid])
-        .closed(true)
-        .build();
-    let markets = gamma.markets(&request).await
-        .map_err(|e| anyhow::anyhow!("gamma markets request failed: {e}"))?;
-    let market = markets.first()
-        .ok_or_else(|| anyhow::anyhow!("gamma вернул пустой список markets для condition_id={cid}"))?;
-    let outcomes = market.outcomes.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("market не содержит outcomes"))?;
-    let prices = market.outcome_prices.as_ref()
-        .ok_or_else(|| anyhow::anyhow!("market не содержит outcome_prices"))?;
-    anyhow::ensure!(outcomes.len() == prices.len(), "outcomes.len() != prices.len()");
-    let threshold = polymarket_client_sdk::types::Decimal::from_str_exact("0.95")
-        .expect("constant decimal");
-    for (label, price) in outcomes.iter().zip(prices.iter()) {
-        if *price >= threshold {
-            return Ok(label.trim().eq_ignore_ascii_case("up"));
-        }
-    }
-    anyhow::bail!("ни один outcome не достиг порога 0.95")
 }
 
 fn gamma_outcome_label_to_currency_kind(label: &str) -> Option<CurrencyUpDownOutcome> {
