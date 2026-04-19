@@ -954,7 +954,7 @@ pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
 pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
 /// Горизонт [`calc_y_train_pnl`] / [`calc_y_train_resolution`]: сколько следующих кадров смотреть.
 /// В [`crate::history_sim`] то же значение используется как лимит кадров до таймаут-выхода (`frames_held`).
-pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 15;
 /// Вычисляет метку y для обучения XGBoost с учётом комиссий Polymarket ([`POLYMARKET_CRYPTO_TAKER_FEE_RATE`]).
 ///
 /// Симулирует покупку 1 USDC токена по цене `p_buy = current_prob`:

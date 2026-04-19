@@ -26,7 +26,9 @@ const BOOST_ROUNDS: u32 = 500;
 const EARLY_STOPPING_PATIENCE: u32 = 20;
 /// Число раундов бустинга при каждом шаге оптимизатора (быстрее).
 const EVAL_BOOST_ROUNDS: u32 = 80;
-/// Доля тестовой выборки (по кадрам для Pnl, по маркетам для Resolution).
+/// Доля валидационной выборки (для optimizer + early stopping).
+const VAL_FRACTION: f64 = 0.1;
+/// Доля тестовой выборки (финальная, честная оценка AUC).
 const TEST_FRACTION: f64 = 0.1;
 
 #[derive(Debug, Clone)]
@@ -168,18 +170,26 @@ fn train_all_variants(
                 side.label(),
             );
 
-            let markets = build_market_datasets(dumps, side, model_type);
+            let max_lag = match model_type {
+                ModelType::Resolution => Some(5),
+                ModelType::Pnl => None,
+            };
+            let markets = build_market_datasets(dumps, side, model_type, max_lag);
 
             if markets.is_empty() {
                 println!("[train] {tag}: нет данных, пропуск");
                 continue;
             }
 
+            let feature_count = match max_lag {
+                Some(n) => XFrame::<SIZE>::count_features_n(n),
+                None => XFrame::<SIZE>::count_features(),
+            };
             println!(
                 "[train] {tag}: {} маркетов, {} строк, {} признаков",
                 markets.len(),
                 markets.iter().map(|m| m.y.len()).sum::<usize>(),
-                XFrame::<SIZE>::count_features(),
+                feature_count,
             );
 
             let model_name = format!(
@@ -189,7 +199,7 @@ fn train_all_variants(
             );
             let model_path = version_path.join(&model_name);
 
-            match train_and_save(&markets, &model_path, &tag, model_type) {
+            match train_and_save(&markets, &model_path, &tag, model_type, feature_count) {
                 Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
@@ -231,14 +241,18 @@ fn load_dumps(step_path: &Path) -> anyhow::Result<Vec<MarketXFramesDump>> {
 }
 
 /// Формирует `MarketDataset` для каждого дампа по заданной ноге и типу модели.
-fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_type: ModelType) -> Vec<MarketDataset> {
-    let feature_count = XFrame::<SIZE>::count_features();
+/// `max_lag` — если `Some(n)`, лаговые массивы обрезаются до первых `n` элементов.
+fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_type: ModelType, max_lag: Option<usize>) -> Vec<MarketDataset> {
+    let feature_count = match max_lag {
+        Some(n) => XFrame::<SIZE>::count_features_n(n),
+        None => XFrame::<SIZE>::count_features(),
+    };
     let mut markets = Vec::new();
 
     for dump in dumps {
         let mut x = Vec::new();
         let mut y = Vec::new();
-        append_frames(side.frames(dump), feature_count, model_type, dump.price_to_beat, dump.final_price, &mut x, &mut y);
+        append_frames(side.frames(dump), feature_count, model_type, dump.price_to_beat, dump.final_price, max_lag, &mut x, &mut y);
         if !y.is_empty() {
             markets.push(MarketDataset { x, y });
         }
@@ -255,6 +269,7 @@ fn append_frames(
     model_type: ModelType,
     price_to_beat: f64,
     final_price: f64,
+    max_lag: Option<usize>,
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
 ) {
@@ -267,7 +282,10 @@ fn append_frames(
         let Some(label) = label else {
             continue;
         };
-        let row = frames[index].to_x_train();
+        let row = match max_lag {
+            Some(n) => frames[index].to_x_train_n(n),
+            None => frames[index].to_x_train(),
+        };
         if row.len() != feature_count {
             continue;
         }
@@ -278,10 +296,10 @@ fn append_frames(
 
 /// Сливает список маркет-датасетов в один плоский `(x, y)`.
 fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
-    let total_rows: usize = markets.iter().map(|m| m.y.len()).sum();
-    let feature_count = XFrame::<SIZE>::count_features();
-    let mut x = Vec::with_capacity(total_rows * feature_count);
-    let mut y = Vec::with_capacity(total_rows);
+    let total_x: usize = markets.iter().map(|m| m.x.len()).sum();
+    let total_y: usize = markets.iter().map(|m| m.y.len()).sum();
+    let mut x = Vec::with_capacity(total_x);
+    let mut y = Vec::with_capacity(total_y);
     for m in markets {
         x.extend_from_slice(&m.x);
         y.extend_from_slice(&m.y);
@@ -289,87 +307,101 @@ fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
     (x, y)
 }
 
-/// Разбивает датасет на train/test, запускает `tune_xgboost_optimizer`, проводит
-/// финальное обучение с оптимальными параметрами и сохраняет модель.
-/// `tag` используется во всех строках лога для идентификации запуска.
+/// 3-way split: train / val / test.
 ///
-/// Для **Resolution** — сплит по маркетам: первые (1 − TEST_FRACTION) маркетов → train,
-/// остальные → test. Каждый маркет целиком попадает в одну из групп, что устраняет
-/// инверсию распределения меток между train и test.
+/// - **val** — используется optimizer'ом для подбора гиперпараметров и early stopping.
+/// - **test** — held-out, только для финальной честной оценки AUC.
 ///
-/// Для **Pnl** — хронологический сплит по кадрам (как раньше).
+/// Для **Resolution** — сплит по маркетам (каждый маркет целиком в одной группе).
+/// Для **Pnl** — хронологический сплит по кадрам.
 fn train_and_save(
     markets: &[MarketDataset],
     model_path: &Path,
     tag: &str,
     model_type: ModelType,
+    feature_count: usize,
 ) -> anyhow::Result<()> {
-    let feature_count = XFrame::<SIZE>::count_features();
-
-    let (x_train, y_train, x_test, y_test) = match model_type {
+    let (x_train, y_train, x_val, y_val, x_test, y_test) = match model_type {
         ModelType::Resolution => {
             let n = markets.len();
-            let train_count = n.saturating_sub(((n as f64) * TEST_FRACTION).ceil() as usize);
-            let (train_markets, test_markets) = markets.split_at(train_count);
+            let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
+            let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
+            let train_count = n.saturating_sub(test_count + val_count);
+            let (train_markets, rest) = markets.split_at(train_count);
+            let (val_markets, test_markets) = rest.split_at(val_count.min(rest.len()));
             println!(
-                "[train] {tag}: сплит по маркетам: {train_count} train / {} test (всего {n})",
+                "[train] {tag}: сплит по маркетам: {train_count} train / {} val / {} test (всего {n})",
+                val_markets.len(),
                 test_markets.len(),
             );
             let (x_train, y_train) = flatten_markets(train_markets);
+            let (x_val, y_val) = flatten_markets(val_markets);
             let (x_test, y_test) = flatten_markets(test_markets);
-            (x_train, y_train, x_test, y_test)
+            (x_train, y_train, x_val, y_val, x_test, y_test)
         }
         ModelType::Pnl => {
             let (x_all, y_all) = flatten_markets(markets);
             let num_rows = y_all.len();
-            let train_size = num_rows - ((num_rows as f64) * TEST_FRACTION) as usize;
+            let test_size = ((num_rows as f64) * TEST_FRACTION) as usize;
+            let val_size = ((num_rows as f64) * VAL_FRACTION) as usize;
+            let train_size = num_rows.saturating_sub(test_size + val_size);
             let train_idx: Vec<usize> = (0..train_size).collect();
-            let test_idx: Vec<usize> = (train_size..num_rows).collect();
+            let val_idx: Vec<usize> = (train_size..train_size + val_size).collect();
+            let test_idx: Vec<usize> = (train_size + val_size..num_rows).collect();
             let (x_train, y_train) = gather_rows(&x_all, &y_all, &train_idx, feature_count);
+            let (x_val, y_val) = gather_rows(&x_all, &y_all, &val_idx, feature_count);
             let (x_test, y_test) = gather_rows(&x_all, &y_all, &test_idx, feature_count);
-            (x_train, y_train, x_test, y_test)
+            (x_train, y_train, x_val, y_val, x_test, y_test)
         }
     };
 
-    let total_rows = y_train.len() + y_test.len();
-    assert_eq!(
-        (y_train.len() + y_test.len()) * feature_count,
-        x_train.len() + x_test.len(),
-        "несовпадение размеров датасета"
-    );
-
+    let total_rows = y_train.len() + y_val.len() + y_test.len();
     if total_rows == 0 {
         anyhow::bail!("датасет пуст, пропуск");
     }
 
-    let has_pos = y_train.iter().chain(y_test.iter()).any(|&v| v > 0.0);
-    let has_neg = y_train.iter().chain(y_test.iter()).any(|&v| v <= 0.0);
+    let mut all_y = y_train.iter().chain(y_val.iter()).chain(y_test.iter());
+    let has_pos = all_y.clone().any(|&v| v > 0.0);
+    let has_neg = all_y.any(|&v| v <= 0.0);
     if !has_pos || !has_neg {
         anyhow::bail!("датасет содержит только один класс (AUC невозможен), пропуск");
     }
 
     let mut dtrain = DMatrix::from_dense(&x_train, y_train.len())?;
     dtrain.set_labels(&y_train)?;
+    let mut dval = DMatrix::from_dense(&x_val, y_val.len())?;
+    dval.set_labels(&y_val)?;
     let mut dtest = DMatrix::from_dense(&x_test, y_test.len())?;
     dtest.set_labels(&y_test)?;
 
-    let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dtest, "test")];
+    // Optimizer и early stopping работают на val (названа "test" для совместимости с eval_xgboost).
+    let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dval, "test")];
 
     match model_type {
         ModelType::Pnl => println!(
-            "[train] {tag}: оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
+            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
         ),
         ModelType::Resolution => println!(
-            "[train] {tag}: оптимизация гиперпараметров по AUC ({OPTIMIZER_TRIALS} итераций)…"
+            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({OPTIMIZER_TRIALS} итераций)…"
         ),
     }
     let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS, tag)?;
     println!("[train] {tag}: лучшие параметры: {params:?}");
 
-    let booster = fit_booster_with_early_stopping(&params, &dtrain, &dtest, tag)?;
+    let booster = fit_booster_with_early_stopping(&params, &dtrain, &dval, tag)?;
 
-    print_eval_metrics(&booster, tag);
-    print_y_distribution(&y_train, &y_test, tag);
+    // Метрики на val (из early stopping)
+    print_eval_metrics(&booster, tag, "val");
+
+    // Финальная честная оценка на held-out test
+    let test_metrics = booster.evaluate(&dtest)?;
+    let test_auc = test_metrics.get("auc").copied().unwrap_or(0.0);
+    let test_logloss = test_metrics.get("logloss").copied().unwrap_or(0.0);
+    println!(
+        "[train] {tag}: held-out test: logloss={test_logloss:.5}  AUC={test_auc:.6}"
+    );
+
+    print_y_distribution(&y_train, &y_val, &y_test, tag);
     print_contributions(&booster, &dtest, tag);
 
     if let Some(parent) = model_path.parent() {
@@ -379,8 +411,9 @@ fn train_and_save(
     Ok(())
 }
 
-/// Печатает финальные метрики logloss и AUC на train и test выборках.
-fn print_eval_metrics(booster: &Booster, tag: &str) {
+/// Печатает метрики logloss и AUC на train и val/test выборках.
+/// `eval_label` — человеко-читаемое имя второй выборки ("val" или "test").
+fn print_eval_metrics(booster: &Booster, tag: &str, eval_label: &str) {
     let results = &booster.eval_dmat_results;
     let get = |metric: &str, split: &str| -> String {
         results
@@ -390,7 +423,7 @@ fn print_eval_metrics(booster: &Booster, tag: &str) {
             .unwrap_or_else(|| "—".to_string())
     };
     println!(
-        "[train] {tag}: метрики: train-logloss:{:>8}  test-logloss:{:>8}  train-auc:{:>8}  test-auc:{:>8}",
+        "[train] {tag}: метрики: train-logloss:{:>8}  {eval_label}-logloss:{:>8}  train-auc:{:>8}  {eval_label}-auc:{:>8}",
         get("logloss", "train"),
         get("logloss", "test"),
         get("auc", "train"),
@@ -440,7 +473,7 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str) {
 }
 
 /// Печатает распределение меток в train и test выборках.
-fn print_y_distribution(y_train: &[f32], y_test: &[f32], tag: &str) {
+fn print_y_distribution(y_train: &[f32], y_val: &[f32], y_test: &[f32], tag: &str) {
     fn count_values(labels: &[f32]) -> std::collections::BTreeMap<String, usize> {
         let mut counts = std::collections::BTreeMap::new();
         for &val in labels {
@@ -461,6 +494,7 @@ fn print_y_distribution(y_train: &[f32], y_test: &[f32], tag: &str) {
     };
 
     print_counts("train", y_train);
+    print_counts("val", y_val);
     print_counts("test", y_test);
 }
 

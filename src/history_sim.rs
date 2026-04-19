@@ -116,50 +116,56 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                     continue;
                 }
 
-                let model_up_path   = version_path.join(format!("model_{interval}_up.ubj"));
-                let model_down_path = version_path.join(format!("model_{interval}_down.ubj"));
+                let model_up_path   = version_path.join(format!("model_{interval}_1s_pnl_up.ubj"));
+                let model_down_path = version_path.join(format!("model_{interval}_1s_pnl_down.ubj"));
+
+                let tag = format!("{currency}/{version}/{interval}");
 
                 let booster_up = match load_booster(&model_up_path) {
                     Some(b) => b,
                     None => {
-                        println!("[sim] {currency}/{version}/{interval}: model_up не найдена, пропуск");
+                        println!("[sim] {tag}: model pnl_up не найдена, пропуск");
                         continue;
                     }
                 };
                 let booster_down = match load_booster(&model_down_path) {
                     Some(b) => b,
                     None => {
-                        println!("[sim] {currency}/{version}/{interval}: model_down не найдена, пропуск");
+                        println!("[sim] {tag}: model pnl_down не найдена, пропуск");
                         continue;
                     }
                 };
 
                 println!(
-                    "[sim] {currency}/{version}/{interval}: модели загружены \
+                    "[sim] {tag}: модели pnl загружены \
                      | threshold={SIM_BUY_THRESHOLD} | position={POSITION_SIZE_USD}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}"
                 );
 
                 let mut stats = SimStats::default();
 
-                for date_path in fs_sorted_dirs(&interval_path)? {
-                    if !date_path.is_dir() {
-                        continue;
-                    }
-                    for file_path in fs_sorted_dirs(&date_path)? {
-                        if file_path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+                // Дампы с шагом 1s — совпадает со step pnl-модели.
+                let step_path = interval_path.join("1s");
+                if step_path.is_dir() {
+                    for date_path in fs_sorted_dirs(&step_path)? {
+                        if !date_path.is_dir() {
                             continue;
                         }
-                        match load_dump(&file_path) {
-                            Ok(dump) => {
-                                simulate_event(&dump, &booster_up, &booster_down, &mut stats);
-                                stats.events += 1;
+                        for file_path in fs_sorted_dirs(&date_path)? {
+                            if file_path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
+                                continue;
                             }
-                            Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
+                            match load_dump(&file_path) {
+                                Ok(dump) => {
+                                    simulate_event(&dump, &booster_up, &booster_down, &mut stats);
+                                    stats.events += 1;
+                                }
+                                Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
+                            }
                         }
                     }
                 }
 
-                print_stats(&currency, &version, interval, &stats);
+                print_stats(&tag, &stats);
             }
         }
     }
@@ -459,9 +465,9 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>) -> Option<f32> {
 
 // ─── Вывод статистики ─────────────────────────────────────────────────────────
 
-fn print_stats(currency: &str, version: &str, interval: &str, stats: &SimStats) {
+fn print_stats(tag: &str, stats: &SimStats) {
     if stats.trades == 0 {
-        println!("[sim] {currency}/{version}/{interval}: нет сделок ({} событий)", stats.events);
+        println!("[sim] {tag}: нет сделок ({} событий)", stats.events);
         return;
     }
 
@@ -469,9 +475,9 @@ fn print_stats(currency: &str, version: &str, interval: &str, stats: &SimStats) 
     let avg_pnl = stats.pnl_usd / stats.trades as f64;
 
     println!(
-        "[sim] {currency}/{version}/{interval} \
+        "[sim] {tag} \
          | events={} (событий) trades={} (сделок) win={:.1}% (винрейт) \
-         | pnl={:+.2}$ (итог) avg={:+.4}$/trade (среднее) fees={:.4}$ (комиссии)",
+         | pnl={:+.4}$ (итог) avg={:+.4}$/trade (среднее) fees={:.4}$ (комиссии)",
         stats.events, stats.trades, win_rate, stats.pnl_usd, avg_pnl, stats.fees_paid,
     );
     println!(

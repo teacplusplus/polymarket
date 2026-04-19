@@ -1,9 +1,16 @@
 pub trait PushFeature {
     fn push(&self, out: &mut Vec<f32>);
+    fn push_n(&self, out: &mut Vec<f32>, _max_lag: usize) {
+        self.push(out);
+    }
 }
 
 pub fn push_feature<T: PushFeature>(v: &T, out: &mut Vec<f32>) {
     v.push(out);
+}
+
+pub fn push_feature_n<T: PushFeature>(v: &T, out: &mut Vec<f32>, max_lag: usize) {
+    v.push_n(out, max_lag);
 }
 
 impl PushFeature for u64 {
@@ -63,10 +70,18 @@ where
             item.push(out);
         }
     }
+
+    fn push_n(&self, out: &mut Vec<f32>, max_lag: usize) {
+        for (i, item) in self.iter().enumerate() {
+            if i >= max_lag { break; }
+            item.push(out);
+        }
+    }
 }
 
 pub trait FeatureLen {
     const LEN: usize;
+    fn len_n(max_lag: usize) -> usize { let _ = max_lag; Self::LEN }
 }
 
 impl FeatureLen for u64 {
@@ -106,4 +121,5 @@ where
     T: FeatureLen,
 {
     const LEN: usize = N * T::LEN;
+    fn len_n(max_lag: usize) -> usize { max_lag.min(N) * T::LEN }
 }
