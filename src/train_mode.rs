@@ -8,10 +8,16 @@ use crate::xframe::{
     Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
 };
 use crate::xframe_dump::MarketXFramesDump;
+use linfa::prelude::Fit;
+use linfa::Dataset;
+use linfa_logistic::LogisticRegression;
+use ndarray::{Array1, Array2};
 use optimizer::sampler::tpe::TpeSampler;
 use optimizer::{Direction, ParamValue, Study};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use xgb::parameters::learning::{EvaluationMetric, LearningTaskParametersBuilder, Metrics, Objective};
 use xgb::parameters::tree::{TreeBoosterParametersBuilder, TreeMethod};
@@ -30,6 +36,75 @@ const EVAL_BOOST_ROUNDS: u32 = 80;
 const VAL_FRACTION: f64 = 0.1;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
 const TEST_FRACTION: f64 = 0.1;
+/// Число итераций логистической регрессии для Platt scaling.
+const CALIBRATE_ITERATIONS: u64 = 100;
+
+// ─── Калибровка (Platt scaling) ──────────────────────────────────────────────
+
+/// Коэффициенты Platt scaling: `calibrated_p = sigmoid(w × raw_pred + intercept)`.
+///
+/// Сохраняется рядом с моделью (`.calibration.bin`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Calibration {
+    pub intercept: f32,
+    pub param_w: f32,
+}
+
+impl Calibration {
+    /// Применяет Platt scaling к сырому предсказанию XGBoost.
+    pub fn apply(&self, raw_pred: f32) -> f32 {
+        let logit = self.param_w * raw_pred + self.intercept;
+        1.0 / (1.0 + (-logit).exp())
+    }
+}
+
+/// Platt scaling: обучает логистическую регрессию `y ~ raw_prediction` на валидационном наборе,
+/// возвращая калибровочные коэффициенты.
+fn fit_calibration(booster: &Booster, dval: &DMatrix, y_val: &[f32]) -> anyhow::Result<Calibration> {
+    let preds = booster.predict(dval)?;
+    let x = Array2::from_shape_vec((preds.len(), 1), preds)?;
+    let targets = Array1::from(y_val.iter().map(|&v| v >= 1.0).collect::<Vec<bool>>());
+
+    let dataset = Dataset::new(x, targets);
+    let model = LogisticRegression::default()
+        .max_iterations(CALIBRATE_ITERATIONS)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("calibration fit error: {e}"))?;
+
+    Ok(Calibration {
+        intercept: model.intercept(),
+        param_w: model.params()[0],
+    })
+}
+
+/// Сохраняет калибровку рядом с моделью: `model_path` → `model_path.calibration.bin`.
+fn save_calibration(cal: &Calibration, model_path: &Path) -> anyhow::Result<PathBuf> {
+    let cal_path = calibration_path(model_path);
+    if let Some(parent) = cal_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::File::create(&cal_path)?;
+    let writer = BufWriter::new(file);
+    bincode::serialize_into(writer, cal)?;
+    Ok(cal_path)
+}
+
+/// Загружает калибровку из файла рядом с моделью.
+pub fn load_calibration(model_path: &Path) -> anyhow::Result<Calibration> {
+    let cal_path = calibration_path(model_path);
+    let file = fs::File::open(&cal_path)?;
+    let reader = BufReader::new(file);
+    Ok(bincode::deserialize_from(reader)?)
+}
+
+/// Путь к файлу калибровки для данной модели.
+pub fn calibration_path(model_path: &Path) -> PathBuf {
+    let mut p = model_path.as_os_str().to_owned();
+    p.push(".calibration.bin");
+    PathBuf::from(p)
+}
+
+// ─── XGBoost параметры ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct XgbParams {
@@ -381,6 +456,22 @@ fn train_and_save(
 
     print_y_distribution(&y_train, &y_val, &y_test, tag);
     print_contributions(&booster, &dtest, tag, max_lag);
+
+    // ── Platt scaling: калибровка на validation set ──────────────────────────
+    match fit_calibration(&booster, &dtest, &y_test) {
+        Ok(cal) => {
+            println!(
+                "[train] {tag}: calibration: intercept={:.4} w={:.4} (пример: raw 0.50→{:.3}, raw 0.85→{:.3}, raw 0.95→{:.3})",
+                cal.intercept, cal.param_w,
+                cal.apply(0.50), cal.apply(0.85), cal.apply(0.95),
+            );
+            match save_calibration(&cal, model_path) {
+                Ok(path) => println!("[train] {tag}: калибровка сохранена → {}", path.display()),
+                Err(err) => eprintln!("[train] {tag}: ошибка сохранения калибровки: {err:#}"),
+            }
+        }
+        Err(err) => eprintln!("[train] {tag}: ошибка калибровки (Platt scaling): {err:#}"),
+    }
 
     if let Some(parent) = model_path.parent() {
         fs::create_dir_all(parent)?;

@@ -24,6 +24,7 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
+use crate::train_mode::{load_calibration, Calibration};
 use crate::xframe::{XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use std::fs;
@@ -32,8 +33,15 @@ use xgb::{Booster, DMatrix};
 
 /// Порог предсказания модели (0.0–1.0) для входа в позицию.
 pub const SIM_BUY_THRESHOLD: f32 = 0.85;
-/// Размер виртуальной позиции в USDC.
-pub const POSITION_SIZE_USD: f64 = 10.0;
+
+/// Стартовый виртуальный банкролл (USDC).
+pub const INITIAL_BANKROLL: f64 = 1000.0;
+/// Множитель Келли: 0.5 = half-Kelly (снижает волатильность при неточности модели).
+pub const KELLY_MULTIPLIER: f64 = 0.5;
+/// Максимальная доля банкролла на одну сделку.
+pub const MAX_BET_FRACTION: f64 = 0.20;
+/// Минимальный размер позиции в USDC (меньше — не торгуем).
+pub const MIN_POSITION_USD: f64 = 1.0;
 
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
 /// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
@@ -67,8 +75,14 @@ enum CloseReason {
 }
 
 /// Накопленная статистика за версию.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SimStats {
+    /// Текущий виртуальный банкролл (USDC).
+    bankroll: f64,
+    /// Пиковый банкролл (для расчёта drawdown).
+    peak_bankroll: f64,
+    /// Максимальная просадка в процентах: `(peak - trough) / peak × 100`.
+    max_drawdown_pct: f64,
     /// Число обработанных событий (файлов `.bin`) за версию.
     events: usize,
     /// Общее число закрытых сделок (каждая открытая позиция — одна сделка).
@@ -91,6 +105,42 @@ struct SimStats {
     resolution_loss: usize,
     /// Число выходов по таймауту: позиция удерживалась >= [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL.
     timeout_count: usize,
+    /// Число пропущенных входов из-за Kelly f* ≤ 0 (нет edge).
+    kelly_skips: usize,
+}
+
+impl SimStats {
+    fn new() -> Self {
+        Self {
+            bankroll: INITIAL_BANKROLL,
+            peak_bankroll: INITIAL_BANKROLL,
+            max_drawdown_pct: 0.0,
+            events: 0,
+            trades: 0,
+            wins: 0,
+            losses: 0,
+            pnl_usd: 0.0,
+            fees_paid: 0.0,
+            tp_count: 0,
+            sl_count: 0,
+            resolution_win: 0,
+            resolution_loss: 0,
+            timeout_count: 0,
+            kelly_skips: 0,
+        }
+    }
+
+    fn update_drawdown(&mut self) {
+        if self.bankroll > self.peak_bankroll {
+            self.peak_bankroll = self.bankroll;
+        }
+        if self.peak_bankroll > 0.0 {
+            let drawdown_pct = (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100.0;
+            if drawdown_pct > self.max_drawdown_pct {
+                self.max_drawdown_pct = drawdown_pct;
+            }
+        }
+    }
 }
 
 // ─── Точка входа ──────────────────────────────────────────────────────────────
@@ -136,14 +186,19 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                     }
                 };
 
+                let calibration_up = load_calibration(&model_up_path).ok();
+                let calibration_down = load_calibration(&model_down_path).ok();
+
                 println!(
-                    "[sim] {tag}: модели pnl загружены \
-                     | threshold={SIM_BUY_THRESHOLD} | position={POSITION_SIZE_USD}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}"
+                    "[sim] {tag}: модели pnl загружены (calibration_up={} calibration_down={}) \
+                     | threshold={SIM_BUY_THRESHOLD} | kelly={KELLY_MULTIPLIER} | max_bet={MAX_BET_FRACTION} \
+                     | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}",
+                    if calibration_up.is_some() { "✓" } else { "✗" },
+                    if calibration_down.is_some() { "✓" } else { "✗" },
                 );
 
-                let mut stats = SimStats::default();
+                let mut sim_stats = SimStats::new();
 
-                // Дампы с шагом 1s — совпадает со step pnl-модели.
                 let step_path = interval_path.join("1s");
                 if step_path.is_dir() {
                     for date_path in fs_sorted_dirs(&step_path)? {
@@ -154,10 +209,10 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                             if file_path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
                                 continue;
                             }
-                            match load_dump(&file_path) {
-                                Ok(dump) => {
-                                    simulate_event(&dump, &booster_up, &booster_down, &mut stats);
-                                    stats.events += 1;
+                            match load_market_xframes(&file_path) {
+                                Ok(market_xframes) => {
+                                    simulate_event(&market_xframes, &booster_up, &booster_down, calibration_up.as_ref(), calibration_down.as_ref(), &mut sim_stats);
+                                    sim_stats.events += 1;
                                 }
                                 Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
                             }
@@ -165,7 +220,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                     }
                 }
 
-                print_stats(&tag, &stats);
+                print_sim_stats(&tag, &sim_stats);
             }
         }
     }
@@ -179,9 +234,16 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 ///
 /// UP и DOWN — зеркальные токены одного события: при 50/50 шансах
 /// `prob_up ≈ 1 − prob_down`. Итерируем по `min(len_up, len_down)` стабильным кадрам.
-fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: &Booster, stats: &mut SimStats) {
-    let frames_up: Vec<&XFrame<SIZE>> = dump.frames_up.iter().filter(|f| f.stable).collect();
-    let frames_down: Vec<&XFrame<SIZE>> = dump.frames_down.iter().filter(|f| f.stable).collect();
+fn simulate_event(
+    market_xframes: &MarketXFramesDump,
+    booster_up: &Booster,
+    booster_down: &Booster,
+    calibration_up: Option<&Calibration>,
+    calibration_down: Option<&Calibration>,
+    sim_stats: &mut SimStats,
+) {
+    let frames_up: Vec<&XFrame<SIZE>> = market_xframes.frames_up.iter().filter(|f| f.stable).collect();
+    let frames_down: Vec<&XFrame<SIZE>> = market_xframes.frames_down.iter().filter(|f| f.stable).collect();
 
     let len = frames_up.len().min(frames_down.len());
     if len == 0 {
@@ -209,8 +271,8 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
         // по двоичному исходу: победитель → 1.0, проигравший → 0.0.
         let (exit_prob_up, exit_prob_down, is_resolution) = if is_last {
             (
-                if dump.up_won() { 1.0_f64 } else { 0.0_f64 },
-                if dump.up_won() { 0.0_f64 } else { 1.0_f64 },
+                if market_xframes.up_won() { 1.0_f64 } else { 0.0_f64 },
+                if market_xframes.up_won() { 0.0_f64 } else { 1.0_f64 },
                 true,
             )
         } else {
@@ -241,8 +303,10 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
                 }
             };
             if let Some((exit_price, reason)) = close {
-                let pnl = close_position(&pos, exit_price, &reason, frame_up, stats);
-                stats.pnl_usd += pnl;
+                let pnl = close_position(&pos, exit_price, &reason, frame_up, sim_stats);
+                sim_stats.pnl_usd += pnl;
+                sim_stats.bankroll += pnl;
+                sim_stats.update_drawdown();
             } else {
                 remaining_up.push(pos);
             }
@@ -273,8 +337,10 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
                 }
             };
             if let Some((exit_price, reason)) = close {
-                let pnl = close_position(&pos, exit_price, &reason, frame_down, stats);
-                stats.pnl_usd += pnl;
+                let pnl = close_position(&pos, exit_price, &reason, frame_down, sim_stats);
+                sim_stats.pnl_usd += pnl;
+                sim_stats.bankroll += pnl;
+                sim_stats.update_drawdown();
             } else {
                 remaining_down.push(pos);
             }
@@ -283,43 +349,118 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
 
         // ── Открытие новых позиций (не на последнем кадре) ───────────────────
         if !is_last {
-            if let Some(pred) = predict_frame(booster_up, frame_up, None) {
-                if pred >= SIM_BUY_THRESHOLD {
-                    positions_up.push(open_position(frame_up, stats));
+            if let Some(raw) = predict_frame(booster_up, frame_up, None) {
+                if raw >= SIM_BUY_THRESHOLD {
+                    let pred = calibration_up.map_or(raw, |c| c.apply(raw));
+                    let size = kelly_position_size(pred, prob_up, sim_stats.bankroll);
+                    if size > 0.0 {
+                        positions_up.push(open_position(frame_up, size, sim_stats));
+                    } else {
+                        sim_stats.kelly_skips += 1;
+                    }
                 }
             }
-            if let Some(pred) = predict_frame(booster_down, frame_down, None) {
-                if pred >= SIM_BUY_THRESHOLD {
-                    positions_down.push(open_position(frame_down, stats));
+            if let Some(raw) = predict_frame(booster_down, frame_down, None) {
+                if raw >= SIM_BUY_THRESHOLD {
+                    let pred = calibration_down.map_or(raw, |c| c.apply(raw));
+                    let size = kelly_position_size(pred, prob_down, sim_stats.bankroll);
+                    if size > 0.0 {
+                        positions_down.push(open_position(frame_down, size, sim_stats));
+                    } else {
+                        sim_stats.kelly_skips += 1;
+                    }
                 }
             }
         }
     }
 }
 
+
+// ─── Kelly criterion ──────────────────────────────────────────────────────────
+
+/// Ожидаемая доля выигрыша при срабатывании Take Profit.
+///
+/// Моделирует покупку $1 токена по `entry_prob`, продажу по `entry_prob + TP`,
+/// с учётом taker-fee на обоих концах.
+fn kelly_gain_ratio(entry_prob: f64) -> f64 {
+    let sell_price = (entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
+    let net = net_round_trip(entry_prob, sell_price);
+    (net - 1.0).max(1e-9)
+}
+
+/// Ожидаемая доля убытка при срабатывании Stop Loss.
+///
+/// Моделирует покупку $1 токена по `entry_prob`, продажу по `entry_prob + SL`,
+/// с учётом taker-fee на обоих концах.
+fn kelly_loss_ratio(entry_prob: f64) -> f64 {
+    let sell_price = (entry_prob + Y_TRAIN_STOP_LOSS_PP).clamp(0.001, 0.999);
+    let net = net_round_trip(entry_prob, sell_price);
+    (1.0 - net).max(1e-9)
+}
+
+/// Чистый возврат на $1 при покупке по `buy` и продаже по `sell` (с fee на обоих концах).
+fn net_round_trip(buy: f64, sell: f64) -> f64 {
+    let nominal_shares = 1.0 / buy;
+    let buy_fee = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy * (1.0 - buy);
+    let actual_shares = nominal_shares - buy_fee / buy;
+
+    let gross = actual_shares * sell;
+    let sell_fee = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell * (1.0 - sell);
+    gross - sell_fee
+}
+
+/// Оптимальная доля банкролла по формуле Келли: `f* = p/l − q/g`.
+///
+/// - `p_win` — вероятность прибыльной сделки (предсказание модели).
+/// - `gain` — доля выигрыша при TP ([`kelly_gain_ratio`]).
+/// - `loss` — доля убытка при SL ([`kelly_loss_ratio`]).
+///
+/// Возвращает «сырую» долю (может быть > 1 при высоком edge).
+fn kelly_fraction(p_win: f64, gain: f64, loss: f64) -> f64 {
+    if gain <= 0.0 || loss <= 0.0 {
+        return 0.0;
+    }
+    let q = 1.0 - p_win;
+    p_win / loss - q / gain
+}
+
+/// Вычисляет размер позиции (USDC) по half-Kelly с учётом банкролла.
+///
+/// Возвращает `0.0` если edge отсутствует или позиция меньше [`MIN_POSITION_USD`].
+fn kelly_position_size(prediction: f32, entry_prob: f64, bankroll: f64) -> f64 {
+    let g = kelly_gain_ratio(entry_prob);
+    let l = kelly_loss_ratio(entry_prob);
+    let f = kelly_fraction(prediction as f64, g, l);
+    let f_adj = f * KELLY_MULTIPLIER;
+    if f_adj <= 0.0 {
+        return 0.0;
+    }
+    let size = f_adj.min(MAX_BET_FRACTION) * bankroll;
+    if size < MIN_POSITION_USD { 0.0 } else { size }
+}
+
 // ─── Торговые операции с учётом комиссий ──────────────────────────────────────
 
-/// Открывает виртуальную позицию за `POSITION_SIZE_USD`.
+/// Открывает виртуальную позицию за `position_size` USDC.
 ///
 /// Цена исполнения определяется обходом ask-стакана (L1→L2→L3): если L1 не хватает
-/// ликвидности — добираем с L2, затем L3. VWAP покупки = `POSITION_SIZE_USD / total_shares`.
+/// ликвидности — добираем с L2, затем L3. VWAP покупки = `position_size / total_shares`.
 /// Taker-комиссия вычитается из полученных шерсов:
 /// `actual_shares = nominal_shares − nominal_shares × FEE_RATE × p × (1−p)`
-fn open_position(frame: &XFrame<SIZE>, stats: &mut SimStats) -> OpenPosition {
-    let (buy_price, nominal_shares) = book_fill_buy(frame);
+fn open_position(frame: &XFrame<SIZE>, position_size: f64, sim_stats: &mut SimStats) -> OpenPosition {
+    let (buy_price, nominal_shares) = book_fill_buy(frame, position_size);
     let buy_price = buy_price.clamp(0.001, 0.999);
 
     let fee_usdc = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
     let fee_shares = fee_usdc / buy_price;
     let actual_shares = nominal_shares - fee_shares;
 
-    stats.fees_paid += fee_usdc;
+    sim_stats.fees_paid += fee_usdc;
 
     OpenPosition {
         shares_held: actual_shares,
-        // entry_prob берём из currency_implied_prob для TP/SL-слежения
         entry_prob: frame.currency_implied_prob.unwrap_or(buy_price),
-        entry_cost: POSITION_SIZE_USD,
+        entry_cost: position_size,
         frames_held: 0,
     }
 }
@@ -336,7 +477,7 @@ fn close_position(
     exit_price: f64,
     reason: &CloseReason,
     frame: &XFrame<SIZE>,
-    stats: &mut SimStats,
+    sim_stats: &mut SimStats,
 ) -> f64 {
     let net_usdc = match reason {
         CloseReason::Resolution { won: true } => pos.shares_held,
@@ -349,22 +490,22 @@ fn close_position(
                 exit_price.clamp(0.001, 0.999)
             };
             let fee_usdc = pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price);
-            stats.fees_paid += fee_usdc;
+            sim_stats.fees_paid += fee_usdc;
             gross_usdc - fee_usdc
         }
     };
 
     let pnl = net_usdc - pos.entry_cost;
 
-    stats.trades += 1;
-    if pnl >= 0.0 { stats.wins += 1; } else { stats.losses += 1; }
+    sim_stats.trades += 1;
+    if pnl >= 0.0 { sim_stats.wins += 1; } else { sim_stats.losses += 1; }
 
     match reason {
-        CloseReason::TakeProfit                => stats.tp_count += 1,
-        CloseReason::StopLoss                  => stats.sl_count += 1,
-        CloseReason::Resolution { won: true }  => stats.resolution_win += 1,
-        CloseReason::Resolution { won: false } => stats.resolution_loss += 1,
-        CloseReason::Timeout                   => stats.timeout_count += 1,
+        CloseReason::TakeProfit                => sim_stats.tp_count += 1,
+        CloseReason::StopLoss                  => sim_stats.sl_count += 1,
+        CloseReason::Resolution { won: true }  => sim_stats.resolution_win += 1,
+        CloseReason::Resolution { won: false } => sim_stats.resolution_loss += 1,
+        CloseReason::Timeout                   => sim_stats.timeout_count += 1,
     }
 
     pnl
@@ -372,18 +513,18 @@ fn close_position(
 
 // ─── Обход стакана ────────────────────────────────────────────────────────────
 
-/// Покупка `POSITION_SIZE_USD` по ask-стакану (L1→L2→L3).
+/// Покупка `position_size` USDC по ask-стакану (L1→L2→L3).
 ///
 /// Возвращает `(vwap_price, total_nominal_shares)`.
 /// Если ликвидности на трёх уровнях не хватает — остаток добирается по `currency_implied_prob`.
-fn book_fill_buy(frame: &XFrame<SIZE>) -> (f64, f64) {
+fn book_fill_buy(frame: &XFrame<SIZE>, position_size: f64) -> (f64, f64) {
     let levels = [
         (frame.book_ask_l1_price, frame.book_ask_l1_size),
         (frame.book_ask_l2_price, frame.book_ask_l2_size),
         (frame.book_ask_l3_price, frame.book_ask_l3_size),
     ];
 
-    let mut remaining_usdc = POSITION_SIZE_USD;
+    let mut remaining_usdc = position_size;
     let mut total_shares = 0.0_f64;
 
     for (price_opt, size_opt) in levels {
@@ -401,7 +542,6 @@ fn book_fill_buy(frame: &XFrame<SIZE>) -> (f64, f64) {
         }
     }
 
-    // Остаток при нехватке ликвидности — добираем по currency_implied_prob
     if remaining_usdc > 1e-9 {
         let fallback = frame.currency_implied_prob
             .unwrap_or(0.5)
@@ -409,7 +549,7 @@ fn book_fill_buy(frame: &XFrame<SIZE>) -> (f64, f64) {
         total_shares += remaining_usdc / fallback;
     }
 
-    let vwap = if total_shares > 0.0 { POSITION_SIZE_USD / total_shares } else { 0.5 };
+    let vwap = if total_shares > 0.0 { position_size / total_shares } else { 0.5 };
     (vwap, total_shares)
 }
 
@@ -472,28 +612,32 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
 
 // ─── Вывод статистики ─────────────────────────────────────────────────────────
 
-fn print_stats(tag: &str, stats: &SimStats) {
-    if stats.trades == 0 {
-        println!("[sim] {tag}: нет сделок ({} событий)", stats.events);
+fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
+    if sim_stats.trades == 0 {
+        println!("[sim] {tag}: нет сделок ({} событий, kelly_skips={})", sim_stats.events, sim_stats.kelly_skips);
         return;
     }
 
-    let win_rate = stats.wins as f64 / stats.trades as f64 * 100.0;
-    let avg_pnl = stats.pnl_usd / stats.trades as f64;
+    let win_rate = sim_stats.wins as f64 / sim_stats.trades as f64 * 100.0;
+    let avg_pnl = sim_stats.pnl_usd / sim_stats.trades as f64;
+    let roi_pct = (sim_stats.bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
 
     println!(
         "[sim] {tag} \
-         | events={} (событий) trades={} (сделок) win={:.1}% (винрейт) \
-         | pnl={:+.4}$ (итог) avg={:+.4}$/trade (среднее) fees={:.4}$ (комиссии)",
-        stats.events, stats.trades, win_rate, stats.pnl_usd, avg_pnl, stats.fees_paid,
+         | events={} trades={} win={:.1}% \
+         | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$",
+        sim_stats.events, sim_stats.trades, win_rate, sim_stats.pnl_usd, avg_pnl, sim_stats.fees_paid,
     );
     println!(
-        "[sim]   TP={} (тейкпрофит) SL={} (стоплосс) Timeout={} (таймаут) \
-         Res✓={} (резолюция выиграл) Res✗={} (резолюция проиграл) \
-         | wins={} (побед) losses={} (потерь)",
-        stats.tp_count, stats.sl_count, stats.timeout_count,
-        stats.resolution_win, stats.resolution_loss,
-        stats.wins, stats.losses,
+        "[sim]   bankroll: {:.2}$ (start={INITIAL_BANKROLL}$) ROI={:+.2}% max_drawdown={:.2}%",
+        sim_stats.bankroll, roi_pct, sim_stats.max_drawdown_pct,
+    );
+    println!(
+        "[sim]   TP={} SL={} Timeout={} Res✓={} Res✗={} kelly_skips={} \
+         | wins={} losses={}",
+        sim_stats.tp_count, sim_stats.sl_count, sim_stats.timeout_count,
+        sim_stats.resolution_win, sim_stats.resolution_loss, sim_stats.kelly_skips,
+        sim_stats.wins, sim_stats.losses,
     );
 }
 
@@ -512,7 +656,7 @@ fn load_booster(path: &Path) -> Option<Booster> {
     }
 }
 
-fn load_dump(path: &Path) -> anyhow::Result<MarketXFramesDump> {
+fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
     let bytes = fs::read(path)?;
     Ok(bincode::deserialize(&bytes)?)
 }
