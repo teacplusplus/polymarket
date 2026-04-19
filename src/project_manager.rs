@@ -925,7 +925,7 @@ fn spawn_bg_price_to_beat_refine(
     period_sec: i64,
 ) {
     tokio::spawn(async move {
-        const MAX_ATTEMPTS: u32 = 15;
+        const MAX_ATTEMPTS: u32 = 30;
         for attempt in 1..=MAX_ATTEMPTS {
             match fetch_price_to_beat_from_polymarket_event_page(project_manager.http.as_ref(), &slug, currency.as_str(), false).await {
                 Ok((price_to_beat, _)) => {

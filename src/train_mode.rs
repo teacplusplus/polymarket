@@ -199,7 +199,7 @@ fn train_all_variants(
             );
             let model_path = version_path.join(&model_name);
 
-            match train_and_save(&markets, &model_path, &tag, model_type, feature_count, max_lag) {
+            match train_and_save(&markets, &model_path, &tag, model_type, max_lag) {
                 Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
@@ -273,10 +273,9 @@ fn append_frames(
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
 ) {
-    let up_won = final_price >= price_to_beat;
     for index in 0..frames.len() {
         let label = match model_type {
-            ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index, up_won),
+            ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
             ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
         };
         let Some(label) = label else {
@@ -307,54 +306,32 @@ fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
     (x, y)
 }
 
-/// 3-way split: train / val / test.
+/// 3-way split по маркетам: train / val / test.
 ///
+/// Каждый маркет целиком попадает в одну группу — модель видит полные жизненные циклы событий.
 /// - **val** — используется optimizer'ом для подбора гиперпараметров и early stopping.
 /// - **test** — held-out, только для финальной честной оценки AUC.
-///
-/// Для **Resolution** — сплит по маркетам (каждый маркет целиком в одной группе).
-/// Для **Pnl** — хронологический сплит по кадрам.
 fn train_and_save(
     markets: &[MarketDataset],
     model_path: &Path,
     tag: &str,
     model_type: ModelType,
-    feature_count: usize,
     max_lag: Option<usize>,
 ) -> anyhow::Result<()> {
-    let (x_train, y_train, x_val, y_val, x_test, y_test) = match model_type {
-        ModelType::Resolution => {
-            let n = markets.len();
-            let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
-            let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
-            let train_count = n.saturating_sub(test_count + val_count);
-            let (train_markets, rest) = markets.split_at(train_count);
-            let (val_markets, test_markets) = rest.split_at(val_count.min(rest.len()));
-            println!(
-                "[train] {tag}: сплит по маркетам: {train_count} train / {} val / {} test (всего {n})",
-                val_markets.len(),
-                test_markets.len(),
-            );
-            let (x_train, y_train) = flatten_markets(train_markets);
-            let (x_val, y_val) = flatten_markets(val_markets);
-            let (x_test, y_test) = flatten_markets(test_markets);
-            (x_train, y_train, x_val, y_val, x_test, y_test)
-        }
-        ModelType::Pnl => {
-            let (x_all, y_all) = flatten_markets(markets);
-            let num_rows = y_all.len();
-            let test_size = ((num_rows as f64) * TEST_FRACTION) as usize;
-            let val_size = ((num_rows as f64) * VAL_FRACTION) as usize;
-            let train_size = num_rows.saturating_sub(test_size + val_size);
-            let train_idx: Vec<usize> = (0..train_size).collect();
-            let val_idx: Vec<usize> = (train_size..train_size + val_size).collect();
-            let test_idx: Vec<usize> = (train_size + val_size..num_rows).collect();
-            let (x_train, y_train) = gather_rows(&x_all, &y_all, &train_idx, feature_count);
-            let (x_val, y_val) = gather_rows(&x_all, &y_all, &val_idx, feature_count);
-            let (x_test, y_test) = gather_rows(&x_all, &y_all, &test_idx, feature_count);
-            (x_train, y_train, x_val, y_val, x_test, y_test)
-        }
-    };
+    let n = markets.len();
+    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
+    let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
+    let train_count = n.saturating_sub(test_count + val_count);
+    let (train_markets, rest) = markets.split_at(train_count);
+    let (val_markets, test_markets) = rest.split_at(val_count.min(rest.len()));
+    println!(
+        "[train] {tag}: сплит по маркетам: {train_count} train / {} val / {} test (всего {n})",
+        val_markets.len(),
+        test_markets.len(),
+    );
+    let (x_train, y_train) = flatten_markets(train_markets);
+    let (x_val, y_val) = flatten_markets(val_markets);
+    let (x_test, y_test) = flatten_markets(test_markets);
 
     let total_rows = y_train.len() + y_val.len() + y_test.len();
     if total_rows == 0 {
@@ -502,16 +479,6 @@ fn print_y_distribution(y_train: &[f32], y_val: &[f32], y_test: &[f32], tag: &st
     print_counts("test", y_test);
 }
 
-/// Собирает строки датасета по индексам.
-fn gather_rows(x: &[f32], y: &[f32], indices: &[usize], feature_count: usize) -> (Vec<f32>, Vec<f32>) {
-    let mut x_out = Vec::with_capacity(indices.len() * feature_count);
-    let mut y_out = Vec::with_capacity(indices.len());
-    for &row_idx in indices {
-        x_out.extend_from_slice(&x[row_idx * feature_count..(row_idx + 1) * feature_count]);
-        y_out.push(y[row_idx]);
-    }
-    (x_out, y_out)
-}
 
 /// Байесовская оптимизация гиперпараметров XGBoost (максимизация AUC на тесте).
 fn tune_xgboost_optimizer(

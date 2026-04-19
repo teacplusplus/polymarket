@@ -974,7 +974,8 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 15;
 ///            `0.0` если `net_ret ≤ Y_TRAIN_STOP_LOSS_PP`,
 ///            `0.0` если за n кадров ни один порог не достигнут.
 /// `up_won` — фактический исход рынка из [`crate::xframe_dump::MarketXFramesDump::up_won`].
-pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, up_won: bool) -> Option<f32> {
+pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64) -> Option<f32> {
+    let up_won = final_price >= price_to_beat;
     let p_buy = x_frames.get(index)?.currency_implied_prob?.clamp(0.001, 0.999);
 
     let nominal_shares = 1.0 / p_buy;
