@@ -20,6 +20,7 @@ pub fn derive_xfeatures(input: TokenStream) -> TokenStream {
     let mut push_calls = Vec::new();
     let mut push_n_calls = Vec::new();
     let mut name_matches = Vec::new();
+    let mut name_n_matches = Vec::new();
     let mut field_lens = Vec::new();
     let mut field_len_n_calls = Vec::new();
 
@@ -63,6 +64,24 @@ pub fn derive_xfeatures(input: TokenStream) -> TokenStream {
                 offset += len;
             }
         });
+
+        name_n_matches.push(quote! {
+            {
+                let len = <#ty as FeatureLen>::len_n(max_lag);
+                if idx >= offset && idx < offset + len {
+                    return Some(Box::leak(format!(
+                        "{}{}",
+                        #ident_str,
+                        if len > 1 {
+                            format!("[{}]", idx - offset)
+                        } else {
+                            String::new()
+                        }
+                    ).into_boxed_str()));
+                }
+                offset += len;
+            }
+        });
     }
 
     let expanded = quote! {
@@ -83,6 +102,13 @@ pub fn derive_xfeatures(input: TokenStream) -> TokenStream {
             pub fn feature_name(idx: usize) -> Option<&'static str> {
                 let mut offset = 0usize;
                 #(#name_matches)*
+                None
+            }
+
+            /// Как [`feature_name`], но с учётом ограничения лаговых массивов до `max_lag`.
+            pub fn feature_name_n(idx: usize, max_lag: usize) -> Option<&'static str> {
+                let mut offset = 0usize;
+                #(#name_n_matches)*
                 None
             }
 

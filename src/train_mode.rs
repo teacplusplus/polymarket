@@ -199,7 +199,7 @@ fn train_all_variants(
             );
             let model_path = version_path.join(&model_name);
 
-            match train_and_save(&markets, &model_path, &tag, model_type, feature_count) {
+            match train_and_save(&markets, &model_path, &tag, model_type, feature_count, max_lag) {
                 Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
@@ -320,6 +320,7 @@ fn train_and_save(
     tag: &str,
     model_type: ModelType,
     feature_count: usize,
+    max_lag: Option<usize>,
 ) -> anyhow::Result<()> {
     let (x_train, y_train, x_val, y_val, x_test, y_test) = match model_type {
         ModelType::Resolution => {
@@ -402,7 +403,7 @@ fn train_and_save(
     );
 
     print_y_distribution(&y_train, &y_val, &y_test, tag);
-    print_contributions(&booster, &dtest, tag);
+    print_contributions(&booster, &dtest, tag, max_lag);
 
     if let Some(parent) = model_path.parent() {
         fs::create_dir_all(parent)?;
@@ -433,7 +434,7 @@ fn print_eval_metrics(booster: &Booster, tag: &str, eval_label: &str) {
 
 /// Вычисляет и печатает SHAP-вклад каждой фичи на первой строке тестовой выборки,
 /// отсортированный по убыванию абсолютного вклада.
-fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str) {
+fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str, max_lag: Option<usize>) {
     let Ok((shap_values, (num_rows, num_cols))) = booster.predict_contributions(dtest) else {
         eprintln!("[train] {tag}: не удалось вычислить SHAP contributions");
         return;
@@ -450,7 +451,10 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str) {
     let mut contributions: Vec<(String, f32, f32)> = (0..n_features)
         .filter_map(|feat_idx| {
             let shap = shap_values[feat_idx];
-            let name = XFrame::<SIZE>::feature_name(feat_idx)?;
+            let name = match max_lag {
+                Some(n) => XFrame::<SIZE>::feature_name_n(feat_idx, n),
+                None => XFrame::<SIZE>::feature_name(feat_idx),
+            }?;
             let percent = if total_abs > 0.0 {
                 shap.abs() / total_abs * 100.0
             } else {

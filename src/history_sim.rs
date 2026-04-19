@@ -283,12 +283,12 @@ fn simulate_event(dump: &MarketXFramesDump, booster_up: &Booster, booster_down: 
 
         // ── Открытие новых позиций (не на последнем кадре) ───────────────────
         if !is_last {
-            if let Some(pred) = predict_frame(booster_up, frame_up) {
+            if let Some(pred) = predict_frame(booster_up, frame_up, None) {
                 if pred >= SIM_BUY_THRESHOLD {
                     positions_up.push(open_position(frame_up, stats));
                 }
             }
-            if let Some(pred) = predict_frame(booster_down, frame_down) {
+            if let Some(pred) = predict_frame(booster_down, frame_down, None) {
                 if pred >= SIM_BUY_THRESHOLD {
                     positions_down.push(open_position(frame_down, stats));
                 }
@@ -454,9 +454,16 @@ fn book_fill_sell(frame: &XFrame<SIZE>, shares_to_sell: f64) -> f64 {
 
 // ─── Предсказание ─────────────────────────────────────────────────────────────
 
-fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>) -> Option<f32> {
-    let features = frame.to_x_train();
-    if features.len() != XFrame::<SIZE>::count_features() {
+fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>) -> Option<f32> {
+    let features = match max_lag {
+        Some(n) => frame.to_x_train_n(n),
+        None => frame.to_x_train(),
+    };
+    let expected = match max_lag {
+        Some(n) => XFrame::<SIZE>::count_features_n(n),
+        None => XFrame::<SIZE>::count_features(),
+    };
+    if features.len() != expected {
         return None;
     }
     let dmat = DMatrix::from_dense(&features, 1).ok()?;
