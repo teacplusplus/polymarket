@@ -58,22 +58,60 @@ impl Calibration {
     }
 }
 
-/// Platt scaling: обучает логистическую регрессию `y ~ raw_prediction` на валидационном наборе,
+/// Platt scaling: обучает логистическую регрессию `y ~ raw_prediction` на наборе данных,
 /// возвращая калибровочные коэффициенты.
-fn fit_calibration(booster: &Booster, dval: &DMatrix, y_val: &[f32]) -> anyhow::Result<Calibration> {
-    let preds = booster.predict(dval)?;
+/// Печатает диагностику для обнаружения инверсии/distribution shift.
+fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> anyhow::Result<Calibration> {
+    let preds = booster.predict(dmat)?;
+
+    let n_pos = y.iter().filter(|&&v| v >= 1.0).count();
+    let n_neg = y.len() - n_pos;
+    let mean_pred_pos: f64 = preds.iter().zip(y.iter())
+        .filter(|(_, yv)| **yv >= 1.0)
+        .map(|(&p, _)| p as f64)
+        .sum::<f64>() / n_pos.max(1) as f64;
+    let mean_pred_neg: f64 = preds.iter().zip(y.iter())
+        .filter(|(_, yv)| **yv < 1.0)
+        .map(|(&p, _)| p as f64)
+        .sum::<f64>() / n_neg.max(1) as f64;
+    let cal_auc = calc_auc(&preds, y);
+    println!(
+        "[calibration] {tag}: n_pos={n_pos} n_neg={n_neg} mean_pred_pos={mean_pred_pos:.4} \
+         mean_pred_neg={mean_pred_neg:.4} AUC={cal_auc:.4}"
+    );
+    if mean_pred_pos < mean_pred_neg {
+        eprintln!(
+            "[calibration] {tag}: WARNING: модель инвертирована на калибровочном сете \
+             (mean_pred_pos < mean_pred_neg). w будет отрицательным."
+        );
+    }
+
     let x = Array2::from_shape_vec((preds.len(), 1), preds)?;
-    let targets = Array1::from(y_val.iter().map(|&v| v >= 1.0).collect::<Vec<bool>>());
+    let targets = Array1::from(y.iter().map(|&v| v >= 1.0).collect::<Vec<bool>>());
 
     let dataset = Dataset::new(x, targets);
     let model = LogisticRegression::default()
+        .alpha(1e-6)
         .max_iterations(CALIBRATE_ITERATIONS)
         .fit(&dataset)
         .map_err(|e| anyhow::anyhow!("calibration fit error: {e}"))?;
 
+    let mut w = model.params()[0];
+    let mut b = model.intercept();
+
+    let model_correct = mean_pred_pos > mean_pred_neg;
+    if model_correct && w < 0.0 {
+        eprintln!(
+            "[calibration] {tag}: FIXING: w={w:.4} отрицательный при корректной модели \
+             (mean_pred_pos > mean_pred_neg). Инвертирую знак."
+        );
+        w = -w;
+        b = -b;
+    }
+
     Ok(Calibration {
-        intercept: model.intercept(),
-        param_w: model.params()[0],
+        intercept: b,
+        param_w: w,
     })
 }
 
@@ -446,10 +484,11 @@ fn train_and_save(
     // Метрики на val (из early stopping)
     print_eval_metrics(&booster, tag, "val");
 
-    // Финальная честная оценка на held-out test
-    let test_metrics = booster.evaluate(&dtest)?;
-    let test_auc = test_metrics.get("auc").copied().unwrap_or(0.0);
-    let test_logloss = test_metrics.get("logloss").copied().unwrap_or(0.0);
+    // Финальная честная оценка на held-out test (AUC считаем вручную,
+    // т.к. booster после load_buffer теряет конфигурацию eval_metrics).
+    let test_preds = booster.predict(&dtest)?;
+    let test_auc = calc_auc(&test_preds, &y_test);
+    let test_logloss = calc_logloss(&test_preds, &y_test);
     println!(
         "[train] {tag}: held-out test: logloss={test_logloss:.5}  AUC={test_auc:.6}"
     );
@@ -457,8 +496,8 @@ fn train_and_save(
     print_y_distribution(&y_train, &y_val, &y_test, tag);
     print_contributions(&booster, &dtest, tag, max_lag);
 
-    // ── Platt scaling: калибровка на validation set ──────────────────────────
-    match fit_calibration(&booster, &dtest, &y_test) {
+    // ── Platt scaling: калибровка на test set ────────────────────────────────
+    match fit_calibration(&booster, &dtest, &y_test, tag) {
         Ok(cal) => {
             println!(
                 "[train] {tag}: calibration: intercept={:.4} w={:.4} (пример: raw 0.50→{:.3}, raw 0.85→{:.3}, raw 0.95→{:.3})",
@@ -758,6 +797,65 @@ fn get_u32(map: &HashMap<String, ParamValue>, key: &str) -> u32 {
         ParamValue::Int(val) => *val as u32,
         _ => panic!("ожидался int для {key}"),
     }
+}
+
+// ─── Метрики (ручной расчёт) ─────────────────────────────────────────────────
+
+/// AUC-ROC по предсказаниям и меткам (Wilcoxon–Mann–Whitney).
+///
+/// Сортирует пары `(pred, label)` по pred **asc** (rank 1 = наименьшее
+/// предсказание), затем считает сумму рангов позитивного класса.
+fn calc_auc(preds: &[f32], labels: &[f32]) -> f32 {
+    let mut pairs: Vec<(f32, bool)> = preds
+        .iter()
+        .zip(labels.iter())
+        .map(|(&p, &y)| (p, y >= 1.0))
+        .collect();
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let n_pos = pairs.iter().filter(|(_, y)| *y).count() as f64;
+    let n_neg = pairs.iter().filter(|(_, y)| !*y).count() as f64;
+    if n_pos == 0.0 || n_neg == 0.0 {
+        return 0.0;
+    }
+
+    let mut sum_ranks = 0.0_f64;
+    let mut rank = 1.0_f64;
+    let mut i = 0;
+    while i < pairs.len() {
+        let mut j = i;
+        while j < pairs.len() && pairs[j].0 == pairs[i].0 {
+            j += 1;
+        }
+        let avg_rank = (rank + rank + (j - i - 1) as f64) / 2.0;
+        for k in i..j {
+            if pairs[k].1 {
+                sum_ranks += avg_rank;
+            }
+        }
+        rank += (j - i) as f64;
+        i = j;
+    }
+
+    let auc = (sum_ranks - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg);
+    auc as f32
+}
+
+/// Binary cross-entropy (logloss).
+fn calc_logloss(preds: &[f32], labels: &[f32]) -> f32 {
+    if preds.is_empty() {
+        return 0.0;
+    }
+    let eps = 1e-7_f32;
+    let sum: f32 = preds
+        .iter()
+        .zip(labels.iter())
+        .map(|(&p, &y)| {
+            let p = p.clamp(eps, 1.0 - eps);
+            -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+        })
+        .sum();
+    sum / preds.len() as f32
 }
 
 /// Возвращает список путей к подпапкам/файлам в `dir`, отсортированных по имени.
