@@ -25,7 +25,7 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 30;
+const OPTIMIZER_TRIALS: usize = 20;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -33,17 +33,22 @@ const EARLY_STOPPING_PATIENCE: u32 = 20;
 /// Число раундов бустинга при каждом шаге оптимизатора (быстрее).
 const EVAL_BOOST_ROUNDS: u32 = 80;
 /// Доля валидационной выборки (для optimizer + early stopping).
-const VAL_FRACTION: f64 = 0.1;
+pub const VAL_FRACTION: f64 = 0.1;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
-const TEST_FRACTION: f64 = 0.1;
+pub const TEST_FRACTION: f64 = 0.1;
 /// Число итераций логистической регрессии для Platt scaling.
 const CALIBRATE_ITERATIONS: u64 = 100;
-/// Понижающий коэффициент `feature_weights` для фич, которые склонны к доминированию.
-/// Снижает вероятность выбора фичи при `colsample_*` < 1.0
-/// (0.1 = фича будет выбрана в ~10× реже остальных).
+/// Понижающий коэффициент `feature_weights` для конкретных фич из [`DOWNWEIGHTED_FEATURES`].
 const DOWNWEIGHT_FACTOR: f32 = 0.1;
+/// Понижающий коэффициент для лаговых фич (массивы `delta_n_*[i]`).
+const LAG_DOWNWEIGHT_FACTOR: f32 = 0.1;
 /// Имена фич, которым автоматически понижается `feature_weight` при обучении.
-const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms"];
+const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "currency_price_vs_beat_pct", "sibling_currency_price_vs_beat_pct"];
+/// Минимальный AUC на калибровочном сете, при котором Platt scaling имеет смысл.
+/// Ниже этого порога сохраняется identity-калибровка (w=1, b=0).
+const CALIBRATION_MIN_AUC: f32 = 0.60;
+/// Максимальное абсолютное значение w и intercept в калибровке (защита от числовой нестабильности).
+const CALIBRATION_MAX_PARAM: f32 = 20.0;
 
 // ─── Калибровка (Platt scaling) ──────────────────────────────────────────────
 
@@ -85,11 +90,13 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
         "[calibration] {tag}: n_pos={n_pos} n_neg={n_neg} mean_pred_pos={mean_pred_pos:.4} \
          mean_pred_neg={mean_pred_neg:.4} AUC={cal_auc:.4}"
     );
-    if mean_pred_pos < mean_pred_neg {
+
+    if cal_auc < CALIBRATION_MIN_AUC {
         eprintln!(
-            "[calibration] {tag}: WARNING: модель инвертирована на калибровочном сете \
-             (mean_pred_pos < mean_pred_neg). w будет отрицательным."
+            "[calibration] {tag}: AUC={cal_auc:.4} < {CALIBRATION_MIN_AUC} — модель слишком \
+             слабая для калибровки. Используется identity (w=1, b=0)."
         );
+        return Ok(Calibration { intercept: 0.0, param_w: 1.0 });
     }
 
     let x = Array2::from_shape_vec((preds.len(), 1), preds)?;
@@ -105,14 +112,21 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
     let mut w = model.params()[0];
     let mut b = model.intercept();
 
-    let model_correct = mean_pred_pos > mean_pred_neg;
-    if model_correct && w < 0.0 {
+    if mean_pred_pos > mean_pred_neg && w < 0.0 {
         eprintln!(
             "[calibration] {tag}: FIXING: w={w:.4} отрицательный при корректной модели \
              (mean_pred_pos > mean_pred_neg). Инвертирую знак."
         );
         w = -w;
         b = -b;
+    }
+
+    if w.abs() > CALIBRATION_MAX_PARAM || b.abs() > CALIBRATION_MAX_PARAM {
+        eprintln!(
+            "[calibration] {tag}: CLAMPING: w={w:.2} b={b:.2} → |max|={CALIBRATION_MAX_PARAM}"
+        );
+        w = w.clamp(-CALIBRATION_MAX_PARAM, CALIBRATION_MAX_PARAM);
+        b = b.clamp(-CALIBRATION_MAX_PARAM, CALIBRATION_MAX_PARAM);
     }
 
     Ok(Calibration {
@@ -813,28 +827,40 @@ fn get_u32(map: &HashMap<String, ParamValue>, key: &str) -> u32 {
 // ─── Feature weights ─────────────────────────────────────────────────────────
 
 /// Строит вектор `feature_weights` длины `n_features`.
-/// Фичи из [`DOWNWEIGHTED_FEATURES`] получают вес [`DOWNWEIGHT_FACTOR`],
-/// остальные — 1.0.
+/// - Фичи из [`DOWNWEIGHTED_FEATURES`] получают вес [`DOWNWEIGHT_FACTOR`].
+/// - Лаговые фичи (имя содержит `[`) получают вес [`LAG_DOWNWEIGHT_FACTOR`].
+/// - Если фича попадает в оба условия, берётся минимальный вес.
 fn build_feature_weights(n_features: usize, max_lag: Option<usize>) -> Vec<f32> {
     let mut weights = vec![1.0_f32; n_features];
-    let mut downweighted = Vec::new();
+    let mut n_explicit = 0usize;
+    let mut n_lag = 0usize;
     for idx in 0..n_features {
         let name = match max_lag {
             Some(n) => XFrame::<SIZE>::feature_name_n(idx, n),
             None => XFrame::<SIZE>::feature_name(idx),
         };
         if let Some(name) = name {
+            let is_lag = name.contains('[');
             let base_name = name.split('[').next().unwrap_or(name);
-            if DOWNWEIGHTED_FEATURES.contains(&base_name) {
+            let is_explicit = DOWNWEIGHTED_FEATURES.contains(&base_name);
+
+            if is_explicit && is_lag {
+                weights[idx] = DOWNWEIGHT_FACTOR.min(LAG_DOWNWEIGHT_FACTOR);
+                n_explicit += 1;
+                n_lag += 1;
+            } else if is_explicit {
                 weights[idx] = DOWNWEIGHT_FACTOR;
-                downweighted.push(name.to_string());
+                n_explicit += 1;
+            } else if is_lag {
+                weights[idx] = LAG_DOWNWEIGHT_FACTOR;
+                n_lag += 1;
             }
         }
     }
-    if !downweighted.is_empty() {
+    if n_explicit > 0 || n_lag > 0 {
         println!(
-            "[train] feature_weights: понижены {}: {:?} (factor={DOWNWEIGHT_FACTOR})",
-            downweighted.len(), downweighted
+            "[train] feature_weights: explicit={n_explicit} (factor={DOWNWEIGHT_FACTOR}), \
+             lag={n_lag} (factor={LAG_DOWNWEIGHT_FACTOR})"
         );
     }
     weights

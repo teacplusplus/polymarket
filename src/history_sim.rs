@@ -24,7 +24,7 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
-use crate::train_mode::{load_calibration, Calibration};
+use crate::train_mode::{load_calibration, Calibration, TEST_FRACTION, VAL_FRACTION};
 use crate::xframe::{XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use std::fs;
@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use xgb::{Booster, DMatrix};
 
 /// Порог предсказания модели (0.0–1.0) для входа в позицию.
-pub const SIM_BUY_THRESHOLD: f32 = 0.85;
+pub const SIM_BUY_THRESHOLD: f32 = 0.70;
 
 /// Стартовый виртуальный банкролл (USDC).
 pub const INITIAL_BANKROLL: f64 = 1000.0;
@@ -74,17 +74,9 @@ enum CloseReason {
     Timeout,
 }
 
-/// Накопленная статистика за версию.
-#[derive(Debug)]
-struct SimStats {
-    /// Текущий виртуальный банкролл (USDC).
-    bankroll: f64,
-    /// Пиковый банкролл (для расчёта drawdown).
-    peak_bankroll: f64,
-    /// Максимальная просадка в процентах: `(peak - trough) / peak × 100`.
-    max_drawdown_pct: f64,
-    /// Число обработанных событий (файлов `.bin`) за версию.
-    events: usize,
+/// Статистика торговли по одной стороне (UP или DOWN).
+#[derive(Debug, Default)]
+struct SideStats {
     /// Общее число закрытых сделок (каждая открытая позиция — одна сделка).
     trades: usize,
     /// Число сделок с P&L ≥ 0.
@@ -109,6 +101,21 @@ struct SimStats {
     kelly_skips: usize,
 }
 
+/// Накопленная статистика за версию.
+#[derive(Debug)]
+struct SimStats {
+    /// Текущий виртуальный банкролл (USDC).
+    bankroll: f64,
+    /// Пиковый банкролл (для расчёта drawdown).
+    peak_bankroll: f64,
+    /// Максимальная просадка в процентах: `(peak - trough) / peak × 100`.
+    max_drawdown_pct: f64,
+    /// Число обработанных событий (файлов `.bin`) за версию.
+    events: usize,
+    up: SideStats,
+    down: SideStats,
+}
+
 impl SimStats {
     fn new() -> Self {
         Self {
@@ -116,19 +123,17 @@ impl SimStats {
             peak_bankroll: INITIAL_BANKROLL,
             max_drawdown_pct: 0.0,
             events: 0,
-            trades: 0,
-            wins: 0,
-            losses: 0,
-            pnl_usd: 0.0,
-            fees_paid: 0.0,
-            tp_count: 0,
-            sl_count: 0,
-            resolution_win: 0,
-            resolution_loss: 0,
-            timeout_count: 0,
-            kelly_skips: 0,
+            up: SideStats::default(),
+            down: SideStats::default(),
         }
     }
+
+    fn total_trades(&self) -> usize { self.up.trades + self.down.trades }
+    fn total_wins(&self) -> usize { self.up.wins + self.down.wins }
+    fn total_losses(&self) -> usize { self.up.losses + self.down.losses }
+    fn total_pnl(&self) -> f64 { self.up.pnl_usd + self.down.pnl_usd }
+    fn total_fees(&self) -> f64 { self.up.fees_paid + self.down.fees_paid }
+    fn total_kelly_skips(&self) -> usize { self.up.kelly_skips + self.down.kelly_skips }
 
     fn update_drawdown(&mut self) {
         if self.bankroll > self.peak_bankroll {
@@ -200,23 +205,22 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 let mut sim_stats = SimStats::new();
 
                 let step_path = interval_path.join("1s");
-                if step_path.is_dir() {
-                    for date_path in fs_sorted_dirs(&step_path)? {
-                        if !date_path.is_dir() {
-                            continue;
+                let all_paths = collect_bin_paths(&step_path)?;
+                let test_paths = test_split_paths(&all_paths);
+
+                println!(
+                    "[sim] {tag}: маркетов всего={}, test={} (TEST_FRACTION={TEST_FRACTION}, VAL_FRACTION={VAL_FRACTION})",
+                    all_paths.len(),
+                    test_paths.len(),
+                );
+
+                for file_path in test_paths {
+                    match load_market_xframes(file_path) {
+                        Ok(market_xframes) => {
+                            simulate_event(&market_xframes, &booster_up, &booster_down, calibration_up.as_ref(), calibration_down.as_ref(), &mut sim_stats);
+                            sim_stats.events += 1;
                         }
-                        for file_path in fs_sorted_dirs(&date_path)? {
-                            if file_path.extension().and_then(|ext| ext.to_str()) != Some("bin") {
-                                continue;
-                            }
-                            match load_market_xframes(&file_path) {
-                                Ok(market_xframes) => {
-                                    simulate_event(&market_xframes, &booster_up, &booster_down, calibration_up.as_ref(), calibration_down.as_ref(), &mut sim_stats);
-                                    sim_stats.events += 1;
-                                }
-                                Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
-                            }
-                        }
+                        Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
                     }
                 }
 
@@ -303,8 +307,7 @@ fn simulate_event(
                 }
             };
             if let Some((exit_price, reason)) = close {
-                let pnl = close_position(&pos, exit_price, &reason, frame_up, sim_stats);
-                sim_stats.pnl_usd += pnl;
+                let pnl = close_position(&pos, exit_price, &reason, frame_up, &mut sim_stats.up);
                 sim_stats.bankroll += pnl;
                 sim_stats.update_drawdown();
             } else {
@@ -337,8 +340,7 @@ fn simulate_event(
                 }
             };
             if let Some((exit_price, reason)) = close {
-                let pnl = close_position(&pos, exit_price, &reason, frame_down, sim_stats);
-                sim_stats.pnl_usd += pnl;
+                let pnl = close_position(&pos, exit_price, &reason, frame_down, &mut sim_stats.down);
                 sim_stats.bankroll += pnl;
                 sim_stats.update_drawdown();
             } else {
@@ -354,9 +356,9 @@ fn simulate_event(
                     let pred = calibration_up.map_or(raw, |c| c.apply(raw));
                     let size = kelly_position_size(pred, prob_up, sim_stats.bankroll);
                     if size > 0.0 {
-                        positions_up.push(open_position(frame_up, size, sim_stats));
+                        positions_up.push(open_position(frame_up, size, &mut sim_stats.up));
                     } else {
-                        sim_stats.kelly_skips += 1;
+                        sim_stats.up.kelly_skips += 1;
                     }
                 }
             }
@@ -365,9 +367,9 @@ fn simulate_event(
                     let pred = calibration_down.map_or(raw, |c| c.apply(raw));
                     let size = kelly_position_size(pred, prob_down, sim_stats.bankroll);
                     if size > 0.0 {
-                        positions_down.push(open_position(frame_down, size, sim_stats));
+                        positions_down.push(open_position(frame_down, size, &mut sim_stats.down));
                     } else {
-                        sim_stats.kelly_skips += 1;
+                        sim_stats.down.kelly_skips += 1;
                     }
                 }
             }
@@ -447,7 +449,7 @@ fn kelly_position_size(prediction: f32, entry_prob: f64, bankroll: f64) -> f64 {
 /// ликвидности — добираем с L2, затем L3. VWAP покупки = `position_size / total_shares`.
 /// Taker-комиссия вычитается из полученных шерсов:
 /// `actual_shares = nominal_shares − nominal_shares × FEE_RATE × p × (1−p)`
-fn open_position(frame: &XFrame<SIZE>, position_size: f64, sim_stats: &mut SimStats) -> OpenPosition {
+fn open_position(frame: &XFrame<SIZE>, position_size: f64, side: &mut SideStats) -> OpenPosition {
     let (buy_price, nominal_shares) = book_fill_buy(frame, position_size);
     let buy_price = buy_price.clamp(0.001, 0.999);
 
@@ -455,7 +457,7 @@ fn open_position(frame: &XFrame<SIZE>, position_size: f64, sim_stats: &mut SimSt
     let fee_shares = fee_usdc / buy_price;
     let actual_shares = nominal_shares - fee_shares;
 
-    sim_stats.fees_paid += fee_usdc;
+    side.fees_paid += fee_usdc;
 
     OpenPosition {
         shares_held: actual_shares,
@@ -477,7 +479,7 @@ fn close_position(
     exit_price: f64,
     reason: &CloseReason,
     frame: &XFrame<SIZE>,
-    sim_stats: &mut SimStats,
+    side: &mut SideStats,
 ) -> f64 {
     let net_usdc = match reason {
         CloseReason::Resolution { won: true } => pos.shares_held,
@@ -490,22 +492,23 @@ fn close_position(
                 exit_price.clamp(0.001, 0.999)
             };
             let fee_usdc = pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price);
-            sim_stats.fees_paid += fee_usdc;
+            side.fees_paid += fee_usdc;
             gross_usdc - fee_usdc
         }
     };
 
     let pnl = net_usdc - pos.entry_cost;
+    side.pnl_usd += pnl;
 
-    sim_stats.trades += 1;
-    if pnl >= 0.0 { sim_stats.wins += 1; } else { sim_stats.losses += 1; }
+    side.trades += 1;
+    if pnl >= 0.0 { side.wins += 1; } else { side.losses += 1; }
 
     match reason {
-        CloseReason::TakeProfit                => sim_stats.tp_count += 1,
-        CloseReason::StopLoss                  => sim_stats.sl_count += 1,
-        CloseReason::Resolution { won: true }  => sim_stats.resolution_win += 1,
-        CloseReason::Resolution { won: false } => sim_stats.resolution_loss += 1,
-        CloseReason::Timeout                   => sim_stats.timeout_count += 1,
+        CloseReason::TakeProfit                => side.tp_count += 1,
+        CloseReason::StopLoss                  => side.sl_count += 1,
+        CloseReason::Resolution { won: true }  => side.resolution_win += 1,
+        CloseReason::Resolution { won: false } => side.resolution_loss += 1,
+        CloseReason::Timeout                   => side.timeout_count += 1,
     }
 
     pnl
@@ -612,33 +615,52 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
 
 // ─── Вывод статистики ─────────────────────────────────────────────────────────
 
+fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
+    if s.trades == 0 {
+        println!("[sim] {tag} [{side_label}]: нет сделок (kelly_skips={})", s.kelly_skips);
+        return;
+    }
+    let win_rate = s.wins as f64 / s.trades as f64 * 100.0;
+    let avg_pnl = s.pnl_usd / s.trades as f64;
+    println!(
+        "[sim] {tag} [{side_label}] \
+         | trades={} win={:.1}% \
+         | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
+         | TP={} SL={} Timeout={} Res✓={} Res✗={} kelly_skips={}",
+        s.trades, win_rate, s.pnl_usd, avg_pnl, s.fees_paid,
+        s.tp_count, s.sl_count, s.timeout_count,
+        s.resolution_win, s.resolution_loss, s.kelly_skips,
+    );
+}
+
 fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
-    if sim_stats.trades == 0 {
-        println!("[sim] {tag}: нет сделок ({} событий, kelly_skips={})", sim_stats.events, sim_stats.kelly_skips);
+    let total_trades = sim_stats.total_trades();
+    if total_trades == 0 {
+        println!("[sim] {tag}: нет сделок ({} событий, kelly_skips={})", sim_stats.events, sim_stats.total_kelly_skips());
         return;
     }
 
-    let win_rate = sim_stats.wins as f64 / sim_stats.trades as f64 * 100.0;
-    let avg_pnl = sim_stats.pnl_usd / sim_stats.trades as f64;
+    let total_pnl = sim_stats.total_pnl();
+    let total_wins = sim_stats.total_wins();
+    let total_fees = sim_stats.total_fees();
+    let win_rate = total_wins as f64 / total_trades as f64 * 100.0;
+    let avg_pnl = total_pnl / total_trades as f64;
     let roi_pct = (sim_stats.bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
 
+    let total_losses = sim_stats.total_losses();
     println!(
         "[sim] {tag} \
          | events={} trades={} win={:.1}% \
-         | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$",
-        sim_stats.events, sim_stats.trades, win_rate, sim_stats.pnl_usd, avg_pnl, sim_stats.fees_paid,
+         | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
+         | wins={total_wins} losses={total_losses}",
+        sim_stats.events, total_trades, win_rate, total_pnl, avg_pnl, total_fees,
     );
     println!(
         "[sim]   bankroll: {:.2}$ (start={INITIAL_BANKROLL}$) ROI={:+.2}% max_drawdown={:.2}%",
         sim_stats.bankroll, roi_pct, sim_stats.max_drawdown_pct,
     );
-    println!(
-        "[sim]   TP={} SL={} Timeout={} Res✓={} Res✗={} kelly_skips={} \
-         | wins={} losses={}",
-        sim_stats.tp_count, sim_stats.sl_count, sim_stats.timeout_count,
-        sim_stats.resolution_win, sim_stats.resolution_loss, sim_stats.kelly_skips,
-        sim_stats.wins, sim_stats.losses,
-    );
+    print_side_stats(tag, "UP", &sim_stats.up);
+    print_side_stats(tag, "DOWN", &sim_stats.down);
 }
 
 // ─── Утилиты ──────────────────────────────────────────────────────────────────
@@ -659,6 +681,37 @@ fn load_booster(path: &Path) -> Option<Booster> {
 fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
     let bytes = fs::read(path)?;
     Ok(bincode::deserialize(&bytes)?)
+}
+
+/// Собирает все `.bin` файлы из `step_path/{date}/` в отсортированном порядке
+/// (идентично `load_dumps` в `train_mode`).
+fn collect_bin_paths(step_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if !step_path.is_dir() {
+        return Ok(paths);
+    }
+    for date_path in fs_sorted_dirs(step_path)? {
+        if !date_path.is_dir() {
+            continue;
+        }
+        for file_path in fs_sorted_dirs(&date_path)? {
+            if file_path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
+                paths.push(file_path);
+            }
+        }
+    }
+    Ok(paths)
+}
+
+/// Возвращает test-срез путей — тот же сплит, что и в `train_and_save`:
+/// последние `ceil(n * TEST_FRACTION)` маркетов.
+fn test_split_paths(all_paths: &[PathBuf]) -> &[PathBuf] {
+    let n = all_paths.len();
+    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
+    let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
+    let train_count = n.saturating_sub(test_count + val_count);
+    let start = train_count + val_count.min(n.saturating_sub(train_count));
+    &all_paths[start..]
 }
 
 fn fs_sorted_dirs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
