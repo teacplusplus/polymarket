@@ -25,7 +25,7 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 100;
+const OPTIMIZER_TRIALS: usize = 30;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -38,6 +38,12 @@ const VAL_FRACTION: f64 = 0.1;
 const TEST_FRACTION: f64 = 0.1;
 /// Число итераций логистической регрессии для Platt scaling.
 const CALIBRATE_ITERATIONS: u64 = 100;
+/// Понижающий коэффициент `feature_weights` для фич, которые склонны к доминированию.
+/// Снижает вероятность выбора фичи при `colsample_*` < 1.0
+/// (0.1 = фича будет выбрана в ~10× реже остальных).
+const DOWNWEIGHT_FACTOR: f32 = 0.1;
+/// Имена фич, которым автоматически понижается `feature_weight` при обучении.
+const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms"];
 
 // ─── Калибровка (Platt scaling) ──────────────────────────────────────────────
 
@@ -465,6 +471,11 @@ fn train_and_save(
     let mut dtest = DMatrix::from_dense(&x_test, y_test.len())?;
     dtest.set_labels(&y_test)?;
 
+    let feature_count = x_train.len() / y_train.len();
+    let fw = build_feature_weights(feature_count, max_lag);
+    dtrain.set_feature_weights(&fw)?;
+    dval.set_feature_weights(&fw)?;
+
     // Optimizer и early stopping работают на val (названа "test" для совместимости с eval_xgboost).
     let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dval, "test")];
 
@@ -797,6 +808,36 @@ fn get_u32(map: &HashMap<String, ParamValue>, key: &str) -> u32 {
         ParamValue::Int(val) => *val as u32,
         _ => panic!("ожидался int для {key}"),
     }
+}
+
+// ─── Feature weights ─────────────────────────────────────────────────────────
+
+/// Строит вектор `feature_weights` длины `n_features`.
+/// Фичи из [`DOWNWEIGHTED_FEATURES`] получают вес [`DOWNWEIGHT_FACTOR`],
+/// остальные — 1.0.
+fn build_feature_weights(n_features: usize, max_lag: Option<usize>) -> Vec<f32> {
+    let mut weights = vec![1.0_f32; n_features];
+    let mut downweighted = Vec::new();
+    for idx in 0..n_features {
+        let name = match max_lag {
+            Some(n) => XFrame::<SIZE>::feature_name_n(idx, n),
+            None => XFrame::<SIZE>::feature_name(idx),
+        };
+        if let Some(name) = name {
+            let base_name = name.split('[').next().unwrap_or(name);
+            if DOWNWEIGHTED_FEATURES.contains(&base_name) {
+                weights[idx] = DOWNWEIGHT_FACTOR;
+                downweighted.push(name.to_string());
+            }
+        }
+    }
+    if !downweighted.is_empty() {
+        println!(
+            "[train] feature_weights: понижены {}: {:?} (factor={DOWNWEIGHT_FACTOR})",
+            downweighted.len(), downweighted
+        );
+    }
+    weights
 }
 
 // ─── Метрики (ручной расчёт) ─────────────────────────────────────────────────

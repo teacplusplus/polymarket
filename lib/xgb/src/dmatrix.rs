@@ -281,6 +281,15 @@ impl DMatrix {
         self.set_float_info(KEY_BASE_MARGIN, array)
     }
 
+    /// Set feature weights for column sampling.
+    ///
+    /// Weights define the probability of each feature being selected when
+    /// `colsample_bytree`, `colsample_bylevel` or `colsample_bynode` < 1.0.
+    /// Array length must equal the number of columns.
+    pub fn set_feature_weights(&mut self, array: &[f32]) -> XGBResult<()> {
+        self.set_float_info("feature_weights", array)
+    }
+
     /// Set the index for the beginning and end of a group.
     ///
     /// Needed when the learning task is ranking.
