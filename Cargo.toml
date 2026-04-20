@@ -24,6 +24,3 @@ dotenvy = "0.15"
 xgb = { path = "./lib/xgb", default-features = false, features = ["local_build"] }
 optimizer = "0.3.0"
 rand = "0.8"
-linfa = "0.8"
-ndarray = "0.16"
-linfa-logistic = "0.8"

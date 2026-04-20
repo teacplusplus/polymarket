@@ -8,10 +8,6 @@ use crate::xframe::{
     Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
 };
 use crate::xframe_dump::MarketXFramesDump;
-use linfa::prelude::Fit;
-use linfa::Dataset;
-use linfa_logistic::LogisticRegression;
-use ndarray::{Array1, Array2};
 use optimizer::sampler::tpe::TpeSampler;
 use optimizer::{Direction, ParamValue, Study};
 use serde::{Deserialize, Serialize};
@@ -36,19 +32,26 @@ const EVAL_BOOST_ROUNDS: u32 = 80;
 pub const VAL_FRACTION: f64 = 0.1;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
 pub const TEST_FRACTION: f64 = 0.1;
-/// Число итераций логистической регрессии для Platt scaling.
-const CALIBRATE_ITERATIONS: u64 = 100;
+/// Максимальное число итераций Newton's method в Platt scaling.
+const CALIBRATE_ITERATIONS: usize = 100;
+/// Порог сходимости (норма градиента) в Platt scaling.
+const CALIBRATE_TOL: f64 = 1e-9;
+/// Минимальный шаг line search (Armijo) в Platt scaling.
+const CALIBRATE_MIN_STEP: f64 = 1e-10;
 /// Понижающий коэффициент `feature_weights` для конкретных фич из [`DOWNWEIGHTED_FEATURES`].
 const DOWNWEIGHT_FACTOR: f32 = 0.1;
 /// Понижающий коэффициент для лаговых фич (массивы `delta_n_*[i]`).
-const LAG_DOWNWEIGHT_FACTOR: f32 = 0.1;
+const LAG_DOWNWEIGHT_FACTOR: f32 = 0.3;
 /// Имена фич, которым автоматически понижается `feature_weight` при обучении.
-const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "currency_price_vs_beat_pct", "sibling_currency_price_vs_beat_pct"];
-/// Минимальный AUC на калибровочном сете, при котором Platt scaling имеет смысл.
+// const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "currency_price_vs_beat_pct", "sibling_currency_price_vs_beat_pct"];
+const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "sibling_currency_price_vs_beat_pct"];
 /// Ниже этого порога сохраняется identity-калибровка (w=1, b=0).
 const CALIBRATION_MIN_AUC: f32 = 0.60;
 /// Максимальное абсолютное значение w и intercept в калибровке (защита от числовой нестабильности).
-const CALIBRATION_MAX_PARAM: f32 = 20.0;
+const CALIBRATION_MAX_PARAM: f32 = 50.0;
+/// Максимальная норма одного Newton-шага (trust region) в Platt scaling.
+/// Защищает от скачков в зону сатурации sigmoid при плохом initial point.
+const CALIBRATE_MAX_STEP_NORM: f64 = 5.0;
 
 // ─── Калибровка (Platt scaling) ──────────────────────────────────────────────
 
@@ -69,8 +72,15 @@ impl Calibration {
     }
 }
 
-/// Platt scaling: обучает логистическую регрессию `y ~ raw_prediction` на наборе данных,
-/// возвращая калибровочные коэффициенты.
+/// Platt scaling: обучает логистическую регрессию `y ~ raw_prediction` методом Ньютона
+/// с line search (Armijo), возвращая калибровочные коэффициенты.
+///
+/// Следует оригинальному псевдокоду Platt (1999) с исправлениями Lin et al. (2007):
+/// - Laplace smoothing для pseudo-labels (устраняет переобучение при малых классах).
+/// - Численно устойчивый расчёт log(1+exp) через сдвиг знака.
+/// - Newton step: [H] · Δ = -∇L, где H — гессиан (2×2), ∇L — градиент (g_a, g_b).
+/// - Armijo line search с backtracking (stepsize /= 2) на случай проблем сходимости.
+///
 /// Печатает диагностику для обнаружения инверсии/distribution shift.
 fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> anyhow::Result<Calibration> {
     let preds = booster.predict(dmat)?;
@@ -99,27 +109,24 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
         return Ok(Calibration { intercept: 0.0, param_w: 1.0 });
     }
 
-    let x = Array2::from_shape_vec((preds.len(), 1), preds)?;
-    let targets = Array1::from(y.iter().map(|&v| v >= 1.0).collect::<Vec<bool>>());
-
-    let dataset = Dataset::new(x, targets);
-    let model = LogisticRegression::default()
-        .alpha(1e-6)
-        .max_iterations(CALIBRATE_ITERATIONS)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("calibration fit error: {e}"))?;
-
-    let mut w = model.params()[0];
-    let mut b = model.intercept();
-
-    if mean_pred_pos > mean_pred_neg && w < 0.0 {
+    if n_pos == 0 || n_neg == 0 {
         eprintln!(
-            "[calibration] {tag}: FIXING: w={w:.4} отрицательный при корректной модели \
-             (mean_pred_pos > mean_pred_neg). Инвертирую знак."
+            "[calibration] {tag}: в калибровочном сете есть только один класс \
+             (n_pos={n_pos}, n_neg={n_neg}). Используется identity (w=1, b=0)."
         );
-        w = -w;
-        b = -b;
+        return Ok(Calibration { intercept: 0.0, param_w: 1.0 });
     }
+
+    let (w, b, iters, converged) = platt_scaling_fit(&preds, y);
+
+    if !converged {
+        eprintln!(
+            "[calibration] {tag}: WARNING: Newton's method не сошёлся за {iters} итераций \
+             (CALIBRATE_ITERATIONS={CALIBRATE_ITERATIONS})."
+        );
+    }
+
+    let (mut w, mut b) = (w, b);
 
     if w.abs() > CALIBRATION_MAX_PARAM || b.abs() > CALIBRATION_MAX_PARAM {
         eprintln!(
@@ -129,10 +136,158 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
         b = b.clamp(-CALIBRATION_MAX_PARAM, CALIBRATION_MAX_PARAM);
     }
 
+    println!("[calibration] {tag}: fit OK | w={w:.4} b={b:.4} iters={iters}");
+
     Ok(Calibration {
         intercept: b,
         param_w: w,
     })
+}
+
+/// Ядро Platt scaling: fit через Newton's method с line search.
+///
+/// Возвращает `(w, b, n_iters, converged)`. Моделируется:
+/// `P(y=1 | raw) = sigmoid(w * raw + b)`.
+///
+/// Для защиты от переобучения на малых выборках применяется Laplace smoothing
+/// (pseudo-labels Platt'а):
+/// - hi_target = (N+ + 1) / (N+ + 2) вместо 1.0
+/// - lo_target = 1 / (N- + 2)      вместо 0.0
+fn platt_scaling_fit(raw: &[f32], y: &[f32]) -> (f32, f32, usize, bool) {
+    let n = raw.len();
+    debug_assert_eq!(n, y.len());
+
+    let n_pos = y.iter().filter(|&&v| v >= 1.0).count() as f64;
+    let n_neg = n as f64 - n_pos;
+
+    let hi_target = (n_pos + 1.0) / (n_pos + 2.0);
+    let lo_target = 1.0           / (n_neg + 2.0);
+
+    let t: Vec<f64> = y.iter()
+        .map(|&v| if v >= 1.0 { hi_target } else { lo_target })
+        .collect();
+    let f: Vec<f64> = raw.iter().map(|&p| p as f64).collect();
+
+    // Начальное приближение:
+    //   A = 0
+    //   B = log((N+ + 1) / (N- + 1))
+    // чтобы sigmoid(B) ≈ P(y=1) (Laplace-сглаженная базовая частота positives).
+    //
+    // Замечание: в оригинальном псевдокоде Platt'а использовалось
+    //   B = log((N- + 1) / (N+ + 1))
+    // т.к. там sigmoid моделирует P(y=-1|f). У нас apply() возвращает P(y=1|f),
+    // поэтому знак инвертирован — критично при сильном дисбалансе классов,
+    // иначе Newton стартует в зоне сатурации sigmoid и расходится.
+    let mut a = 0.0_f64;
+    let mut b = ((n_pos + 1.0) / (n_neg + 1.0)).ln();
+
+    let mut fval = platt_neg_log_likelihood(&f, &t, a, b);
+
+    let mut iters = 0;
+    let mut converged = false;
+
+    for iter in 0..CALIBRATE_ITERATIONS {
+        iters = iter + 1;
+
+        // Градиент (g_a, g_b) и гессиан [[h_aa, h_ab], [h_ab, h_bb]] функции
+        // L = - sum_i [ t_i * log(p_i) + (1 - t_i) * log(1 - p_i) ],
+        // где p_i = sigmoid(a * f_i + b).
+        let (mut g_a, mut g_b) = (0.0_f64, 0.0_f64);
+        let (mut h_aa, mut h_ab, mut h_bb) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for i in 0..n {
+            let p = sigmoid_stable(a * f[i] + b);
+            let d = p - t[i];
+            let w_i = p * (1.0 - p);
+            g_a += f[i] * d;
+            g_b += d;
+            h_aa += f[i] * f[i] * w_i;
+            h_ab += f[i] * w_i;
+            h_bb += w_i;
+        }
+
+        if g_a.abs() < CALIBRATE_TOL && g_b.abs() < CALIBRATE_TOL {
+            converged = true;
+            break;
+        }
+
+        // Регуляризация гессиана (сдвиг диагонали) на случай сингулярности.
+        let eps = 1e-12_f64;
+        let det = (h_aa + eps) * (h_bb + eps) - h_ab * h_ab;
+        if det.abs() < 1e-18 {
+            converged = true;
+            break;
+        }
+        // Δ = H⁻¹ · ∇L; шаг Ньютона = -Δ.
+        let mut da = -((h_bb + eps) * g_a - h_ab * g_b) / det;
+        let mut db = -(-h_ab * g_a + (h_aa + eps) * g_b) / det;
+
+        // Trust region: при плохом initial point (особенно на дисбалансированных
+        // данных) Newton может предложить огромный шаг, выбрасывающий параметры
+        // в зону сатурации sigmoid — Hessian там вырождается и алгоритм
+        // застревает. Ограничиваем норму шага сверху.
+        let step_norm = (da * da + db * db).sqrt();
+        if step_norm > CALIBRATE_MAX_STEP_NORM {
+            let scale = CALIBRATE_MAX_STEP_NORM / step_norm;
+            da *= scale;
+            db *= scale;
+        }
+
+        // Armijo line search: ищем stepsize, при котором L(a+s·da, b+s·db) < L(a,b) + 1e-4·s·(∇L·Δ).
+        let gd = g_a * da + g_b * db;
+        let mut stepsize = 1.0_f64;
+        let mut accepted = false;
+        while stepsize >= CALIBRATE_MIN_STEP {
+            let new_a = a + stepsize * da;
+            let new_b = b + stepsize * db;
+            let new_f = platt_neg_log_likelihood(&f, &t, new_a, new_b);
+            if new_f < fval + 1e-4 * stepsize * gd {
+                a = new_a;
+                b = new_b;
+                fval = new_f;
+                accepted = true;
+                break;
+            }
+            stepsize *= 0.5;
+        }
+        if !accepted {
+            // Line search не нашёл улучшения — считаем, что сошлись.
+            converged = true;
+            break;
+        }
+    }
+
+    (a as f32, b as f32, iters, converged)
+}
+
+/// Численно устойчивый расчёт отрицательного log-likelihood для Platt scaling.
+fn platt_neg_log_likelihood(f: &[f64], t: &[f64], a: f64, b: f64) -> f64 {
+    let mut sum = 0.0_f64;
+    for i in 0..f.len() {
+        let z = a * f[i] + b;
+        // log(1 + exp(-z)) численно устойчиво:
+        //   если z >= 0: log(1 + exp(-z))
+        //   если z <  0: -z + log(1 + exp(z))
+        let log_1p_exp_neg_z = if z >= 0.0 {
+            (-z).exp().ln_1p()
+        } else {
+            -z + z.exp().ln_1p()
+        };
+        // Cross-entropy в терминах fApB:
+        //   L_i = t_i * log(1+exp(-z)) + (1 - t_i) * (z + log(1+exp(-z)))
+        //       = log(1+exp(-z)) + (1 - t_i) * z
+        sum += log_1p_exp_neg_z + (1.0 - t[i]) * z;
+    }
+    sum
+}
+
+/// Численно устойчивая сигмоида: `1 / (1 + exp(-z))`.
+fn sigmoid_stable(z: f64) -> f64 {
+    if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        let ez = z.exp();
+        ez / (1.0 + ez)
+    }
 }
 
 /// Сохраняет калибровку рядом с моделью: `model_path` → `model_path.calibration.bin`.
@@ -304,7 +459,7 @@ fn train_all_variants(
             );
 
             let max_lag = match model_type {
-                ModelType::Resolution => Some(5),
+                ModelType::Resolution => None,
                 ModelType::Pnl => None,
             };
             let markets = build_market_datasets(dumps, side, model_type, max_lag);

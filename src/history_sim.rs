@@ -99,6 +99,13 @@ struct SideStats {
     timeout_count: usize,
     /// Число пропущенных входов из-за Kelly f* ≤ 0 (нет edge).
     kelly_skips: usize,
+    /// Число кадров, где raw >= threshold (для диагностики воронки).
+    raw_above_threshold: usize,
+    /// Суммарные значения для расчёта средних (диагностика).
+    diag_sum_raw: f64,
+    diag_sum_calibrated: f64,
+    diag_sum_entry_prob: f64,
+    diag_sum_kelly_f: f64,
 }
 
 /// Накопленная статистика за версию.
@@ -194,12 +201,23 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 let calibration_up = load_calibration(&model_up_path).ok();
                 let calibration_down = load_calibration(&model_down_path).ok();
 
+                let cal_info = |cal: &Option<Calibration>, label: &str| -> String {
+                    match cal {
+                        Some(c) => format!(
+                            "{label}=✓(w={:.3} b={:.3} | 0.7→{:.3} 0.8→{:.3} 0.9→{:.3})",
+                            c.param_w, c.intercept,
+                            c.apply(0.7), c.apply(0.8), c.apply(0.9),
+                        ),
+                        None => format!("{label}=✗"),
+                    }
+                };
+
                 println!(
-                    "[sim] {tag}: модели pnl загружены (calibration_up={} calibration_down={}) \
+                    "[sim] {tag}: модели pnl загружены | {} | {} \
                      | threshold={SIM_BUY_THRESHOLD} | kelly={KELLY_MULTIPLIER} | max_bet={MAX_BET_FRACTION} \
                      | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}",
-                    if calibration_up.is_some() { "✓" } else { "✗" },
-                    if calibration_down.is_some() { "✓" } else { "✗" },
+                    cal_info(&calibration_up, "cal_up"),
+                    cal_info(&calibration_down, "cal_down"),
                 );
 
                 let mut sim_stats = SimStats::new();
@@ -354,6 +372,16 @@ fn simulate_event(
             if let Some(raw) = predict_frame(booster_up, frame_up, None) {
                 if raw >= SIM_BUY_THRESHOLD {
                     let pred = calibration_up.map_or(raw, |c| c.apply(raw));
+                    let g = kelly_gain_ratio(prob_up);
+                    let l = kelly_loss_ratio(prob_up);
+                    let f = kelly_fraction(pred as f64, g, l);
+
+                    sim_stats.up.raw_above_threshold += 1;
+                    sim_stats.up.diag_sum_raw += raw as f64;
+                    sim_stats.up.diag_sum_calibrated += pred as f64;
+                    sim_stats.up.diag_sum_entry_prob += prob_up;
+                    sim_stats.up.diag_sum_kelly_f += f;
+
                     let size = kelly_position_size(pred, prob_up, sim_stats.bankroll);
                     if size > 0.0 {
                         positions_up.push(open_position(frame_up, size, &mut sim_stats.up));
@@ -365,6 +393,16 @@ fn simulate_event(
             if let Some(raw) = predict_frame(booster_down, frame_down, None) {
                 if raw >= SIM_BUY_THRESHOLD {
                     let pred = calibration_down.map_or(raw, |c| c.apply(raw));
+                    let g = kelly_gain_ratio(prob_down);
+                    let l = kelly_loss_ratio(prob_down);
+                    let f = kelly_fraction(pred as f64, g, l);
+
+                    sim_stats.down.raw_above_threshold += 1;
+                    sim_stats.down.diag_sum_raw += raw as f64;
+                    sim_stats.down.diag_sum_calibrated += pred as f64;
+                    sim_stats.down.diag_sum_entry_prob += prob_down;
+                    sim_stats.down.diag_sum_kelly_f += f;
+
                     let size = kelly_position_size(pred, prob_down, sim_stats.bankroll);
                     if size > 0.0 {
                         positions_down.push(open_position(frame_down, size, &mut sim_stats.down));
@@ -616,8 +654,18 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
 // ─── Вывод статистики ─────────────────────────────────────────────────────────
 
 fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
+    let n = s.raw_above_threshold.max(1) as f64;
+    let diag = format!(
+        "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4}",
+        s.raw_above_threshold,
+        s.diag_sum_raw / n,
+        s.diag_sum_calibrated / n,
+        s.diag_sum_entry_prob / n,
+        s.diag_sum_kelly_f / n,
+    );
+
     if s.trades == 0 {
-        println!("[sim] {tag} [{side_label}]: нет сделок (kelly_skips={})", s.kelly_skips);
+        println!("[sim] {tag} [{side_label}]: нет сделок (kelly_skips={}) | {diag}", s.kelly_skips);
         return;
     }
     let win_rate = s.wins as f64 / s.trades as f64 * 100.0;
@@ -631,6 +679,7 @@ fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         s.tp_count, s.sl_count, s.timeout_count,
         s.resolution_win, s.resolution_loss, s.kelly_skips,
     );
+    println!("[sim] {tag} [{side_label}]   {diag}");
 }
 
 fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
