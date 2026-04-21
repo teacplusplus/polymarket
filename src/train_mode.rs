@@ -4,8 +4,8 @@
 
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::xframe::{
-    calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES,
-    Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
+    apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE,
+    Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
 };
 use crate::xframe_dump::MarketXFramesDump;
 use optimizer::sampler::tpe::TpeSampler;
@@ -21,7 +21,7 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 100;
+const OPTIMIZER_TRIALS: usize = 10;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -473,7 +473,7 @@ struct MarketDataset {
 }
 
 /// Обучает модели для всех комбинаций model_type × side. Дампы уже разбиты
-/// по сплитам на уровне путей — `build_market_datasets` применяется per-split,
+/// по сплитам на уровне путей — [`build_market_datasets`] применяется per-split,
 /// чтобы фильтрация пустых меток не сдвигала границы.
 fn train_all_variants(
     train_dumps: &[MarketXFramesDump],
@@ -640,8 +640,8 @@ fn append_frames(
             continue;
         };
         let row = match max_lag {
-            Some(n) => frames[index].to_x_train_n(n),
-            None => frames[index].to_x_train(),
+            Some(n) => frames[index].to_x_train_n_with(n, apply_side_symmetry),
+            None => frames[index].to_x_train_with(apply_side_symmetry),
         };
         if row.len() != feature_count {
             continue;

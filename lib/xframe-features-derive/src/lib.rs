@@ -92,11 +92,37 @@ pub fn derive_xfeatures(input: TokenStream) -> TokenStream {
                 out
             }
 
-            /// Как [`to_x_train`], но для лаговых массивов берёт только первые `max_lag` элементов.
+            /// Как [`to_x_train`], но позволяет переопределить некоторые поля структуры
+            /// перед сериализацией: лямде даётся `&mut Self` (клон текущего фрейма),
+            /// и она может модифицировать значения (например, инвертировать знаки
+            /// для side-симметрии перед обучением/инференсом).
+            pub fn to_x_train_with<__F>(&self, mutate: __F) -> Vec<f32>
+            where
+                Self: ::std::clone::Clone,
+                __F: ::std::ops::FnOnce(&mut Self),
+            {
+                let mut frame = <Self as ::std::clone::Clone>::clone(self);
+                mutate(&mut frame);
+                frame.to_x_train()
+            }
+
+            /// Как [`to_x_train_n`], но для лаговых массивов берёт только первые `max_lag` элементов.
             pub fn to_x_train_n(&self, max_lag: usize) -> Vec<f32> {
                 let mut out = Vec::new();
                 #(#push_n_calls)*
                 out
+            }
+
+            /// Как [`to_x_train_n`], но пускает значения через лямду-мутатор
+            /// (см. [`Self::to_x_train_with`]).
+            pub fn to_x_train_n_with<__F>(&self, max_lag: usize, mutate: __F) -> Vec<f32>
+            where
+                Self: ::std::clone::Clone,
+                __F: ::std::ops::FnOnce(&mut Self),
+            {
+                let mut frame = <Self as ::std::clone::Clone>::clone(self);
+                mutate(&mut frame);
+                frame.to_x_train_n(max_lag)
             }
 
             pub fn feature_name(idx: usize) -> Option<&'static str> {

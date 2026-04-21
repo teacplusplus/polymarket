@@ -28,7 +28,7 @@ use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
     Calibration, TEST_FRACTION, VAL_FRACTION,
 };
-use crate::xframe::{XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
+use crate::xframe::{apply_side_symmetry, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use std::fs;
 use std::path::Path;
@@ -37,7 +37,7 @@ use xgb::{Booster, DMatrix};
 /// Порог сырого предсказания модели (0.0–1.0) для рассмотрения входа в позицию.
 /// Дальнейшую селекцию делает Kelly (`f* > 0`), поэтому порог служит только
 /// грубым префильтром, отсекающим заведомо шумовые сигналы.
-pub const SIM_BUY_THRESHOLD: f32 = 0.6;
+pub const SIM_BUY_THRESHOLD: f32 = 0.60;
 
 /// Стартовый виртуальный банкролл (USDC).
 pub const INITIAL_BANKROLL: f64 = 1000.0;
@@ -644,8 +644,8 @@ fn book_fill_sell(frame: &XFrame<SIZE>, shares_to_sell: f64) -> f64 {
 
 fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>) -> Option<f32> {
     let features = match max_lag {
-        Some(n) => frame.to_x_train_n(n),
-        None => frame.to_x_train(),
+        Some(n) => frame.to_x_train_n_with(n, apply_side_symmetry),
+        None => frame.to_x_train_with(apply_side_symmetry),
     };
     let expected = match max_lag {
         Some(n) => XFrame::<SIZE>::count_features_n(n),
