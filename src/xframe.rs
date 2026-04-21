@@ -457,6 +457,46 @@ pub struct XFrame<const N: usize> {
     pub sibling_currency_price_vs_beat_pct: Option<f64>,
 }
 
+/// Хук для side-симметричных коррекций `XFrame` перед сериализацией в feature
+/// vector. Вызывается из `to_x_train_with` / `to_x_train_n_with` в `train_mode`
+/// и `history_sim` — модификации видны только в векторе признаков, сам `XFrame`
+/// в памяти/на диске не меняется (клон перед мутацией).
+///
+/// ### Сейчас делает
+/// Нормализует «время до конца события» на длину интервала **своего** окна,
+/// чтобы одна и та же модель одинаково работала на 5m и 15m:
+///
+/// * [`XFrame::event_remaining_ms`] — нормируется на `interval_ms` текущего
+///   маркета (по `xframe_interval_type`).
+/// * [`XFrame::sibling_event_remaining_ms`] — токены ходят парами 5m ↔ 15m,
+///   поэтому sibling живёт в **противоположном** таймфрейме: нормируем на
+///   `kind.sibling().interval_ms()`.
+///
+/// Шкала — ppm (`remaining_ms * 1_000_000 / interval_ms`), диапазон
+/// `0..=1_000_000` (`1_000_000` = самое начало окна). Если дискриминант
+/// `xframe_interval_type` невалиден — поля не трогаем.
+pub fn apply_side_symmetry<const N: usize>(frame: &mut XFrame<N>) {
+    const NORMALIZED_SCALE: i64 = 1_000_000;
+
+    if let Some(kind) = XFrameIntervalKind::from_i32(frame.xframe_interval_type) {
+        let self_interval_ms = kind.interval_ms();
+        if self_interval_ms > 0 {
+            frame.event_remaining_ms = frame
+                .event_remaining_ms
+                .saturating_mul(NORMALIZED_SCALE)
+                / self_interval_ms;
+        }
+
+        let sibling_interval_ms = kind.sibling().interval_ms();
+        if sibling_interval_ms > 0 {
+            frame.sibling_event_remaining_ms = frame
+                .sibling_event_remaining_ms
+                .saturating_mul(NORMALIZED_SCALE)
+                / sibling_interval_ms;
+        }
+    }
+}
+
 /// См. [`XFrame::stable`]. `market_id` — `condition_id` рынка (для логов). `event_start_ms` — Gamma `start_ms` в [`crate::project_manager::MarketEventData`]; `ws_connect_wall_ms` — [`crate::project_manager::ProjectManager::record_market_ws_connect_wall_ms`].
 pub fn compute_xframe_stable(
     market_id: &str,

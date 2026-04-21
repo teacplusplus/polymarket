@@ -77,6 +77,25 @@ impl XFrameIntervalKind {
         }
     }
 
+    /// Длительность окна в миллисекундах (`FIVE_MIN_SEC` / `FIFTEEN_MIN_SEC` × 1000).
+    #[inline]
+    pub const fn interval_ms(self) -> i64 {
+        match self {
+            Self::FiveMin => FIVE_MIN_SEC * 1_000,
+            Self::FifteenMin => FIFTEEN_MIN_SEC * 1_000,
+        }
+    }
+
+    /// Парный интервал: для пары токенов 5m ↔ 15m всегда противоположный.
+    /// Используется при нормировке `sibling_*` полей XFrame, т.к. sibling
+    /// живёт в своём таймфрейме.
+    #[inline]
+    pub const fn sibling(self) -> Self {
+        match self {
+            Self::FiveMin => Self::FifteenMin,
+            Self::FifteenMin => Self::FiveMin,
+        }
+    }
 }
 
 /// Исход токена up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).

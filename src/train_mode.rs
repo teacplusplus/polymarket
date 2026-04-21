@@ -4,8 +4,8 @@
 
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::xframe::{
-    calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES,
-    Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
+    apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE,
+    Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
 };
 use crate::xframe_dump::MarketXFramesDump;
 use optimizer::sampler::tpe::TpeSampler;
@@ -21,7 +21,7 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 20;
+const OPTIMIZER_TRIALS: usize = 10;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -32,12 +32,6 @@ const EVAL_BOOST_ROUNDS: u32 = 80;
 pub const VAL_FRACTION: f64 = 0.1;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
 pub const TEST_FRACTION: f64 = 0.1;
-/// Максимальное число итераций Newton's method в Platt scaling.
-const CALIBRATE_ITERATIONS: usize = 100;
-/// Порог сходимости (норма градиента) в Platt scaling.
-const CALIBRATE_TOL: f64 = 1e-9;
-/// Минимальный шаг line search (Armijo) в Platt scaling.
-const CALIBRATE_MIN_STEP: f64 = 1e-10;
 /// Понижающий коэффициент `feature_weights` для конкретных фич из [`DOWNWEIGHTED_FEATURES`].
 const DOWNWEIGHT_FACTOR: f32 = 0.1;
 /// Понижающий коэффициент для лаговых фич (массивы `delta_n_*[i]`).
@@ -45,41 +39,95 @@ const LAG_DOWNWEIGHT_FACTOR: f32 = 0.3;
 /// Имена фич, которым автоматически понижается `feature_weight` при обучении.
 // const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "currency_price_vs_beat_pct", "sibling_currency_price_vs_beat_pct"];
 const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "sibling_currency_price_vs_beat_pct"];
-/// Ниже этого порога сохраняется identity-калибровка (w=1, b=0).
+/// Ниже этого порога сохраняется identity-калибровка.
 const CALIBRATION_MIN_AUC: f32 = 0.60;
-/// Максимальное абсолютное значение w и intercept в калибровке (защита от числовой нестабильности).
-const CALIBRATION_MAX_PARAM: f32 = 50.0;
-/// Максимальная норма одного Newton-шага (trust region) в Platt scaling.
-/// Защищает от скачков в зону сатурации sigmoid при плохом initial point.
-const CALIBRATE_MAX_STEP_NORM: f64 = 5.0;
+/// Эпсилон для клиппинга выходов isotonic regression: исключает 0/1 значения,
+/// которые сломают logloss и Kelly при логарифмировании.
+const CALIBRATION_EPS: f32 = 1e-3;
+/// Минимальный суммарный вес одного блока (число сэмплов) в isotonic-калибровке.
+/// После PAV последовательно объединяем соседние блоки до достижения этого порога —
+/// это регуляризация против переобучения на малых калибровочных сетах.
+/// Монотонность при этом сохраняется (weighted-avg двух non-decreasing соседей
+/// остаётся в интервале [prev, next]).
+const CALIBRATION_MIN_BLOCK_WEIGHT: f64 = 50.0;
 
-// ─── Калибровка (Platt scaling) ──────────────────────────────────────────────
+// ─── Калибровка (Isotonic Regression) ────────────────────────────────────────
 
-/// Коэффициенты Platt scaling: `calibrated_p = sigmoid(w × raw_pred + intercept)`.
+/// Изотоническая калибровка: кусочно-линейная монотонная (non-decreasing) функция
+/// `calibrated = f(raw)`, подогнанная алгоритмом PAV (Pool Adjacent Violators).
 ///
 /// Сохраняется рядом с моделью (`.calibration.bin`).
+///
+/// # Представление
+///
+/// После PAV результат — последовательность блоков с неубывающими значениями.
+/// Для каждого блока берётся один опорный узел `(x, y)`, где `x` — взвешенное
+/// среднее raw-предсказаний в блоке, `y` — доля позитивных меток в блоке
+/// (с клиппингом в `[CALIBRATION_EPS, 1 − CALIBRATION_EPS]`).
+///
+/// `apply(raw)` возвращает линейно-интерполированное значение между соседними
+/// опорными узлами; на границах — ближайшее `ys`-значение.
+///
+/// # Преимущество перед Platt scaling
+///
+/// Isotonic не предполагает параметрическую форму (sigmoid) и не сжимает
+/// «хвосты» распределения raw-предсказаний на скошенных данных.
+/// Platt scaling на DOWN-моделях сжимал `raw 0.79 → cal 0.32`, ломая Kelly-фильтр.
+/// PAV сохраняет монотонность, но не искажает плотность сигнала.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Calibration {
-    pub intercept: f32,
-    pub param_w: f32,
+    /// Опорные raw-значения, строго возрастают.
+    pub xs: Vec<f32>,
+    /// Калибровочные значения в опорных узлах; неубывающая последовательность
+    /// в `[CALIBRATION_EPS, 1 − CALIBRATION_EPS]`.
+    pub ys: Vec<f32>,
 }
 
 impl Calibration {
-    /// Применяет Platt scaling к сырому предсказанию XGBoost.
+    /// Тождественная калибровка `apply(raw) = raw` — используется как fallback
+    /// при слабом AUC или пустом калибровочном сете.
+    pub fn identity() -> Self {
+        Self { xs: vec![0.0, 1.0], ys: vec![0.0, 1.0] }
+    }
+
+    /// Применяет isotonic к сырому предсказанию XGBoost.
+    ///
+    /// Для `raw` вне диапазона опорных узлов возвращает ближайшее ys (края).
+    /// Внутри диапазона — линейная интерполяция между соседними узлами.
     pub fn apply(&self, raw_pred: f32) -> f32 {
-        let logit = self.param_w * raw_pred + self.intercept;
-        1.0 / (1.0 + (-logit).exp())
+        let n = self.xs.len();
+        if n == 0 {
+            return raw_pred;
+        }
+        if n == 1 {
+            return self.ys[0];
+        }
+        if raw_pred <= self.xs[0] {
+            return self.ys[0];
+        }
+        if raw_pred >= self.xs[n - 1] {
+            return self.ys[n - 1];
+        }
+        // Бинарный поиск интервала: xs[idx - 1] ≤ raw_pred ≤ xs[idx].
+        let idx = match self.xs.binary_search_by(|probe| {
+            probe.partial_cmp(&raw_pred).unwrap_or(std::cmp::Ordering::Equal)
+        }) {
+            Ok(i) => return self.ys[i],
+            Err(i) => i,
+        };
+        let (x0, x1) = (self.xs[idx - 1], self.xs[idx]);
+        let (y0, y1) = (self.ys[idx - 1], self.ys[idx]);
+        let dx = x1 - x0;
+        if dx.abs() < f32::EPSILON {
+            return y1;
+        }
+        let t = (raw_pred - x0) / dx;
+        y0 + t * (y1 - y0)
     }
 }
 
-/// Platt scaling: обучает логистическую регрессию `y ~ raw_prediction` методом Ньютона
-/// с line search (Armijo), возвращая калибровочные коэффициенты.
-///
-/// Следует оригинальному псевдокоду Platt (1999) с исправлениями Lin et al. (2007):
-/// - Laplace smoothing для pseudo-labels (устраняет переобучение при малых классах).
-/// - Численно устойчивый расчёт log(1+exp) через сдвиг знака.
-/// - Newton step: [H] · Δ = -∇L, где H — гессиан (2×2), ∇L — градиент (g_a, g_b).
-/// - Armijo line search с backtracking (stepsize /= 2) на случай проблем сходимости.
+/// Isotonic regression калибровка: подгоняет монотонную неубывающую функцию
+/// методом PAV (Pool Adjacent Violators) к парам `(raw_prediction, label)`.
 ///
 /// Печатает диагностику для обнаружения инверсии/distribution shift.
 fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> anyhow::Result<Calibration> {
@@ -104,190 +152,159 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
     if cal_auc < CALIBRATION_MIN_AUC {
         eprintln!(
             "[calibration] {tag}: AUC={cal_auc:.4} < {CALIBRATION_MIN_AUC} — модель слишком \
-             слабая для калибровки. Используется identity (w=1, b=0)."
+             слабая для калибровки. Используется identity."
         );
-        return Ok(Calibration { intercept: 0.0, param_w: 1.0 });
+        return Ok(Calibration::identity());
     }
 
     if n_pos == 0 || n_neg == 0 {
         eprintln!(
             "[calibration] {tag}: в калибровочном сете есть только один класс \
-             (n_pos={n_pos}, n_neg={n_neg}). Используется identity (w=1, b=0)."
+             (n_pos={n_pos}, n_neg={n_neg}). Используется identity."
         );
-        return Ok(Calibration { intercept: 0.0, param_w: 1.0 });
+        return Ok(Calibration::identity());
     }
 
-    let (w, b, iters, converged) = platt_scaling_fit(&preds, y);
+    let cal = isotonic_fit(&preds, y);
+    println!(
+        "[calibration] {tag}: fit OK | breakpoints={} | \
+         range=[{:.3}…{:.3}] → [{:.3}…{:.3}]",
+        cal.xs.len(),
+        cal.xs.first().copied().unwrap_or(0.0),
+        cal.xs.last().copied().unwrap_or(0.0),
+        cal.ys.first().copied().unwrap_or(0.0),
+        cal.ys.last().copied().unwrap_or(0.0),
+    );
 
-    if !converged {
-        eprintln!(
-            "[calibration] {tag}: WARNING: Newton's method не сошёлся за {iters} итераций \
-             (CALIBRATE_ITERATIONS={CALIBRATE_ITERATIONS})."
-        );
-    }
-
-    let (mut w, mut b) = (w, b);
-
-    if w.abs() > CALIBRATION_MAX_PARAM || b.abs() > CALIBRATION_MAX_PARAM {
-        eprintln!(
-            "[calibration] {tag}: CLAMPING: w={w:.2} b={b:.2} → |max|={CALIBRATION_MAX_PARAM}"
-        );
-        w = w.clamp(-CALIBRATION_MAX_PARAM, CALIBRATION_MAX_PARAM);
-        b = b.clamp(-CALIBRATION_MAX_PARAM, CALIBRATION_MAX_PARAM);
-    }
-
-    println!("[calibration] {tag}: fit OK | w={w:.4} b={b:.4} iters={iters}");
-
-    Ok(Calibration {
-        intercept: b,
-        param_w: w,
-    })
+    Ok(cal)
 }
 
-/// Ядро Platt scaling: fit через Newton's method с line search.
+/// Ядро isotonic regression: алгоритм PAV (Pool Adjacent Violators).
 ///
-/// Возвращает `(w, b, n_iters, converged)`. Моделируется:
-/// `P(y=1 | raw) = sigmoid(w * raw + b)`.
+/// # Алгоритм
 ///
-/// Для защиты от переобучения на малых выборках применяется Laplace smoothing
-/// (pseudo-labels Platt'а):
-/// - hi_target = (N+ + 1) / (N+ + 2) вместо 1.0
-/// - lo_target = 1 / (N- + 2)      вместо 0.0
-fn platt_scaling_fit(raw: &[f32], y: &[f32]) -> (f32, f32, usize, bool) {
-    let n = raw.len();
-    debug_assert_eq!(n, y.len());
+/// 1. Сортируем пары `(raw, label)` по `raw` (asc).
+/// 2. Предагрегируем точки с одинаковым `raw` в один начальный блок
+///    (сумма меток, суммарный вес).
+/// 3. Проходим слева направо, добавляя блоки в стек. Если текущая вершина
+///    стека имеет среднее `> ` значение нового блока — это нарушение
+///    монотонности, сливаем блоки (взвешенное среднее) и повторяем проверку
+///    с новой вершиной. После обработки всех блоков стек содержит неубывающую
+///    последовательность.
+/// 4. Для каждого блока вычисляем опорный узел: `x = взвешенное среднее raw`,
+///    `y = доля позитивных в блоке`, клиппим `y` в `[eps, 1 − eps]`.
+///
+/// Сложность: `O(N log N)` сортировка + `O(N)` PAV (амортизированно).
+fn isotonic_fit(preds: &[f32], y: &[f32]) -> Calibration {
+    debug_assert_eq!(preds.len(), y.len());
+    if preds.is_empty() {
+        return Calibration::identity();
+    }
 
-    let n_pos = y.iter().filter(|&&v| v >= 1.0).count() as f64;
-    let n_neg = n as f64 - n_pos;
-
-    let hi_target = (n_pos + 1.0) / (n_pos + 2.0);
-    let lo_target = 1.0           / (n_neg + 2.0);
-
-    let t: Vec<f64> = y.iter()
-        .map(|&v| if v >= 1.0 { hi_target } else { lo_target })
+    let mut pairs: Vec<(f32, f32)> = preds.iter().zip(y.iter())
+        .map(|(&p, &yv)| (p, if yv >= 1.0 { 1.0_f32 } else { 0.0_f32 }))
         .collect();
-    let f: Vec<f64> = raw.iter().map(|&p| p as f64).collect();
+    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Начальное приближение:
-    //   A = 0
-    //   B = log((N+ + 1) / (N- + 1))
-    // чтобы sigmoid(B) ≈ P(y=1) (Laplace-сглаженная базовая частота positives).
-    //
-    // Замечание: в оригинальном псевдокоде Platt'а использовалось
-    //   B = log((N- + 1) / (N+ + 1))
-    // т.к. там sigmoid моделирует P(y=-1|f). У нас apply() возвращает P(y=1|f),
-    // поэтому знак инвертирован — критично при сильном дисбалансе классов,
-    // иначе Newton стартует в зоне сатурации sigmoid и расходится.
-    let mut a = 0.0_f64;
-    let mut b = ((n_pos + 1.0) / (n_neg + 1.0)).ln();
+    #[derive(Clone, Copy)]
+    struct Block { sum_x: f64, sum_y: f64, weight: f64 }
+    impl Block {
+        fn value(&self) -> f64 { self.sum_y / self.weight }
+    }
 
-    let mut fval = platt_neg_log_likelihood(&f, &t, a, b);
-
-    let mut iters = 0;
-    let mut converged = false;
-
-    for iter in 0..CALIBRATE_ITERATIONS {
-        iters = iter + 1;
-
-        // Градиент (g_a, g_b) и гессиан [[h_aa, h_ab], [h_ab, h_bb]] функции
-        // L = - sum_i [ t_i * log(p_i) + (1 - t_i) * log(1 - p_i) ],
-        // где p_i = sigmoid(a * f_i + b).
-        let (mut g_a, mut g_b) = (0.0_f64, 0.0_f64);
-        let (mut h_aa, mut h_ab, mut h_bb) = (0.0_f64, 0.0_f64, 0.0_f64);
-        for i in 0..n {
-            let p = sigmoid_stable(a * f[i] + b);
-            let d = p - t[i];
-            let w_i = p * (1.0 - p);
-            g_a += f[i] * d;
-            g_b += d;
-            h_aa += f[i] * f[i] * w_i;
-            h_ab += f[i] * w_i;
-            h_bb += w_i;
+    // Шаг 1: предагрегация точек с идентичным raw в один блок.
+    // Это важно: иначе PAV сохранит два блока с одинаковым x,
+    // но разными y, создавая дубликаты опорных узлов.
+    let mut blocks: Vec<Block> = Vec::with_capacity(pairs.len());
+    for &(x, y_i) in &pairs {
+        if let Some(last) = blocks.last_mut() {
+            let prev_x = last.sum_x / last.weight;
+            if (prev_x - x as f64).abs() < 1e-12 {
+                last.sum_x += x as f64;
+                last.sum_y += y_i as f64;
+                last.weight += 1.0;
+                continue;
+            }
         }
+        blocks.push(Block { sum_x: x as f64, sum_y: y_i as f64, weight: 1.0 });
+    }
 
-        if g_a.abs() < CALIBRATE_TOL && g_b.abs() < CALIBRATE_TOL {
-            converged = true;
-            break;
-        }
-
-        // Регуляризация гессиана (сдвиг диагонали) на случай сингулярности.
-        let eps = 1e-12_f64;
-        let det = (h_aa + eps) * (h_bb + eps) - h_ab * h_ab;
-        if det.abs() < 1e-18 {
-            converged = true;
-            break;
-        }
-        // Δ = H⁻¹ · ∇L; шаг Ньютона = -Δ.
-        let mut da = -((h_bb + eps) * g_a - h_ab * g_b) / det;
-        let mut db = -(-h_ab * g_a + (h_aa + eps) * g_b) / det;
-
-        // Trust region: при плохом initial point (особенно на дисбалансированных
-        // данных) Newton может предложить огромный шаг, выбрасывающий параметры
-        // в зону сатурации sigmoid — Hessian там вырождается и алгоритм
-        // застревает. Ограничиваем норму шага сверху.
-        let step_norm = (da * da + db * db).sqrt();
-        if step_norm > CALIBRATE_MAX_STEP_NORM {
-            let scale = CALIBRATE_MAX_STEP_NORM / step_norm;
-            da *= scale;
-            db *= scale;
-        }
-
-        // Armijo line search: ищем stepsize, при котором L(a+s·da, b+s·db) < L(a,b) + 1e-4·s·(∇L·Δ).
-        let gd = g_a * da + g_b * db;
-        let mut stepsize = 1.0_f64;
-        let mut accepted = false;
-        while stepsize >= CALIBRATE_MIN_STEP {
-            let new_a = a + stepsize * da;
-            let new_b = b + stepsize * db;
-            let new_f = platt_neg_log_likelihood(&f, &t, new_a, new_b);
-            if new_f < fval + 1e-4 * stepsize * gd {
-                a = new_a;
-                b = new_b;
-                fval = new_f;
-                accepted = true;
+    // Шаг 2: собственно PAV — стек блоков с неубывающими значениями.
+    let mut stack: Vec<Block> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let mut new_block = block;
+        while let Some(&top) = stack.last() {
+            if top.value() <= new_block.value() {
                 break;
             }
-            stepsize *= 0.5;
+            stack.pop();
+            new_block = Block {
+                sum_x: top.sum_x + new_block.sum_x,
+                sum_y: top.sum_y + new_block.sum_y,
+                weight: top.weight + new_block.weight,
+            };
         }
-        if !accepted {
-            // Line search не нашёл улучшения — считаем, что сошлись.
-            converged = true;
-            break;
+        stack.push(new_block);
+    }
+
+    // Шаг 3: регуляризация — последовательно аккумулируем блоки в «bucket»,
+    // пока суммарный вес не достигнет CALIBRATION_MIN_BLOCK_WEIGHT.
+    // Монотонность сохраняется: если v_1 ≤ … ≤ v_k и v_{k+1} ≤ … ≤ v_m,
+    // то weighted_avg(v_1..v_k) ≤ v_k ≤ v_{k+1} ≤ weighted_avg(v_{k+1}..v_m).
+    let min_weight = CALIBRATION_MIN_BLOCK_WEIGHT;
+    if !stack.is_empty() && min_weight > 1.0 {
+        let mut regularized: Vec<Block> = Vec::with_capacity(stack.len());
+        let mut acc: Option<Block> = None;
+        for block in stack.drain(..) {
+            let merged = match acc.take() {
+                Some(a) => Block {
+                    sum_x: a.sum_x + block.sum_x,
+                    sum_y: a.sum_y + block.sum_y,
+                    weight: a.weight + block.weight,
+                },
+                None => block,
+            };
+            if merged.weight >= min_weight {
+                regularized.push(merged);
+            } else {
+                acc = Some(merged);
+            }
         }
+        if let Some(a) = acc {
+            // Хвост с недобранным весом: сливаем в предыдущий bucket (если есть),
+            // иначе сохраняем как единственный блок.
+            if let Some(last) = regularized.last_mut() {
+                last.sum_x += a.sum_x;
+                last.sum_y += a.sum_y;
+                last.weight += a.weight;
+            } else {
+                regularized.push(a);
+            }
+        }
+        stack = regularized;
     }
 
-    (a as f32, b as f32, iters, converged)
-}
-
-/// Численно устойчивый расчёт отрицательного log-likelihood для Platt scaling.
-fn platt_neg_log_likelihood(f: &[f64], t: &[f64], a: f64, b: f64) -> f64 {
-    let mut sum = 0.0_f64;
-    for i in 0..f.len() {
-        let z = a * f[i] + b;
-        // log(1 + exp(-z)) численно устойчиво:
-        //   если z >= 0: log(1 + exp(-z))
-        //   если z <  0: -z + log(1 + exp(z))
-        let log_1p_exp_neg_z = if z >= 0.0 {
-            (-z).exp().ln_1p()
-        } else {
-            -z + z.exp().ln_1p()
-        };
-        // Cross-entropy в терминах fApB:
-        //   L_i = t_i * log(1+exp(-z)) + (1 - t_i) * (z + log(1+exp(-z)))
-        //       = log(1+exp(-z)) + (1 - t_i) * z
-        sum += log_1p_exp_neg_z + (1.0 - t[i]) * z;
+    let eps = CALIBRATION_EPS;
+    let mut xs: Vec<f32> = Vec::with_capacity(stack.len());
+    let mut ys: Vec<f32> = Vec::with_capacity(stack.len());
+    for b in &stack {
+        let x = (b.sum_x / b.weight) as f32;
+        let y_val = ((b.sum_y / b.weight) as f32).clamp(eps, 1.0 - eps);
+        // Защита от численных дубликатов x (если всё же проскочили):
+        // оставляем только строго возрастающие узлы.
+        if let Some(&prev_x) = xs.last() {
+            if x <= prev_x {
+                continue;
+            }
+        }
+        xs.push(x);
+        ys.push(y_val);
     }
-    sum
-}
 
-/// Численно устойчивая сигмоида: `1 / (1 + exp(-z))`.
-fn sigmoid_stable(z: f64) -> f64 {
-    if z >= 0.0 {
-        1.0 / (1.0 + (-z).exp())
-    } else {
-        let ez = z.exp();
-        ez / (1.0 + ez)
+    if xs.is_empty() {
+        return Calibration::identity();
     }
+    Calibration { xs, ys }
 }
 
 /// Сохраняет калибровку рядом с моделью: `model_path` → `model_path.calibration.bin`.
@@ -415,15 +432,32 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     }
 
                     let tag_prefix = format!("{currency}/{version_str}/{interval}/{step_sec}s");
-                    println!("[train] {tag_prefix}: загрузка дампов...");
-                    let dumps = load_dumps(&step_path)?;
-                    if dumps.is_empty() {
-                        println!("[train] {tag_prefix}: нет дампов, пропуск");
+                    println!("[train] {tag_prefix}: сбор путей...");
+                    let paths = collect_bin_paths(&step_path)?;
+                    if paths.is_empty() {
+                        println!("[train] {tag_prefix}: нет маркетов, пропуск");
                         continue;
                     }
-                    println!("[train] {tag_prefix}: загружено {} дампов", dumps.len());
 
-                    train_all_variants(&dumps, &version_path, &tag_prefix, interval, step_sec)?;
+                    // Сплит по путям — идентично history_sim; дампы загружаем
+                    // только после сплита, чтобы битые/пустые маркеты не сдвигали границы.
+                    let (train_count, val_count, test_count) = split_counts(paths.len());
+                    let train_paths = &paths[..train_count];
+                    let val_paths   = &paths[train_count..train_count + val_count];
+                    let test_paths  = &paths[train_count + val_count..];
+                    println!(
+                        "[train] {tag_prefix}: маркетов {} → сплит {train_count} train / {val_count} val / {test_count} test",
+                        paths.len(),
+                    );
+
+                    let train_dumps = load_dumps_for_paths(train_paths);
+                    let val_dumps   = load_dumps_for_paths(val_paths);
+                    let test_dumps  = load_dumps_for_paths(test_paths);
+
+                    train_all_variants(
+                        &train_dumps, &val_dumps, &test_dumps,
+                        &version_path, &tag_prefix, interval, step_sec,
+                    )?;
                 }
             }
         }
@@ -438,9 +472,13 @@ struct MarketDataset {
     y: Vec<f32>,
 }
 
-/// Обучает модели для всех комбинаций model_type × side на загруженных дампах.
+/// Обучает модели для всех комбинаций model_type × side. Дампы уже разбиты
+/// по сплитам на уровне путей — [`build_market_datasets`] применяется per-split,
+/// чтобы фильтрация пустых меток не сдвигала границы.
 fn train_all_variants(
-    dumps: &[MarketXFramesDump],
+    train_dumps: &[MarketXFramesDump],
+    val_dumps: &[MarketXFramesDump],
+    test_dumps: &[MarketXFramesDump],
     version_path: &Path,
     tag_prefix: &str,
     interval: &str,
@@ -462,9 +500,12 @@ fn train_all_variants(
                 ModelType::Resolution => None,
                 ModelType::Pnl => None,
             };
-            let markets = build_market_datasets(dumps, side, model_type, max_lag);
+            let train_markets = build_market_datasets(train_dumps, side, model_type, max_lag);
+            let val_markets   = build_market_datasets(val_dumps,   side, model_type, max_lag);
+            let test_markets  = build_market_datasets(test_dumps,  side, model_type, max_lag);
 
-            if markets.is_empty() {
+            let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
+            if total_markets == 0 {
                 println!("[train] {tag}: нет данных, пропуск");
                 continue;
             }
@@ -473,11 +514,13 @@ fn train_all_variants(
                 Some(n) => XFrame::<SIZE>::count_features_n(n),
                 None => XFrame::<SIZE>::count_features(),
             };
+            let total_rows: usize = train_markets.iter().chain(val_markets.iter()).chain(test_markets.iter())
+                .map(|m| m.y.len())
+                .sum();
             println!(
-                "[train] {tag}: {} маркетов, {} строк, {} признаков",
-                markets.len(),
-                markets.iter().map(|m| m.y.len()).sum::<usize>(),
-                feature_count,
+                "[train] {tag}: маркетов {}/{}/{} (train/val/test), {} строк, {} признаков",
+                train_markets.len(), val_markets.len(), test_markets.len(),
+                total_rows, feature_count,
             );
 
             let model_name = format!(
@@ -487,7 +530,10 @@ fn train_all_variants(
             );
             let model_path = version_path.join(&model_name);
 
-            match train_and_save(&markets, &model_path, &tag, model_type, max_lag) {
+            match train_and_save(
+                &train_markets, &val_markets, &test_markets,
+                &model_path, &tag, model_type, max_lag,
+            ) {
                 Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
@@ -496,36 +542,60 @@ fn train_all_variants(
     Ok(())
 }
 
-/// Обходит подпапки `{step_path}/{date}/`, читает и десериализует все `.bin` файлы.
-/// Возвращает дампы в хронологическом порядке (отсортированы по пути).
-fn load_dumps(step_path: &Path) -> anyhow::Result<Vec<MarketXFramesDump>> {
-    let mut dumps = Vec::new();
-
+/// Собирает все `.bin` файлы из `step_path/{date}/` в хронологическом порядке
+/// (по имени пути). Единственный источник истины для порядка маркетов —
+/// используется и тренером, и симулятором.
+pub fn collect_bin_paths(step_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if !step_path.is_dir() {
+        return Ok(paths);
+    }
     for date_path in fs_read_dirs(step_path)? {
         if !date_path.is_dir() {
             continue;
         }
-        for file in fs_read_dirs(&date_path)? {
-            if file.extension().and_then(|ext| ext.to_str()) != Some("bin") {
-                continue;
+        for file_path in fs_read_dirs(&date_path)? {
+            if file_path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
+                paths.push(file_path);
             }
-            let bytes = match fs::read(&file) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    eprintln!("[train] не удалось прочитать {}: {err}", file.display());
-                    continue;
-                }
-            };
-            match bincode::deserialize(&bytes) {
-                Ok(dump) => dumps.push(dump),
-                Err(err) => {
-                    eprintln!("[train] ошибка десериализации {}: {err}", file.display());
-                }
-            };
         }
     }
+    Ok(paths)
+}
 
-    Ok(dumps)
+/// Хронологический 3-way сплит по количеству маркетов.
+/// Возвращает `(train_count, val_count, test_count)` так, что
+/// `train_count + val_count + test_count == n`. Границы считаются **по путям**,
+/// идентично в тренере и симуляторе — одни и те же маркеты всегда
+/// попадают в один и тот же сплит.
+pub fn split_counts(n: usize) -> (usize, usize, usize) {
+    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
+    let val_count_raw = ((n as f64) * VAL_FRACTION).ceil() as usize;
+    let train_count = n.saturating_sub(test_count + val_count_raw);
+    let val_count = val_count_raw.min(n.saturating_sub(train_count));
+    let test_count = n - train_count - val_count;
+    (train_count, val_count, test_count)
+}
+
+/// Загружает дампы для заданного списка путей. Ошибки чтения/десериализации
+/// молча пропускаются (печатаются в stderr) — идентичное поведение
+/// с [`crate::history_sim`]: битый файл одинаково игнорируется обоими.
+fn load_dumps_for_paths(paths: &[PathBuf]) -> Vec<MarketXFramesDump> {
+    let mut dumps = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("[train] не удалось прочитать {}: {err}", path.display());
+                continue;
+            }
+        };
+        match bincode::deserialize::<MarketXFramesDump>(&bytes) {
+            Ok(dump) => dumps.push(dump),
+            Err(err) => eprintln!("[train] ошибка десериализации {}: {err}", path.display()),
+        }
+    }
+    dumps
 }
 
 /// Формирует `MarketDataset` для каждого дампа по заданной ноге и типу модели.
@@ -570,8 +640,8 @@ fn append_frames(
             continue;
         };
         let row = match max_lag {
-            Some(n) => frames[index].to_x_train_n(n),
-            None => frames[index].to_x_train(),
+            Some(n) => frames[index].to_x_train_n_with(n, apply_side_symmetry),
+            None => frames[index].to_x_train_with(apply_side_symmetry),
         };
         if row.len() != feature_count {
             continue;
@@ -594,29 +664,22 @@ fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
     (x, y)
 }
 
-/// 3-way split по маркетам: train / val / test.
+/// Обучение на уже расщеплённых по сплитам маркетах.
 ///
-/// Каждый маркет целиком попадает в одну группу — модель видит полные жизненные циклы событий.
+/// Сплит выполнен на уровне путей в [`run_train_mode`] и идентичен тому,
+/// что использует [`crate::history_sim`] — один и тот же маркет всегда
+/// попадает в один и тот же сплит.
 /// - **val** — используется optimizer'ом для подбора гиперпараметров и early stopping.
 /// - **test** — held-out, только для финальной честной оценки AUC.
 fn train_and_save(
-    markets: &[MarketDataset],
+    train_markets: &[MarketDataset],
+    val_markets: &[MarketDataset],
+    test_markets: &[MarketDataset],
     model_path: &Path,
     tag: &str,
     model_type: ModelType,
     max_lag: Option<usize>,
 ) -> anyhow::Result<()> {
-    let n = markets.len();
-    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
-    let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
-    let train_count = n.saturating_sub(test_count + val_count);
-    let (train_markets, rest) = markets.split_at(train_count);
-    let (val_markets, test_markets) = rest.split_at(val_count.min(rest.len()));
-    println!(
-        "[train] {tag}: сплит по маркетам: {train_count} train / {} val / {} test (всего {n})",
-        val_markets.len(),
-        test_markets.len(),
-    );
     let (x_train, y_train) = flatten_markets(train_markets);
     let (x_val, y_val) = flatten_markets(val_markets);
     let (x_test, y_test) = flatten_markets(test_markets);
@@ -676,20 +739,25 @@ fn train_and_save(
     print_y_distribution(&y_train, &y_val, &y_test, tag);
     print_contributions(&booster, &dtest, tag, max_lag);
 
-    // ── Platt scaling: калибровка на test set ────────────────────────────────
-    match fit_calibration(&booster, &dtest, &y_test, tag) {
+    // ── Isotonic regression: калибровка на VAL set ───────────────────────────
+    // Val уже «запачкан» early stopping'ом, но это лучше чем калибровать на test:
+    // test обязан оставаться полностью held-out для честной финальной оценки AUC.
+    // Кроме того, isotonic имеет O(N) параметров и катастрофически переобучается
+    // если калибровочный сет совпадает с тем, по которому меряется AUC.
+    match fit_calibration(&booster, &dval, &y_val, tag) {
         Ok(cal) => {
             println!(
-                "[train] {tag}: calibration: intercept={:.4} w={:.4} (пример: raw 0.50→{:.3}, raw 0.85→{:.3}, raw 0.95→{:.3})",
-                cal.intercept, cal.param_w,
-                cal.apply(0.50), cal.apply(0.85), cal.apply(0.95),
+                "[train] {tag}: calibration: breakpoints={} \
+                 (примеры: raw 0.50→{:.3}, 0.70→{:.3}, 0.85→{:.3}, 0.95→{:.3})",
+                cal.xs.len(),
+                cal.apply(0.50), cal.apply(0.70), cal.apply(0.85), cal.apply(0.95),
             );
             match save_calibration(&cal, model_path) {
                 Ok(path) => println!("[train] {tag}: калибровка сохранена → {}", path.display()),
                 Err(err) => eprintln!("[train] {tag}: ошибка сохранения калибровки: {err:#}"),
             }
         }
-        Err(err) => eprintln!("[train] {tag}: ошибка калибровки (Platt scaling): {err:#}"),
+        Err(err) => eprintln!("[train] {tag}: ошибка калибровки (isotonic): {err:#}"),
     }
 
     if let Some(parent) = model_path.parent() {
