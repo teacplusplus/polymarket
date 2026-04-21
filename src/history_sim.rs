@@ -37,7 +37,7 @@ use xgb::{Booster, DMatrix};
 /// Порог сырого предсказания модели (0.0–1.0) для рассмотрения входа в позицию.
 /// Дальнейшую селекцию делает Kelly (`f* > 0`), поэтому порог служит только
 /// грубым префильтром, отсекающим заведомо шумовые сигналы.
-pub const SIM_BUY_THRESHOLD: f32 = 0.60;
+pub const SIM_BUY_THRESHOLD: f32 = 0.6;
 
 /// Стартовый виртуальный банкролл (USDC).
 pub const INITIAL_BANKROLL: f64 = 1000.0;
@@ -53,6 +53,33 @@ pub const MIN_POSITION_USD: f64 = 0.1;
 /// См. [Polymarket: Fees](https://docs.polymarket.com/trading/fees).
 pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
 
+/// Порог «удержания до конца» в секундах: когда `event_remaining_ms` ≤
+/// `HOLD_TO_END_THRESHOLD_SEC × 1000`, активируется зона удержания — TP и
+/// Timeout перестают закрывать позицию (ждём резолюцию ради выплаты $1 без
+/// fee). Основания для выхода в зоне:
+/// * **SL** по ценовой дельте (`current_prob − entry_prob ≤ Y_TRAIN_STOP_LOSS_PP`) —
+///   жёсткий предохранитель от catastrophic loss при переуверенной
+///   resolution-модели;
+/// * **EV-правило** (см. [`EV_EXIT_MARGIN`]): `EV_sell · (1 − MARGIN) > EV_hold` —
+///   мягкий выход, когда рыночная продажа выгоднее ожидаемой резолюции.
+pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 60;
+
+/// Коэффициент EMA для сглаживания `p_win` от resolution-модели в зоне
+/// удержания: `p_ema = α · p_now + (1 − α) · p_prev`. Чем меньше α, тем
+/// плавнее и менее чувствителен EV-exit к одиночному выбросу модели.
+pub const EV_EXIT_P_WIN_EMA_ALPHA: f64 = 0.3;
+
+/// Защитный зазор EV-exit: продаём только если `EV_sell · (1 − MARGIN) >
+/// EV_hold`. Сглаживает границу равенства EV и компенсирует неучтённые
+/// эффекты (шум модели, неполнота bid-стака, погрешность калибровки).
+pub const EV_EXIT_MARGIN: f64 = 0.01;
+
+/// Минимальный остаток времени до конца маркета (мс) для открытия НОВОЙ
+/// позиции: `Y_TRAIN_HORIZON_FRAMES × step_sec × 1000` при симуляции на
+/// 1s-моделях = 15 с. Ближе к резолюции TP/SL за горизонт почти не
+/// играют — вход превращается в лотерею и тратит комиссию.
+pub const MIN_ENTRY_REMAINING_MS: i64 = (Y_TRAIN_HORIZON_FRAMES as i64) * 1000;
+
 // ─── Типы ─────────────────────────────────────────────────────────────────────
 
 /// Открытая виртуальная позиция в одном токене.
@@ -66,6 +93,11 @@ struct OpenPosition {
     entry_cost: f64,
     /// Сколько кадров позиция уже удерживается (для таймаута).
     frames_held: usize,
+    /// EMA вероятности выигрыша от resolution-модели, используется для
+    /// EV-exit в зоне удержания (см. [`EV_EXIT_P_WIN_EMA_ALPHA`]). `None`,
+    /// пока позиция ни разу не попадала в зону удержания / пока модель
+    /// resolution не вернула валидного предсказания.
+    p_win_ema: Option<f64>,
 }
 
 /// Причина закрытия позиции.
@@ -77,6 +109,10 @@ enum CloseReason {
     Resolution { won: bool },
     /// Позиция удерживалась больше [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL — боковик, выход по рынку.
     Timeout,
+    /// В зоне удержания (≤ [`HOLD_TO_END_THRESHOLD_SEC`] с) EV-правило
+    /// сработало: `EV_sell · (1 − EV_EXIT_MARGIN) > EV_hold`, где
+    /// `EV_hold = EMA(p_win_resolution) · shares`. Рыночный выход по бид-стаку.
+    EvExit,
 }
 
 /// Статистика торговли по одной стороне (UP или DOWN).
@@ -102,6 +138,10 @@ struct SideStats {
     resolution_loss: usize,
     /// Число выходов по таймауту: позиция удерживалась >= [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL.
     timeout_count: usize,
+    /// Число EV-exit-ов в зоне удержания до конца маркета (см. [`CloseReason::EvExit`]).
+    ev_exit_count: usize,
+    /// Число пропущенных входов из-за приближения к резолюции (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`).
+    late_entry_skips: usize,
     /// Число пропущенных входов из-за Kelly f* ≤ 0 (нет edge).
     kelly_skips: usize,
     /// Число кадров, где raw >= threshold (для диагностики воронки).
@@ -185,6 +225,8 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 
                 let model_up_path   = version_path.join(format!("model_{interval}_1s_pnl_up.ubj"));
                 let model_down_path = version_path.join(format!("model_{interval}_1s_pnl_down.ubj"));
+                let model_resolution_up_path   = version_path.join(format!("model_{interval}_1s_resolution_up.ubj"));
+                let model_resolution_down_path = version_path.join(format!("model_{interval}_1s_resolution_down.ubj"));
 
                 let tag = format!("{currency}/{version}/{interval}");
 
@@ -206,6 +248,14 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 let calibration_up = load_calibration(&model_up_path).ok();
                 let calibration_down = load_calibration(&model_down_path).ok();
 
+                // Resolution-модели (1s) используются только для EV-exit в зоне удержания.
+                // Их отсутствие не блокирует симуляцию — в зоне удержания без них позиция
+                // просто ждёт резолюции (TP/SL/Timeout в зоне всё равно отключены).
+                let booster_resolution_up   = load_booster(&model_resolution_up_path);
+                let booster_resolution_down = load_booster(&model_resolution_down_path);
+                let calibration_resolution_up   = load_calibration(&model_resolution_up_path).ok();
+                let calibration_resolution_down = load_calibration(&model_resolution_down_path).ok();
+
                 let cal_info = |cal: &Option<Calibration>, label: &str| -> String {
                     match cal {
                         Some(c) => format!(
@@ -219,10 +269,14 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 
                 println!(
                     "[sim] {tag}: модели pnl загружены | {} | {} \
+                     | resolution: up={} down={} \
+                     | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s ev_margin={EV_EXIT_MARGIN} ema_α={EV_EXIT_P_WIN_EMA_ALPHA} min_entry_ms={MIN_ENTRY_REMAINING_MS} \
                      | threshold={SIM_BUY_THRESHOLD} | kelly={KELLY_MULTIPLIER} | max_bet={MAX_BET_FRACTION} \
                      | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}",
                     cal_info(&calibration_up, "cal_up"),
                     cal_info(&calibration_down, "cal_down"),
+                    if booster_resolution_up.is_some()   { "✓" } else { "✗" },
+                    if booster_resolution_down.is_some() { "✓" } else { "✗" },
                 );
 
                 let mut sim_stats = SimStats::new();
@@ -240,7 +294,14 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 for file_path in test_paths {
                     match load_market_xframes(file_path) {
                         Ok(market_xframes) => {
-                            simulate_event(&market_xframes, &booster_up, &booster_down, calibration_up.as_ref(), calibration_down.as_ref(), &mut sim_stats);
+                            simulate_event(
+                                &market_xframes,
+                                &booster_up, &booster_down,
+                                calibration_up.as_ref(), calibration_down.as_ref(),
+                                booster_resolution_up.as_ref(), booster_resolution_down.as_ref(),
+                                calibration_resolution_up.as_ref(), calibration_resolution_down.as_ref(),
+                                &mut sim_stats,
+                            );
                             sim_stats.events += 1;
                         }
                         Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
@@ -261,12 +322,17 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 ///
 /// UP и DOWN — зеркальные токены одного события: при 50/50 шансах
 /// `prob_up ≈ 1 − prob_down`. Итерируем по `min(len_up, len_down)` стабильным кадрам.
+#[allow(clippy::too_many_arguments)]
 fn simulate_event(
     market_xframes: &MarketXFramesDump,
     booster_up: &Booster,
     booster_down: &Booster,
     calibration_up: Option<&Calibration>,
     calibration_down: Option<&Calibration>,
+    booster_resolution_up: Option<&Booster>,
+    booster_resolution_down: Option<&Booster>,
+    calibration_resolution_up: Option<&Calibration>,
+    calibration_resolution_down: Option<&Calibration>,
     sim_stats: &mut SimStats,
 ) {
     let frames_up: Vec<&XFrame<SIZE>> = market_xframes.frames_up.iter().filter(|f| f.stable).collect();
@@ -313,6 +379,8 @@ fn simulate_event(
             exit_prob_up,
             is_last,
             is_resolution,
+            booster_resolution_up,
+            calibration_resolution_up,
             &mut sim_stats.up,
             &mut sim_stats.bankroll,
         );
@@ -323,63 +391,122 @@ fn simulate_event(
             exit_prob_down,
             is_last,
             is_resolution,
+            booster_resolution_down,
+            calibration_resolution_down,
             &mut sim_stats.down,
             &mut sim_stats.bankroll,
         );
 
         if !is_last { sim_stats.update_drawdown(); }
 
-        // ── Открытие новых позиций (не на последнем кадре) ───────────────────
+        // ── Открытие новых позиций ───────────────────────────────────────────
+        // Не входим в позицию на последнем кадре (там только закрытие) и слишком
+        // близко к резолюции — за оставшиеся < MIN_ENTRY_REMAINING_MS TP/SL
+        // за горизонт не успеют сработать, вход превращается в лотерею.
         if !is_last {
-            if let Some(raw) = predict_frame(booster_up, frame_up, None) {
-                if raw >= SIM_BUY_THRESHOLD {
-                    let pred = calibration_up.map_or(raw, |c| c.apply(raw));
-                    let g = kelly_gain_ratio(prob_up);
-                    let l = kelly_loss_ratio(prob_up);
-                    let f = kelly_fraction(pred as f64, g, l);
-
-                    sim_stats.up.raw_above_threshold += 1;
-                    sim_stats.up.diag_sum_raw += raw as f64;
-                    sim_stats.up.diag_sum_calibrated += pred as f64;
-                    sim_stats.up.diag_sum_entry_prob += prob_up;
-                    sim_stats.up.diag_sum_kelly_f += f;
-
-                    let size = kelly_position_size(pred, prob_up, sim_stats.bankroll);
-                    if size > 0.0 {
-                        positions_up.push(open_position(frame_up, size, &mut sim_stats.up));
-                    } else {
-                        sim_stats.up.kelly_skips += 1;
-                    }
-                }
-            }
-            if let Some(raw) = predict_frame(booster_down, frame_down, None) {
-                if raw >= SIM_BUY_THRESHOLD {
-                    let pred = calibration_down.map_or(raw, |c| c.apply(raw));
-                    let g = kelly_gain_ratio(prob_down);
-                    let l = kelly_loss_ratio(prob_down);
-                    let f = kelly_fraction(pred as f64, g, l);
-
-                    sim_stats.down.raw_above_threshold += 1;
-                    sim_stats.down.diag_sum_raw += raw as f64;
-                    sim_stats.down.diag_sum_calibrated += pred as f64;
-                    sim_stats.down.diag_sum_entry_prob += prob_down;
-                    sim_stats.down.diag_sum_kelly_f += f;
-
-                    let size = kelly_position_size(pred, prob_down, sim_stats.bankroll);
-                    if size > 0.0 {
-                        positions_down.push(open_position(frame_down, size, &mut sim_stats.down));
-                    } else {
-                        sim_stats.down.kelly_skips += 1;
-                    }
-                }
-            }
+            try_open_position(
+                frame_up, prob_up,
+                booster_up, calibration_up,
+                &mut positions_up,
+                &mut sim_stats.up,
+                sim_stats.bankroll,
+            );
+            try_open_position(
+                frame_down, prob_down,
+                booster_down, calibration_down,
+                &mut positions_down,
+                &mut sim_stats.down,
+                sim_stats.bankroll,
+            );
         }
     }
 }
 
+/// Решение об открытии новой позиции для одной стороны на одном кадре.
+///
+/// Сигнал входа берётся у **pnl-модели** (большая обучающая выборка,
+/// стабильный AUC), сайзинг — через классический TP/SL Kelly
+/// ([`kelly_gain_ratio`] / [`kelly_loss_ratio`]).
+///
+/// В hold zone TP по ценовой дельте отключён, зато доступны SL как
+/// catastrophic-предохранитель и мягкий EV-exit (см. `manage_positions`).
+/// TP/SL-Kelly здесь даёт **более консервативный** сайз, чем
+/// резолюционная формула — это осознанный выбор: в переобученных/
+/// нестационарных окнах мы не хотим раздувать позиции под ожидание
+/// полной выплаты резолюции.
+///
+/// При `event_remaining_ms < MIN_ENTRY_REMAINING_MS` вход пропускается
+/// (`late_entry_skips++`): за оставшееся время TP/SL физически не
+/// успевают сработать, вход вырождается в лотерею.
+fn try_open_position(
+    frame: &XFrame<SIZE>,
+    entry_prob: f64,
+    booster_pnl: &Booster,
+    calibration_pnl: Option<&Calibration>,
+    positions: &mut Vec<OpenPosition>,
+    stats: &mut SideStats,
+    bankroll: f64,
+) {
+    if frame.event_remaining_ms > 0 && frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
+        stats.late_entry_skips += 1;
+        return;
+    }
+
+    let kelly_gain = kelly_gain_ratio(entry_prob);
+    let kelly_loss = kelly_loss_ratio(entry_prob);
+
+    let Some(raw) = predict_frame(booster_pnl, frame, None) else { return };
+    if raw < SIM_BUY_THRESHOLD {
+        return;
+    }
+
+    let pred = calibration_pnl.map_or(raw, |c| c.apply(raw));
+    let kelly_f = kelly_fraction(pred as f64, kelly_gain, kelly_loss);
+
+    stats.raw_above_threshold += 1;
+    stats.diag_sum_raw += raw as f64;
+    stats.diag_sum_calibrated += pred as f64;
+    stats.diag_sum_entry_prob += entry_prob;
+    stats.diag_sum_kelly_f += kelly_f;
+
+    let kelly_f_adj = kelly_f * KELLY_MULTIPLIER;
+    if kelly_f_adj <= 0.0 {
+        stats.kelly_skips += 1;
+        return;
+    }
+    let size = kelly_f_adj.min(MAX_BET_FRACTION) * bankroll;
+    if size < MIN_POSITION_USD {
+        stats.kelly_skips += 1;
+        return;
+    }
+
+    positions.push(open_position(frame, size, stats));
+}
+
 /// Общий lifecycle позиций одной стороны за один кадр: инкремент `frames_held`,
-/// проверка TP/SL/Timeout/Resolution и закрытие подходящих позиций в `stats`.
-/// P&L закрытий добавляется к `bankroll`.
+/// обновление EMA `p_win` (в зоне удержания), проверка TP/SL/Timeout/
+/// Resolution/EvExit и закрытие подходящих позиций в `stats`. P&L закрытий
+/// добавляется к `bankroll`.
+///
+/// При `event_remaining_ms ≤ HOLD_TO_END_THRESHOLD_SEC × 1000` включается
+/// «зона удержания до конца»: TP и Timeout НЕ закрывают позицию, зато
+/// доступны два выхода:
+///
+/// 1. **Hard SL** по ценовой дельте (`current_prob − entry_prob ≤
+///    Y_TRAIN_STOP_LOSS_PP`) — предохранитель от сценария, когда
+///    resolution-модель переуверенно держит `p_ema` высоким, а цена
+///    уходит вниз. Проверяется первым.
+/// 2. **EV-правило** (soft exit): продаём, если рыночный exit чистым USDC
+///    (после fee) выгоднее ожидаемого удержания до резолюции:
+///    ```text
+///    EV_sell = book_fill_sell(shares) − taker_fee(shares, sell_vwap)
+///    EV_hold = EMA(p_win_resolution) · shares · 1.0
+///    sell_now  ⇔  EV_sell · (1 − EV_EXIT_MARGIN) > EV_hold
+///    ```
+///
+/// Если resolution-модель не загружена — EV-exit недоступен, но hard SL
+/// всё равно работает; в остальных случаях позиция ждёт резолюции.
+#[allow(clippy::too_many_arguments)]
 fn manage_positions(
     positions: &mut Vec<OpenPosition>,
     frame: &XFrame<SIZE>,
@@ -387,12 +514,43 @@ fn manage_positions(
     exit_prob_last: f64,
     is_last: bool,
     is_resolution: bool,
+    booster_resolution: Option<&Booster>,
+    calibration_resolution: Option<&Calibration>,
     stats: &mut SideStats,
     bankroll: &mut f64,
 ) {
     for pos in positions.iter_mut() { pos.frames_held += 1; }
+
+    let in_hold_zone = !is_last
+        && frame.event_remaining_ms > 0
+        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+
+    // p_win от resolution-модели считаем один раз на кадр — все позиции
+    // одной стороны делят один и тот же кадр. EMA обновляется уже
+    // индивидуально для каждой позиции (у каждой своя история).
+    let p_win_now: Option<f64> = if in_hold_zone && !positions.is_empty() {
+        booster_resolution.and_then(|b| {
+            predict_frame(b, frame, None).map(|raw| {
+                calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
+            })
+        })
+    } else {
+        None
+    };
+
     let mut remaining: Vec<OpenPosition> = Vec::new();
-    for pos in positions.drain(..) {
+    for mut pos in positions.drain(..) {
+        if in_hold_zone {
+            if let Some(p) = p_win_now {
+                pos.p_win_ema = Some(match pos.p_win_ema {
+                    Some(prev) => {
+                        EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev
+                    }
+                    None => p,
+                });
+            }
+        }
+
         let close = if is_last {
             let reason = if is_resolution {
                 CloseReason::Resolution { won: exit_prob_last > 0.5 }
@@ -400,6 +558,38 @@ fn manage_positions(
                 CloseReason::Timeout
             };
             Some((exit_prob_last, reason))
+        } else if in_hold_zone {
+            // В зоне удержания TP и Timeout отключены, но остаются два выхода:
+            //
+            // 1. Hard SL по ценовой дельте — предохранитель от переуверенной
+            //    resolution-модели. Проверяется первым, чтобы в catastrophic
+            //    сценариях ограничить потерю на уровне SL, а не всего entry_cost.
+            // 2. EV-правило — мягкий выход, когда рыночная продажа даёт больше
+            //    USDC, чем ожидаемая выплата при резолюции.
+            let delta = current_prob - pos.entry_prob;
+            if delta <= Y_TRAIN_STOP_LOSS_PP {
+                Some((current_prob, CloseReason::StopLoss))
+            } else if let Some(p_ema) = pos.p_win_ema {
+                let gross_usdc = book_fill_sell(frame, pos.shares_held);
+                let sell_vwap = if pos.shares_held > 0.0 {
+                    (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
+                } else {
+                    current_prob.clamp(0.001, 0.999)
+                };
+                let fee = pos.shares_held
+                    * POLYMARKET_CRYPTO_TAKER_FEE_RATE
+                    * sell_vwap
+                    * (1.0 - sell_vwap);
+                let ev_sell = gross_usdc - fee;
+                let ev_hold = p_ema * pos.shares_held;
+                if ev_sell * (1.0 - EV_EXIT_MARGIN) > ev_hold {
+                    Some((current_prob, CloseReason::EvExit))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             let delta = current_prob - pos.entry_prob;
             if delta >= Y_TRAIN_TAKE_PROFIT_PP {
@@ -471,21 +661,6 @@ fn kelly_fraction(p_win: f64, gain: f64, loss: f64) -> f64 {
     p_win / loss - q / gain
 }
 
-/// Вычисляет размер позиции (USDC) по half-Kelly с учётом банкролла.
-///
-/// Возвращает `0.0` если edge отсутствует или позиция меньше [`MIN_POSITION_USD`].
-fn kelly_position_size(prediction: f32, entry_prob: f64, bankroll: f64) -> f64 {
-    let g = kelly_gain_ratio(entry_prob);
-    let l = kelly_loss_ratio(entry_prob);
-    let f = kelly_fraction(prediction as f64, g, l);
-    let f_adj = f * KELLY_MULTIPLIER;
-    if f_adj <= 0.0 {
-        return 0.0;
-    }
-    let size = f_adj.min(MAX_BET_FRACTION) * bankroll;
-    if size < MIN_POSITION_USD { 0.0 } else { size }
-}
-
 // ─── Торговые операции с учётом комиссий ──────────────────────────────────────
 
 /// Открывает виртуальную позицию за `position_size` USDC.
@@ -509,6 +684,7 @@ fn open_position(frame: &XFrame<SIZE>, position_size: f64, stats: &mut SideStats
         entry_prob: frame.currency_implied_prob.unwrap_or(buy_price),
         entry_cost: position_size,
         frames_held: 0,
+        p_win_ema: None,
     }
 }
 
@@ -529,7 +705,10 @@ fn close_position(
     let net_usdc = match reason {
         CloseReason::Resolution { won: true } => pos.shares_held,
         CloseReason::Resolution { won: false } => 0.0,
-        CloseReason::TakeProfit | CloseReason::StopLoss | CloseReason::Timeout => {
+        CloseReason::TakeProfit
+        | CloseReason::StopLoss
+        | CloseReason::Timeout
+        | CloseReason::EvExit => {
             let gross_usdc = book_fill_sell(frame, pos.shares_held);
             let sell_price = if pos.shares_held > 0.0 {
                 (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
@@ -554,6 +733,7 @@ fn close_position(
         CloseReason::Resolution { won: true }  => stats.resolution_win += 1,
         CloseReason::Resolution { won: false } => stats.resolution_loss += 1,
         CloseReason::Timeout                   => stats.timeout_count += 1,
+        CloseReason::EvExit                    => stats.ev_exit_count += 1,
     }
 
     pnl
@@ -683,10 +863,10 @@ fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
-         | TP={} SL={} Timeout={} Res✓={} Res✗={}",
+         | TP={} SL={} Timeout={} EvExit={} Res✓={} Res✗={} late_skips={}",
         s.trades, win_rate, s.pnl_usd, avg_pnl, s.fees_paid,
-        s.tp_count, s.sl_count, s.timeout_count,
-        s.resolution_win, s.resolution_loss,
+        s.tp_count, s.sl_count, s.timeout_count, s.ev_exit_count,
+        s.resolution_win, s.resolution_loss, s.late_entry_skips,
     );
 }
 

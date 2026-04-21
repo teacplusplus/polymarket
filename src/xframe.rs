@@ -51,7 +51,7 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "0"))]
     pub currency_up_down_outcome: i32,
     /// Дискриминант [`CurrencyUpDownDelayClass`] по Gamma `question` (см. [crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question]): [XFRAME_BTC_5M_DELAY_CLASS_DELAY_5MIN] / [XFRAME_BTC_5M_DELAY_CLASS_DELAY_10MIN]. Для 15m — [XFRAME_BTC_15M_DELAY_CLASS_ALIGNED].
-    #[xfeature]
+    //#[xfeature]
     #[derivative(Default(value = "0"))]
     pub currency_up_down_delay_class: i32,
     /// Рыночная оценка вероятности исхода для **этого** токена (см. [`Self::currency_up_down_outcome`]): mid L1 при спреде ≤ 10¢, при широком спреде — last trade, как в UI Polymarket.
@@ -1016,7 +1016,8 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 15;
 /// `up_won` — фактический исход рынка из [`crate::xframe_dump::MarketXFramesDump::up_won`].
 pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64) -> Option<f32> {
     let up_won = final_price >= price_to_beat;
-    let p_buy = x_frames.get(index)?.currency_implied_prob?.clamp(0.001, 0.999);
+    let current = x_frames.get(index)?;
+    let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
 
     let nominal_shares = 1.0 / p_buy;
     let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
@@ -1024,16 +1025,25 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
     let actual_shares  = nominal_shares - fee_buy_shares;
 
     for i in 1..=n {
-        let future = x_frames.get(index + i)?;
+        // Отсутствие следующего кадра трактуется как конец маркета
+        // (дампы обрезаются по реальному завершению события).
+        let future_opt = x_frames.get(index + i);
+        let reached_end = match future_opt {
+            None => true,
+            Some(f) => f.event_remaining_ms <= 0,
+        };
 
-        let net_ret = if future.event_remaining_ms <= 0 {
-            let won = y_train_resolution_token_won(future, up_won);
+        let net_ret = if reached_end {
+            // `currency_up_down_outcome` константен на протяжении маркета,
+            // поэтому для определения токена берём текущий кадр.
+            let won = y_train_resolution_token_won(current, up_won);
             if won {
                 actual_shares - 1.0
             } else {
                 -1.0
             }
         } else {
+            let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
             let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
             let gross_usdc    = actual_shares * p_sell;
             let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
@@ -1044,6 +1054,11 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
             return Some(1.0);
         } else if net_ret <= Y_TRAIN_STOP_LOSS_PP {
             return Some(0.0);
+        }
+
+        // Кадры закончились — дальше смотреть некуда, ни TP/SL не сработал.
+        if future_opt.is_none() {
+            break;
         }
     }
     Some(0.0)
@@ -1062,16 +1077,29 @@ fn y_train_resolution_token_won(frame: &XFrame<SIZE>, up_won: bool) -> bool {
     }
 }
 
-/// Метка y по исходу события (resolution).
+/// Метка y для resolution-модели: чистый бинарный исход маркета.
 ///
-/// Из `currency_price_vs_beat_pct` текущего кадра восстанавливает спотовую цену,
-/// затем сравнивает с `final_price` (цена закрытия окна):
-/// - Up-токен: `won = final_price >= current_spot`
-/// - Down-токен: `won = final_price < current_spot`
+/// Семантика: *«если войти в позицию на кадре `index`, доживёт ли она до
+/// резолюции как победитель, не выбив стоп по пути?»* — симметрично
+/// [`calc_y_train_pnl`], но целевое событие — победа в резолюции, а не
+/// достижение TP.
 ///
-/// Сканирует до `n` будущих кадров в поисках резолюции (`event_remaining_ms ≤ 0`).
-/// Если резолюция не найдена в горизонте или `currency_price_vs_beat_pct` отсутствует —
-/// возвращает `None` (сэмпл пропускается при обучении).
+/// Модель покупки/выхода идентична [`calc_y_train_pnl`]:
+/// * buy по [`XFrame::currency_implied_prob`] текущего кадра
+///   (`p_buy`, с taker-fee Polymarket [`POLYMARKET_CRYPTO_TAKER_FEE_RATE`]);
+/// * для каждого из `n` будущих кадров симулируется:
+///   - резолюция (`event_remaining_ms ≤ 0`) — выплата $1/шер победителю без
+///     fee, $0 проигравшему (исход по [`y_train_resolution_token_won`]);
+///   - иначе — **taker-продажа с fee** по `p_sell = future.currency_implied_prob`
+///     для проверки досрочного стопа.
+///
+/// Решение:
+/// * если на любом промежуточном кадре `net_ret ≤ Y_TRAIN_STOP_LOSS_PP` —
+///   позиция была бы закрыта по SL ещё до резолюции → `Some(0.0)`;
+/// * если на любом кадре в горизонте наступила резолюция и SL не сработал
+///   раньше → `Some(1.0)` при победе / `Some(0.0)` при проигрыше;
+/// * если за `n` кадров ни стоп, ни резолюция не наступили → `None`
+///   (сэмпл не размечается, чтобы не смещать классификатор шумом).
 pub fn calc_y_train_resolution(
     n: usize,
     x_frames: &[XFrame<SIZE>],
@@ -1079,30 +1107,43 @@ pub fn calc_y_train_resolution(
     price_to_beat: f64,
     final_price: f64,
 ) -> Option<f32> {
+    let up_won = final_price >= price_to_beat;
     let current = x_frames.get(index)?;
-    let last_idx = x_frames.len().saturating_sub(1);
+    let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
 
-    let mut resolved = false;
+    let nominal_shares = 1.0 / p_buy;
+    let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
+    let fee_buy_shares = fee_buy_usdc / p_buy;
+    let actual_shares  = nominal_shares - fee_buy_shares;
+
     for i in 1..=n {
-        let Some(future) = x_frames.get(index + i) else { break };
-        if future.event_remaining_ms <= 0 || index + i == last_idx {
-            resolved = true;
-            break;
+        // Отсутствие следующего кадра трактуется как конец маркета
+        // (дампы обрезаются по реальному завершению события).
+        let future_opt = x_frames.get(index + i);
+        let reached_end = match future_opt {
+            None => true,
+            Some(f) => f.event_remaining_ms <= 0,
+        };
+
+        // Резолюция: комиссии нет, победитель получает $1/шер.
+        // `currency_up_down_outcome` константен на протяжении маркета.
+        if reached_end {
+            let won = y_train_resolution_token_won(current, up_won);
+            return Some(if won { 1.0 } else { 0.0 });
+        }
+
+        // Промежуточный кадр — taker-продажа с fee, проверяем досрочный стоп.
+        let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
+        let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
+        let gross_usdc    = actual_shares * p_sell;
+        let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
+        let net_ret = (gross_usdc - fee_sell_usdc) - 1.0;
+        if net_ret <= Y_TRAIN_STOP_LOSS_PP {
+            return Some(0.0);
         }
     }
-    if !resolved {
-        return None;
-    }
 
-
-    let currency_price_vs_beat_pct = current.currency_price_vs_beat_pct?;
-    let current_spot = price_to_beat * (1.0 - currency_price_vs_beat_pct / 100.0);
-
-    let won = match CurrencyUpDownOutcome::from_i32(current.currency_up_down_outcome)? {
-        CurrencyUpDownOutcome::Up => final_price >= current_spot,
-        CurrencyUpDownOutcome::Down => final_price < current_spot,
-    };
-    Some(if won { 1.0 } else { 0.0 })
+    None
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.

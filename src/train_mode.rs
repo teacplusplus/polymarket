@@ -2,6 +2,7 @@
 //! строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
 //! и сохраняет модель рядом с папкой версии.
 
+use crate::history_sim::HOLD_TO_END_THRESHOLD_SEC;
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::xframe::{
     apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE,
@@ -21,7 +22,7 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 10;
+const OPTIMIZER_TRIALS: usize = 20;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -472,34 +473,39 @@ struct MarketDataset {
     y: Vec<f32>,
 }
 
-/// Обучает модели для всех комбинаций model_type × side. Дампы уже разбиты
-/// по сплитам на уровне путей — [`build_market_datasets`] применяется per-split,
-/// чтобы фильтрация пустых меток не сдвигала границы.
+/// Обучает модели для всех комбинаций `model_type × side` на одном
+/// `(currency, version, interval, step_sec)`. Каждая комбинация даёт отдельный
+/// файл `model_{interval}_{step_sec}s_{model_type}_{side}.ubj` — формат,
+/// который грузит `history_sim`.
 fn train_all_variants(
     train_dumps: &[MarketXFramesDump],
-    val_dumps: &[MarketXFramesDump],
-    test_dumps: &[MarketXFramesDump],
+    val_dumps:   &[MarketXFramesDump],
+    test_dumps:  &[MarketXFramesDump],
     version_path: &Path,
     tag_prefix: &str,
     interval: &str,
     step_sec: u64,
 ) -> anyhow::Result<()> {
     for model_type in [ModelType::Pnl, ModelType::Resolution] {
-        if matches!(model_type, ModelType::Pnl) && step_sec != 1 {
+        // Pnl и Resolution обучаем только на step_sec = 1 с: лейблы обеих
+        // моделей считаются через [`crate::xframe::calc_y_train_pnl`] /
+        // [`crate::xframe::calc_y_train_resolution`] по горизонту
+        // [`Y_TRAIN_HORIZON_FRAMES`] кадров, который на 1s-шаге даёт
+        // осмысленные 15 с; на 2s/4s тот же горизонт превращается в 30/60 с
+        // и семантика меняется, а `history_sim` всё равно использует
+        // только 1s-модели.
+        if step_sec != 1 {
             continue;
         }
 
         for side in [FrameSide::Up, FrameSide::Down] {
-            let tag = format!(
-                "{tag_prefix}/{}/{}",
-                model_type.label(),
-                side.label(),
-            );
+            let tag = format!("{tag_prefix}/{}/{}", model_type.label(), side.label());
 
             let max_lag = match model_type {
                 ModelType::Resolution => None,
                 ModelType::Pnl => None,
             };
+
             let train_markets = build_market_datasets(train_dumps, side, model_type, max_lag);
             let val_markets   = build_market_datasets(val_dumps,   side, model_type, max_lag);
             let test_markets  = build_market_datasets(test_dumps,  side, model_type, max_lag);
@@ -523,12 +529,11 @@ fn train_all_variants(
                 total_rows, feature_count,
             );
 
-            let model_name = format!(
+            let model_path = version_path.join(format!(
                 "model_{interval}_{step_sec}s_{}_{}.ubj",
                 model_type.label(),
                 side.label(),
-            );
-            let model_path = version_path.join(&model_name);
+            ));
 
             match train_and_save(
                 &train_markets, &val_markets, &test_markets,
@@ -631,7 +636,21 @@ fn append_frames(
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
 ) {
+    // Граница hold zone в мс (условие идентично [`crate::history_sim::manage_positions`]:
+    // `event_remaining_ms > 0 && event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000`).
+    // Resolution-модель используется исключительно внутри hold zone, поэтому и
+    // обучаем её только на кадрах этого диапазона — обучающее распределение
+    // совпадает с инференс-распределением.
+    let hold_zone_max_ms: i64 = HOLD_TO_END_THRESHOLD_SEC * 1000;
+
     for index in 0..frames.len() {
+        if matches!(model_type, ModelType::Resolution) {
+            let remaining = frames[index].event_remaining_ms;
+            if remaining <= 0 || remaining > hold_zone_max_ms {
+                continue;
+            }
+        }
+
         let label = match model_type {
             ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
             ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
