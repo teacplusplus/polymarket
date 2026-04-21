@@ -432,15 +432,32 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     }
 
                     let tag_prefix = format!("{currency}/{version_str}/{interval}/{step_sec}s");
-                    println!("[train] {tag_prefix}: загрузка дампов...");
-                    let dumps = load_dumps(&step_path)?;
-                    if dumps.is_empty() {
-                        println!("[train] {tag_prefix}: нет дампов, пропуск");
+                    println!("[train] {tag_prefix}: сбор путей...");
+                    let paths = collect_bin_paths(&step_path)?;
+                    if paths.is_empty() {
+                        println!("[train] {tag_prefix}: нет маркетов, пропуск");
                         continue;
                     }
-                    println!("[train] {tag_prefix}: загружено {} дампов", dumps.len());
 
-                    train_all_variants(&dumps, &version_path, &tag_prefix, interval, step_sec)?;
+                    // Сплит по путям — идентично history_sim; дампы загружаем
+                    // только после сплита, чтобы битые/пустые маркеты не сдвигали границы.
+                    let (train_count, val_count, test_count) = split_counts(paths.len());
+                    let train_paths = &paths[..train_count];
+                    let val_paths   = &paths[train_count..train_count + val_count];
+                    let test_paths  = &paths[train_count + val_count..];
+                    println!(
+                        "[train] {tag_prefix}: маркетов {} → сплит {train_count} train / {val_count} val / {test_count} test",
+                        paths.len(),
+                    );
+
+                    let train_dumps = load_dumps_for_paths(train_paths);
+                    let val_dumps   = load_dumps_for_paths(val_paths);
+                    let test_dumps  = load_dumps_for_paths(test_paths);
+
+                    train_all_variants(
+                        &train_dumps, &val_dumps, &test_dumps,
+                        &version_path, &tag_prefix, interval, step_sec,
+                    )?;
                 }
             }
         }
@@ -455,9 +472,13 @@ struct MarketDataset {
     y: Vec<f32>,
 }
 
-/// Обучает модели для всех комбинаций model_type × side на загруженных дампах.
+/// Обучает модели для всех комбинаций model_type × side. Дампы уже разбиты
+/// по сплитам на уровне путей — `build_market_datasets` применяется per-split,
+/// чтобы фильтрация пустых меток не сдвигала границы.
 fn train_all_variants(
-    dumps: &[MarketXFramesDump],
+    train_dumps: &[MarketXFramesDump],
+    val_dumps: &[MarketXFramesDump],
+    test_dumps: &[MarketXFramesDump],
     version_path: &Path,
     tag_prefix: &str,
     interval: &str,
@@ -479,9 +500,12 @@ fn train_all_variants(
                 ModelType::Resolution => None,
                 ModelType::Pnl => None,
             };
-            let markets = build_market_datasets(dumps, side, model_type, max_lag);
+            let train_markets = build_market_datasets(train_dumps, side, model_type, max_lag);
+            let val_markets   = build_market_datasets(val_dumps,   side, model_type, max_lag);
+            let test_markets  = build_market_datasets(test_dumps,  side, model_type, max_lag);
 
-            if markets.is_empty() {
+            let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
+            if total_markets == 0 {
                 println!("[train] {tag}: нет данных, пропуск");
                 continue;
             }
@@ -490,11 +514,13 @@ fn train_all_variants(
                 Some(n) => XFrame::<SIZE>::count_features_n(n),
                 None => XFrame::<SIZE>::count_features(),
             };
+            let total_rows: usize = train_markets.iter().chain(val_markets.iter()).chain(test_markets.iter())
+                .map(|m| m.y.len())
+                .sum();
             println!(
-                "[train] {tag}: {} маркетов, {} строк, {} признаков",
-                markets.len(),
-                markets.iter().map(|m| m.y.len()).sum::<usize>(),
-                feature_count,
+                "[train] {tag}: маркетов {}/{}/{} (train/val/test), {} строк, {} признаков",
+                train_markets.len(), val_markets.len(), test_markets.len(),
+                total_rows, feature_count,
             );
 
             let model_name = format!(
@@ -504,7 +530,10 @@ fn train_all_variants(
             );
             let model_path = version_path.join(&model_name);
 
-            match train_and_save(&markets, &model_path, &tag, model_type, max_lag) {
+            match train_and_save(
+                &train_markets, &val_markets, &test_markets,
+                &model_path, &tag, model_type, max_lag,
+            ) {
                 Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
@@ -513,36 +542,60 @@ fn train_all_variants(
     Ok(())
 }
 
-/// Обходит подпапки `{step_path}/{date}/`, читает и десериализует все `.bin` файлы.
-/// Возвращает дампы в хронологическом порядке (отсортированы по пути).
-fn load_dumps(step_path: &Path) -> anyhow::Result<Vec<MarketXFramesDump>> {
-    let mut dumps = Vec::new();
-
+/// Собирает все `.bin` файлы из `step_path/{date}/` в хронологическом порядке
+/// (по имени пути). Единственный источник истины для порядка маркетов —
+/// используется и тренером, и симулятором.
+pub fn collect_bin_paths(step_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    if !step_path.is_dir() {
+        return Ok(paths);
+    }
     for date_path in fs_read_dirs(step_path)? {
         if !date_path.is_dir() {
             continue;
         }
-        for file in fs_read_dirs(&date_path)? {
-            if file.extension().and_then(|ext| ext.to_str()) != Some("bin") {
-                continue;
+        for file_path in fs_read_dirs(&date_path)? {
+            if file_path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
+                paths.push(file_path);
             }
-            let bytes = match fs::read(&file) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    eprintln!("[train] не удалось прочитать {}: {err}", file.display());
-                    continue;
-                }
-            };
-            match bincode::deserialize(&bytes) {
-                Ok(dump) => dumps.push(dump),
-                Err(err) => {
-                    eprintln!("[train] ошибка десериализации {}: {err}", file.display());
-                }
-            };
         }
     }
+    Ok(paths)
+}
 
-    Ok(dumps)
+/// Хронологический 3-way сплит по количеству маркетов.
+/// Возвращает `(train_count, val_count, test_count)` так, что
+/// `train_count + val_count + test_count == n`. Границы считаются **по путям**,
+/// идентично в тренере и симуляторе — одни и те же маркеты всегда
+/// попадают в один и тот же сплит.
+pub fn split_counts(n: usize) -> (usize, usize, usize) {
+    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
+    let val_count_raw = ((n as f64) * VAL_FRACTION).ceil() as usize;
+    let train_count = n.saturating_sub(test_count + val_count_raw);
+    let val_count = val_count_raw.min(n.saturating_sub(train_count));
+    let test_count = n - train_count - val_count;
+    (train_count, val_count, test_count)
+}
+
+/// Загружает дампы для заданного списка путей. Ошибки чтения/десериализации
+/// молча пропускаются (печатаются в stderr) — идентичное поведение
+/// с [`crate::history_sim`]: битый файл одинаково игнорируется обоими.
+fn load_dumps_for_paths(paths: &[PathBuf]) -> Vec<MarketXFramesDump> {
+    let mut dumps = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("[train] не удалось прочитать {}: {err}", path.display());
+                continue;
+            }
+        };
+        match bincode::deserialize::<MarketXFramesDump>(&bytes) {
+            Ok(dump) => dumps.push(dump),
+            Err(err) => eprintln!("[train] ошибка десериализации {}: {err}", path.display()),
+        }
+    }
+    dumps
 }
 
 /// Формирует `MarketDataset` для каждого дампа по заданной ноге и типу модели.
@@ -611,29 +664,22 @@ fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
     (x, y)
 }
 
-/// 3-way split по маркетам: train / val / test.
+/// Обучение на уже расщеплённых по сплитам маркетах.
 ///
-/// Каждый маркет целиком попадает в одну группу — модель видит полные жизненные циклы событий.
+/// Сплит выполнен на уровне путей в [`run_train_mode`] и идентичен тому,
+/// что использует [`crate::history_sim`] — один и тот же маркет всегда
+/// попадает в один и тот же сплит.
 /// - **val** — используется optimizer'ом для подбора гиперпараметров и early stopping.
 /// - **test** — held-out, только для финальной честной оценки AUC.
 fn train_and_save(
-    markets: &[MarketDataset],
+    train_markets: &[MarketDataset],
+    val_markets: &[MarketDataset],
+    test_markets: &[MarketDataset],
     model_path: &Path,
     tag: &str,
     model_type: ModelType,
     max_lag: Option<usize>,
 ) -> anyhow::Result<()> {
-    let n = markets.len();
-    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
-    let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
-    let train_count = n.saturating_sub(test_count + val_count);
-    let (train_markets, rest) = markets.split_at(train_count);
-    let (val_markets, test_markets) = rest.split_at(val_count.min(rest.len()));
-    println!(
-        "[train] {tag}: сплит по маркетам: {train_count} train / {} val / {} test (всего {n})",
-        val_markets.len(),
-        test_markets.len(),
-    );
     let (x_train, y_train) = flatten_markets(train_markets);
     let (x_val, y_val) = flatten_markets(val_markets);
     let (x_test, y_test) = flatten_markets(test_markets);

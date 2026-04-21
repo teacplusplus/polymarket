@@ -24,11 +24,14 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
-use crate::train_mode::{load_calibration, Calibration, TEST_FRACTION, VAL_FRACTION};
+use crate::train_mode::{
+    collect_bin_paths, load_calibration, split_counts,
+    Calibration, TEST_FRACTION, VAL_FRACTION,
+};
 use crate::xframe::{XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use xgb::{Booster, DMatrix};
 
 /// Порог сырого предсказания модели (0.0–1.0) для рассмотрения входа в позицию.
@@ -226,12 +229,12 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 
                 let step_path = interval_path.join("1s");
                 let all_paths = collect_bin_paths(&step_path)?;
-                let test_paths = test_split_paths(&all_paths);
+                let (train_count, val_count, test_count) = split_counts(all_paths.len());
+                let test_paths = &all_paths[train_count + val_count..];
 
                 println!(
-                    "[sim] {tag}: маркетов всего={}, test={} (TEST_FRACTION={TEST_FRACTION}, VAL_FRACTION={VAL_FRACTION})",
+                    "[sim] {tag}: маркетов всего={} → сплит {train_count}/{val_count}/{test_count} (train/val/test), TEST_FRACTION={TEST_FRACTION}, VAL_FRACTION={VAL_FRACTION}",
                     all_paths.len(),
-                    test_paths.len(),
                 );
 
                 for file_path in test_paths {
@@ -740,39 +743,8 @@ fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
     Ok(bincode::deserialize(&bytes)?)
 }
 
-/// Собирает все `.bin` файлы из `step_path/{date}/` в отсортированном порядке
-/// (идентично `load_dumps` в `train_mode`).
-fn collect_bin_paths(step_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    if !step_path.is_dir() {
-        return Ok(paths);
-    }
-    for date_path in fs_sorted_dirs(step_path)? {
-        if !date_path.is_dir() {
-            continue;
-        }
-        for file_path in fs_sorted_dirs(&date_path)? {
-            if file_path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
-                paths.push(file_path);
-            }
-        }
-    }
-    Ok(paths)
-}
-
-/// Возвращает test-срез путей — тот же сплит, что и в `train_and_save`:
-/// последние `ceil(n * TEST_FRACTION)` маркетов.
-fn test_split_paths(all_paths: &[PathBuf]) -> &[PathBuf] {
-    let n = all_paths.len();
-    let test_count = ((n as f64) * TEST_FRACTION).ceil() as usize;
-    let val_count = ((n as f64) * VAL_FRACTION).ceil() as usize;
-    let train_count = n.saturating_sub(test_count + val_count);
-    let start = train_count + val_count.min(n.saturating_sub(train_count));
-    &all_paths[start..]
-}
-
-fn fs_sorted_dirs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
+fn fs_sorted_dirs(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut entries: Vec<std::path::PathBuf> = fs::read_dir(dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .collect();
     entries.sort();
