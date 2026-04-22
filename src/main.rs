@@ -10,6 +10,7 @@ pub mod currency_ws;
 pub mod data_ws;
 pub mod xframe_dump;
 pub mod train_mode;
+pub mod tee_log;
 pub mod history_sim;
 
 use anyhow::Result;

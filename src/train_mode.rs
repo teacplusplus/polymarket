@@ -4,11 +4,13 @@
 
 use crate::history_sim::HOLD_TO_END_THRESHOLD_SEC;
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
+use crate::tee_log::TEE_LOG;
 use crate::xframe::{
     apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE,
     Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
 };
 use crate::xframe_dump::MarketXFramesDump;
+use crate::{tee_eprintln, tee_println};
 use optimizer::sampler::tpe::TpeSampler;
 use optimizer::{Direction, ParamValue, Study};
 use serde::{Deserialize, Serialize};
@@ -27,8 +29,25 @@ const OPTIMIZER_TRIALS: usize = 100;
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
 const EARLY_STOPPING_PATIENCE: u32 = 20;
-/// Число раундов бустинга при каждом шаге оптимизатора (быстрее).
+/// Базовое число раундов бустинга на TPE-пробу при референсном [`EVAL_REFERENCE_ETA`].
+/// Реальный бюджет раундов масштабируется в [`eval_boost_rounds`] обратно
+/// пропорционально `eta`, чтобы медленные модели (малый `eta`) успевали сойтись
+/// и не проседали по AUC из-за недоучивания.
 const EVAL_BOOST_ROUNDS: u32 = 80;
+/// Верхняя граница раундов на TPE-пробу: даже при очень малом `eta` не уходим
+/// в квадратичный по времени оптимайзер. См. [`eval_boost_rounds`].
+const EVAL_BOOST_ROUNDS_MAX: u32 = 300;
+/// Референсный `eta`, относительно которого [`EVAL_BOOST_ROUNDS`] считается
+/// «правильным» бюджетом. При меньших `eta` число раундов увеличивается
+/// пропорционально `reference_eta / eta`.
+const EVAL_REFERENCE_ETA: f32 = 0.1;
+/// Нижняя граница `eta` в пространстве поиска TPE. Значения ниже ~0.03
+/// при фиксированном `EVAL_BOOST_ROUNDS` гарантированно не сходятся и
+/// приводят к вырожденным «лучшим» trial'ам (AUC пробы близок к константе,
+/// early stopping финального обучения останавливается на первых раундах).
+const ETA_MIN: f32 = 0.03;
+/// Верхняя граница `eta` — соответствует прежнему поведению.
+const ETA_MAX: f32 = 0.3;
 /// Доля валидационной выборки (для optimizer + early stopping).
 pub const VAL_FRACTION: f64 = 0.1;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
@@ -51,6 +70,15 @@ const CALIBRATION_EPS: f32 = 1e-3;
 /// Монотонность при этом сохраняется (weighted-avg двух non-decreasing соседей
 /// остаётся в интервале [prev, next]).
 const CALIBRATION_MIN_BLOCK_WEIGHT: f64 = 50.0;
+
+/// Максимальный лаг `delta_n_*` для PnL-модели: `None` — полный вектор
+/// [`XFrame::to_x_train_with`]; `Some(n)` — обрезка лагов до `n` первых
+/// элементов через [`XFrame::to_x_train_n_with`]. Общий источник истины
+/// для тренера и [`crate::history_sim`]: один и тот же feature layout
+/// на обучении и инференсе.
+pub const PNL_MAX_LAG: Option<usize> = None;
+/// Максимальный лаг `delta_n_*` для Resolution-модели (см. [`PNL_MAX_LAG`]).
+pub const RESOLUTION_MAX_LAG: Option<usize> = None;
 
 // ─── Калибровка (Isotonic Regression) ────────────────────────────────────────
 
@@ -145,13 +173,13 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
         .map(|(&p, _)| p as f64)
         .sum::<f64>() / n_neg.max(1) as f64;
     let cal_auc = calc_auc(&preds, y);
-    println!(
+    tee_println!(
         "[calibration] {tag}: n_pos={n_pos} n_neg={n_neg} mean_pred_pos={mean_pred_pos:.4} \
          mean_pred_neg={mean_pred_neg:.4} AUC={cal_auc:.4}"
     );
 
     if cal_auc < CALIBRATION_MIN_AUC {
-        eprintln!(
+        tee_eprintln!(
             "[calibration] {tag}: AUC={cal_auc:.4} < {CALIBRATION_MIN_AUC} — модель слишком \
              слабая для калибровки. Используется identity."
         );
@@ -159,7 +187,7 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
     }
 
     if n_pos == 0 || n_neg == 0 {
-        eprintln!(
+        tee_eprintln!(
             "[calibration] {tag}: в калибровочном сете есть только один класс \
              (n_pos={n_pos}, n_neg={n_neg}). Используется identity."
         );
@@ -167,7 +195,7 @@ fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> a
     }
 
     let cal = isotonic_fit(&preds, y);
-    println!(
+    tee_println!(
         "[calibration] {tag}: fit OK | breakpoints={} | \
          range=[{:.3}…{:.3}] → [{:.3}…{:.3}]",
         cal.xs.len(),
@@ -401,7 +429,18 @@ pub fn run_train_mode() -> anyhow::Result<()> {
         anyhow::bail!("Папка xframes/ не найдена — сначала запустите сбор данных (STATUS=default)");
     }
 
+    let log_path = xframes_root.join("last_train_mode.txt");
+    {
+        let file = fs::File::create(&log_path)?;
+        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
+        *guard = Some(BufWriter::new(file));
+    }
+    tee_println!("[train] лог пишется в {}", log_path.display());
+
     for currency_path in fs_read_dirs(xframes_root)? {
+        if !currency_path.is_dir() {
+            continue;
+        }
         let currency = currency_path
             .file_name()
             .unwrap_or_default()
@@ -409,6 +448,9 @@ pub fn run_train_mode() -> anyhow::Result<()> {
             .to_string();
 
         for version_path in fs_read_dirs(&currency_path)? {
+            if !version_path.is_dir() {
+                continue;
+            }
             let version_str = version_path
                 .file_name()
                 .unwrap_or_default()
@@ -433,10 +475,10 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     }
 
                     let tag_prefix = format!("{currency}/{version_str}/{interval}/{step_sec}s");
-                    println!("[train] {tag_prefix}: сбор путей...");
+                    tee_println!("[train] {tag_prefix}: сбор путей...");
                     let paths = collect_bin_paths(&step_path)?;
                     if paths.is_empty() {
-                        println!("[train] {tag_prefix}: нет маркетов, пропуск");
+                        tee_println!("[train] {tag_prefix}: нет маркетов, пропуск");
                         continue;
                     }
 
@@ -446,7 +488,7 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     let train_paths = &paths[..train_count];
                     let val_paths   = &paths[train_count..train_count + val_count];
                     let test_paths  = &paths[train_count + val_count..];
-                    println!(
+                    tee_println!(
                         "[train] {tag_prefix}: маркетов {} → сплит {train_count} train / {val_count} val / {test_count} test",
                         paths.len(),
                     );
@@ -461,6 +503,14 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     )?;
                 }
             }
+        }
+    }
+
+    {
+        use std::io::Write;
+        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
+        if let Some(mut w) = guard.take() {
+            let _ = w.flush();
         }
     }
 
@@ -502,8 +552,8 @@ fn train_all_variants(
             let tag = format!("{tag_prefix}/{}/{}", model_type.label(), side.label());
 
             let max_lag = match model_type {
-                ModelType::Resolution => None,
-                ModelType::Pnl => None,
+                ModelType::Resolution => RESOLUTION_MAX_LAG,
+                ModelType::Pnl => PNL_MAX_LAG,
             };
 
             let train_markets = build_market_datasets(train_dumps, side, model_type, max_lag);
@@ -512,7 +562,7 @@ fn train_all_variants(
 
             let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
             if total_markets == 0 {
-                println!("[train] {tag}: нет данных, пропуск");
+                tee_println!("[train] {tag}: нет данных, пропуск");
                 continue;
             }
 
@@ -523,7 +573,7 @@ fn train_all_variants(
             let total_rows: usize = train_markets.iter().chain(val_markets.iter()).chain(test_markets.iter())
                 .map(|m| m.y.len())
                 .sum();
-            println!(
+            tee_println!(
                 "[train] {tag}: маркетов {}/{}/{} (train/val/test), {} строк, {} признаков",
                 train_markets.len(), val_markets.len(), test_markets.len(),
                 total_rows, feature_count,
@@ -539,8 +589,8 @@ fn train_all_variants(
                 &train_markets, &val_markets, &test_markets,
                 &model_path, &tag, model_type, max_lag,
             ) {
-                Ok(()) => println!("[train] {tag}: модель сохранена → {}", model_path.display()),
-                Err(err) => eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
+                Ok(()) => tee_println!("[train] {tag}: модель сохранена → {}", model_path.display()),
+                Err(err) => tee_eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
         }
     }
@@ -591,13 +641,13 @@ fn load_dumps_for_paths(paths: &[PathBuf]) -> Vec<MarketXFramesDump> {
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(err) => {
-                eprintln!("[train] не удалось прочитать {}: {err}", path.display());
+                tee_eprintln!("[train] не удалось прочитать {}: {err}", path.display());
                 continue;
             }
         };
         match bincode::deserialize::<MarketXFramesDump>(&bytes) {
             Ok(dump) => dumps.push(dump),
-            Err(err) => eprintln!("[train] ошибка десериализации {}: {err}", path.display()),
+            Err(err) => tee_eprintln!("[train] ошибка десериализации {}: {err}", path.display()),
         }
     }
     dumps
@@ -731,15 +781,15 @@ fn train_and_save(
     let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dval, "test")];
 
     match model_type {
-        ModelType::Pnl => println!(
+        ModelType::Pnl => tee_println!(
             "[train] {tag}: оптимизация гиперпараметров по AUC на val ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
         ),
-        ModelType::Resolution => println!(
+        ModelType::Resolution => tee_println!(
             "[train] {tag}: оптимизация гиперпараметров по AUC на val ({OPTIMIZER_TRIALS} итераций)…"
         ),
     }
     let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS, tag)?;
-    println!("[train] {tag}: лучшие параметры: {params:?}");
+    tee_println!("[train] {tag}: лучшие параметры: {params:?}");
 
     let booster = fit_booster_with_early_stopping(&params, &dtrain, &dval, tag)?;
 
@@ -751,7 +801,7 @@ fn train_and_save(
     let test_preds = booster.predict(&dtest)?;
     let test_auc = calc_auc(&test_preds, &y_test);
     let test_logloss = calc_logloss(&test_preds, &y_test);
-    println!(
+    tee_println!(
         "[train] {tag}: held-out test: logloss={test_logloss:.5}  AUC={test_auc:.6}"
     );
 
@@ -765,18 +815,18 @@ fn train_and_save(
     // если калибровочный сет совпадает с тем, по которому меряется AUC.
     match fit_calibration(&booster, &dval, &y_val, tag) {
         Ok(cal) => {
-            println!(
+            tee_println!(
                 "[train] {tag}: calibration: breakpoints={} \
                  (примеры: raw 0.50→{:.3}, 0.70→{:.3}, 0.85→{:.3}, 0.95→{:.3})",
                 cal.xs.len(),
                 cal.apply(0.50), cal.apply(0.70), cal.apply(0.85), cal.apply(0.95),
             );
             match save_calibration(&cal, model_path) {
-                Ok(path) => println!("[train] {tag}: калибровка сохранена → {}", path.display()),
-                Err(err) => eprintln!("[train] {tag}: ошибка сохранения калибровки: {err:#}"),
+                Ok(path) => tee_println!("[train] {tag}: калибровка сохранена → {}", path.display()),
+                Err(err) => tee_eprintln!("[train] {tag}: ошибка сохранения калибровки: {err:#}"),
             }
         }
-        Err(err) => eprintln!("[train] {tag}: ошибка калибровки (isotonic): {err:#}"),
+        Err(err) => tee_eprintln!("[train] {tag}: ошибка калибровки (isotonic): {err:#}"),
     }
 
     if let Some(parent) = model_path.parent() {
@@ -797,7 +847,7 @@ fn print_eval_metrics(booster: &Booster, tag: &str, eval_label: &str) {
             .map(|val| format!("{val:.5}"))
             .unwrap_or_else(|| "—".to_string())
     };
-    println!(
+    tee_println!(
         "[train] {tag}: метрики: train-logloss:{:>8}  {eval_label}-logloss:{:>8}  train-auc:{:>8}  {eval_label}-auc:{:>8}",
         get("logloss", "train"),
         get("logloss", "test"),
@@ -810,7 +860,7 @@ fn print_eval_metrics(booster: &Booster, tag: &str, eval_label: &str) {
 /// отсортированный по убыванию абсолютного вклада.
 fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str, max_lag: Option<usize>) {
     let Ok((shap_values, (num_rows, num_cols))) = booster.predict_contributions(dtest) else {
-        eprintln!("[train] {tag}: не удалось вычислить SHAP contributions");
+        tee_eprintln!("[train] {tag}: не удалось вычислить SHAP contributions");
         return;
     };
     if num_rows == 0 {
@@ -842,12 +892,12 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str, max_lag: O
         pct_b.partial_cmp(pct_a).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    println!("[train] {tag}: SHAP contributions (первая строка теста, топ-20):");
+    tee_println!("[train] {tag}: SHAP contributions (первая строка теста, топ-20):");
     for (name, shap, percent) in contributions.iter().take(20) {
-        println!("  {:>8.4}  {:>6.2}%  {name}", shap, percent);
+        tee_println!("  {:>8.4}  {:>6.2}%  {name}", shap, percent);
     }
     let bias = shap_values[num_cols - 1];
-    println!("  {:>8.4}           __bias__", bias);
+    tee_println!("  {:>8.4}           __bias__", bias);
 }
 
 /// Печатает распределение меток в train и test выборках.
@@ -864,10 +914,10 @@ fn print_y_distribution(y_train: &[f32], y_val: &[f32], y_test: &[f32], tag: &st
     let print_counts = |split: &str, labels: &[f32]| {
         let counts = count_values(labels);
         let total = labels.len();
-        println!("[train] {tag}: распределение y ({split}, всего={total}):");
+        tee_println!("[train] {tag}: распределение y ({split}, всего={total}):");
         for (val, count) in &counts {
             let percent = *count as f64 / total as f64 * 100.0;
-            println!("  y={val}: {count:>6}  ({percent:>5.1}%)");
+            tee_println!("  y={val}: {count:>6}  ({percent:>5.1}%)");
         }
     };
 
@@ -891,7 +941,7 @@ fn tune_xgboost_optimizer(
 
     study.optimize_with_sampler(trials, |trial| {
         let params = XgbParams {
-            eta: trial.suggest_float("eta", 0.005, 0.3)? as f32,
+            eta: trial.suggest_float("eta", ETA_MIN as f64, ETA_MAX as f64)? as f32,
             max_depth: trial.suggest_int("max_depth", 2, 8)? as u32,
             min_child_weight: trial.suggest_float("min_child_weight", 1.0, 20.0)? as f32,
             gamma: trial.suggest_float("gamma", 0.0, 10.0)? as f32,
@@ -903,12 +953,12 @@ fn tune_xgboost_optimizer(
         };
         let score = eval_xgboost(&params, eval_sets, dtrain)
             .map_err(|_err| optimizer::Error::InvalidStep)?;
-        println!("[train] {tag} trial #{}: auc={score:.6}", trial.id());
+        tee_println!("[train] {tag} trial #{}: auc={score:.6}", trial.id());
         Ok::<f64, optimizer::Error>(score)
     })?;
 
     let best = study.best_trial()?;
-    println!("[train] {tag}: лучший trial: value={} params={:?}", best.value, best.params);
+    tee_println!("[train] {tag}: лучший trial: value={} params={:?}", best.value, best.params);
     Ok(params_from_map(&best.params))
 }
 
@@ -918,7 +968,8 @@ fn eval_xgboost(
     eval_sets: &[(&DMatrix, &str); 2],
     dtrain: &DMatrix,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    let booster = fit_booster(params, dtrain, eval_sets, EVAL_BOOST_ROUNDS)?;
+    let rounds = eval_boost_rounds(params.eta);
+    let booster = fit_booster(params, dtrain, eval_sets, rounds)?;
     let auc = booster
         .eval_dmat_results
         .get("auc")
@@ -926,6 +977,18 @@ fn eval_xgboost(
         .copied()
         .unwrap_or(0.0) as f64;
     Ok(auc)
+}
+
+/// Бюджет раундов на TPE-пробу: обратная пропорция к `eta` относительно
+/// [`EVAL_REFERENCE_ETA`] с клиппингом в `[EVAL_BOOST_ROUNDS, EVAL_BOOST_ROUNDS_MAX]`.
+///
+/// Мотивация: сходимость градиентного бустинга ≈ `T * eta = const`,
+/// поэтому при фиксированном `T = EVAL_BOOST_ROUNDS` пробы с малым `eta`
+/// систематически недоучиваются, и TPE видит шум вместо реального AUC.
+fn eval_boost_rounds(eta: f32) -> u32 {
+    let eta = eta.max(ETA_MIN);
+    let scaled = (EVAL_BOOST_ROUNDS as f32 * EVAL_REFERENCE_ETA / eta).ceil();
+    (scaled as u32).clamp(EVAL_BOOST_ROUNDS, EVAL_BOOST_ROUNDS_MAX)
 }
 
 /// Обучение с early stopping: останавливается, когда AUC на тесте не улучшается
@@ -974,7 +1037,7 @@ fn fit_booster_with_early_stopping(
         } else {
             rounds_without_improvement += 1;
             if rounds_without_improvement >= EARLY_STOPPING_PATIENCE {
-                println!(
+                tee_println!(
                     "[train] {tag}: early stopping на раунде {round}: лучший AUC={best_auc:.6} на раунде {best_round}"
                 );
                 break;
@@ -1100,7 +1163,7 @@ fn build_feature_weights(n_features: usize, max_lag: Option<usize>) -> Vec<f32> 
         }
     }
     if n_explicit > 0 || n_lag > 0 {
-        println!(
+        tee_println!(
             "[train] feature_weights: explicit={n_explicit} (factor={DOWNWEIGHT_FACTOR}), \
              lag={n_lag} (factor={LAG_DOWNWEIGHT_FACTOR})"
         );

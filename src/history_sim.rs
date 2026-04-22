@@ -24,13 +24,16 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
+use crate::tee_log::TEE_LOG;
 use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
-    Calibration, TEST_FRACTION, VAL_FRACTION,
+    Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
 };
 use crate::xframe::{apply_side_symmetry, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
-use std::fs;
+use crate::{tee_eprintln, tee_println};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use xgb::{Booster, DMatrix};
 
@@ -62,7 +65,7 @@ pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
 ///   resolution-модели;
 /// * **EV-правило** (см. [`EV_EXIT_MARGIN`]): `EV_sell · (1 − MARGIN) > EV_hold` —
 ///   мягкий выход, когда рыночная продажа выгоднее ожидаемой резолюции.
-pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 60;
+pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 45;
 
 /// Коэффициент EMA для сглаживания `p_win` от resolution-модели в зоне
 /// удержания: `p_ema = α · p_now + (1 − α) · p_prev`. Чем меньше α, тем
@@ -109,10 +112,14 @@ enum CloseReason {
     Resolution { won: bool },
     /// Позиция удерживалась больше [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL — боковик, выход по рынку.
     Timeout,
-    /// В зоне удержания (≤ [`HOLD_TO_END_THRESHOLD_SEC`] с) EV-правило
-    /// сработало: `EV_sell · (1 − EV_EXIT_MARGIN) > EV_hold`, где
-    /// `EV_hold = EMA(p_win_resolution) · shares`. Рыночный выход по бид-стаку.
-    EvExit,
+    /// EV-правило сработало в hold zone **с прибылью** (`EV_sell > entry_cost`):
+    /// рыночный выход даёт больше USDC, чем вложили на вход. Рыночный выход
+    /// по бид-стаку.
+    EvExitProfit,
+    /// EV-правило сработало в hold zone **с убытком** (`EV_sell ≤ entry_cost`):
+    /// продажа сейчас выгоднее ожидания резолюции, но ниже цены входа.
+    /// Срабатывает, когда модель быстрее рынка увидела негативный исход.
+    EvExitLoss,
 }
 
 /// Статистика торговли по одной стороне (UP или DOWN).
@@ -138,8 +145,10 @@ struct SideStats {
     resolution_loss: usize,
     /// Число выходов по таймауту: позиция удерживалась >= [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL.
     timeout_count: usize,
-    /// Число EV-exit-ов в зоне удержания до конца маркета (см. [`CloseReason::EvExit`]).
-    ev_exit_count: usize,
+    /// Число прибыльных EV-exit-ов (см. [`CloseReason::EvExitProfit`]).
+    ev_exit_profit_count: usize,
+    /// Число убыточных EV-exit-ов (см. [`CloseReason::EvExitLoss`]).
+    ev_exit_loss_count: usize,
     /// Число пропущенных входов из-за приближения к резолюции (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`).
     late_entry_skips: usize,
     /// Число пропущенных входов из-за Kelly f* ≤ 0 (нет edge).
@@ -208,6 +217,14 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
         anyhow::bail!("Папка xframes/ не найдена — сначала соберите данные (STATUS=default)");
     }
 
+    let log_path = xframes_root.join("last_history_sim.txt");
+    {
+        let file = File::create(&log_path)?;
+        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
+        *guard = Some(BufWriter::new(file));
+    }
+    tee_println!("[sim] лог пишется в {}", log_path.display());
+
     for currency_path in fs_sorted_dirs(xframes_root)? {
         let currency = dir_name(&currency_path);
 
@@ -233,14 +250,14 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 let booster_up = match load_booster(&model_up_path) {
                     Some(b) => b,
                     None => {
-                        println!("[sim] {tag}: model pnl_up не найдена, пропуск");
+                        tee_println!("[sim] {tag}: model pnl_up не найдена, пропуск");
                         continue;
                     }
                 };
                 let booster_down = match load_booster(&model_down_path) {
                     Some(b) => b,
                     None => {
-                        println!("[sim] {tag}: model pnl_down не найдена, пропуск");
+                        tee_println!("[sim] {tag}: model pnl_down не найдена, пропуск");
                         continue;
                     }
                 };
@@ -267,7 +284,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                     }
                 };
 
-                println!(
+                tee_println!(
                     "[sim] {tag}: модели pnl загружены | {} | {} \
                      | resolution: up={} down={} \
                      | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s ev_margin={EV_EXIT_MARGIN} ema_α={EV_EXIT_P_WIN_EMA_ALPHA} min_entry_ms={MIN_ENTRY_REMAINING_MS} \
@@ -286,7 +303,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 let (train_count, val_count, test_count) = split_counts(all_paths.len());
                 let test_paths = &all_paths[train_count + val_count..];
 
-                println!(
+                tee_println!(
                     "[sim] {tag}: маркетов всего={} → сплит {train_count}/{val_count}/{test_count} (train/val/test), TEST_FRACTION={TEST_FRACTION}, VAL_FRACTION={VAL_FRACTION}",
                     all_paths.len(),
                 );
@@ -304,12 +321,19 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                             );
                             sim_stats.events += 1;
                         }
-                        Err(err) => eprintln!("[sim] {}: {err}", file_path.display()),
+                        Err(err) => tee_eprintln!("[sim] {}: {err}", file_path.display()),
                     }
                 }
 
                 print_sim_stats(&tag, &sim_stats);
             }
+        }
+    }
+
+    {
+        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
+        if let Some(mut w) = guard.take() {
+            let _ = w.flush();
         }
     }
 
@@ -455,7 +479,7 @@ fn try_open_position(
     let kelly_gain = kelly_gain_ratio(entry_prob);
     let kelly_loss = kelly_loss_ratio(entry_prob);
 
-    let Some(raw) = predict_frame(booster_pnl, frame, None) else { return };
+    let Some(raw) = predict_frame(booster_pnl, frame, PNL_MAX_LAG) else { return };
     if raw < SIM_BUY_THRESHOLD {
         return;
     }
@@ -530,7 +554,7 @@ fn manage_positions(
     // индивидуально для каждой позиции (у каждой своя история).
     let p_win_now: Option<f64> = if in_hold_zone && !positions.is_empty() {
         booster_resolution.and_then(|b| {
-            predict_frame(b, frame, None).map(|raw| {
+            predict_frame(b, frame, RESOLUTION_MAX_LAG).map(|raw| {
                 calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
             })
         })
@@ -583,7 +607,12 @@ fn manage_positions(
                 let ev_sell = gross_usdc - fee;
                 let ev_hold = p_ema * pos.shares_held;
                 if ev_sell * (1.0 - EV_EXIT_MARGIN) > ev_hold {
-                    Some((current_prob, CloseReason::EvExit))
+                    let reason = if ev_sell > pos.entry_cost {
+                        CloseReason::EvExitProfit
+                    } else {
+                        CloseReason::EvExitLoss
+                    };
+                    Some((current_prob, reason))
                 } else {
                     None
                 }
@@ -708,7 +737,8 @@ fn close_position(
         CloseReason::TakeProfit
         | CloseReason::StopLoss
         | CloseReason::Timeout
-        | CloseReason::EvExit => {
+        | CloseReason::EvExitProfit
+        | CloseReason::EvExitLoss => {
             let gross_usdc = book_fill_sell(frame, pos.shares_held);
             let sell_price = if pos.shares_held > 0.0 {
                 (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
@@ -733,7 +763,8 @@ fn close_position(
         CloseReason::Resolution { won: true }  => stats.resolution_win += 1,
         CloseReason::Resolution { won: false } => stats.resolution_loss += 1,
         CloseReason::Timeout                   => stats.timeout_count += 1,
-        CloseReason::EvExit                    => stats.ev_exit_count += 1,
+        CloseReason::EvExitProfit              => stats.ev_exit_profit_count += 1,
+        CloseReason::EvExitLoss                => stats.ev_exit_loss_count += 1,
     }
 
     pnl
@@ -851,21 +882,22 @@ fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         s.diag_sum_kelly_f / n,
         s.kelly_skips,
     );
-    println!("[sim] {tag} [{side_label}]   {diag}");
+    tee_println!("[sim] {tag} [{side_label}]   {diag}");
 
     if s.trades == 0 {
-        println!("[sim] {tag} [{side_label}]: нет сделок");
+        tee_println!("[sim] {tag} [{side_label}]: нет сделок");
         return;
     }
     let win_rate = s.wins as f64 / s.trades as f64 * 100.0;
     let avg_pnl = s.pnl_usd / s.trades as f64;
-    println!(
+    tee_println!(
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
-         | TP={} SL={} Timeout={} EvExit={} Res✓={} Res✗={} late_skips={}",
+         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={} Res✗={} late_skips={}",
         s.trades, win_rate, s.pnl_usd, avg_pnl, s.fees_paid,
-        s.tp_count, s.sl_count, s.timeout_count, s.ev_exit_count,
+        s.tp_count, s.sl_count, s.timeout_count,
+        s.ev_exit_profit_count, s.ev_exit_loss_count,
         s.resolution_win, s.resolution_loss, s.late_entry_skips,
     );
 }
@@ -873,7 +905,7 @@ fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
 fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
     let total_trades = sim_stats.total_trades();
     if total_trades == 0 {
-        println!("[sim] {tag}: нет сделок ({} событий, kelly_skips={})", sim_stats.events, sim_stats.total_kelly_skips());
+        tee_println!("[sim] {tag}: нет сделок ({} событий, kelly_skips={})", sim_stats.events, sim_stats.total_kelly_skips());
         print_side_stats(tag, "UP",   &sim_stats.up);
         print_side_stats(tag, "DOWN", &sim_stats.down);
         return;
@@ -887,14 +919,14 @@ fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
     let roi_pct = (sim_stats.bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
 
     let total_losses = sim_stats.total_losses();
-    println!(
+    tee_println!(
         "[sim] {tag} \
          | events={} trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
          | wins={total_wins} losses={total_losses}",
         sim_stats.events, total_trades, win_rate, total_pnl, avg_pnl, total_fees,
     );
-    println!(
+    tee_println!(
         "[sim]   bankroll: {:.2}$ (start={INITIAL_BANKROLL}$) ROI={:+.2}% max_drawdown={:.2}%",
         sim_stats.bankroll, roi_pct, sim_stats.max_drawdown_pct,
     );
@@ -912,7 +944,7 @@ fn load_booster(path: &Path) -> Option<Booster> {
     match Booster::load(path) {
         Ok(b) => Some(b),
         Err(err) => {
-            eprintln!("[sim] не удалось загрузить модель {}: {err}", path.display());
+            tee_eprintln!("[sim] не удалось загрузить модель {}: {err}", path.display());
             None
         }
     }
@@ -925,7 +957,9 @@ fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
 
 fn fs_sorted_dirs(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let mut entries: Vec<std::path::PathBuf> = fs::read_dir(dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+        .map(|entry| entry.path())
         .collect();
     entries.sort();
     Ok(entries)

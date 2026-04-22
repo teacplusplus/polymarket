@@ -138,12 +138,16 @@ pub async fn dump_market_xframes_binary_lane(
     let frame_count = frames_up.len() + frames_down.len();
     let dump = MarketXFramesDump { frames_up, frames_down, price_to_beat, final_price };
 
-    let feature_count = XFrame::<SIZE>::count_features();
+    // Версия схемы дампа — размер сериализованного `XFrame<SIZE>` по умолчанию (bincode).
+    // Меняется при любом изменении раскладки полей/констант структуры, поэтому
+    // подходит в качестве стабильного «fingerprint» для разбиения по версиям.
+    let schema_size = bincode::serialized_size(&XFrame::<SIZE>::default())
+        .expect("XFrame::<SIZE>::default() must be bincode-serializable") as usize;
 
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let base: PathBuf = Path::new("xframes")
         .join(project_manager.currency.as_str())
-        .join(format!("{feature_count}"))
+        .join(format!("{schema_size}"))
         .join(interval_label)
         .join(format!("{step_secs}s"))
         .join(&date);

@@ -199,119 +199,100 @@ pub struct XFrame<const N: usize> {
     // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до `currency_price_z_score`. ---
     #[xfeature]
     pub other_book_bid_l1_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l1_price: [Option<f64>; N],
     #[xfeature]
     pub other_book_ask_l1_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l1_price: [Option<f64>; N],
     #[xfeature]
     pub other_tick_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_tick_size: [Option<f64>; N],
     #[xfeature]
     pub other_spread: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_spread: [Option<f64>; N],
     #[xfeature]
     pub other_book_bid_l1_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l1_size: [Option<f64>; N],
     #[xfeature]
     pub other_book_ask_l1_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l1_size: [Option<f64>; N],
     #[xfeature]
     pub other_book_bid_l2_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l2_price: [Option<f64>; N],
     #[xfeature]
     pub other_book_bid_l2_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l2_size: [Option<f64>; N],
     #[xfeature]
     pub other_book_bid_l3_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l3_price: [Option<f64>; N],
     #[xfeature]
     pub other_book_bid_l3_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l3_size: [Option<f64>; N],
     #[xfeature]
     pub other_book_ask_l2_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l2_price: [Option<f64>; N],
     #[xfeature]
     pub other_book_ask_l2_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l2_size: [Option<f64>; N],
     #[xfeature]
     pub other_book_ask_l3_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l3_price: [Option<f64>; N],
     #[xfeature]
     pub other_book_ask_l3_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l3_size: [Option<f64>; N],
     #[xfeature]
     pub other_last_trade_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_last_trade_price: [Option<f64>; N],
     #[xfeature]
     #[derivative(Default(value = "0.0"))]
     pub other_trade_size: f64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_trade_size: [Option<f64>; N],
     #[xfeature]
     #[derivative(Default(value = "0.0"))]
     pub other_trade_volume_bucket: f64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_trade_volume_bucket: [Option<f64>; N],
     #[xfeature]
     #[derivative(Default(value = "0"))]
     pub other_buy_count_window: u64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_buy_count_window: [Option<i64>; N],
     #[xfeature]
     #[derivative(Default(value = "0"))]
     pub other_sell_count_window: u64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_sell_count_window: [Option<i64>; N],
@@ -328,132 +309,91 @@ pub struct XFrame<const N: usize> {
     pub currency_price_vs_beat_pct: Option<f64>,
     // --- Парный маркет (5m ↔ 15m), тот же Up или Down; микроструктура токена с `sibling` `market_id`. ---
     /// Остаток времени до конца события на парном маркете, мс (логика как у `event_remaining_ms`).
-    #[xfeature]
     #[derivative(Default(value = "-1"))]
     pub sibling_event_remaining_ms: i64,
-    #[xfeature]
     pub sibling_book_bid_l1_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_bid_l1_price: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_ask_l1_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_ask_l1_price: [Option<f64>; N],
-    #[xfeature]
     pub sibling_tick_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_tick_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_spread: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_spread: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_bid_l1_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_bid_l1_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_ask_l1_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_ask_l1_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_bid_l2_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_bid_l2_price: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_bid_l2_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_bid_l2_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_bid_l3_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_bid_l3_price: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_bid_l3_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_bid_l3_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_ask_l2_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_ask_l2_price: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_ask_l2_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_ask_l2_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_ask_l3_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_ask_l3_price: [Option<f64>; N],
-    #[xfeature]
     pub sibling_book_ask_l3_size: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_book_ask_l3_size: [Option<f64>; N],
-    #[xfeature]
     pub sibling_last_trade_price: Option<f64>,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_last_trade_price: [Option<f64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0.0"))]
     pub sibling_trade_size: f64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_trade_size: [Option<f64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0.0"))]
     pub sibling_trade_volume_bucket: f64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_trade_volume_bucket: [Option<f64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0"))]
     pub sibling_buy_count_window: u64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_buy_count_window: [Option<i64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0"))]
     pub sibling_sell_count_window: u64,
-    #[xfeature]
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub sibling_delta_n_sell_count_window: [Option<i64>; N],
     /// Как [`Self::currency_implied_prob`], для токена парного маркета (`sibling` кадр).
-    #[xfeature]
     pub sibling_currency_implied_prob: Option<f64>,
     /// `(price_to_beat_sibling - spot) / price_to_beat_sibling * 100` на парном маркете; тот же спот, другой beat из Gamma.
-    #[xfeature]
     pub sibling_currency_price_vs_beat_pct: Option<f64>,
 }
 
