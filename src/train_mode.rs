@@ -76,7 +76,7 @@ const CALIBRATION_MIN_BLOCK_WEIGHT: f64 = 50.0;
 /// элементов через [`XFrame::to_x_train_n_with`]. Общий источник истины
 /// для тренера и [`crate::history_sim`]: один и тот же feature layout
 /// на обучении и инференсе.
-pub const PNL_MAX_LAG: Option<usize> = None;
+pub const PNL_MAX_LAG: Option<usize> = Some(5);
 /// Максимальный лаг `delta_n_*` для Resolution-модели (см. [`PNL_MAX_LAG`]).
 pub const RESOLUTION_MAX_LAG: Option<usize> = None;
 
