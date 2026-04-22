@@ -22,7 +22,7 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 20;
+const OPTIMIZER_TRIALS: usize = 100;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
