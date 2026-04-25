@@ -79,8 +79,10 @@ pub const EV_EXIT_MARGIN: f64 = 0.01;
 
 /// Минимальный остаток времени до конца маркета (мс) для открытия НОВОЙ
 /// позиции: `Y_TRAIN_HORIZON_FRAMES × step_sec × 1000` при симуляции на
-/// 1s-моделях = 15 с. Ближе к резолюции TP/SL за горизонт почти не
-/// играют — вход превращается в лотерею и тратит комиссию.
+/// 1s-моделях = 15 с. Ближе к резолюции TP/SL за горизонт физически не
+/// успевают сработать — вход вырождается в лотерею с уплатой taker-fee.
+/// Используется в [`buy_gate`] как ранний отказ под именем `LateEntry`.
+pub const MIN_ENTRY_REMAINING_MS: i64 = 15 * 1000;
 
 // ─── Типы ─────────────────────────────────────────────────────────────────────
 
@@ -258,8 +260,15 @@ pub struct SideStats {
     pub(crate) ev_exit_profit_count: usize,
     /// Число убыточных EV-exit-ов (см. [`CloseReason::EvExitLoss`]).
     pub(crate) ev_exit_loss_count: usize,
-    /// Число пропущенных входов из-за приближения к резолюции (`event_remaining_ms <= 0`).
+    /// Число пропущенных входов из-за приближения к резолюции
+    /// (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`, включая `≤ 0`).
     pub(crate) late_entry_skips: usize,
+    /// Число пропущенных входов из-за «нестабильного» кадра
+    /// (`!frame.stable` — поздний WS-коннект, нет `event_start_ms`).
+    /// Закрытие уже открытых позиций такие кадры **не** блокируют —
+    /// время идёт, и `manage_positions` отрабатывает TP/SL/Resolution
+    /// как обычно. Только новые входы пропускаются.
+    pub(crate) unstable_skips: usize,
     /// Число пропущенных входов из-за Kelly f* ≤ 0 (нет edge).
     pub(crate) kelly_skips: usize,
     /// Число пропущенных входов в **strict**-режиме ([`crate::real_sim`]):
@@ -337,12 +346,22 @@ impl SimStats {
         self.up.kelly_strict_sell_skips + self.down.kelly_strict_sell_skips
     }
 
-    pub(crate) fn update_drawdown(&mut self) {
-        if self.bankroll > self.peak_bankroll {
-            self.peak_bankroll = self.bankroll;
+    /// Обновляет `peak_bankroll` и `max_drawdown_pct` по **equity**
+    /// (mark-to-market): `equity = bankroll + Σ(shares_held × current_prob)`
+    /// для всех открытых позиций. Считается на **каждом** тике (а не только
+    /// на моменте сделки), иначе `max_drawdown_pct` системно занижен — между
+    /// `open` и `close` реализованный bankroll не двигается, хотя цена
+    /// открытой позиции может уйти в большой минус.
+    ///
+    /// Имена полей `peak_bankroll`/`max_drawdown_pct` остаются прежними для
+    /// совместимости с логами и `print_sim_stats`, но **семантика теперь
+    /// equity-based**, а не bankroll-based.
+    pub(crate) fn update_drawdown(&mut self, equity: f64) {
+        if equity > self.peak_bankroll {
+            self.peak_bankroll = equity;
         }
         if self.peak_bankroll > 0.0 {
-            let drawdown_pct = (self.peak_bankroll - self.bankroll) / self.peak_bankroll * 100.0;
+            let drawdown_pct = (self.peak_bankroll - equity) / self.peak_bankroll * 100.0;
             if drawdown_pct > self.max_drawdown_pct {
                 self.max_drawdown_pct = drawdown_pct;
             }
@@ -468,6 +487,23 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                     }
                 }
 
+                // Инвариант бухгалтерии: накопленный PnL по сторонам обязан
+                // в точности совпадать с дельтой bankroll'а от стартового
+                // капитала. Любое расхождение — тихий drift в close_position
+                // (двойной учёт fee, потерянная сделка, невычтенный entry_cost
+                // и т. п.). Допуск 1e-6 USDC покрывает округление f64 на
+                // длинной серии сделок без маскирования реальных багов.
+                debug_assert!(
+                    {
+                        let sides_pnl = sim_stats.up.pnl_usd + sim_stats.down.pnl_usd;
+                        let bankroll_pnl = sim_stats.bankroll - INITIAL_BANKROLL;
+                        (sides_pnl - bankroll_pnl).abs() < 1e-6
+                    },
+                    "[sim] {tag}: PnL invariant violated — up.pnl + down.pnl = {:.6}, bankroll - INITIAL = {:.6}",
+                    sim_stats.up.pnl_usd + sim_stats.down.pnl_usd,
+                    sim_stats.bankroll - INITIAL_BANKROLL,
+                );
+
                 print_sim_stats(&tag, &sim_stats);
             }
         }
@@ -485,10 +521,17 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 
 // ─── Симуляция события ────────────────────────────────────────────────────────
 
-/// Один синхронный цикл по парным кадрам (UP[i], DOWN[i]).
+/// Симулирует один маркет: **два независимых прохода** по кадрам — сначала
+/// сторона UP, затем сторона DOWN. Связи между кадрами UP/DOWN по индексу
+/// нет (они хранятся в `MarketXFramesDump` как два независимых временных
+/// ряда, и любая попытка пройти их «параллельно по `idx`» десинхронизуется
+/// при первом же пропуске кадра у одной из сторон).
 ///
-/// UP и DOWN — зеркальные токены одного события: при 50/50 шансах
-/// `prob_up ≈ 1 − prob_down`. Итерируем по `min(len_up, len_down)` стабильным кадрам.
+/// Bankroll шарится между двумя проходами: после прохода UP все его позиции
+/// закрыты по Resolution (либо естественно при `event_remaining_ms ≤ 0`,
+/// либо через `last_idx`-fallback на битом буфере), и DOWN стартует с
+/// post-UP-bankroll. Это совпадает с фактической бухгалтерией live-режима
+/// для ОДНОГО интервала (см. [`crate::real_sim`]).
 #[allow(clippy::too_many_arguments)]
 fn simulate_event(
     market_xframes: &MarketXFramesDump,
@@ -502,100 +545,140 @@ fn simulate_event(
     calibration_resolution_down: Option<&Calibration>,
     sim_stats: &mut SimStats,
 ) {
-    let frames_up: Vec<&XFrame<SIZE>> = market_xframes.frames_up.iter().filter(|f| f.stable).collect();
-    let frames_down: Vec<&XFrame<SIZE>> = market_xframes.frames_down.iter().filter(|f| f.stable).collect();
+    // Дамп `xframe_dump.rs` уже отфильтрован по `stable=true` (см.
+    // `dump_market_xframes_binary_lane` → `if !frame.stable { continue; }`),
+    // поэтому повторный filter здесь был бы no-op'ом и лишним аллоком.
+    // Стабильность всё равно перепроверяется в `buy_gate` через
+    // `BuyGate::Unstable` — это симметрично с `real_sim` (там кадры
+    // приходят из live-фанаута без предварительного фильтра).
+    let frames_up: Vec<&XFrame<SIZE>>   = market_xframes.frames_up.iter().collect();
+    let frames_down: Vec<&XFrame<SIZE>> = market_xframes.frames_down.iter().collect();
 
-    let len = frames_up.len().min(frames_down.len());
+    // Бинарная выплата на резолюции: победивший токен → $1, проигравший → $0.
+    // Считаем один раз — `sell_gate` возьмёт её только при
+    // `event_remaining_ms ≤ 0` (или на `is_last_idx`-fallback'е).
+    let up_won = market_xframes.up_won();
+
+    // Сначала UP: все его позиции закроются к концу прохода, после чего
+    // bankroll корректно описывает доступный капитал для DOWN-прохода.
+    {
+        let SimStats { bankroll, peak_bankroll, max_drawdown_pct, up, .. } = &mut *sim_stats;
+        let mut positions_up: Vec<OpenPosition> = Vec::new();
+        run_side_simulation(
+            &frames_up, up_won,
+            booster_up, calibration_up,
+            booster_resolution_up, calibration_resolution_up,
+            &mut positions_up,
+            bankroll, peak_bankroll, max_drawdown_pct,
+            up,
+        );
+    }
+    {
+        let SimStats { bankroll, peak_bankroll, max_drawdown_pct, down, .. } = &mut *sim_stats;
+        let mut positions_down: Vec<OpenPosition> = Vec::new();
+        run_side_simulation(
+            &frames_down, !up_won,
+            booster_down, calibration_down,
+            booster_resolution_down, calibration_resolution_down,
+            &mut positions_down,
+            bankroll, peak_bankroll, max_drawdown_pct,
+            down,
+        );
+    }
+}
+
+/// Один проход одной стороны (UP или DOWN) по своему временно́му ряду
+/// кадров. Внутри: `manage_positions` → `try_open_position` →
+/// **mark-to-market equity** drawdown.
+///
+/// Equity на каждом тике считается как `bankroll + Σ(pos.shares_held ×
+/// current_prob)`. Это критично: между `open` и `close` реализованный
+/// `bankroll` не двигается, поэтому если считать drawdown только по
+/// `bankroll`, метрика системно занижается на длинных удержаниях,
+/// уходящих в красное и закрывающихся через Resolution.
+///
+/// Сайзинг новых позиций идёт от **available capital** =
+/// `bankroll − Σ(open.entry_cost)` той же стороны (cross-side для
+/// history_sim не нужен, т.к. UP и DOWN запускаются последовательно и
+/// другая сторона на данном проходе всегда пуста).
+#[allow(clippy::too_many_arguments)]
+fn run_side_simulation(
+    frames: &[&XFrame<SIZE>],
+    won: bool,
+    booster_pnl: &Booster,
+    calibration_pnl: Option<&Calibration>,
+    booster_resolution: Option<&Booster>,
+    calibration_resolution: Option<&Calibration>,
+    positions: &mut Vec<OpenPosition>,
+    bankroll: &mut f64,
+    peak_bankroll: &mut f64,
+    max_drawdown_pct: &mut f64,
+    side_stats: &mut SideStats,
+) {
+    let len = frames.len();
     if len == 0 {
         return;
     }
-
-    // Fallback на случай «битого» буфера: вектор кадров может оборваться
-    // раньше, чем событие дойдёт до `event_remaining_ms ≤ 0` (пропуск
-    // записи, ранний рестарт процесса и т.п.). В штатных дампах последний
-    // кадр уже в резолюции и `sell_gate` закрывает всё через Resolution
-    // сам; `last_idx` нужен только чтобы добить остатки в аномалии, не
-    // теряя PnL от ещё открытых позиций.
+    // Fallback на «битый» буфер: дамп может оборваться раньше, чем
+    // `event_remaining_ms ≤ 0`. В штатных прогонах последний кадр уже в
+    // резолюции и `sell_gate` закрывает всё сам; `last_idx` нужен только
+    // чтобы добить остатки в аномалии, не теряя PnL ещё открытых позиций.
     let last_idx = len - 1;
-    let mut positions_up: Vec<OpenPosition>   = Vec::new();
-    let mut positions_down: Vec<OpenPosition> = Vec::new();
+    let won_opt: Option<bool> = Some(won);
 
-    // Бинарная выплата на резолюции: победивший токен → $1, проигравший → $0.
-    // Истина known «заранее» (всё событие уже отыграно), поэтому считаем один
-    // раз — `sell_gate` возьмёт её только при `event_remaining_ms ≤ 0`.
-    // `Some(true)` / `Some(false)` однозначно мапятся в `CloseReason::
-    // Resolution { won }` и `exit_price ∈ {1.0, 0.0}` внутри `sell_gate`.
-    let up_won = market_xframes.up_won();
-    let won_up:   Option<bool> = Some(up_won);
-    let won_down: Option<bool> = Some(!up_won);
-
-    for idx in 0..len {
-        let frame_up = frames_up[idx];
-        let frame_down = frames_down[idx];
-
-        // Кадры без `currency_implied_prob` не фильтруем здесь: и
-        // `sell_gate` (через `manage_positions`), и `try_open_position`
-        // сами short-circuit-ят `None` внутри себя (Hold/skip без
-        // изменения статистики), поэтому внешний `continue` был бы
-        // дубликатом той же проверки.
+    for (idx, frame) in frames.iter().enumerate() {
         let is_last_idx = idx == last_idx;
 
-        // `is_last_idx` + `won_{up,down}` = Some(..) заставляет `sell_gate`
-        // принудительно закрыть позиции через `Resolution` даже если
-        // буфер оборвался до `event_remaining_ms ≤ 0` (fallback для
-        // битого дампа). В штатных прогонах к последнему индексу
-        // `event_remaining_ms` уже ≤ 0 и ветка выбирается естественно.
+        // 1) Закрытия по TP/SL/Timeout/EV/Resolution.
         manage_positions(
-            &mut positions_up,
-            frame_up,
+            positions,
+            frame,
             is_last_idx,
-            won_up,
-            booster_resolution_up,
-            calibration_resolution_up,
-            &mut sim_stats.up,
-            &mut sim_stats.bankroll,
-            None,
-            "",
-        );
-        manage_positions(
-            &mut positions_down,
-            frame_down,
-            is_last_idx,
-            won_down,
-            booster_resolution_down,
-            calibration_resolution_down,
-            &mut sim_stats.down,
-            &mut sim_stats.bankroll,
+            won_opt,
+            booster_resolution,
+            calibration_resolution,
+            side_stats,
+            bankroll,
             None,
             "",
         );
 
-        // На уже завершившемся событии (event_remaining_ms ≤ 0) и на
-        // последнем индексе буфера drawdown не обновляем и новых позиций
-        // не открываем: `manage_positions` выше уже закрыл всё по
-        // Resolution, `buy_gate` внутри `try_open_position` всё равно
-        // вернул бы `LateEntry` при `event_remaining_ms ≤ 0`.
-        if frame_up.event_remaining_ms > 0 && !is_last_idx {
-            sim_stats.update_drawdown();
+        // 2) Открытие новой позиции — от available_bankroll, иначе Kelly
+        //    раздувает экспозицию: bankroll не уменьшается на open
+        //    (всё списание идёт через PnL на close), и без этой коррекции
+        //    последовательные сигналы открыли бы 5×10% = 50% bankroll
+        //    параллельно вместо одного 10%.
+        let same_side_locked: f64 = positions.iter().map(|p| p.entry_cost).sum();
+        let available = (*bankroll - same_side_locked).max(0.0);
+        try_open_position(
+            frame,
+            booster_pnl,
+            calibration_pnl,
+            positions,
+            side_stats,
+            available,
+            None,
+            "",
+        );
 
-            try_open_position(
-                frame_up,
-                booster_up, calibration_up,
-                &mut positions_up,
-                &mut sim_stats.up,
-                sim_stats.bankroll,
-                None,
-                "",
-            );
-            try_open_position(
-                frame_down,
-                booster_down, calibration_down,
-                &mut positions_down,
-                &mut sim_stats.down,
-                sim_stats.bankroll,
-                None,
-                "",
-            );
+        // 3) Mark-to-market equity на каждом тике (а не только на сделке).
+        //    Не используем `currency_implied_prob.unwrap_or(0.0)` бездумно:
+        //    `None` означает «mark-to-market неизвестен», и оценивать
+        //    позицию в нуль — это занижение equity на ровном месте; в
+        //    таком кадре пропускаем апдейт, метрика подождёт следующего.
+        if let Some(prob) = frame.currency_implied_prob {
+            let prob = prob.clamp(0.0, 1.0);
+            let positions_value: f64 = positions.iter().map(|p| p.shares_held * prob).sum();
+            let equity = *bankroll + positions_value;
+            if equity > *peak_bankroll {
+                *peak_bankroll = equity;
+            }
+            if *peak_bankroll > 0.0 {
+                let dd = (*peak_bankroll - equity) / *peak_bankroll * 100.0;
+                if dd > *max_drawdown_pct {
+                    *max_drawdown_pct = dd;
+                }
+            }
         }
     }
 }
@@ -613,9 +696,13 @@ fn simulate_event(
 /// нестационарных окнах мы не хотим раздувать позиции под ожидание
 /// полной выплаты резолюции.
 ///
-/// При `event_remaining_ms < 0` вход пропускается
+/// При `event_remaining_ms < MIN_ENTRY_REMAINING_MS` вход пропускается
 /// (`late_entry_skips++`): за оставшееся время TP/SL физически не
 /// успевают сработать, вход вырождается в лотерею.
+///
+/// При `!frame.stable` вход также пропускается (`unstable_skips++`):
+/// фичи такого кадра не покрываются обучением (поздний WS-коннект),
+/// pnl-модель нельзя считать применимой.
 /// Результат «сухого» прогона всех ранних `return`-ов [`try_open_position`].
 ///
 /// Нужен, чтобы одна и та же цепочка проверок (late-entry → predict →
@@ -629,12 +716,19 @@ fn simulate_event(
 /// и вызова `open_position`), чтобы `try_open_position` не пересчитывал их
 /// повторно.
 pub enum BuyGate {
-    /// До резолюции осталось меньше `0` **или** событие
-    /// уже завершилось (`event_remaining_ms ≤ 0`). Вход бессмысленен: TP/SL
-    /// за оставшийся горизонт не успеют сработать, а на уже закрытом событии
+    /// До резолюции осталось меньше [`MIN_ENTRY_REMAINING_MS`]
+    /// (≈ горизонт обучения, обычно 15 с) **или** событие уже завершилось
+    /// (`event_remaining_ms ≤ 0`). Вход бессмысленен: TP/SL за оставшийся
+    /// горизонт физически не успеют сработать, а на уже закрытом событии
     /// покупка — это лотерея по биркам `0/1`. В `try_open_position` это
     /// `stats.late_entry_skips += 1`.
     LateEntry,
+    /// Кадр помечен `stable=false` — WS-коннект случился позже, чем
+    /// `event_start_ms` или `ws_connect_wall_ms + SIZE`-секунд истории
+    /// (см. [`crate::xframe::compute_xframe_stable`]). Pnl-модель обучалась
+    /// только на стабильных кадрах, применять её к нестабильным некорректно.
+    /// В `try_open_position` это `stats.unstable_skips += 1`.
+    Unstable,
     /// `predict_frame` не вернул значение (нет свежих фич / лаг больше
     /// `PNL_MAX_LAG`) **или** сырой скор ниже `SIM_BUY_THRESHOLD`.
     /// Счётчики не мутируются (до `raw_above_threshold` мы не дошли).
@@ -663,8 +757,11 @@ pub(crate) fn buy_gate(
     bankroll: f64,
 ) -> BuyGate {
 
-    if frame.event_remaining_ms <= 0 {
+    if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return BuyGate::LateEntry;
+    }
+    if !frame.stable {
+        return BuyGate::Unstable;
     }
     // Без `currency_implied_prob` ни Kelly, ни размер посчитать не из
     // чего. Оба вызывающих (`run_history_sim`, `real_sim::tick_once`)
@@ -725,6 +822,10 @@ pub(crate) fn try_open_position(
     match buy_gate(frame, booster_pnl, calibration_pnl, bankroll) {
         BuyGate::LateEntry => {
             stats.late_entry_skips += 1;
+            false
+        }
+        BuyGate::Unstable => {
+            stats.unstable_skips += 1;
             false
         }
         BuyGate::BelowThreshold => {
@@ -811,12 +912,13 @@ pub(crate) enum SellGate {
 /// * `frames_held` — как бы **после** инкремента этим тиком. В
 ///   `manage_positions` это уже инкрементированное `pos.frames_held`; в
 ///   WS-предикате — `pos.frames_held + 1`, т.к. инкремент ещё не случился.
-/// * `booster_resolution`/`calibration_resolution` — резолюционная модель.
-///   Передаётся реальным вызовом из `manage_positions`; WS-предикат
-///   [`any_position_would_sell`] передаёт `None/None`, чтобы **не дёргать
-///   predict_frame на каждом тике**, даже на «тихих». В этом случае
-///   EMA этим тиком не обновляется (`new_p_win_ema = pos.p_win_ema`), и
-///   EV-exit считается по последнему известному EMA.
+/// * `p_win_now` — свежая оценка `P(win)` от resolution-модели на этом
+///   кадре (после калибровки), посчитанная **одной** инференцией в
+///   вызывающем `manage_positions` и переиспользуемая для всех его
+///   позиций. WS-предикат [`any_position_would_sell`] передаёт `None`,
+///   чтобы намеренно **не дёргать predict_frame** на «тихих» тиках; в
+///   этом случае EMA не обновляется (`new_p_win_ema = pos.p_win_ema`)
+///   и EV-exit считается по последнему известному EMA.
 /// * `strict_book` — `Some(book)` только в реальном исполнении через
 ///   `manage_positions` при наличии HTTP-стакана. В WS-предикате всегда
 ///   `None` — EV-exit оценивается через `book_fill_sell` (WS-fallback).
@@ -826,12 +928,10 @@ pub(crate) enum SellGate {
 /// зафиксировать честно нельзя (остаток пришлось бы досчитывать по
 /// implied prob), ждём следующего тика.
 ///
-/// Стоимость: `predict_frame` вызывается один раз **на позицию** (а не
-/// один раз на кадр, как было в старом `manage_positions`). На практике
-/// в одном лейне `(interval, side)` одновременно 0–1 позиция, поэтому
-/// разницы нет; если число позиций вырастет — booster-инференс на одном
-/// XFrame стоит сотни микросекунд, всё равно на порядки меньше HTTP-
-/// запроса ордербука и разницы не заметит.
+/// Стоимость: `predict_frame` resolution-модели вызывается **один раз
+/// на кадр** в `manage_positions` и переиспользуется для всех его
+/// позиций. `sell_gate` сам инференса не делает; его доля каждой
+/// позиции — только EMA-апдейт, проверки TP/SL/Timeout/EV.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sell_gate(
     pos: &OpenPosition,
@@ -839,8 +939,7 @@ pub(crate) fn sell_gate(
     frame: &XFrame<SIZE>,
     is_last: bool,
     won: Option<bool>,
-    booster_resolution: Option<&Booster>,
-    calibration_resolution: Option<&Calibration>,
+    p_win_now: Option<f64>,
     strict_book: Option<&StrictBook>,
 ) -> SellGate {
     // Событие завершилось (`event_remaining_ms ≤ 0`) или вызывающий
@@ -890,15 +989,12 @@ pub(crate) fn sell_gate(
     let delta = current_prob - pos.entry_prob;
 
     if in_hold_zone {
-        // Свежий p_win_resolution + EMA-апдейт делаем здесь же, чтобы
-        // вся логика sell-решения была в одном месте. Если booster не
-        // задан (WS-предикат) или predict не удался (лаг кадра больше
-        // `RESOLUTION_MAX_LAG`) — `p_win_now = None`, EMA не обновляется.
-        let p_win_now: Option<f64> = booster_resolution.and_then(|b| {
-            predict_frame(b, frame, RESOLUTION_MAX_LAG).map(|raw| {
-                calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
-            })
-        });
+        // EMA-апдейт делаем здесь же, чтобы вся логика sell-решения
+        // была в одном месте. Если `p_win_now=None` (WS-предикат или
+        // predict не удался — лаг больше `RESOLUTION_MAX_LAG`) — EMA
+        // этим тиком не обновляется, EV-exit считаем по последнему
+        // известному `pos.p_win_ema`. Сам инференс делает вызывающий
+        // (`manage_positions`) **один раз на кадр**, см. контракт.
         let new_p_win_ema: Option<f64> = match (p_win_now, pos.p_win_ema) {
             (Some(p), Some(prev)) => Some(
                 EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev,
@@ -1009,10 +1105,10 @@ pub(crate) fn any_position_would_sell(
                 // срабатывает — `expect(..)` на `won` не взведётся.
                 false,
                 None,
-                // Без booster: EV-exit использует последнее известное
-                // `pos.p_win_ema` без свежего predict_frame — дешёвый gate,
-                // на «тихих» тиках мы намеренно не запускаем инференс.
-                None,
+                // `p_win_now = None`: EV-exit использует последнее
+                // известное `pos.p_win_ema` без свежего predict_frame —
+                // дешёвый gate, на «тихих» тиках мы намеренно не
+                // запускаем resolution-инференс.
                 None,
                 // Без HTTP: EV считаем через WS-fallback `book_fill_sell`.
                 None,
@@ -1049,14 +1145,35 @@ pub(crate) fn manage_positions(
 ) -> bool {
     for pos in positions.iter_mut() { pos.frames_held += 1; }
 
+    // `predict_frame` resolution-модели стоит дёшево относительно HTTP,
+    // но всё же это booster-инференс по полному вектору фич. Считаем
+    // **один раз на кадр**, переиспользуем для всех позиций этой
+    // стороны (на практике 0–1 одновременно, но если правила входа
+    // станут более либеральными — экономия линейная по числу позиций).
+    //
+    // Считаем только если действительно нужно: hold-zone — единственная
+    // ветка, где `sell_gate` смотрит на `p_win_now`. Иначе — `None`
+    // (EV-exit и EMA-апдейт всё равно не сработают вне зоны).
+    let in_hold_zone = frame.event_remaining_ms > 0
+        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+    let p_win_now: Option<f64> = if in_hold_zone && !positions.is_empty() {
+        booster_resolution.and_then(|b| {
+            predict_frame(b, frame, RESOLUTION_MAX_LAG).map(|raw| {
+                calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
+            })
+        })
+    } else {
+        None
+    };
+
     let mut sold = false;
     let mut remaining: Vec<OpenPosition> = Vec::new();
     for mut pos in positions.drain(..) {
-        // Весь decision-tree (включая predict_frame resolution-модели и
-        // EMA-апдейт `p_win_ema`) живёт в `sell_gate`. Здесь подаём
-        // `pos.frames_held` уже после инкремента и сами обе модели —
-        // гейт внутри себя вызовет predict и применит EMA. Текущий
-        // `current_prob` он достаёт из `frame.currency_implied_prob`.
+        // Весь decision-tree (EMA-апдейт `p_win_ema`, проверки
+        // TP/SL/Timeout/EV) живёт в `sell_gate`. Здесь подаём
+        // `pos.frames_held` уже после инкремента и **готовый**
+        // `p_win_now` (один инференс на кадр выше). Текущий
+        // `current_prob` гейт достаёт из `frame.currency_implied_prob`.
         // `is_last` = true принудительно закрывает позицию через
         // Resolution (fallback для битого буфера в истории).
         let close = match sell_gate(
@@ -1065,8 +1182,7 @@ pub(crate) fn manage_positions(
             frame,
             is_last,
             won,
-            booster_resolution,
-            calibration_resolution,
+            p_win_now,
             strict_book,
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
@@ -1289,7 +1405,22 @@ fn book_fill_buy(frame: &XFrame<SIZE>, position_size: f64) -> (f64, f64) {
 /// Продажа `shares_to_sell` по bid-стакану (L1→L2→L3).
 ///
 /// Возвращает валовый USDC до вычета fee.
-/// Если ликвидности не хватает — остаток продаётся по `currency_implied_prob`.
+///
+/// Шеры, для которых не хватает bid-ликвидности на трёх верхних уровнях,
+/// **сжигаются**: они вносят `0` USDC в выручку — то есть учитываются
+/// как полная потеря. Это явная замена прежнего fallback'а по
+/// `currency_implied_prob`, который **системно завышал** оценку модели:
+/// он позволял допродать любой остаток «бесплатно по mid», тогда как
+/// в живой торговле непокрытый ликвидностью объём — это либо рейс
+/// по более худшим уровням стакана (скрытым в L4+), либо вообще
+/// невозможность исполнения.
+///
+/// Для оценки обученной модели worst-case-лосс на хвосте — корректнее,
+/// чем оптимистичный fallback. На стороне `real_sim` строгий вариант
+/// [`book_fill_sell_strict`] вообще возвращает `None` (откладываем
+/// продажу до следующего тика); здесь же позиция **обязана закрыться**
+/// (Resolution на конце буфера, либо явный TP/SL/Timeout/EV), поэтому
+/// «отложить» нельзя — выбираем консервативную оценку выручки.
 fn book_fill_sell(frame: &XFrame<SIZE>, shares_to_sell: f64) -> f64 {
     let levels = [
         (frame.book_bid_l1_price, frame.book_bid_l1_size),
@@ -1306,20 +1437,11 @@ fn book_fill_sell(frame: &XFrame<SIZE>, shares_to_sell: f64) -> f64 {
 
         if remaining <= size {
             total_usdc += remaining * price;
-            remaining = 0.0;
             break;
         } else {
             total_usdc += size * price;
             remaining -= size;
         }
-    }
-
-    // Остаток при нехватке ликвидности — продаём по currency_implied_prob
-    if remaining > 1e-9 {
-        let fallback = frame.currency_implied_prob
-            .unwrap_or(0.0)
-            .clamp(0.0, 0.999);
-        total_usdc += remaining * fallback;
     }
 
     total_usdc
@@ -1370,11 +1492,11 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
-         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={} Res✗={} late_skips={}",
+         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={} Res✗={} late_skips={} unstable_skips={}",
         s.trades, win_rate, s.pnl_usd, avg_pnl, s.fees_paid,
         s.tp_count, s.sl_count, s.timeout_count,
         s.ev_exit_profit_count, s.ev_exit_loss_count,
-        s.resolution_win, s.resolution_loss, s.late_entry_skips,
+        s.resolution_win, s.resolution_loss, s.late_entry_skips, s.unstable_skips,
     );
 }
 
