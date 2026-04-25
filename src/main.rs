@@ -12,9 +12,16 @@ pub mod xframe_dump;
 pub mod train_mode;
 pub mod tee_log;
 pub mod history_sim;
+pub mod real_sim;
 
 use anyhow::Result;
 use project_manager::ProjectManager;
+
+/// Список валют, для которых поднимаются независимые `ProjectManager`-ы
+/// (свой WS + свой кэш xframes + свои воркеры `real_sim`). Новую валюту
+/// достаточно добавить сюда — точки входа режимов `Default` и `RealSim` сами
+/// пройдут по массиву.
+const CURRENCIES: &[&str] = &["btc"];
 
 /// Режим запуска, считанный из переменной окружения `STATUS` (`.env`).
 #[derive(Debug)]
@@ -25,6 +32,10 @@ enum AppMode {
     Train,
     /// Историческая симуляция торговли по накопленным дампам с подсчётом P&L.
     HistorySim,
+    /// Реальная (виртуальная) торговля по живому WS потоку: поднимает тот же
+    /// `ProjectManager` что и `Default`, плюс 4 tokio-воркера раз-в-секунду
+    /// (5m × 15m × up/down) с логикой из `history_sim`.
+    RealSim,
 }
 
 impl AppMode {
@@ -32,6 +43,7 @@ impl AppMode {
         match std::env::var("STATUS").as_deref() {
             Ok("train")         => AppMode::Train,
             Ok("history_sim")   => AppMode::HistorySim,
+            Ok("real_sim")      => AppMode::RealSim,
             _                   => AppMode::Default,
         }
     }
@@ -56,7 +68,26 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
-            let _project_manager = ProjectManager::new("btc".to_string());
+            for currency in CURRENCIES {
+                // ProjectManager::new спаунит фоновые таски, удерживающие
+                // собственные `Arc`-клоны — возвращаемый Arc можно сразу
+                // отпустить, пайплайн продолжит жить. Карта каналов
+                // `lane_frame_channels` у `real_sim_state` остаётся пустой,
+                // фанаут просто молча отбрасывает кадры.
+                let _ = ProjectManager::new((*currency).to_string());
+            }
+
+            std::future::pending::<()>().await;
+        }
+        AppMode::RealSim => {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
+
+            for currency in CURRENCIES {
+                let project_manager = ProjectManager::new((*currency).to_string());
+                real_sim::run_real_sim(project_manager).await?;
+            }
 
             std::future::pending::<()>().await;
         }

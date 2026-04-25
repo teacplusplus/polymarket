@@ -91,6 +91,17 @@ pub struct Booster {
     pub eval_dmat_results: BTreeMap<String, BTreeMap<String, f32>>,
 }
 
+// SAFETY: `BoosterHandle` — сырой указатель на внутреннее состояние XGBoost.
+// Вендорная libxgboost в этом репозитории — 3.0.0 (см.
+// `xgboost-sys/xgboost/CMakeLists.txt` и `python-package/pyproject.toml`);
+// thread-safe inference через `XGBoosterPredict*` поддерживается в upstream
+// начиная с 1.7 (см. https://github.com/dmlc/xgboost/pull/8245) и, таким
+// образом, доступен в нашей 3.0.0. Мы не вызываем `update`/`save`/иные
+// мутирующие API из нескольких потоков одновременно, поэтому передача
+// `Booster` между тасками и чтение `&Booster` из разных потоков — безопасны.
+unsafe impl Send for Booster {}
+unsafe impl Sync for Booster {}
+
 impl Booster {
     /// Create a new Booster model with given parameters.
     ///

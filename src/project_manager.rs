@@ -16,6 +16,7 @@ use crate::data_ws::{
     make_ws_channel, spawn_persistent_interval_market_ws, CurrencyUpDownOutcome, MarketSnapshot,
     MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws, WsCommand,
 };
+use crate::real_sim::RealSimState;
 use crate::xframe::{
     currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
     find_same_outcome_sibling_asset_id, XFrame, SIZE,
@@ -36,6 +37,18 @@ struct PrevMarket {
     market_id: Option<String>,
     gamma_question: Option<String>,
     price_to_beat: Option<f64>,
+}
+
+/// Свежесобранный `stable` [`XFrame`] лейна 1s, который фанаутится
+/// подписчикам через [`ProjectManager::real_sim_state`] →
+/// [`crate::real_sim::RealSimState::lane_frame_channels`] сразу после
+/// записи в `xframes_by_market[0]`. Используется в [`crate::real_sim`] как
+/// push-источник кадров (вместо поллинга `xframes_by_market` раз в секунду).
+#[derive(Clone, Debug)]
+pub struct LaneFrame {
+    pub market_id: String,
+    pub asset_id: String,
+    pub frame: XFrame<SIZE>,
 }
 
 /// Кадр, собранный в этом тике `build_frames_from_buffer_lane_once`, до записи в соответствующий лейн `xframes_by_market`.
@@ -77,9 +90,19 @@ pub struct ProjectManager {
     pub clob: Arc<clob::Client>,
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
+    pub real_sim_state: Arc<RwLock<RealSimState>>,
 }
 
 impl ProjectManager {
+    /// Создаёт `ProjectManager` и запускает фоновые таски (WS, сборщик фреймов,
+    /// up/down-интервалы).
+    ///
+    /// `RealSimState` создаётся всегда с пустой картой каналов
+    /// [`crate::real_sim::LaneFrameChannels`]: в режиме `real_sim`
+    /// ([`crate::real_sim::run_real_sim`]) воркеры сами создают свои каналы и
+    /// регистрируют `(Sender, dummy_rx)` в карте, а в остальных режимах карта
+    /// так и остаётся пустой — фанаут `get` возвращает `None` и кадры молча
+    /// отбрасываются (без спама `Full`/`Closed`).
     pub fn new(currency: String) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
@@ -94,6 +117,8 @@ impl ProjectManager {
 
         let (market_ws_tx, market_ws_rx) =
             mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
+
+        let real_sim_state = Arc::new(RwLock::new(RealSimState::new()));
 
         let project_manager = Arc::new(Self {
             currency: Arc::new(currency),
@@ -118,6 +143,7 @@ impl ProjectManager {
             clob,
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
+            real_sim_state,
         });
 
         spawn_persistent_interval_market_ws(project_manager.clone(), market_ws_rx);
@@ -664,6 +690,42 @@ impl ProjectManager {
             if entry.frame.stable {
                 run_log::xframe_stored(&entry.frame);
             }
+
+            if lane == 0 && entry.frame.stable {
+                let kind = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type);
+                let side = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome);
+                if let (Some(kind), Some(side)) = (kind, side) {
+                    // Клонируем `Arc<RwLock<_>>` каналов из state под коротким
+                    // read-локом, дальше работаем уже через него — так
+                    // `real_sim_state` не держим во время `try_send`.
+                    let channels_arc = self
+                        .real_sim_state
+                        .read()
+                        .await
+                        .lane_frame_channels
+                        .channels
+                        .clone();
+                    let channels_guard = channels_arc.read().await;
+                    if let Some(tx) = channels_guard.get(&(kind, side)) {
+                        let lane_frame = LaneFrame {
+                            market_id: entry.market_id.clone(),
+                            asset_id: entry.asset_id.clone(),
+                            frame: entry.frame.clone(),
+                        };
+                        match tx.try_send(lane_frame) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => eprintln!(
+                                "{} lane_frame fanout Full({:?},{:?}): worker lagging",
+                                current_timestamp_ms(),
+                                kind,
+                                side,
+                            ),
+                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        }
+                    }
+                }
+            }
+
             xframes_by_market_lock
                 .entry(entry.market_id)
                 .or_insert_with(HashMap::new)
