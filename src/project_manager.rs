@@ -16,6 +16,7 @@ use crate::data_ws::{
     make_ws_channel, spawn_persistent_interval_market_ws, CurrencyUpDownOutcome, MarketSnapshot,
     MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws, WsCommand,
 };
+use crate::account::SharedAccount;
 use crate::real_sim::RealSimState;
 use crate::xframe::{
     currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
@@ -91,6 +92,12 @@ pub struct ProjectManager {
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub real_sim_state: Arc<RwLock<RealSimState>>,
+    /// Единый счёт-капитал всего процесса. См. [`crate::account::Account`].
+    /// Создаётся **снаружи** до спавна `ProjectManager`-ов и пробрасывается
+    /// клонированным `Arc`-ом — несколько PM (по одному на валюту) делят
+    /// один и тот же `bankroll/peak/max_drawdown` и не «дрейфуют»
+    /// независимыми псевдо-счетами.
+    pub account: SharedAccount,
 }
 
 impl ProjectManager {
@@ -103,7 +110,7 @@ impl ProjectManager {
     /// регистрируют `(Sender, dummy_rx)` в карте, а в остальных режимах карта
     /// так и остаётся пустой — фанаут `get` возвращает `None` и кадры молча
     /// отбрасываются (без спама `Full`/`Closed`).
-    pub fn new(currency: String) -> Arc<Self> {
+    pub fn new(currency: String, account: SharedAccount) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
         let http = Arc::new(
@@ -144,6 +151,7 @@ impl ProjectManager {
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state,
+            account,
         });
 
         spawn_persistent_interval_market_ws(project_manager.clone(), market_ws_rx);

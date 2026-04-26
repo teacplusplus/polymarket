@@ -13,8 +13,10 @@ pub mod train_mode;
 pub mod tee_log;
 pub mod history_sim;
 pub mod real_sim;
+pub mod account;
 
 use anyhow::Result;
+use account::Account;
 use project_manager::ProjectManager;
 
 /// Список валют, для которых поднимаются независимые `ProjectManager`-ы
@@ -68,13 +70,19 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
+            // Единый счёт-капитал на все валюты процесса.
+            // Создаётся ДО спавна `ProjectManager`-ов и клонируется в каждый
+            // через `Arc` — drawdown/bankroll едины поверх всех 4 лейнов
+            // (5m up/down × 15m up/down) и всех валют.
+            let account = Account::new_shared();
+
             for currency in CURRENCIES {
                 // ProjectManager::new спаунит фоновые таски, удерживающие
                 // собственные `Arc`-клоны — возвращаемый Arc можно сразу
                 // отпустить, пайплайн продолжит жить. Карта каналов
                 // `lane_frame_channels` у `real_sim_state` остаётся пустой,
                 // фанаут просто молча отбрасывает кадры.
-                let _ = ProjectManager::new((*currency).to_string());
+                let _ = ProjectManager::new((*currency).to_string(), account.clone());
             }
 
             std::future::pending::<()>().await;
@@ -84,8 +92,12 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
+            // См. комментарий в `AppMode::Default` — общий счёт на процесс.
+            let account = Account::new_shared();
+
             for currency in CURRENCIES {
-                let project_manager = ProjectManager::new((*currency).to_string());
+                let project_manager =
+                    ProjectManager::new((*currency).to_string(), account.clone());
                 real_sim::run_real_sim(project_manager).await?;
             }
 

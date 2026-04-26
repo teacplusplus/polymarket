@@ -24,6 +24,7 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
+use crate::account::Account;
 use crate::tee_log::TEE_LOG;
 use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
@@ -302,15 +303,15 @@ pub struct SideStats {
     pub(crate) diag_sum_kelly_f: f64,
 }
 
-/// Накопленная статистика за версию.
+/// Накопленная статистика за версию (per-interval счётчики, без денег).
+///
+/// **Денежные** поля (bankroll/peak_bankroll/max_drawdown_pct) и
+/// `update_drawdown` вынесены в [`crate::account::Account`] — он один на
+/// процесс/группу `ProjectManager`-ов, чтобы экспозиция и drawdown
+/// считались по единому счёту, а не по «параллельным» псевдо-счетам
+/// каждого интервала.
 #[derive(Debug)]
 pub struct SimStats {
-    /// Текущий виртуальный банкролл (USDC).
-    pub(crate) bankroll: f64,
-    /// Пиковый банкролл (для расчёта drawdown).
-    pub(crate) peak_bankroll: f64,
-    /// Максимальная просадка в процентах: `(peak - trough) / peak × 100`.
-    pub(crate) max_drawdown_pct: f64,
     /// Число обработанных событий (файлов `.bin`) за версию.
     pub(crate) events: usize,
     /// Статистика по стороне UP (ставка на «цена вырастет»). Агрегируется
@@ -324,9 +325,6 @@ pub struct SimStats {
 impl SimStats {
     pub(crate) fn new() -> Self {
         Self {
-            bankroll: INITIAL_BANKROLL,
-            peak_bankroll: INITIAL_BANKROLL,
-            max_drawdown_pct: 0.0,
             events: 0,
             up: SideStats::default(),
             down: SideStats::default(),
@@ -344,28 +342,6 @@ impl SimStats {
     }
     pub(crate) fn total_kelly_strict_sell_skips(&self) -> usize {
         self.up.kelly_strict_sell_skips + self.down.kelly_strict_sell_skips
-    }
-
-    /// Обновляет `peak_bankroll` и `max_drawdown_pct` по **equity**
-    /// (mark-to-market): `equity = bankroll + Σ(shares_held × current_prob)`
-    /// для всех открытых позиций. Считается на **каждом** тике (а не только
-    /// на моменте сделки), иначе `max_drawdown_pct` системно занижен — между
-    /// `open` и `close` реализованный bankroll не двигается, хотя цена
-    /// открытой позиции может уйти в большой минус.
-    ///
-    /// Имена полей `peak_bankroll`/`max_drawdown_pct` остаются прежними для
-    /// совместимости с логами и `print_sim_stats`, но **семантика теперь
-    /// equity-based**, а не bankroll-based.
-    pub(crate) fn update_drawdown(&mut self, equity: f64) {
-        if equity > self.peak_bankroll {
-            self.peak_bankroll = equity;
-        }
-        if self.peak_bankroll > 0.0 {
-            let drawdown_pct = (self.peak_bankroll - equity) / self.peak_bankroll * 100.0;
-            if drawdown_pct > self.max_drawdown_pct {
-                self.max_drawdown_pct = drawdown_pct;
-            }
-        }
     }
 }
 
@@ -457,6 +433,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 );
 
                 let mut sim_stats = SimStats::new();
+                let mut account = Account::new();
 
                 let step_path = interval_path.join("1s");
                 let all_paths = collect_bin_paths(&step_path)?;
@@ -480,6 +457,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                                 booster_resolution_up.as_ref(), booster_resolution_down.as_ref(),
                                 calibration_resolution_up.as_ref(), calibration_resolution_down.as_ref(),
                                 &mut sim_stats,
+                                &mut account,
                             );
                             sim_stats.events += 1;
                         }
@@ -496,15 +474,15 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                 debug_assert!(
                     {
                         let sides_pnl = sim_stats.up.pnl_usd + sim_stats.down.pnl_usd;
-                        let bankroll_pnl = sim_stats.bankroll - INITIAL_BANKROLL;
+                        let bankroll_pnl = account.bankroll - INITIAL_BANKROLL;
                         (sides_pnl - bankroll_pnl).abs() < 1e-6
                     },
                     "[sim] {tag}: PnL invariant violated — up.pnl + down.pnl = {:.6}, bankroll - INITIAL = {:.6}",
                     sim_stats.up.pnl_usd + sim_stats.down.pnl_usd,
-                    sim_stats.bankroll - INITIAL_BANKROLL,
+                    account.bankroll - INITIAL_BANKROLL,
                 );
 
-                print_sim_stats(&tag, &sim_stats);
+                print_sim_stats(&tag, &sim_stats, &account);
             }
         }
     }
@@ -544,6 +522,7 @@ fn simulate_event(
     calibration_resolution_up: Option<&Calibration>,
     calibration_resolution_down: Option<&Calibration>,
     sim_stats: &mut SimStats,
+    account: &mut Account,
 ) {
     // Дамп `xframe_dump.rs` уже отфильтрован по `stable=true` (см.
     // `dump_market_xframes_binary_lane` → `if !frame.stable { continue; }`),
@@ -562,27 +541,25 @@ fn simulate_event(
     // Сначала UP: все его позиции закроются к концу прохода, после чего
     // bankroll корректно описывает доступный капитал для DOWN-прохода.
     {
-        let SimStats { bankroll, peak_bankroll, max_drawdown_pct, up, .. } = &mut *sim_stats;
         let mut positions_up: Vec<OpenPosition> = Vec::new();
         run_side_simulation(
             &frames_up, up_won,
             booster_up, calibration_up,
             booster_resolution_up, calibration_resolution_up,
             &mut positions_up,
-            bankroll, peak_bankroll, max_drawdown_pct,
-            up,
+            account,
+            &mut sim_stats.up,
         );
     }
     {
-        let SimStats { bankroll, peak_bankroll, max_drawdown_pct, down, .. } = &mut *sim_stats;
         let mut positions_down: Vec<OpenPosition> = Vec::new();
         run_side_simulation(
             &frames_down, !up_won,
             booster_down, calibration_down,
             booster_resolution_down, calibration_resolution_down,
             &mut positions_down,
-            bankroll, peak_bankroll, max_drawdown_pct,
-            down,
+            account,
+            &mut sim_stats.down,
         );
     }
 }
@@ -610,9 +587,7 @@ fn run_side_simulation(
     booster_resolution: Option<&Booster>,
     calibration_resolution: Option<&Calibration>,
     positions: &mut Vec<OpenPosition>,
-    bankroll: &mut f64,
-    peak_bankroll: &mut f64,
-    max_drawdown_pct: &mut f64,
+    account: &mut Account,
     side_stats: &mut SideStats,
 ) {
     let len = frames.len();
@@ -629,16 +604,29 @@ fn run_side_simulation(
     for (idx, frame) in frames.iter().enumerate() {
         let is_last_idx = idx == last_idx;
 
+        // Booster-инференсы считаем ОДИН раз за кадр, перед передачей в
+        // `manage_positions` / `try_open_position`. На однопоточном пути
+        // history_sim это просто аккуратнее — общая API с real_sim, где
+        // тот же предвычисленный `pnl_raw` / `p_win_now` живёт ВНЕ
+        // write-локов (без него 4×N воркеров блокировали бы друг друга
+        // на время `predict_frame`).
+        let p_win_now = compute_p_win_now(
+            frame,
+            booster_resolution,
+            calibration_resolution,
+            !positions.is_empty(),
+        );
+        let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl);
+
         // 1) Закрытия по TP/SL/Timeout/EV/Resolution.
         manage_positions(
             positions,
             frame,
             is_last_idx,
             won_opt,
-            booster_resolution,
-            calibration_resolution,
+            p_win_now,
             side_stats,
-            bankroll,
+            &mut account.bankroll,
             None,
             "",
         );
@@ -649,11 +637,10 @@ fn run_side_simulation(
         //    последовательные сигналы открыли бы 5×10% = 50% bankroll
         //    параллельно вместо одного 10%.
         let same_side_locked: f64 = positions.iter().map(|p| p.entry_cost).sum();
-        let available = (*bankroll - same_side_locked).max(0.0);
+        let available = (account.bankroll - same_side_locked).max(0.0);
         try_open_position(
             frame,
-            booster_pnl,
-            calibration_pnl,
+            pnl_inference,
             positions,
             side_stats,
             available,
@@ -669,16 +656,8 @@ fn run_side_simulation(
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
             let positions_value: f64 = positions.iter().map(|p| p.shares_held * prob).sum();
-            let equity = *bankroll + positions_value;
-            if equity > *peak_bankroll {
-                *peak_bankroll = equity;
-            }
-            if *peak_bankroll > 0.0 {
-                let dd = (*peak_bankroll - equity) / *peak_bankroll * 100.0;
-                if dd > *max_drawdown_pct {
-                    *max_drawdown_pct = dd;
-                }
-            }
+            let equity = account.bankroll + positions_value;
+            account.update_drawdown(equity);
         }
     }
 }
@@ -715,6 +694,84 @@ fn run_side_simulation(
 /// ровно те промежуточные значения, которые нужны дальше (для `diag_sum_*`
 /// и вызова `open_position`), чтобы `try_open_position` не пересчитывал их
 /// повторно.
+/// Результат предвычисленного booster + калибровка-прохода PnL-модели:
+/// `raw` — сырой инференс (используется для проверки `SIM_BUY_THRESHOLD`),
+/// `pred` — после применения [`Calibration`] (идёт в Kelly-формулу).
+///
+/// Оба значения нужны на одном тике: порог сравнивается с `raw` (как и было
+/// до выноса), а Kelly использует калиброванное `pred`. Возвращаем парой,
+/// чтобы caller считал инференс ОДИН раз и не повторял `Calibration::apply`
+/// внутри [`buy_gate`].
+#[derive(Clone, Copy, Debug)]
+pub struct PnlInference {
+    pub raw: f32,
+    pub pred: f32,
+}
+
+/// Booster-инференс + калибровка PnL-модели для текущего кадра — основной
+/// «дорогой» шаг buy-decision'а. Возвращает `None`, если входить заведомо
+/// нельзя (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`, `!frame.stable`,
+/// нет `currency_implied_prob`) или если `predict_frame` отказался (лаг
+/// превысил [`PNL_MAX_LAG`]).
+///
+/// Калибровку считаем **здесь же**, а не в [`buy_gate`]: она тоже
+/// детерминирована от `raw` и не зависит от состояния (`Calibration` —
+/// иммутабельная map / spline). Тогда `buy_gate` совсем не видит `&Booster`
+/// / `Option<&Calibration>` и под write-локами в `real_sim::tick_once`
+/// никаких CPU-инференсов не остаётся.
+///
+/// Вынесен из [`buy_gate`], чтобы [`crate::real_sim::tick_once`] мог делать
+/// инференс **до** взятия write-локов (`state.write() + account.write()`):
+/// один predict за кадр против двух раньше (один ради `may_open` снаружи,
+/// второй внутри `try_open_position` под локами). На однопоточном пути
+/// `history_sim` разницы нет — call-site вызывает `compute_pnl_inference`
+/// сразу перед `buy_gate` / `try_open_position`.
+pub(crate) fn compute_pnl_inference(
+    frame: &XFrame<SIZE>,
+    booster_pnl: &Booster,
+    calibration_pnl: Option<&Calibration>,
+) -> Option<PnlInference> {
+    if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
+        return None;
+    }
+    if !frame.stable {
+        return None;
+    }
+    if frame.currency_implied_prob.is_none() {
+        return None;
+    }
+    let raw = predict_frame(booster_pnl, frame, PNL_MAX_LAG)?;
+    let pred = calibration_pnl.map_or(raw, |c| c.apply(raw));
+    Some(PnlInference { raw, pred })
+}
+
+/// Резолюционная вероятность победы для активного hold-zone — booster +
+/// калибровка одной командой. `None`, если вызывать модель не имеет смысла
+/// (вне hold-zone, нет позиций, нет `booster_resolution`, predict отказался
+/// из-за [`RESOLUTION_MAX_LAG`]).
+///
+/// Аналогично [`compute_pnl_raw`], вынесено для real_sim — чтобы
+/// resolution-инференс уходил **до** write-локов. На history_sim это
+/// один и тот же кадр × все позиции одной стороны, и `manage_positions`
+/// раньше делал predict внутри себя; теперь предвычисление делает caller.
+pub(crate) fn compute_p_win_now(
+    frame: &XFrame<SIZE>,
+    booster_resolution: Option<&Booster>,
+    calibration_resolution: Option<&Calibration>,
+    has_positions: bool,
+) -> Option<f64> {
+    let in_hold_zone = frame.event_remaining_ms > 0
+        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+    if !in_hold_zone || !has_positions {
+        return None;
+    }
+    booster_resolution.and_then(|b| {
+        predict_frame(b, frame, RESOLUTION_MAX_LAG).map(|raw| {
+            calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
+        })
+    })
+}
+
 pub enum BuyGate {
     /// До резолюции осталось меньше [`MIN_ENTRY_REMAINING_MS`]
     /// (≈ горизонт обучения, обычно 15 с) **или** событие уже завершилось
@@ -750,10 +807,16 @@ pub enum BuyGate {
 /// только здесь. `try_open_position` оборачивает это в счётчики и реальный
 /// `open_position`; `real_sim` использует `matches!(.., BuyGate::Proceed)`
 /// как дешёвый gate до HTTP-запроса стакана.
+///
+/// `pnl_inference` — **заранее посчитанный** booster + калибровка PnL-модели
+/// (см. [`compute_pnl_inference`]). Гейт сам по себе не делает ни predict, ни
+/// `Calibration::apply` — это позволяет `real_sim::tick_once` считать всю
+/// «дорогую» часть decision-tree ОДИН раз за кадр **вне** write-локов и
+/// переиспользовать в обоих местах (`may_open` и `try_open_position`), вместо
+/// двух predict'ов под лок-критсекцией.
 pub(crate) fn buy_gate(
     frame: &XFrame<SIZE>,
-    booster_pnl: &Booster,
-    calibration_pnl: Option<&Calibration>,
+    pnl_inference: Option<PnlInference>,
     bankroll: f64,
 ) -> BuyGate {
 
@@ -771,13 +834,17 @@ pub(crate) fn buy_gate(
     let Some(entry_prob) = frame.currency_implied_prob else {
         return BuyGate::BelowThreshold;
     };
-    let Some(raw) = predict_frame(booster_pnl, frame, PNL_MAX_LAG) else {
+    // `pnl_inference == None` означает либо «inference не звали из-за late_entry/
+    // !stable/нет implied_prob» (мы уже выше вернулись бы), либо «predict
+    // вернул None — лаг превысил `PNL_MAX_LAG`». В обоих случаях это эквивалент
+    // прежнего `predict_frame(...) == None` → `BelowThreshold`, статистика
+    // совпадает с прошлым поведением (диагностические суммы не трогаются).
+    let Some(PnlInference { raw, pred }) = pnl_inference else {
         return BuyGate::BelowThreshold;
     };
     if raw < SIM_BUY_THRESHOLD {
         return BuyGate::BelowThreshold;
     }
-    let pred = calibration_pnl.map_or(raw, |c| c.apply(raw));
     let kelly_gain = kelly_gain_ratio(entry_prob);
     let kelly_loss = kelly_loss_ratio(entry_prob);
     let kelly_f = kelly_fraction(pred as f64, kelly_gain, kelly_loss);
@@ -800,8 +867,7 @@ pub(crate) fn buy_gate(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_open_position(
     frame: &XFrame<SIZE>,
-    booster_pnl: &Booster,
-    calibration_pnl: Option<&Calibration>,
+    pnl_inference: Option<PnlInference>,
     positions: &mut Vec<OpenPosition>,
     stats: &mut SideStats,
     bankroll: f64,
@@ -815,11 +881,16 @@ pub(crate) fn try_open_position(
     //
     // Нет `currency_implied_prob` — `buy_gate` всё равно вернул бы
     // `BelowThreshold` (no-op здесь, `diag_sum_*` не трогаются), так
-    // что коротко замыкаем до booster-инференса и пропускаем тик.
+    // что коротко замыкаем без обращения к gate и пропускаем тик.
+    //
+    // `pnl_inference` пробрасывается caller'ом (см. [`compute_pnl_inference`])
+    // — это позволяет real_sim считать booster + калибровку ОДИН раз вне локов
+    // и переиспользовать здесь, вместо повторного `predict_frame` /
+    // `Calibration::apply` под write-локом.
     let Some(entry_prob) = frame.currency_implied_prob else {
         return false;
     };
-    match buy_gate(frame, booster_pnl, calibration_pnl, bankroll) {
+    match buy_gate(frame, pnl_inference, bankroll) {
         BuyGate::LateEntry => {
             stats.late_entry_skips += 1;
             false
@@ -1136,8 +1207,7 @@ pub(crate) fn manage_positions(
     frame: &XFrame<SIZE>,
     is_last: bool,
     won: Option<bool>,
-    booster_resolution: Option<&Booster>,
-    calibration_resolution: Option<&Calibration>,
+    p_win_now: Option<f64>,
     stats: &mut SideStats,
     bankroll: &mut f64,
     strict_book: Option<&StrictBook>,
@@ -1145,26 +1215,13 @@ pub(crate) fn manage_positions(
 ) -> bool {
     for pos in positions.iter_mut() { pos.frames_held += 1; }
 
-    // `predict_frame` resolution-модели стоит дёшево относительно HTTP,
-    // но всё же это booster-инференс по полному вектору фич. Считаем
-    // **один раз на кадр**, переиспользуем для всех позиций этой
-    // стороны (на практике 0–1 одновременно, но если правила входа
-    // станут более либеральными — экономия линейная по числу позиций).
-    //
-    // Считаем только если действительно нужно: hold-zone — единственная
-    // ветка, где `sell_gate` смотрит на `p_win_now`. Иначе — `None`
-    // (EV-exit и EMA-апдейт всё равно не сработают вне зоны).
-    let in_hold_zone = frame.event_remaining_ms > 0
-        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
-    let p_win_now: Option<f64> = if in_hold_zone && !positions.is_empty() {
-        booster_resolution.and_then(|b| {
-            predict_frame(b, frame, RESOLUTION_MAX_LAG).map(|raw| {
-                calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
-            })
-        })
-    } else {
-        None
-    };
+    // `p_win_now` приходит уже посчитанным caller'ом (см. [`compute_p_win_now`]).
+    // Это resolution-инференс booster + калибровка — единственный «дорогой»
+    // шаг decision-tree продаж. Вынос наверх по стэку нужен в первую очередь
+    // для real_sim: predict выполняется ВНЕ write-локов, не блокируя 4×N
+    // параллельных воркеров. На history_sim семантика та же (вызов раз на
+    // кадр, переиспользуется для всех позиций стороны), просто сама арифметика
+    // живёт в caller'е, а не здесь.
 
     let mut sold = false;
     let mut remaining: Vec<OpenPosition> = Vec::new();
@@ -1500,7 +1557,7 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
     );
 }
 
-pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
+pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account) {
     let total_trades = sim_stats.total_trades();
     if total_trades == 0 {
         tee_println!(
@@ -1520,7 +1577,7 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
     let total_fees = sim_stats.total_fees();
     let win_rate = total_wins as f64 / total_trades as f64 * 100.0;
     let avg_pnl = total_pnl / total_trades as f64;
-    let roi_pct = (sim_stats.bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
+    let roi_pct = (account.bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
 
     let total_losses = sim_stats.total_losses();
     tee_println!(
@@ -1532,7 +1589,7 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats) {
     );
     tee_println!(
         "[sim]   bankroll: {:.2}$ (start={INITIAL_BANKROLL}$) ROI={:+.2}% max_drawdown={:.2}%",
-        sim_stats.bankroll, roi_pct, sim_stats.max_drawdown_pct,
+        account.bankroll, roi_pct, account.max_drawdown_pct,
     );
 
     print_side_stats(tag, "UP",   &sim_stats.up);

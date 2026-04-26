@@ -37,10 +37,12 @@
 //!   независимых GET `/book` каждый воркер шлёт `BookRequest` в общий
 //!   `mpsc` и ждёт ответ через персональный `oneshot`.
 
+use crate::account::{Account, SharedAccount};
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
-    BuyGate, any_position_would_sell, buy_gate, load_booster, manage_positions, print_sim_stats,
-    try_open_position, BookLevel, OpenPosition, SimStats, StrictBook,
+    BuyGate, any_position_would_sell, buy_gate, compute_p_win_now, compute_pnl_inference,
+    load_booster, manage_positions, print_sim_stats, try_open_position, BookLevel, OpenPosition,
+    SimStats, StrictBook,
 };
 use crate::project_manager::{LaneFrame, ProjectManager};
 use crate::train_mode::{load_calibration, Calibration};
@@ -126,24 +128,22 @@ impl LaneFrameChannels {
 }
 
 /// Разделяемое состояние симуляции: 2 [`SimStats`] (один на интервал,
-/// банкролл/drawdown общий для UP+DOWN внутри интервала) и 4 списка открытых
-/// позиций. Структуры и поля — из [`crate::history_sim`], не дублируем.
-/// Плюс под-структура [`LaneFrameChannels`] — push-канал от `ProjectManager`:
+/// per-interval счётчики trades/wins/...) + push-канал от `ProjectManager`:
 /// `build_frames_from_buffer_lane_once(lane=0)` шлёт сюда `LaneFrame` каждый
 /// стабильный тик. Сам state живёт внутри
 /// [`crate::project_manager::ProjectManager::real_sim_state`] (`Arc<RwLock<_>>`).
+///
+/// **Денежная** часть состояния (bankroll, drawdown, last_prob,
+/// открытые позиции) живёт в [`crate::account::Account`], который
+/// шарится между ВСЕМИ `ProjectManager`-ами процесса. Это нужно для
+/// корректного Kelly-сайзинга и mark-to-market по единому портфелю
+/// поверх всех валют и всех 4 лейнов: 4×N параллельных воркеров видят
+/// общий `bankroll` и общую сумму `entry_cost` всех позиций.
 pub struct RealSimState {
-    /// Агрегированная статистика по интервалам (bankroll/drawdown/up-down счётчики).
-    /// Банкролл общий для UP+DOWN одного интервала — поэтому ключ это
-    /// [`XFrameIntervalKind`], а side-счётчики лежат внутри `SimStats.up/down`.
-    /// Карта инициализируется оба ключа сразу, воркеры делают `get_mut(&kind).unwrap()`.
+    /// Агрегированная статистика по интервалам (per-interval счётчики).
+    /// Карта инициализируется оба ключа сразу, воркеры делают
+    /// `get_mut(&kind).unwrap()`.
     pub stats: HashMap<XFrameIntervalKind, SimStats>,
-    /// Открытые позиции 4 лейнов `(интервал, сторона)` в одной карте.
-    /// Ключи совпадают с [`LANE_FRAME_ROUTES`] и [`LaneFrameChannels::channels`],
-    /// карта инициализируется полным набором пустых `Vec`, поэтому
-    /// воркеры могут безопасно делать `.get_mut(&key).unwrap()` без
-    /// вставки «по необходимости».
-    pub positions: HashMap<(XFrameIntervalKind, CurrencyUpDownOutcome), Vec<OpenPosition>>,
     pub lane_frame_channels: LaneFrameChannels,
 }
 
@@ -152,13 +152,8 @@ impl RealSimState {
         let mut stats = HashMap::with_capacity(2);
         stats.insert(XFrameIntervalKind::FiveMin, SimStats::new());
         stats.insert(XFrameIntervalKind::FifteenMin, SimStats::new());
-        let mut positions = HashMap::with_capacity(LANE_FRAME_ROUTES.len());
-        for key in LANE_FRAME_ROUTES {
-            positions.insert(key, Vec::new());
-        }
         Self {
             stats,
-            positions,
             lane_frame_channels: LaneFrameChannels::new(),
         }
     }
@@ -193,7 +188,8 @@ fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
 /// (5m × up/down, 15m × up/down). Каждый таск слушает свой `mpsc::Receiver`
 /// из [`LaneFrameChannels`] и обрабатывает кадр в [`tick_once`].
 pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
-    let currency = project_manager.currency.as_str().to_string();
+    let currency_arc = project_manager.currency.clone();
+    let currency = currency_arc.as_str().to_string();
     let version_path = latest_version_path(&currency)
         .ok_or_else(|| anyhow!(
             "нет ни одной версии в xframes/{currency}/ — сначала соберите данные (STATUS=default) и обучите модели (STATUS=train)"
@@ -210,7 +206,17 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
     // живёт внутри `ProjectManager` и создаётся прямо в `ProjectManager::new`.
     // Воркеры и фанаут 1s-кадров делят один и тот же `Arc<RwLock<RealSimState>>`.
     let state = project_manager.real_sim_state.clone();
+    let account = project_manager.account.clone();
     let channels = state.read().await.lane_frame_channels.channels.clone();
+
+    // Пред-инициализируем `Account.positions` для 4 лейнов этой валюты,
+    // чтобы в `tick_once` можно было делать `get_mut(&key).unwrap()`.
+    // Идемпотентно: повторные запуски `run_real_sim` для одной и той же
+    // валюты не затрут уже накопленные позиции.
+    account
+        .write()
+        .await
+        .register_currency_lanes(&currency, &LANE_FRAME_ROUTES);
 
     // Один координатор на все 4 воркера: батчит параллельные запросы
     // ордербуков в один `clob.order_books(&[...])`. Каждый воркер получает
@@ -247,6 +253,8 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
         spawn_side_worker(
             book_tx.clone(),
             state.clone(),
+            account.clone(),
+            currency_arc.clone(),
             interval_kind,
             side,
             models,
@@ -263,6 +271,8 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
 fn spawn_side_worker(
     book_tx: mpsc::Sender<BookRequest>,
     state: Arc<RwLock<RealSimState>>,
+    account: SharedAccount,
+    currency: Arc<String>,
     interval_kind: XFrameIntervalKind,
     side: CurrencyUpDownOutcome,
     models: SideModels,
@@ -280,6 +290,8 @@ fn spawn_side_worker(
             if let Err(err) = tick_once(
                 &book_tx,
                 &state,
+                &account,
+                currency.as_str(),
                 interval_kind,
                 side,
                 &models,
@@ -300,6 +312,8 @@ fn spawn_side_worker(
 async fn tick_once(
     book_tx: &mpsc::Sender<BookRequest>,
     state: &Arc<RwLock<RealSimState>>,
+    account: &SharedAccount,
+    currency: &str,
     interval_kind: XFrameIntervalKind,
     side: CurrencyUpDownOutcome,
     models: &SideModels,
@@ -313,29 +327,71 @@ async fn tick_once(
         frame,
     } = lane_frame;
 
-    let Some(currency_implied_prob) = frame.currency_implied_prob else {
-        return Ok(());
-    };
-
+    // `event_over` и `market_changed` считаем до early-return, т.к. они нужны
+    // и для bookkeeping-апдейта `events` ниже (а тот — обязан произойти даже
+    // в кадрах без `currency_implied_prob`, иначе целые маркеты могут
+    // «пропасть» из счётчика, если в их первом фрейме prob ещё не
+    // подоспела).
+    //
     // Событие завершилось, как только `event_remaining_ms ≤ 0`
     // (в `xframe.rs` значение всегда рассчитывается как `end_ms - now`,
     // сентинел `-1` не используется). В этом случае `sell_gate` вместо
     // TP/SL/EV закрывает все позиции по бинарной выплате CTF ($1/шер
-    // победителю, $0 проигравшему — без комиссии). Победителя
-    // определяем по `currency_implied_prob ≥ 0.5` (в реальности CLOB
-    // за секунды до резолюции уже схлопывается к 0/1) и только при
-    // `event_over` — пока событие идёт, исход неизвестен, `won = None`
-    // честно отражает это, а `sell_gate` на этой ветке к `won` вообще
-    // не обращается.
+    // победителю, $0 проигравшему — без комиссии).
     let event_over = frame.event_remaining_ms <= 0;
-    let won: Option<bool> = event_over.then(|| currency_implied_prob >= 0.5);
     let market_changed = last_market_id.as_deref() != Some(market_id.as_str());
-    let other_side = match side {
-        CurrencyUpDownOutcome::Up => CurrencyUpDownOutcome::Down,
-        CurrencyUpDownOutcome::Down => CurrencyUpDownOutcome::Up,
+
+    // ── Bookkeeping #1: bump `events` ДО early-return ─────────────────────────
+    // `events` отражает «сколько маркетов мы наблюдали для этого интервала».
+    // Делаем bump на смене `market_id`, ДО проверки `currency_implied_prob`:
+    // иначе маркет, у которого первый прилетевший кадр случайно пришёл с
+    // `prob=None` (типично сразу после ws-reconnect), просто не попадёт в
+    // счётчик. Сторона — только `Up`, потому что бинарный маркет общий
+    // для UP/DOWN-токенов: бамп с обоих сторон дал бы 2× event'ов.
+    //
+    // `last_market_id` обновляем СРАЗУ (и здесь, и на early-return): пара
+    // `events ↔ last_market_id` обязана быть атомарной по отношению к
+    // `market_id`, иначе на следующем тике `market_changed` снова даст true
+    // и мы зальём событие повторно.
+    if market_changed && side == CurrencyUpDownOutcome::Up {
+        state
+            .write()
+            .await
+            .stats
+            .get_mut(&interval_kind)
+            .expect("stats map initialized for both intervals")
+            .events += 1;
+    }
+
+    let Some(currency_implied_prob) = frame.currency_implied_prob else {
+        return Ok(());
     };
 
-    // ── Снапшот состояния для гейтов и mark-to-market ────────────────────────
+    // Победителя определяем по `currency_implied_prob ≥ 0.5` (в реальности
+    // CLOB за секунды до резолюции уже схлопывается к 0/1) и только при
+    // `event_over` — пока событие идёт, исход неизвестен, `won = None`
+    // честно отражает это, а `sell_gate` на этой ветке к `won` вообще не
+    // обращается.
+    let won: Option<bool> = event_over.then(|| currency_implied_prob >= 0.5);
+
+    let lane_key = (currency.to_string(), interval_kind, side);
+
+    // ── Bookkeeping #2: записать last_prob в общий реестр Account ─────────────
+    // Делаем это **сразу** после того как узнали `currency_implied_prob`, в
+    // СОБСТВЕННОМ узком `account.write()` — параллельные воркеры других
+    // лейнов, висящие на `account.read()` для своего snapshot'а, тут же
+    // увидят свежее значение в своих mark-to-market. Если оставить запись
+    // в большой общий `account.write()` для торговли, она будет видна
+    // только после HTTP-задержки (десятки ms на ордербук), что замусоривает
+    // mark-to-market параллельных лейнов «старой» prob.
+    {
+        let mut account_guard = account.write().await;
+        account_guard
+            .last_prob
+            .insert(lane_key.clone(), currency_implied_prob);
+    }
+
+    // ── Снапшот состояния для гейтов ──────────────────────────────────────────
     // * `has_positions` — нужно ли **звать** `manage_positions`. Даже если
     //   ни одна позиция не закрывается по WS, вызов нужен для обновления
     //   `frames_held`/`p_win_ema` и, на `event_over`, для Resolution (которой
@@ -350,64 +406,63 @@ async fn tick_once(
     //   HTTP не делаем; `manage_positions` отработает на WS-fallback для
     //   одного только bookkeeping'а (никаких закрытий не сработает,
     //   предикат симметричен фактическим условиям из `manage_positions`).
-    // * `available_bankroll_pre` — доступный для НОВОГО входа капитал,
-    //   `bankroll − same_side_locked − cross_side_locked`. Без вычитания
-    //   уже занятой entry_cost с обеих сторон ОДНОГО интервала Kelly
-    //   рос бы поверх той же базы и допускал бы 4×MAX_BET_FRACTION
-    //   суммарной экспозиции (4 лейна, общий `bankroll`).
-    // * `cross_side_value_snap` — стоимость позиций ДРУГОЙ стороны при
-    //   `prob_other ≈ 1 − prob_this` (CLOB-арбитраж UP+DOWN ≈ 1).
-    //   Снимок, потому что внутри write-блока этой стороны конкурентный
-    //   тик другой стороны держит свой write-lock; стейт уже не доступен
-    //   через тот же guard. Метрика mark-to-market — приближённая, но
-    //   monotonic-консистентная между тиками двух сторон.
-    let other_prob = (1.0 - currency_implied_prob).clamp(0.0, 1.0);
-    let (
-        has_positions,
-        needs_sell,
-        available_bankroll_pre,
-        cross_side_locked,
-        cross_side_value_snap,
-    ) = {
-        let guard = state.read().await;
-        let stats = guard
-            .stats
-            .get(&interval_kind)
-            .expect("stats map initialized for both intervals");
-        let this_positions = guard
+    // * `available_bankroll_pre` — доступный для НОВОГО входа капитал:
+    //   `account.bankroll − Σ(entry_cost) по ВСЕМ лейнам ВСЕХ валют` —
+    //   `Account.positions` теперь портфельный, и Kelly видит экспозицию
+    //   на ОБЩИЙ bankroll сразу со всех PM. Без этой агрегации `4×N`
+    //   параллельных воркеров (4 лейна × N валют) раздули бы суммарную
+    //   экспозицию до `4N × MAX_BET_FRACTION` исходного капитала.
+    let (has_positions, needs_sell, available_bankroll_pre) = {
+        let account_guard = account.read().await;
+        let this_positions = account_guard
             .positions
-            .get(&(interval_kind, side))
-            .expect("positions map initialized for all LANE_FRAME_ROUTES");
-        let other_positions = guard
+            .get(&lane_key)
+            .expect("Account.positions pre-populated by run_real_sim");
+        let total_locked: f64 = account_guard
             .positions
-            .get(&(interval_kind, other_side))
-            .expect("positions map initialized for all LANE_FRAME_ROUTES");
-        let same_locked: f64 = this_positions.iter().map(|p| p.entry_cost).sum();
-        let other_locked: f64 = other_positions.iter().map(|p| p.entry_cost).sum();
-        let other_value: f64 = other_positions
-            .iter()
-            .map(|p| p.shares_held * other_prob)
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|p| p.entry_cost)
             .sum();
-        let available = (stats.bankroll - same_locked - other_locked).max(0.0);
+        let available = (account_guard.bankroll - total_locked).max(0.0);
         (
             !this_positions.is_empty(),
             any_position_would_sell(this_positions, &frame, event_over),
             available,
-            other_locked,
-            other_value,
         )
     };
 
+    // ── Booster-инференсы — СТРОГО ВНЕ write-локов ────────────────────────────
+    // Дорогая часть decision-tree (XGBoost predict + калибровка) не зависит от
+    // `state`/`account`: входы — `frame` и иммутабельные `&Booster`/
+    // `Option<&Calibration>` из `RealSimWorkerCfg`. Считаем ОДИН раз за тик и
+    // прокидываем готовые значения и в дешёвый `buy_gate`-предикат для
+    // `may_open` (см. ниже), и в `try_open_position` / `manage_positions` под
+    // write-локами. Без этого:
+    //   * `predict_frame` для PnL-модели запускался ДВА раза за тик (один раз
+    //     здесь под `may_open`, второй — в `try_open_position` внутри
+    //     `state.write() + account.write()`);
+    //   * `predict_frame` resolution-модели запускался под теми же локами
+    //     внутри `manage_positions`.
+    // На 4×N параллельных воркеров это материальная задержка критсекции —
+    // выносим наружу.
+    let pnl_inference = compute_pnl_inference(
+        &frame,
+        &models.booster_pnl,
+        models.calibration_pnl.as_ref(),
+    );
+    let p_win_now = compute_p_win_now(
+        &frame,
+        models.booster_resolution.as_deref(),
+        models.calibration_resolution.as_ref(),
+        has_positions,
+    );
+
     // `buy_gate` сам отказывает, если событие уже завершилось или до резолюции;
-    // `available_bankroll_pre` уже учитывает экспозицию обеих сторон, так что
-    // Kelly не сможет раздуть позицию поверх занятого капитала.
+    // `available_bankroll_pre` уже учитывает экспозицию всех лейнов всех валют,
+    // так что Kelly не сможет раздуть позицию поверх занятого капитала.
     let may_open = matches!(
-        buy_gate(
-            &frame,
-            &models.booster_pnl,
-            models.calibration_pnl.as_ref(),
-            available_bankroll_pre,
-        ),
+        buy_gate(&frame, pnl_inference, available_bankroll_pre),
         BuyGate::Proceed { .. }
     );
     let needs_http = needs_sell || may_open;
@@ -441,120 +496,168 @@ async fn tick_once(
         None => false,
     };
 
-    let mut guard = state.write().await;
-
-    // Смена активного маркета для этого `(интервал, сторона)` — bump `events`
-    // один раз на интервал (только таск `Up`: один polymarket market на пару).
-    if market_changed && side == CurrencyUpDownOutcome::Up {
-        guard
-            .stats
-            .get_mut(&interval_kind)
-            .expect("stats map initialized for both intervals")
-            .events += 1;
-    }
-
-    // ── Торговая часть ────────────────────────────────────────────────────────
-    // «Купили/продали» получаем напрямую из возвратов `manage_positions` /
-    // `try_open_position` — никакого до/после диффа `stats.trades` /
-    // `positions.len()` (buy+sell за один тик оставит `len` тем же).
+    // ── Торговля + Mark-to-market под write-локами ────────────────────────────
+    // Лок-порядок: state.write() → account.write(). Никогда наоборот, иначе
+    // 4×N параллельных воркеров (4 лейна × N валют) могут зайти в дедлок.
+    // Bookkeeping (`events` bump и `last_prob` insert) уже сделан выше в
+    // отдельных узких локах — здесь только торговля и MtM.
+    //
+    // Локи держим минимальное время:
+    //   * `state_guard` дропаем СРАЗУ после трейдинга — MtM использует
+    //     только `Account`, и держать там state.write() — значит зря
+    //     блокировать `events`-bump параллельных воркеров.
+    //   * `account_guard` живёт до конца блока, после чего тоже дропается.
+    //   * Печать (`print_sim_stats`) выполняется уже под READ-локами вне
+    //     этого блока — `tee_println!` может блокироваться на stdout/файле,
+    //     держать там write — большой штраф для других воркеров.
     let mut sold = false;
     let mut bought = false;
-    if has_positions || may_open {
-        // Destructure `RealSimState` за одну операцию — получаем независимые
-        // `&mut` к каждому полю (split borrow `stats` и `positions` —
-        // разные поля одной структуры), и только после этого выбираем
-        // по ключам конкретные `SimStats` и `Vec<OpenPosition>`.
-        let RealSimState {
-            stats,
-            positions,
-            ..
-        } = &mut *guard;
-
-        let stats: &mut SimStats = stats
-            .get_mut(&interval_kind)
-            .expect("stats map initialized for both intervals");
-        let positions: &mut Vec<OpenPosition> = positions
-            .get_mut(&(interval_kind, side))
-            .expect("positions map initialized for all LANE_FRAME_ROUTES");
-        let side_stats = match side {
-            CurrencyUpDownOutcome::Up => &mut stats.up,
-            CurrencyUpDownOutcome::Down => &mut stats.down,
-        };
-
-        // 1) Жизненный цикл уже открытых позиций: инкремент `frames_held`,
-        //    EMA `p_win`, проверка TP/SL/Timeout/Resolution/EV. Вызываем
-        //    **всегда**, когда позиции есть, — даже без HTTP: Resolution
-        //    (`event_remaining_ms ≤ 0`) исполняется без `strict_book`, а
-        //    «тихий» тик сам ничего не закроет по WS-fallback, т.к.
-        //    предикат `needs_sell` симметричен условиям `manage_positions`.
-        //    `strict_book.as_ref()` будет `Some` только при `needs_http=true`.
-        if has_positions {
-            sold = manage_positions(
-                positions,
-                &frame,
-                event_over,
-                won,
-                models.booster_resolution.as_deref(),
-                models.calibration_resolution.as_ref(),
-                side_stats,
-                &mut stats.bankroll,
-                strict_book.as_ref(),
-                tag,
-            );
-        }
-
-        // 2) BUY: пропускаем, если WS отстаёт. На `event_over` `may_open`
-        //    уже `false` (внутри `buy_gate` сработал `LateEntry`).
-        //    Пересчитываем `available_bankroll`: `manage_positions` мог
-        //    закрыть нашу позицию — освободившийся entry_cost снова
-        //    доступен Kelly. `cross_side_locked` зафиксирован снапшотом
-        //    в read-блоке (другая сторона внутри ЭТОГО тика не меняется).
-        if may_open && !ws_lagging {
-            let same_locked_post: f64 = positions.iter().map(|p| p.entry_cost).sum();
-            let available_bankroll_post =
-                (stats.bankroll - same_locked_post - cross_side_locked).max(0.0);
-            bought = try_open_position(
-                &frame,
-                &models.booster_pnl,
-                models.calibration_pnl.as_ref(),
-                positions,
-                side_stats,
-                available_bankroll_post,
-                strict_book.as_ref(),
-                tag,
-            );
-        }
-    }
-
-    // Mark-to-market equity drawdown — на КАЖДОМ тике, не только на сделке.
-    // Между open и close реализованный bankroll не двигается, и без
-    // mark-to-market `max_drawdown_pct` системно занижен на длинных
-    // удержаниях, уходящих в красное и закрывающихся через Resolution.
-    // Считаем `equity = bankroll + Σ(this × prob_this) + Σ(other × prob_other)`,
-    // где `prob_other ≈ 1 − prob_this` (CLOB-арбитраж).
     {
-        let RealSimState {
-            stats: stats_map,
-            positions: positions_map,
-            ..
-        } = &mut *guard;
-        let stats: &mut SimStats = stats_map
-            .get_mut(&interval_kind)
-            .expect("stats map initialized for both intervals");
-        let this_positions = positions_map
-            .get(&(interval_kind, side))
-            .expect("positions map initialized for all LANE_FRAME_ROUTES");
-        let this_value: f64 = this_positions
-            .iter()
-            .map(|p| p.shares_held * currency_implied_prob)
-            .sum();
-        let equity = stats.bankroll + this_value + cross_side_value_snap;
-        stats.update_drawdown(equity);
+        let mut state_guard = state.write().await;
+        let mut account_guard = account.write().await;
+
+        // ── Фаза 1: торговля ──────────────────────────────────────────────────
+        // «Купили/продали» получаем напрямую из возвратов `manage_positions` /
+        // `try_open_position` — никакого до/после диффа `stats.trades` /
+        // `positions.len()` (buy+sell за один тик оставит `len` тем же).
+        if has_positions || may_open {
+            // Lock на чужие лейны (cross-lane locked) — это сумма по ВСЕМ
+            // лейнам ВСЕХ валют, кроме своего; считаем ДО split-borrow, пока
+            // `account_guard.positions` доступен только по `&`.
+            let cross_lanes_locked: f64 = account_guard
+                .positions
+                .iter()
+                .filter(|(k, _)| *k != &lane_key)
+                .flat_map(|(_, v)| v.iter())
+                .map(|p| p.entry_cost)
+                .sum();
+
+            // `stats` живёт в `RealSimState`, `bankroll`/`positions` — в
+            // `Account`. Берём split-borrow по обоим guard'ам сразу: это
+            // разные структуры за разными RwLock'ами, conflict'а нет.
+            let stats: &mut SimStats = state_guard
+                .stats
+                .get_mut(&interval_kind)
+                .expect("stats map initialized for both intervals");
+            let side_stats = match side {
+                CurrencyUpDownOutcome::Up => &mut stats.up,
+                CurrencyUpDownOutcome::Down => &mut stats.down,
+            };
+
+            let Account {
+                bankroll,
+                positions: account_positions,
+                ..
+            } = &mut *account_guard;
+            let this_positions: &mut Vec<OpenPosition> = account_positions
+                .get_mut(&lane_key)
+                .expect("Account.positions pre-populated by run_real_sim");
+
+            // 1) Жизненный цикл уже открытых позиций: инкремент `frames_held`,
+            //    EMA `p_win`, проверка TP/SL/Timeout/Resolution/EV. Вызываем
+            //    **всегда**, когда позиции есть, — даже без HTTP: Resolution
+            //    (`event_remaining_ms ≤ 0`) исполняется без `strict_book`, а
+            //    «тихий» тик сам ничего не закроет по WS-fallback, т.к.
+            //    предикат `needs_sell` симметричен условиям `manage_positions`.
+            //    `strict_book.as_ref()` будет `Some` только при `needs_http=true`.
+            if has_positions {
+                sold = manage_positions(
+                    this_positions,
+                    &frame,
+                    event_over,
+                    won,
+                    p_win_now,
+                    side_stats,
+                    bankroll,
+                    strict_book.as_ref(),
+                    tag,
+                );
+            }
+
+            // 2) BUY: пропускаем, если WS отстаёт. На `event_over` `may_open`
+            //    уже `false` (внутри `buy_gate` сработал `LateEntry`).
+            //    Пересчитываем `available_bankroll`: `manage_positions` мог
+            //    закрыть нашу позицию — освободившийся entry_cost снова
+            //    доступен Kelly. `cross_lanes_locked` зафиксирован снапшотом
+            //    выше (другие лейны/валюты внутри ЭТОГО account.write()-блока
+            //    не меняются — параллельные `tick_once` стоят на `account.write()`).
+            if may_open && !ws_lagging {
+                let same_locked_post: f64 = this_positions.iter().map(|p| p.entry_cost).sum();
+                let available_bankroll_post = (*bankroll - cross_lanes_locked - same_locked_post).max(0.0);
+                bought = try_open_position(
+                    &frame,
+                    pnl_inference,
+                    this_positions,
+                    side_stats,
+                    available_bankroll_post,
+                    strict_book.as_ref(),
+                    tag,
+                );
+            }
+        }
+
+        // `state_guard` больше не нужен — отпускаем явно ДО MtM, чтобы
+        // параллельные воркеры могли делать `events`-bump (`state.write()`)
+        // и читать `stats`, не дожидаясь нашего MtM по 4-N лейнам.
+        drop(state_guard);
+
+        // ── Фаза 2: Mark-to-market equity drawdown ────────────────────────────
+        // Считается на КАЖДОМ тике, не только на сделке. Между open и close
+        // реализованный bankroll не двигается, и без MtM `max_drawdown_pct`
+        // системно занижен на длинных удержаниях, уходящих в красное и
+        // закрывающихся через Resolution.
+        //
+        // Поскольку `bankroll`, `positions` и `last_prob` живут в одном
+        // `Account`, equity считается **истинно портфельный** — по всем
+        // валютам и всем 4 лейнам каждой:
+        //     equity = account.bankroll + Σ_(c,i,s) Σ_pos shares_held × prob[c,i,s]
+        // Для текущего лейна prob — свежий `currency_implied_prob` из кадра;
+        // для остальных — `account.last_prob[(c, i, s)]`, который обновляется
+        // в начале каждого `tick_once` соответствующего лейна. Если записи
+        // ещё нет (старт процесса) и при этом там уже есть позиции — берём
+        // `0.5` (нейтрально), но в штатной работе позиции открываются только
+        // ПОСЛЕ хотя бы одного `tick_once`, так что fallback почти не
+        // срабатывает.
+        let total_value: f64 = {
+            let Account {
+                positions: account_positions,
+                last_prob,
+                ..
+            } = &*account_guard;
+            account_positions
+                .iter()
+                .map(|((c, i, s), pos_vec)| {
+                    let prob = if c.as_str() == currency && *i == interval_kind && *s == side {
+                        currency_implied_prob
+                    } else {
+                        last_prob
+                            .get(&(c.clone(), *i, *s))
+                            .copied()
+                            .unwrap_or(0.5)
+                    };
+                    pos_vec.iter().map(|p| p.shares_held * prob).sum::<f64>()
+                })
+                .sum()
+        };
+        let equity = account_guard.bankroll + total_value;
+        account_guard.update_drawdown(equity);
+
+        // `account_guard` дропается на закрытии этого блока.
     }
 
-    // Если случилась buy или sell — печатаем полную статистику (1:1 с history_sim).
+    // ── Фаза 3: print on trade под READ-локами ────────────────────────────────
+    // Срабатывает только при реальной сделке (редко) и не блокирует
+    // параллельных писателей — `state.read()`/`account.read()` совместимы с
+    // другими читателями. Между дропом write-локов выше и этим блоком
+    // другой воркер мог успеть сделать свою сделку или MtM, поэтому печать
+    // отражает «текущее состояние», а не строгий снапшот сразу после нашей
+    // сделки. Для метрики мониторинга это допустимо; цена строгой
+    // консистентности — держать write-локи на медленном `tee_println!` —
+    // непропорционально велика.
     if bought || sold {
-        let stats = guard
+        let state_guard = state.read().await;
+        let account_guard = account.read().await;
+        let stats = state_guard
             .stats
             .get(&interval_kind)
             .expect("stats map initialized for both intervals");
@@ -569,7 +672,7 @@ async fn tick_once(
             "[real_sim] {tag}: {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
             current_timestamp_ms(),
         );
-        print_sim_stats(tag, stats);
+        print_sim_stats(tag, stats, &account_guard);
     }
 
     *last_market_id = Some(market_id);
