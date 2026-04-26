@@ -27,16 +27,14 @@
 use crate::account::Account;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
-use crate::tee_log::TEE_LOG;
 use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
     Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
 };
-use crate::xframe::{apply_side_symmetry, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
+use crate::xframe::{apply_side_symmetry, BookLevel, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println};
-use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::fs;
 use std::path::Path;
 use xgb::{Booster, DMatrix};
 
@@ -52,7 +50,7 @@ pub const KELLY_MULTIPLIER: f64 = 1.0;
 /// Максимальная доля банкролла на одну сделку.
 pub const MAX_BET_FRACTION: f64 = 0.10;
 /// Минимальный размер позиции в USDC (меньше — не торгуем).
-pub const MIN_POSITION_USD: f64 = 0.1;
+pub const MIN_POSITION_USD: f64 = 0.10;
 
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
 /// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
@@ -86,6 +84,47 @@ pub const EV_EXIT_MARGIN: f64 = 0.01;
 /// успевают сработать — вход вырождается в лотерею с уплатой taker-fee.
 /// Используется в [`buy_gate`] как ранний отказ под именем `LateEntry`.
 pub const MIN_ENTRY_REMAINING_MS: i64 = 15 * 1000;
+
+/// Максимально допустимое отклонение VWAP **strict-fill'а** от лучшей цены
+/// (L1) в долях. `0.02` = 2%: если для покупки за `position_size` USDC
+/// VWAP `(position_size / total_shares)` уходит больше чем на 2% выше
+/// лучшего ask — [`book_fill_buy_strict`] возвращает `None`, позиция не
+/// открывается. Симметрично для [`book_fill_sell_strict`]: VWAP продажи
+/// ниже best bid больше чем на 2% → `None`, продажа откладывается на
+/// следующий тик.
+///
+/// **Зачем**: в `real_sim` `StrictBook.asks`/`bids` — это **полная**
+/// лестница CLOB, не первые три уровня. Без cap'а Kelly мог бы
+/// «доедать» позицию L4–L20 на тонком маркете, выкупая шерсы на 5–20¢
+/// хуже mid и сжигая весь edge модели. Cap отсекает такие ситуации
+/// и оставляет позицию закрытой/неоткрытой до восстановления глубины.
+///
+/// Значение 2% выбрано как «хуже типичного спреда (≤ 10¢ → mid),
+/// но ещё в пределах сделок, где fee + slippage не съедают edge модели
+/// (`SIM_BUY_THRESHOLD = 0.6`, после калибровки edge ~ 1–3%)». На
+/// `history_sim`-пути cap не применяется (там `book_fill_buy`/`sell`
+/// без strict-режима).
+pub const MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
+
+/// Аварийный halt новых входов по mark-to-market drawdown (`Account::max_drawdown_pct`).
+/// `Some(pct)` — при `max_drawdown_pct ≥ pct` `try_open_position` отклоняет
+/// все новые позиции до конца жизни процесса (drawdown — историческая
+/// величина, не сбрасывается). `None` — kill-switch выключен.
+///
+/// **Что не трогает**: ведение/закрытие уже открытых позиций
+/// ([`manage_positions`], TP/SL/EV-exit/Timeout, резолюционный колбек).
+/// Выйти из позиции важнее, чем дождаться улучшения equity.
+///
+/// **Где проверяется**: только в `real_sim::tick_once` перед
+/// `try_open_position` — `history_sim` это offline-backtest, halt по
+/// drawdown'у искажал бы итоговую метрику модели.
+///
+/// Значение по умолчанию (30%) — точка, после которой Kelly-сайзинг
+/// на оставшемся капитале математически даёт ROI restoration ≥ 43%
+/// от текущего bankroll (1 / (1 − 0.30) − 1), что заведомо вне
+/// статпредсказуемости моделей такого типа: дальше «лезть в позиции»
+/// — это азартное усреднение в просадке, не торговля.
+pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
 
 // ─── Типы ─────────────────────────────────────────────────────────────────────
 
@@ -123,31 +162,59 @@ pub(crate) struct StrictBook {
     pub(crate) bids: Vec<BookLevel>,
     /// Уровни предложения (asks), лучший ask = первый.
     pub(crate) asks: Vec<BookLevel>,
-}
-
-/// Один уровень стакана: цена в probability-шкале `[0..1]` и размер в шерсах.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct BookLevel {
-    /// Цена уровня (probability, `0..1`).
-    pub(crate) price: f64,
-    /// Размер уровня в шерсах.
-    pub(crate) size: f64,
+    /// `OrderBookSummaryResponse.last_trade_price` Polymarket CLOB —
+    /// цена последней сделки по этому asset_id на момент HTTP-снимка.
+    /// Нужна, чтобы воспроизвести логику
+    /// [`crate::xframe::currency_implied_prob_polymarket_style`]:
+    /// при широком спреде (`> POLYMARKET_WIDE_SPREAD_USD = 10¢`) UI
+    /// Polymarket показывает не mid L1, а last trade. Без этого поля
+    /// HTTP-выведенная implied_prob систематически расходилась бы
+    /// с `XFrame.currency_implied_prob` (mid вместо last trade) на
+    /// тонких маркетах — а именно она используется как фича модели
+    /// и как oporная вероятность для Kelly-расчёта в `open_position`
+    /// и `sell_gate`. `None` если CLOB не вернул `last_trade_price`
+    /// (новый рынок без сделок).
+    pub(crate) last_trade_price: Option<f64>,
+    /// `OrderBookSummaryResponse.min_order_size` Polymarket CLOB —
+    /// **минимальный размер ордера в шерсах**, который маркет принимает
+    /// (статичный атрибут маркета). Используется в
+    /// [`book_fill_buy_strict`] / [`book_fill_sell_strict`]: если число
+    /// шерсов меньше `min_order_size` — strict-исполнение отказывает
+    /// (`None`), потому что в реальной торговле такой ордер CLOB
+    /// отклонил бы, а локальная бухгалтерия должна симметрично не
+    /// открывать/не закрывать позицию.
+    ///
+    /// **Не приходит из WS**: market WS-канал Polymarket публикует
+    /// только динамику (`book`, `price_change`, `tick_size_change`,
+    /// `last_trade_price`, `market_resolved`), а статика маркета
+    /// (`min_order_size`, `neg_risk`, фактический `tick_size` на
+    /// старте) живёт в HTTP CLOB. Поэтому `XFrame` это поле не
+    /// содержит — `history_sim` идёт через
+    /// `book_fill_buy`/`book_fill_sell` без min-проверки. На
+    /// `real_sim`-пути значение заполняется в [`crate::real_sim::parse_book_levels`]
+    /// из ответа `clob.order_books(&[...])`. `None` — CLOB не вернул
+    /// поле (теоретически не должно случаться, но защитно — пропускаем
+    /// проверку, чтобы не зарубить торговлю на пустом значении).
+    pub(crate) min_order_size: Option<f64>,
 }
 
 /// Эффективная `currency_implied_prob` для текущего тика.
 ///
 /// Если в тике передан HTTP-стакан ([`StrictBook`], только real_sim) —
-/// возвращаем mid лучшего bid/ask по нему (HTTP всегда свежее WS-кадра,
-/// и `frame.currency_implied_prob` может отстать на десятки ms из-за
-/// буфера WS / реконнекта). Иначе — `frame.currency_implied_prob` как было.
+/// считаем «отображаемую на UI Polymarket» вероятность по тем же
+/// правилам, что и WS-фича `XFrame.currency_implied_prob` (см.
+/// [`crate::xframe::currency_implied_prob_polymarket_style`]):
+/// при спреде `≤ 10¢` — mid L1, при широком — `last_trade_price`
+/// (с фоллбэком на mid, если last trade неизвестен). Это критично:
+/// `XFrame.currency_implied_prob` уходит в модель как фича и как
+/// «опорная цена» для Kelly. Если бы тут было «всегда mid», на тонких
+/// маркетах HTTP-prob и WS-prob систематически расходились бы — Kelly
+/// в `open_position` и delta в `sell_gate` начали бы считаться в
+/// другой шкале, чем та, на которой обучалась модель.
 ///
-/// Используется во всех местах, где раньше прямой доступ к
-/// `frame.currency_implied_prob` определял решение о входе/выходе и
-/// размер позиции (Kelly): `buy_gate`, `try_open_position`, `sell_gate`,
-/// `open_position`. На `history_sim`-пути `strict_book = None` всегда —
-/// поведение совпадает с прежним. На `real_sim`-пути strict_book
-/// доступен в `try_open_position`/`manage_positions`/`sell_gate` через
-/// один и тот же `Option<&StrictBook>`-параметр.
+/// HTTP всё равно свежее WS-кадра (нет буфера/реконнекта), поэтому
+/// при наличии strict_book берём именно его. Иначе — `frame.currency_implied_prob`
+/// как было. На `history_sim`-пути `strict_book = None` всегда.
 pub(crate) fn effective_implied_prob(
     frame: &XFrame<SIZE>,
     strict_book: Option<&StrictBook>,
@@ -163,11 +230,17 @@ pub(crate) fn effective_implied_prob(
             .iter()
             .find(|l| l.price > 0.0 && l.size > 0.0)
             .map(|l| l.price);
-        match (best_bid, best_ask) {
-            (Some(b), Some(a)) => return Some(((b + a) / 2.0).clamp(0.001, 0.999)),
-            (Some(b), None) => return Some(b.clamp(0.001, 0.999)),
-            (None, Some(a)) => return Some(a.clamp(0.001, 0.999)),
-            (None, None) => {}
+        let spread = match (best_bid, best_ask) {
+            (Some(b), Some(a)) => Some((a - b).max(0.0)),
+            _ => None,
+        };
+        if let Some(p) = crate::xframe::currency_implied_prob_polymarket_style(
+            best_bid,
+            best_ask,
+            spread,
+            book.last_trade_price,
+        ) {
+            return Some(p.clamp(0.001, 0.999));
         }
     }
     frame.currency_implied_prob
@@ -175,10 +248,26 @@ pub(crate) fn effective_implied_prob(
 
 /// Строгая покупка `position_size` USDC по `asks` [`StrictBook`] без fallback.
 ///
-/// Возвращает `Some((vwap, total_shares))` если удалось полностью заполнить
-/// `position_size` за счёт фактических уровней стакана. Если суммарной
-/// ликвидности не хватает (или `asks` пуст) — возвращает `None`: позиция
-/// не должна открываться.
+/// Возвращает `Some((vwap, total_shares))`, если удалось полностью заполнить
+/// `position_size` фактическими уровнями стакана **и** выполнены оба
+/// инвариативных условия живой торговли:
+///
+/// 1. **Slippage cap** ([`MAX_SLIPPAGE_FROM_L1_PCT`]): VWAP не должен
+///    отклоняться от лучшего ask больше, чем на `MAX_SLIPPAGE_FROM_L1_PCT`.
+///    На полной лестнице CLOB без cap'а Kelly мог бы доедать L4–L20 на
+///    тонком маркете и платить на 5–20¢ выше mid — это сжигает edge
+///    модели и в `real_sim` представляет реальный финансовый риск.
+/// 2. **`min_order_size`** (`StrictBook.min_order_size`, статичный атрибут
+///    маркета из `OrderBookSummaryResponse.min_order_size`): итоговое
+///    `total_shares` не должно быть меньше этого значения. Иначе CLOB
+///    отклонил бы ордер, а локальная бухгалтерия зеркалом должна не
+///    создавать «фантомную» позицию.
+///
+/// На любом из этих отказов возвращаем `None` — позиция не открывается,
+/// `try_open_position` инкрементирует `kelly_strict_buy_skips` и
+/// печатает skip-лог. Если `book.min_order_size = None` (CLOB не вернул
+/// поле) — проверка `min_order_size` пропускается; защитный fallback,
+/// чтобы случайно не зарубить торговлю при отсутствии данных.
 pub(crate) fn book_fill_buy_strict(
     book: &StrictBook,
     position_size: f64,
@@ -186,6 +275,11 @@ pub(crate) fn book_fill_buy_strict(
     if position_size <= 0.0 {
         return None;
     }
+    let best_ask = book
+        .asks
+        .iter()
+        .find(|l| l.price > 0.0 && l.size > 0.0)
+        .map(|l| l.price)?;
     let mut remaining_usdc = position_size;
     let mut total_shares = 0.0_f64;
     for level in &book.asks {
@@ -206,17 +300,51 @@ pub(crate) fn book_fill_buy_strict(
         return None;
     }
     let vwap = position_size / total_shares;
+    // Slippage cap: VWAP относительно best ask. Покупка тейкером
+    // **выше** best ask — это и есть проскальзывание; считаем по `vwap`,
+    // не по последнему сожранному уровню, потому что fee/EV-расчёты
+    // ниже по стеку идут от VWAP.
+    if (vwap - best_ask) / best_ask > MAX_SLIPPAGE_FROM_L1_PCT {
+        return None;
+    }
+    if let Some(min) = book.min_order_size {
+        if total_shares < min {
+            return None;
+        }
+    }
     Some((vwap, total_shares))
 }
 
 /// Строгая продажа `shares_to_sell` по `bids` [`StrictBook`] без fallback.
 ///
 /// Возвращает `Some(gross_usdc)` (до вычета taker-fee), если ликвидности
-/// достаточно, иначе `None`.
+/// достаточно **и** выполнены те же инвариантные условия живой торговли,
+/// что у [`book_fill_buy_strict`]:
+///
+/// 1. **Slippage cap** ([`MAX_SLIPPAGE_FROM_L1_PCT`]): VWAP продажи
+///    `(gross_usdc / shares_to_sell)` не должен быть ниже best bid
+///    больше, чем на `MAX_SLIPPAGE_FROM_L1_PCT`. Иначе — `None`,
+///    `manage_positions` оставит позицию открытой и попробует
+///    повторно на следующем тике (`kelly_strict_sell_skips++`).
+/// 2. **`min_order_size`**: `shares_to_sell` < `min_order_size` →
+///    `None`, ровно по той же причине, что у buy: ордер CLOB бы
+///    отклонил.
+///
+/// Если `book.min_order_size = None` — проверка пропускается.
 pub(crate) fn book_fill_sell_strict(book: &StrictBook, shares_to_sell: f64) -> Option<f64> {
     if shares_to_sell <= 0.0 {
         return Some(0.0);
     }
+    if let Some(min) = book.min_order_size {
+        if shares_to_sell < min {
+            return None;
+        }
+    }
+    let best_bid = book
+        .bids
+        .iter()
+        .find(|l| l.price > 0.0 && l.size > 0.0)
+        .map(|l| l.price)?;
     let mut remaining = shares_to_sell;
     let mut total_usdc = 0.0_f64;
     for level in &book.bids {
@@ -233,6 +361,10 @@ pub(crate) fn book_fill_sell_strict(book: &StrictBook, shares_to_sell: f64) -> O
         }
     }
     if remaining > 1e-9 {
+        return None;
+    }
+    let vwap = total_usdc / shares_to_sell;
+    if (best_bid - vwap) / best_bid > MAX_SLIPPAGE_FROM_L1_PCT {
         return None;
     }
     Some(total_usdc)
@@ -455,13 +587,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
         anyhow::bail!("Папка xframes/ не найдена — сначала соберите данные (STATUS=default)");
     }
 
-    let log_path = xframes_root.join("last_history_sim.txt");
-    {
-        let file = File::create(&log_path)?;
-        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
-    tee_println!("[sim] лог пишется в {}", log_path.display());
+    crate::tee_log::init_tee_log_file(&xframes_root.join("last_history_sim.txt"), "sim")?;
 
     for currency_path in fs_sorted_dirs(xframes_root)? {
         let currency = dir_name(&currency_path);
@@ -594,12 +720,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
         }
     }
 
-    {
-        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
-        }
-    }
+    crate::tee_log::finish_tee_log();
 
     Ok(())
 }
@@ -700,19 +821,20 @@ fn simulate_event(
     // сторон одним проходом — точно так же, как async-обёртка делает
     // в real_sim после колбека `xframe_dump`.
     if let Some(market_id) = market_id_opt {
+        // `resolve_pending_market_sync` всегда печатает
+        // `[resolve]`-строки через `tee_println!` (в файл
+        // `xframes/last_history_sim.txt`). Раньше тут стоял `log=false`,
+        // чтобы не забивать stdout history_sim'а сотнями маркетов;
+        // сейчас логи идут в файл, в stdout всё равно дублируются —
+        // но трассировка per-market PnL критичнее, чем компактный
+        // вывод (агрегаты `print_sim_stats` показывают ИТОГ, но не
+        // отдельные win/loss-сделки, по которым он сложился).
         account.resolve_pending_market_sync(
             sim_stats,
             currency,
             interval_kind,
             &market_id,
             up_won,
-            // history_sim прогоняет сотни маркетов подряд: per-market
-            // `[resolve]`-логи забивают вывод и дублируются финальными
-            // агрегатами `print_sim_stats`. PnL/`bankroll`/stats
-            // обновляются идентично — log gate не влияет на
-            // расчёты, только на вывод. Real_sim, наоборот, ставит
-            // `true` (см. `Account::resolve_pending_market`).
-            false,
         );
     }
 
@@ -751,11 +873,16 @@ fn simulate_event(
 /// — оттуда их закроет финальный `Account::resolve_pending_market_sync`
 /// в `simulate_event` по бинарному CTF-payout.
 ///
-/// Equity на каждом тике считается как `bankroll + Σ(pos.shares_held ×
-/// current_prob)`. Это критично: между `open` и `close` реализованный
-/// `bankroll` не двигается, поэтому если считать drawdown только по
-/// `bankroll`, метрика системно занижается на длинных удержаниях,
-/// уходящих в красное и закрывающихся через резолюцию.
+/// Equity на каждом тике считается как
+/// `bankroll + Σ(local pos × current_prob) + Σ(pending × entry_prob)`,
+/// симметрично `real_sim::tick_once` (фаза 2). Это критично: между
+/// `open` и `close` реализованный `bankroll` не двигается, поэтому
+/// если считать drawdown только по `bankroll`, метрика системно
+/// занижается на длинных удержаниях, уходящих в красное и
+/// закрывающихся через резолюцию. Pending-слагаемое нужно, чтобы
+/// surviving UP-позиции, переехавшие после UP-прохода в
+/// `account.pending_resolution[lane_key_up]`, не «исчезали» из equity
+/// на DOWN-проходе и не давали искусственный drawdown.
 ///
 /// Сайзинг новых позиций идёт от **available capital** =
 /// `bankroll − Σ(open.entry_cost)` той же стороны (cross-side для
@@ -852,10 +979,39 @@ fn run_side_simulation(
         //    `None` означает «mark-to-market неизвестен», и оценивать
         //    позицию в нуль — это занижение equity на ровном месте; в
         //    таком кадре пропускаем апдейт, метрика подождёт следующего.
+        //
+        //    Equity-формула симметрична `real_sim::tick_once` (фаза 2):
+        //      equity = bankroll
+        //             + Σ(local positions × current_prob)
+        //             + Σ(account.pending_resolution[*] × entry_prob)
+        //
+        //    Pending-учёт критичен на DOWN-проходе: к этому моменту
+        //    surviving позиции UP-стороны уже переехали в
+        //    `account.pending_resolution[lane_key_up]` (см. блок ниже,
+        //    после цикла), и без них equity занижен на стоимость
+        //    UP-pending → искусственный drawdown, которого реально нет
+        //    (mark-to-market при переезде в pending не двигается:
+        //    `entry_prob × shares ≈ entry_cost`, реальный PnL прилетит
+        //    в `resolve_pending_market_sync` после обоих side-проходов).
+        //
+        //    `account.positions` в history_sim во время `run_side_simulation`
+        //    всегда пуст (UP/DOWN запускаются последовательно, и каждый
+        //    держит свои живые позиции в **локальной** Vec, не в
+        //    `account.positions`; между `simulate_event`-ами
+        //    `assert!`-инвариант ниже гарантирует пустое pending).
+        //    Поэтому `account.positions`-слагаемое тут опускаем — оно
+        //    тождественно ноль; в real_sim'е оно нужно потому, что там
+        //    позиции 4×N лейнов реально живут в `account.positions`.
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
             let positions_value: f64 = positions.iter().map(|p| p.shares_held * prob).sum();
-            let equity = account.bankroll + positions_value;
+            let pending_value: f64 = account
+                .pending_resolution
+                .values()
+                .flat_map(|v| v.iter())
+                .map(|p| p.shares_held * p.entry_prob)
+                .sum();
+            let equity = account.bankroll + positions_value + pending_value;
             account.update_drawdown(equity);
         }
     }
@@ -1687,17 +1843,22 @@ fn close_position(
 
 // ─── Обход стакана ────────────────────────────────────────────────────────────
 
-/// Покупка `position_size` USDC по ask-стакану (L1→L2→L3).
+/// Покупка `position_size` USDC по ask-стакану кадра ([`XFrame::book_asks`]).
 ///
 /// Возвращает `(vwap_price, total_nominal_shares)`.
 ///
+/// Идём по полному ask-стакану кадра (`book_asks`, от лучшего к худшему):
+/// L1/L2/L3 фичи параллельно живут отдельно для XGBoost, исполнение же —
+/// по единой лестнице, без ручного перечисления слотов. Если в будущем
+/// WS начнёт отдавать L4+, этот код менять не придётся.
+///
 /// **Пессимистичный режим (симметрично [`book_fill_sell`])**: если
-/// ликвидности на трёх верхних уровнях стакана не хватает на
-/// `position_size` USDC, остаток USDC **сжигается** — мы записываем
+/// суммарной ликвидности на всех уровнях не хватает на `position_size`
+/// USDC, остаток USDC **сжигается** — мы записываем
 /// `entry_cost = position_size`, но шерсов получаем только столько,
-/// сколько закрыли L1+L2+L3 фактическими уровнями. VWAP тогда
-/// автоматически становится хуже (`position_size / total_shares`):
-/// деньги ушли, экспозиция меньше, чем хотели.
+/// сколько закрыли реальными уровнями. VWAP тогда автоматически
+/// становится хуже (`position_size / total_shares`): деньги ушли,
+/// экспозиция меньше, чем хотели.
 ///
 /// Раньше остаток добивался по `currency_implied_prob`, что **системно
 /// завышало** оценку модели: backtest как будто всегда исполнялся по
@@ -1708,53 +1869,72 @@ fn close_position(
 /// и вход, и выход показывают худший результат, что лучше отражает
 /// worst-case live-исполнения.
 ///
-/// Если на L1–L3 нет ни одного валидного уровня (`total_shares = 0`),
+/// Если в `book_asks` нет ни одного валидного уровня (`total_shares = 0`),
 /// `open_position` отказывается открывать (`None`) — вход пропускается
 /// аналогично strict-режиму.
 fn book_fill_buy(frame: &XFrame<SIZE>, position_size: f64) -> (f64, f64) {
-    let levels = [
-        (frame.book_ask_l1_price, frame.book_ask_l1_size),
-        (frame.book_ask_l2_price, frame.book_ask_l2_size),
-        (frame.book_ask_l3_price, frame.book_ask_l3_size),
-    ];
-
     let mut remaining_usdc = position_size;
     let mut total_shares = 0.0_f64;
 
-    for (price_opt, size_opt) in levels {
-        let (Some(price), Some(size)) = (price_opt, size_opt) else { break };
-        if price <= 0.0 || size <= 0.0 { break }
+    // `book_asks: Option<Vec<...>>` — `None` встречается у легаси-дампов до
+    // миграции на полную лестницу: тогда фоллбэчимся на L1/L2/L3 фичи кадра
+    // (тот же набор, что использовался до перехода на векторы), чтобы
+    // поведение `book_fill_buy` на старых кадрах не деградировало до пустого
+    // стакана.
+    let fallback_asks;
+    let asks: &[BookLevel] = match frame.book_asks.as_deref() {
+        Some(asks) => asks,
+        None => {
+            fallback_asks = book_levels_from_legacy_l123([
+                (frame.book_ask_l1_price, frame.book_ask_l1_size),
+                (frame.book_ask_l2_price, frame.book_ask_l2_size),
+                (frame.book_ask_l3_price, frame.book_ask_l3_size),
+            ]);
+            &fallback_asks
+        }
+    };
 
-        let affordable = remaining_usdc / price;
-        if affordable <= size {
+    for level in asks {
+        if level.price <= 0.0 || level.size <= 0.0 { continue }
+
+        let affordable = remaining_usdc / level.price;
+        if affordable <= level.size {
             total_shares += affordable;
-            // Нашли уровень, который полностью вмещает остаток USDC —
-            // больше уровней проходить не нужно; `remaining_usdc` после
-            // удаления fallback по `currency_implied_prob` нигде не
-            // читается, обнулять необязательно.
+            remaining_usdc = 0.0;
             break;
         } else {
-            total_shares += size;
-            remaining_usdc -= size * price;
+            total_shares += level.size;
+            remaining_usdc -= level.size * level.price;
         }
+    }
+
+    if remaining_usdc > 1e-9 {
+        let fallback = frame.currency_implied_prob
+            .unwrap_or(0.5)
+            .clamp(0.001, 0.999);
+        total_shares += remaining_usdc / fallback;
     }
 
     let vwap = if total_shares > 0.0 { position_size / total_shares } else { 0.5 };
     (vwap, total_shares)
 }
 
-/// Продажа `shares_to_sell` по bid-стакану (L1→L2→L3).
+/// Продажа `shares_to_sell` по bid-стакану кадра ([`XFrame::book_bids`]).
 ///
 /// Возвращает валовый USDC до вычета fee.
 ///
-/// Шеры, для которых не хватает bid-ликвидности на трёх верхних уровнях,
-/// **сжигаются**: они вносят `0` USDC в выручку — то есть учитываются
-/// как полная потеря. Это явная замена прежнего fallback'а по
-/// `currency_implied_prob`, который **системно завышал** оценку модели:
-/// он позволял допродать любой остаток «бесплатно по mid», тогда как
-/// в живой торговле непокрытый ликвидностью объём — это либо рейс
-/// по более худшим уровням стакана (скрытым в L4+), либо вообще
-/// невозможность исполнения.
+/// Идём по полному bid-стакану кадра (`book_bids`, от лучшего к худшему):
+/// L1/L2/L3 фичи остаются для модели отдельно, исполнение работает по
+/// единой лестнице.
+///
+/// Шеры, для которых не хватает bid-ликвидности, **сжигаются**: они
+/// вносят `0` USDC в выручку — то есть учитываются как полная потеря.
+/// Это явная замена прежнего fallback'а по `currency_implied_prob`,
+/// который **системно завышал** оценку модели: он позволял допродать
+/// любой остаток «бесплатно по mid», тогда как в живой торговле
+/// непокрытый ликвидностью объём — это либо рейс по более худшим
+/// уровням стакана (скрытым в L4+), либо вообще невозможность
+/// исполнения.
 ///
 /// Для оценки обученной модели worst-case-лосс на хвосте — корректнее,
 /// чем оптимистичный fallback. На стороне `real_sim` строгий вариант
@@ -1763,29 +1943,58 @@ fn book_fill_buy(frame: &XFrame<SIZE>, position_size: f64) -> (f64, f64) {
 /// (Resolution на конце буфера, либо явный TP/SL/Timeout/EV), поэтому
 /// «отложить» нельзя — выбираем консервативную оценку выручки.
 fn book_fill_sell(frame: &XFrame<SIZE>, shares_to_sell: f64) -> f64 {
-    let levels = [
-        (frame.book_bid_l1_price, frame.book_bid_l1_size),
-        (frame.book_bid_l2_price, frame.book_bid_l2_size),
-        (frame.book_bid_l3_price, frame.book_bid_l3_size),
-    ];
-
     let mut remaining = shares_to_sell;
     let mut total_usdc = 0.0_f64;
 
-    for (price_opt, size_opt) in levels {
-        let (Some(price), Some(size)) = (price_opt, size_opt) else { break };
-        if price <= 0.0 || size <= 0.0 { break }
+    // `book_bids: Option<Vec<...>>` — `None` это легаси-дамп без сохранённой
+    // лестницы. Фоллбэчимся на L1/L2/L3 фичи (как до миграции на векторы) —
+    // иначе старые кадры детерминированно отдавали бы выручку 0 USDC и ломали
+    // back-test на исторических данных.
+    let fallback_bids;
+    let bids: &[BookLevel] = match frame.book_bids.as_deref() {
+        Some(bids) => bids,
+        None => {
+            fallback_bids = book_levels_from_legacy_l123([
+                (frame.book_bid_l1_price, frame.book_bid_l1_size),
+                (frame.book_bid_l2_price, frame.book_bid_l2_size),
+                (frame.book_bid_l3_price, frame.book_bid_l3_size),
+            ]);
+            &fallback_bids
+        }
+    };
 
-        if remaining <= size {
-            total_usdc += remaining * price;
+    for level in bids {
+        if level.price <= 0.0 || level.size <= 0.0 { continue }
+
+        if remaining <= level.size {
+            total_usdc += remaining * level.price;
             break;
         } else {
-            total_usdc += size * price;
-            remaining -= size;
+            total_usdc += level.size * level.price;
+            remaining -= level.size;
         }
     }
 
     total_usdc
+}
+
+/// Пересобирает [`BookLevel`]-лестницу из трёх кандидатов `(price, size)` в
+/// порядке «лучший → худший». Невалидные уровни (отсутствие цены/размера,
+/// нулевые/отрицательные/нефинитные значения) пропускаются.
+///
+/// Используется как фоллбэк в [`book_fill_buy`]/[`book_fill_sell`] для
+/// легаси-кадров без сохранённой полной лестницы (`book_bids`/`book_asks =
+/// None` после миграции — см. [`crate::migration`]).
+fn book_levels_from_legacy_l123(levels: [(Option<f64>, Option<f64>); 3]) -> Vec<BookLevel> {
+    let mut out = Vec::with_capacity(3);
+    for (price_opt, size_opt) in levels {
+        if let (Some(price), Some(size)) = (price_opt, size_opt) {
+            if price > 0.0 && size > 0.0 && price.is_finite() && size.is_finite() {
+                out.push(BookLevel { price, size });
+            }
+        }
+    }
+    out
 }
 
 // ─── Предсказание ─────────────────────────────────────────────────────────────

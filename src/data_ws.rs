@@ -14,6 +14,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 pub use crate::market_snapshot::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, MarketSnapshot, TradeSide, XFrameIntervalKind,
 };
+use crate::xframe::BookLevel;
 
 
 const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
@@ -476,7 +477,7 @@ fn parse_single_snapshot(
     let xframe_interval_kind = xframe_interval_kind_for_asset(interval_by_asset, &asset_id);
 
     let timestamp_ms = parse_i64(value.get("timestamp")).unwrap_or_else(current_timestamp_ms);
-    let book = parse_book_top3(value);
+    let book = parse_book_snapshot(value);
 
     Some(MarketSnapshot {
         market_id,
@@ -496,6 +497,8 @@ fn parse_single_snapshot(
         book_ask_l2_size: book.book_ask_l2_size,
         book_ask_l3_price: book.book_ask_l3_price,
         book_ask_l3_size: book.book_ask_l3_size,
+        book_bids: book.book_bids,
+        book_asks: book.book_asks,
         tick_size: parse_f64(value.get("new_tick_size")).or(parse_f64(value.get("tick_size"))),
         spread: parse_f64(value.get("spread")),
         // WS trade event uses `price` for last trade value.
@@ -559,6 +562,11 @@ fn parse_price_change_snapshots(
             book_ask_l2_size: None,
             book_ask_l3_price: None,
             book_ask_l3_size: None,
+            // `price_change` несёт только `best_bid`/`best_ask`, без размеров —
+            // полную лестницу собрать нельзя, оставляем `None`. Прокинется
+            // последняя известная из book-снимка через aggregate_events.
+            book_bids: None,
+            book_asks: None,
             tick_size: None,
             spread: None,
             last_trade_price: None,
@@ -619,6 +627,8 @@ fn parse_new_market_snapshots(
             book_ask_l2_size: None,
             book_ask_l3_price: None,
             book_ask_l3_size: None,
+            book_bids: None,
+            book_asks: None,
             tick_size,
             spread: None,
             last_trade_price: None,
@@ -632,7 +642,7 @@ fn parse_new_market_snapshots(
 }
 
 #[derive(Default)]
-struct ParsedBookTop3 {
+struct ParsedBook {
     book_bid_l1_price: Option<f64>,
     book_ask_l1_price: Option<f64>,
     book_bid_l1_size: Option<f64>,
@@ -645,6 +655,12 @@ struct ParsedBookTop3 {
     book_ask_l2_size: Option<f64>,
     book_ask_l3_price: Option<f64>,
     book_ask_l3_size: Option<f64>,
+    /// Полный bid-стакан, отсортирован «best → worst» (по убыванию цены).
+    /// `None` — массива `bids` в JSON не было (есть только `best_bid` в
+    /// корне → лестницу собрать нельзя).
+    book_bids: Option<Vec<BookLevel>>,
+    /// Полный ask-стакан, отсортирован «best → worst» (по возрастанию цены).
+    book_asks: Option<Vec<BookLevel>>,
 }
 
 fn parse_side_levels_sorted(levels: Option<&Vec<Value>>, bids: bool) -> Vec<(f64, f64)> {
@@ -667,14 +683,17 @@ fn parse_side_levels_sorted(levels: Option<&Vec<Value>>, bids: bool) -> Vec<(f64
     out
 }
 
-/// Топ-3 уровня bid/ask из `bids`/`asks` (`book`); при отсутствии массивов — только поля `best_bid`/`best_ask` в корне JSON.
-fn parse_book_top3(value: &Value) -> ParsedBookTop3 {
+/// Парсит book-снапшот из WS-сообщения: полные лестницы `bids`/`asks`
+/// (отсортированные best→worst) плюс распакованные L1/L2/L3 поля для фич
+/// модели. Если массивов нет — заполняются только `best_bid`/`best_ask` из
+/// корня JSON, а лестницы остаются `None`.
+fn parse_book_snapshot(value: &Value) -> ParsedBook {
     let bids = value.get("bids").and_then(Value::as_array);
     let asks = value.get("asks").and_then(Value::as_array);
     let bid_levels = parse_side_levels_sorted(bids, true);
     let ask_levels = parse_side_levels_sorted(asks, false);
 
-    let mut out = ParsedBookTop3::default();
+    let mut out = ParsedBook::default();
 
     if !bid_levels.is_empty() {
         out.book_bid_l1_price = Some(bid_levels[0].0);
@@ -687,6 +706,7 @@ fn parse_book_top3(value: &Value) -> ParsedBookTop3 {
             out.book_bid_l3_price = Some(bid_levels[2].0);
             out.book_bid_l3_size = Some(bid_levels[2].1);
         }
+        out.book_bids = Some(level_pairs_to_book_levels(&bid_levels));
     } else {
         out.book_bid_l1_price = parse_f64(value.get("best_bid"));
     }
@@ -702,11 +722,28 @@ fn parse_book_top3(value: &Value) -> ParsedBookTop3 {
             out.book_ask_l3_price = Some(ask_levels[2].0);
             out.book_ask_l3_size = Some(ask_levels[2].1);
         }
+        out.book_asks = Some(level_pairs_to_book_levels(&ask_levels));
     } else {
         out.book_ask_l1_price = parse_f64(value.get("best_ask"));
     }
 
     out
+}
+
+/// `(price, size)`-пары → `Vec<BookLevel>` без невалидных уровней
+/// (нулевой/отрицательный/нефинитный price или size). Порядок исходного
+/// массива сохраняется (см. [`parse_side_levels_sorted`]).
+fn level_pairs_to_book_levels(pairs: &[(f64, f64)]) -> Vec<BookLevel> {
+    pairs
+        .iter()
+        .filter_map(|&(price, size)| {
+            if price > 0.0 && size > 0.0 && price.is_finite() && size.is_finite() {
+                Some(BookLevel { price, size })
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn parse_trade_side(json_field: Option<&Value>) -> Option<TradeSide> {

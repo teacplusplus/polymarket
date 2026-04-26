@@ -14,6 +14,7 @@ pub mod tee_log;
 pub mod history_sim;
 pub mod real_sim;
 pub mod account;
+pub mod migration;
 
 use anyhow::Result;
 use account::Account;
@@ -38,6 +39,10 @@ enum AppMode {
     /// `ProjectManager` что и `Default`, плюс 4 tokio-воркера раз-в-секунду
     /// (5m × 15m × up/down) с логикой из `history_sim`.
     RealSim,
+    /// Одноразовая миграция дампов `xframes/...` под актуальную раскладку
+    /// `XFrame` (см. `migration::run_migration`). Вызывается вручную через
+    /// `STATUS=migrate`; идемпотентна — повторный запуск ничего не сделает.
+    Migrate,
 }
 
 impl AppMode {
@@ -46,6 +51,7 @@ impl AppMode {
             Ok("train")         => AppMode::Train,
             Ok("history_sim")   => AppMode::HistorySim,
             Ok("real_sim")      => AppMode::RealSim,
+            Ok("migrate")       => AppMode::Migrate,
             _                   => AppMode::Default,
         }
     }
@@ -64,6 +70,9 @@ async fn main() -> Result<()> {
         }
         AppMode::HistorySim => {
             history_sim::run_sim_mode()?;
+        }
+        AppMode::Migrate => {
+            migration::run_migration()?;
         }
         AppMode::Default => {
             rustls::crypto::ring::default_provider()
@@ -91,6 +100,18 @@ async fn main() -> Result<()> {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
+
+            // TEE_LOG — единый файл прогона на ВЕСЬ процесс real_sim'а
+            // (а не на валюту), чтобы все 4×N tokio-воркеров писали в
+            // один и тот же `BufWriter<File>`. Открываем ДО спавна
+            // `run_real_sim`, чтобы первые `tee_*`-вызовы (`[real_sim]
+            // версия моделей`, init-сообщения воркеров) уже попали в
+            // файл. Закрытие — на завершении процесса; `BufWriter` сам
+            // флашится в Drop'е статика.
+            tee_log::init_tee_log_file(
+                std::path::Path::new("xframes/last_real_sim.txt"),
+                "real_sim",
+            )?;
 
             // См. комментарий в `AppMode::Default` — общий счёт на процесс.
             let account = Account::new_shared();

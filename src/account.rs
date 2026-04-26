@@ -333,11 +333,6 @@ impl Account {
             interval,
             market_id,
             up_won,
-            // real_sim — это live-режим: каждое реальное закрытие
-            // позиции по результату маркета должно остаться в логе
-            // (per-position строка + summary). См. doc-комментарий
-            // у `resolve_pending_market_sync` про `log`.
-            true,
         );
     }
 
@@ -359,14 +354,16 @@ impl Account {
     /// Всё остальное (формула выплаты, обновление `bankroll` /
     /// `SideStats`) — единое для обоих путей.
     ///
-    /// `log = true` печатает per-position и summary строки `[resolve]`
-    /// через `tee_println!` (используется в real_sim — каждое реальное
-    /// закрытие маркета должно быть видно в логе и оставаться в файле
-    /// прогона). `log = false` отключает оба уровня — нужно
-    /// history_sim, где маркетов сотни и этот лог в каждом
-    /// `simulate_event` забивает вывод; финальные агрегаты по PnL/ROI
-    /// и так печатает `print_sim_stats`. PnL/`bankroll`/stats при
-    /// этом обновляются идентично — это исключительно log gate.
+    /// **Логирование всегда включено**: каждая закрытая по резолюции
+    /// позиция печатает `[resolve] … {WIN|LOSS} shares=… cost=… pnl=…
+    /// bankroll=…` через `tee_println!`, плюс summary `closed= total_pnl=`
+    /// в конце. Раньше был `log: bool`-флаг, чтобы глушить эти строки
+    /// в `history_sim` (там маркетов сотни), но сейчас на всех
+    /// путях прогон пишется ещё и в файл (`xframes/last_history_sim.txt`,
+    /// `xframes/last_real_sim.txt`) — терять из лога per-market PnL,
+    /// который драйвит итоговый bankroll, нельзя ни в backtest'e, ни в
+    /// live: на этих строках строится трассировка «как именно сложилась
+    /// final-метрика».
     pub fn resolve_pending_market_sync(
         &mut self,
         sim_stats: &mut SimStats,
@@ -374,7 +371,6 @@ impl Account {
         interval: XFrameIntervalKind,
         market_id: &str,
         up_won: bool,
-        log: bool,
     ) {
         // Split borrow: одновременно нужны `pending_resolution` (итерация)
         // и `bankroll` (PnL).
@@ -450,7 +446,7 @@ impl Account {
                         side_stats.resolution_loss += 1;
                     }
 
-                    if log {
+                    {
                         let tag = format!(
                             "{}/{}/{}",
                             cur,
@@ -476,7 +472,7 @@ impl Account {
             }
         }
 
-        if log && closed > 0 {
+        if closed > 0 {
             crate::tee_println!(
                 "[resolve] {currency}/{interval} market={market_id} closed={closed} \
                  total_pnl={total_pnl:+.4} bankroll={bankroll:.4}",

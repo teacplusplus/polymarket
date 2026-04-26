@@ -41,9 +41,10 @@ use crate::account::{Account, SharedAccount};
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
     BuyGate, any_position_would_sell, buy_gate, compute_p_win_now, compute_pnl_inference,
-    load_booster, manage_positions, print_sim_stats, try_open_position, BookLevel, OpenPosition,
+    load_booster, manage_positions, print_sim_stats, try_open_position, OpenPosition,
     SimStats, StrictBook,
 };
+use crate::xframe::BookLevel;
 use crate::project_manager::{LaneFrame, ProjectManager};
 use crate::train_mode::{load_calibration, Calibration};
 use crate::util::current_timestamp_ms;
@@ -221,7 +222,7 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
     let version = dir_name(&version_path);
     let tag_prefix = format!("{currency}/{version}");
 
-    println!(
+    crate::tee_println!(
         "[real_sim] версия моделей: {tag_prefix} (из {})",
         version_path.display(),
     );
@@ -259,7 +260,7 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
         let models = load_side_models(&version_path, label, side_lbl).ok_or_else(|| {
             anyhow!("не удалось загрузить pnl-модель {label}/{side_lbl}")
         })?;
-        println!(
+        crate::tee_println!(
             "[real_sim] {tag_prefix}/{label}/{side_lbl}: pnl ✓  resolution={}",
             if models.booster_resolution.is_some() { "✓" } else { "✗" },
         );
@@ -323,10 +324,10 @@ fn spawn_side_worker(
                 &mut last_market_id,
                 lane_frame,
             ).await {
-                eprintln!("[real_sim] {tag}: tick error: {err:#}");
+                crate::tee_eprintln!("[real_sim] {tag}: tick error: {err:#}");
             }
         }
-        eprintln!("[real_sim] {tag}: канал закрыт — воркер завершён");
+        crate::tee_eprintln!("[real_sim] {tag}: канал закрыт — воркер завершён");
     });
 }
 
@@ -427,7 +428,7 @@ async fn tick_once(
     //   на ОБЩИЙ bankroll сразу со всех PM. Без этой агрегации `4×N`
     //   параллельных воркеров (4 лейна × N валют) раздули бы суммарную
     //   экспозицию до `4N × MAX_BET_FRACTION` исходного капитала.
-    let (has_positions, needs_sell, available_bankroll_pre) = {
+    let (has_positions, needs_sell, available_bankroll_pre, dd_halt_active, account_max_dd_pct) = {
         let account_guard = account.read().await;
         let this_positions = account_guard
             .positions
@@ -440,10 +441,23 @@ async fn tick_once(
             .map(|p| p.entry_cost)
             .sum();
         let available = (account_guard.bankroll - total_locked).max(0.0);
+        // Kill-switch по mark-to-market drawdown: если `EMERGENCY_HALT_DRAWDOWN_PCT
+        // = Some(p)` и `account.max_drawdown_pct ≥ p` — новые входы (и только
+        // новые) блокируем до конца жизни процесса. `max_drawdown_pct` —
+        // историческая величина (не сбрасывается на восстановлении), так что
+        // halt — необратимое состояние без явного рестарта. `manage_positions`
+        // (TP/SL/EV/Timeout/резолюция) продолжает работать как обычно: выйти
+        // из позиции важнее, чем дождаться улучшения equity.
+        let dd_halt = match crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT {
+            Some(threshold) => account_guard.max_drawdown_pct >= threshold,
+            None => false,
+        };
         (
             !this_positions.is_empty(),
             any_position_would_sell(this_positions, &frame),
             available,
+            dd_halt,
+            account_guard.max_drawdown_pct,
         )
     };
 
@@ -487,10 +501,26 @@ async fn tick_once(
     // may_open`). Поэтому `buy_gate` использует `frame.currency_implied_prob`
     // (WS-prob); strict-prob по mid HTTP-стакана будет передан в
     // фактический `try_open_position` ниже, после `fetch_http_strict_book`.
-    let may_open = matches!(
+    let may_open = !dd_halt_active
+        && matches!(
+            buy_gate(&frame, pnl_inference, available_bankroll_pre, None),
+            BuyGate::Proceed { .. }
+        );
+    if dd_halt_active && matches!(
         buy_gate(&frame, pnl_inference, available_bankroll_pre, None),
         BuyGate::Proceed { .. }
-    );
+    ) {
+        // Один лог на каждый «пропущенный по halt» вход. Альтернатива —
+        // `Once`-флаг через статик, но при многоинтервальном/мультивалютном
+        // деплое полезно видеть, что halt продолжает резать кандидатов
+        // (а не молча; проблему «спама» гасит то, что halt — необратимое
+        // состояние, и поток входов модели в просадке естественно скуднее).
+        crate::tee_eprintln!(
+            "[real_sim] {tag}: halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
+            crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT,
+            account_max_dd_pct
+        );
+    }
     let needs_http = needs_sell || may_open;
 
     // ── HTTP-ордербук: один запрос за кадр, переиспользуется для всего ───────
@@ -513,7 +543,7 @@ async fn tick_once(
         Some(book) => {
             let lagging = is_ws_lagging(book, &frame);
             if lagging {
-                eprintln!(
+                crate::tee_eprintln!(
                     "[real_sim] {tag}: WS отстаёт — ордербук по HTTP расходится с last XFrame (market={market_id} asset={asset_id}); новые позиции пропускаем, ведём только закрытия"
                 );
             }
@@ -755,7 +785,7 @@ async fn tick_once(
         } else {
             "sell"
         };
-        println!(
+        crate::tee_println!(
             "[real_sim] {tag}: {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
             current_timestamp_ms(),
         );
@@ -800,7 +830,7 @@ async fn fetch_http_strict_book(
         reply: reply_tx,
     };
     if book_tx.send(req).await.is_err() {
-        eprintln!(
+        crate::tee_eprintln!(
             "[real_sim] {tag}: book-coord канал закрыт — strict-fill выключен на тик"
         );
         return None;
@@ -815,13 +845,13 @@ async fn fetch_http_strict_book(
     match tokio::time::timeout(Duration::from_millis(BOOK_REPLY_TIMEOUT_MS), reply_rx).await {
         Ok(Ok(book)) => book,
         Ok(Err(_)) => {
-            eprintln!(
+            crate::tee_eprintln!(
                 "[real_sim] {tag}: book-coord уронил oneshot до ответа — strict-fill выключен на тик"
             );
             None
         }
         Err(_) => {
-            eprintln!(
+            crate::tee_eprintln!(
                 "[real_sim] {tag}: ожидание ответа book-coord > {BOOK_REPLY_TIMEOUT_MS}ms — strict-fill выключен на тик"
             );
             None
@@ -902,7 +932,7 @@ async fn run_book_coordinator(
             .cloned()
             .collect();
         for aid in invalid_ids {
-            eprintln!("[real_sim/book-coord] невалидный asset_id={aid} — отвечаем None");
+            crate::tee_eprintln!("[real_sim/book-coord] невалидный asset_id={aid} — отвечаем None");
             if let Some(senders) = by_asset.remove(&aid) {
                 for s in senders {
                     let _ = s.send(None);
@@ -937,8 +967,7 @@ async fn run_book_coordinator(
         match http_result {
             Ok(Ok(responses)) if responses.len() == n => {
                 for (aid, resp) in valid_ids.iter().zip(responses.iter()) {
-                    let (bids, asks) = parse_book_levels(resp);
-                    let book = StrictBook { bids, asks };
+                    let book = parse_book_levels(resp);
                     if let Some(senders) = by_asset.remove(aid) {
                         // 99.9% случаев тут ровно 1 sender, но если
                         // дедуплицировали несколько — клонируем.
@@ -953,7 +982,7 @@ async fn run_book_coordinator(
                 }
             }
             Ok(Ok(responses)) => {
-                eprintln!(
+                crate::tee_eprintln!(
                     "[real_sim/book-coord] order_books вернул {} ответов на {n} запросов — отбрасываем батч",
                     responses.len(),
                 );
@@ -964,7 +993,7 @@ async fn run_book_coordinator(
                 }
             }
             Ok(Err(err)) => {
-                eprintln!(
+                crate::tee_eprintln!(
                     "[real_sim/book-coord] order_books({n} assets) failed: {err:#}"
                 );
                 for senders in by_asset.into_values() {
@@ -974,7 +1003,7 @@ async fn run_book_coordinator(
                 }
             }
             Err(_) => {
-                eprintln!(
+                crate::tee_eprintln!(
                     "[real_sim/book-coord] order_books({n} assets) timed out > {BOOK_HTTP_TIMEOUT_MS}ms — отбрасываем батч"
                 );
                 for senders in by_asset.into_values() {
@@ -985,7 +1014,7 @@ async fn run_book_coordinator(
             }
         }
     }
-    eprintln!("[real_sim/book-coord] mpsc закрыт — координатор завершён");
+    crate::tee_eprintln!("[real_sim/book-coord] mpsc закрыт — координатор завершён");
 }
 
 /// Превращает `OrderBookSummaryResponse` в пару `(bids, asks)` формата
@@ -994,7 +1023,21 @@ async fn run_book_coordinator(
 /// Polymarket CLOB отдаёт `bids`/`asks` в обратном порядке («худшее → лучшее»,
 /// best = последний элемент), поэтому здесь мы их реверсим. Уровни с
 /// неположительной ценой/размером или нечитаемым `Decimal` отбрасываются.
-fn parse_book_levels(book: &OrderBookSummaryResponse) -> (Vec<BookLevel>, Vec<BookLevel>) {
+/// Преобразует ответ CLOB `POST /books` в [`StrictBook`].
+///
+/// Помимо bids/asks (отсортированных «лучший → худший») сохраняем:
+/// * `last_trade_price` — для воспроизведения Polymarket-style логики
+///   `mid L1 ≤ 10¢ / иначе last trade` в
+///   [`crate::history_sim::effective_implied_prob`] (без него HTTP-prob
+///   систематически расходился бы с фичей `XFrame.currency_implied_prob`,
+///   которая идёт в модель).
+/// * `min_order_size` — статичный атрибут маркета, которого нет в
+///   WS-канале CLOB, но без которого strict-исполнение
+///   ([`crate::history_sim::book_fill_buy_strict`] /
+///   `book_fill_sell_strict`) не может зеркалить «CLOB отклонит ордер
+///   меньше минимума» — без него локальная бухгалтерия открывала бы
+///   фантомные позиции, которых нет on-chain.
+fn parse_book_levels(book: &OrderBookSummaryResponse) -> StrictBook {
     let to_level = |o: &polymarket_client_sdk::clob::types::response::OrderSummary| {
         let price = o.price.to_string().parse::<f64>().ok()?;
         let size = o.size.to_string().parse::<f64>().ok()?;
@@ -1005,7 +1048,22 @@ fn parse_book_levels(book: &OrderBookSummaryResponse) -> (Vec<BookLevel>, Vec<Bo
     };
     let bids: Vec<BookLevel> = book.bids.iter().rev().filter_map(to_level).collect();
     let asks: Vec<BookLevel> = book.asks.iter().rev().filter_map(to_level).collect();
-    (bids, asks)
+    let last_trade_price = book
+        .last_trade_price
+        .and_then(|d| d.to_string().parse::<f64>().ok())
+        .filter(|p| p.is_finite() && *p > 0.0);
+    let min_order_size = book
+        .min_order_size
+        .to_string()
+        .parse::<f64>()
+        .ok()
+        .filter(|s| s.is_finite() && *s > 0.0);
+    StrictBook {
+        bids,
+        asks,
+        last_trade_price,
+        min_order_size,
+    }
 }
 
 /// Возвращает `true`, если HTTP-ордербук расходится с тремя верхними уровнями
@@ -1051,7 +1109,7 @@ fn is_ws_lagging(book: &StrictBook, frame: &XFrame<SIZE>) -> bool {
     let ask_bad = (0..ws_ask.len()).any(|i| diverges(ws_ask[i], http_ask(i)));
 
     if bid_bad || ask_bad {
-        eprintln!(
+        crate::tee_eprintln!(
             "[real_sim] WS vs HTTP ордербук (tol={tol:.4}):\n  \
              bid WS  L1/L2/L3 = {:?}/{:?}/{:?}\n  \
              bid HTTP L1/L2/L3 = {:?}/{:?}/{:?}\n  \

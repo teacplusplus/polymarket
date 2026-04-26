@@ -1,6 +1,7 @@
 pub use crate::constants::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind,
 };
+use crate::xframe::BookLevel;
 
 #[derive(Debug, Clone)]
 pub struct MarketSnapshot {
@@ -21,6 +22,8 @@ pub struct MarketSnapshot {
     pub book_ask_l2_size: Option<f64>,
     pub book_ask_l3_price: Option<f64>,
     pub book_ask_l3_size: Option<f64>,
+    pub book_bids: Option<Vec<BookLevel>>,
+    pub book_asks: Option<Vec<BookLevel>>,
     pub tick_size: Option<f64>,
     pub spread: Option<f64>,
     pub last_trade_price: Option<f64>,
@@ -58,6 +61,8 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, bucket_start_ms: i64) -> Op
         book_ask_l2_size: None,
         book_ask_l3_price: None,
         book_ask_l3_size: None,
+        book_bids: None,
+        book_asks: None,
         tick_size: None,
         spread: None,
         last_trade_price: None,
@@ -107,6 +112,15 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, bucket_start_ms: i64) -> Op
         }
         if event_market_snapshot.book_ask_l3_size.is_some() {
             aggregated_market_snapshot.book_ask_l3_size = event_market_snapshot.book_ask_l3_size;
+        }
+        // Полные лестницы прокидываются как единое целое: пришёл новый
+        // book-снимок — он целиком заменяет агрегат (никакого мерджа уровней
+        // между событиями внутри одного бакета — это уже задача Polymarket).
+        if event_market_snapshot.book_bids.is_some() {
+            aggregated_market_snapshot.book_bids = event_market_snapshot.book_bids;
+        }
+        if event_market_snapshot.book_asks.is_some() {
+            aggregated_market_snapshot.book_asks = event_market_snapshot.book_asks;
         }
         if event_market_snapshot.tick_size.is_some() {
             aggregated_market_snapshot.tick_size = event_market_snapshot.tick_size;

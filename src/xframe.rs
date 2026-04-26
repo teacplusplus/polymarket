@@ -16,6 +16,21 @@ pub const SIZE: usize = 15;
 
 const MIN_POSITIVE_ASK: f64 = 1e-12;
 
+/// Один уровень стакана: цена в probability-шкале `[0..1]` и размер в шерсах.
+///
+/// Лежит в [`XFrame::book_bids`] / [`XFrame::book_asks`] (в порядке от лучшего
+/// к худшему) и в [`crate::history_sim::StrictBook`]. Тип общий, поэтому
+/// `XFrame`-side фолбэки в [`crate::history_sim::book_fill_buy`] /
+/// [`crate::history_sim::book_fill_sell`] и strict-исполнение по HTTP-снимку
+/// CLOB обходят одну и ту же лестницу.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BookLevel {
+    /// Цена уровня (probability, `0..1`).
+    pub price: f64,
+    /// Размер уровня в шерсах.
+    pub size: f64,
+}
+
 /// Окно секундных цен спота для μ и σ в z-score (≈ 60 мин). Ключи `prices_by_sec` — Unix-секунды.
 const CURRENCY_PRICE_ZSCORE_WINDOW_SEC: i64 = SIZE as i64;
 /// Минимум точек в окне для выборочного СКО.
@@ -152,6 +167,22 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub delta_n_book_ask_l3_size: [Option<f64>; N],
+    /// Полный bid-стакан кадра (от лучшего к худшему). Источник истины для
+    /// исполнения **buy/sell** в [`crate::history_sim::book_fill_buy`] и
+    /// [`crate::history_sim::book_fill_sell`]; парные L1/L2/L3 поля выше
+    /// сохраняются как фичи модели (XGBoost обучается на них) и из них же
+    /// заполняется этот вектор в [`XFrame::new`]. Без атрибута `#[xfeature]` —
+    /// в обучающий вектор не идёт.
+    ///
+    /// `None` — стакан недоступен (например, пустой кадр-плейсхолдер или
+    /// дамп до миграции, в котором уровней не было); `Some(vec)` — известный
+    /// стакан, возможно пустой, если все L1/L2/L3 пришли невалидными.
+    #[serde(default)]
+    pub book_bids: Option<Vec<BookLevel>>,
+    /// Полный ask-стакан кадра (от лучшего к худшему). Семантика как у
+    /// [`Self::book_bids`].
+    #[serde(default)]
+    pub book_asks: Option<Vec<BookLevel>>,
     /// Цена последней известной сделки на бакете; прокидывается с предыдущего кадра, если в текущем нет обновления.
     #[xfeature]
     pub last_trade_price: Option<f64>,
@@ -560,6 +591,21 @@ impl<const N: usize> XFrame<N> {
         let book_ask_l3_size = snapshot
             .book_ask_l3_size
             .or_else(|| previous.and_then(|prior_frame| prior_frame.book_ask_l3_size));
+        // Полный стакан кадра — берётся целиком из снапшота, как пришёл из
+        // WS (`book`-сообщение содержит весь видимый CLOB-снимок). Если в
+        // текущем тике лестницы не было (например, `price_change` без
+        // глубины), наследуем последнюю известную с предыдущего кадра —
+        // та же логика «прокидывания», что и для скалярных `book_*_l*_*`
+        // полей выше. Параллельно живут L1/L2/L3 фичи для XGBoost; они
+        // выводятся из `book_*_l*` полей снапшота, а не из этого вектора.
+        let book_bids = snapshot
+            .book_bids
+            .clone()
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_bids.clone()));
+        let book_asks = snapshot
+            .book_asks
+            .clone()
+            .or_else(|| previous.and_then(|prior_frame| prior_frame.book_asks.clone()));
         let last_trade_price = snapshot
             .last_trade_price
             .or(previous.and_then(|prior_frame| prior_frame.last_trade_price));
@@ -612,6 +658,8 @@ impl<const N: usize> XFrame<N> {
             book_ask_l2_size,
             book_ask_l3_price,
             book_ask_l3_size,
+            book_bids,
+            book_asks,
             currency_price_z_score,
             currency_price_vs_beat_pct,
             last_trade_price,
@@ -1087,7 +1135,7 @@ pub fn calc_y_train_resolution(
 }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.
-fn book_l1_mid_price(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64> {
+pub(crate) fn book_l1_mid_price(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64> {
     match (best_bid, best_ask) {
         (Some(b), Some(a)) if b.is_finite() && a.is_finite() => Some((b + a) * 0.5),
         _ => None,
@@ -1095,10 +1143,16 @@ fn book_l1_mid_price(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64
 }
 
 /// Порог как в UI Polymarket: при спреде **> 10¢** показывают last trade, иначе mid.
-const POLYMARKET_WIDE_SPREAD_USD: f64 = 0.10;
+pub(crate) const POLYMARKET_WIDE_SPREAD_USD: f64 = 0.10;
 
 /// Оценка «отображаемой» цены/вероятности: при узком спреде — mid L1; при широком (`> 10¢`) — [`last_trade_price`], если есть, иначе mid.
-fn currency_implied_prob_polymarket_style(
+///
+/// Используется и при сборке `XFrame.currency_implied_prob` из WS-кадра
+/// (см. `XFrame::from_market_snapshot`), и в `history_sim::effective_implied_prob`
+/// поверх HTTP-стакана ([`crate::history_sim::StrictBook`]) — один источник
+/// истины для «отображаемой» Polymarket-вероятности, чтобы фичи модели и
+/// решения о входе/выходе работали в одной шкале.
+pub(crate) fn currency_implied_prob_polymarket_style(
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     spread_reported: Option<f64>,
