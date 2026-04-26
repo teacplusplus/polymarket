@@ -67,6 +67,28 @@ pub fn spawn_dump_market_xframes_binary(
         let up_won = final_price >= price_to_beat;
         eprintln!("xframe_dump: market_id={market_id} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}");
 
+        // Резолюционный колбек по `final_price`: закрывает все
+        // pending-позиции этого маркета (Up/Down обоих лейнов, что
+        // соответствует `interval_kind`) по бинарной выплате CTF.
+        // Должен дёргаться **до** дампа, чтобы `bankroll`/`SideStats`
+        // обновились до того, как `cleanup_stale_market_data`
+        // снесёт буфер кадров. Sleep выше (`max_step` сек) — это
+        // запас на доезд последних кадров до буфера; за это время
+        // `tick_once` успевает довести stale-позиции в
+        // `pending_resolution` через `manage_positions`, плюс
+        // сама резолюция-обёртка дополнительно вытащит из
+        // active book позиции с `pos.market_id == market_id`
+        // (см. `Account::resolve_pending_market`).
+        crate::account::Account::resolve_pending_market(
+            &project_manager.account,
+            &project_manager.real_sim_state,
+            project_manager.currency.as_str(),
+            interval_kind,
+            &market_id,
+            up_won,
+        )
+        .await;
+
         for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
             if let Err(err) =
                 dump_market_xframes_binary_lane(

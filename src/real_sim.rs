@@ -86,6 +86,30 @@ const BOOK_BATCH_IDLE_MS: u64 = 5;
 /// после этого срока выходим в HTTP даже если очередь не «успокоилась».
 const BOOK_BATCH_MAX_MS: u64 = 50;
 
+/// Тайм-аут одного `clob.order_books(&[...])` HTTP-запроса в
+/// [`run_book_coordinator`]. Polymarket CLOB обычно отвечает за
+/// 50–200 ms; всё, что больше 2 секунд — почти наверняка зависший
+/// сокет / DNS-таймаут / 5xx без авторазрыва. Без явного тайм-аута
+/// один такой запрос блокировал бы координатор на десятки секунд:
+/// все 4 воркера висят на `oneshot::Receiver` в `fetch_http_strict_book`,
+/// фанаут лейнов копит кадры в очередях `LANE_FRAME_CHANNEL_CAP`,
+/// и выйти из ситуации без рестарта процесса нельзя.
+///
+/// На срабатывании отвечаем `None` всем `oneshot`-получателям батча —
+/// `tick_once` пойдёт без strict-fill (WS-fallback для закрытий, скип
+/// для buy через `kelly_strict_buy_skips`). На следующем кадре
+/// координатор соберёт новый батч.
+const BOOK_HTTP_TIMEOUT_MS: u64 = 2000;
+
+/// Тайм-аут ожидания ответа координатора в [`fetch_http_strict_book`]
+/// со стороны воркера. Должен покрывать `BOOK_BATCH_IDLE_MS` +
+/// `BOOK_BATCH_MAX_MS` + `BOOK_HTTP_TIMEOUT_MS` + запас на
+/// планировщик; берём `3 × BOOK_HTTP_TIMEOUT_MS` как простой и
+/// достаточный буфер. Если за это время `oneshot::Sender` не пришёл
+/// (координатор завис или потерял запрос) — воркер выходит без
+/// strict_book на этом тике, не блокируя дальше всю свою цепочку.
+const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
+
 /// Полный набор 4 ключей фанаута 1s-кадров: `(interval, side)`.
 const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
     (XFrameIntervalKind::FifteenMin, CurrencyUpDownOutcome::Down),
@@ -167,14 +191,14 @@ struct SideModels {
     calibration_resolution: Option<Calibration>,
 }
 
-fn interval_label(kind: XFrameIntervalKind) -> &'static str {
+pub(crate) fn interval_label(kind: XFrameIntervalKind) -> &'static str {
     match kind {
         XFrameIntervalKind::FiveMin => "5m",
         XFrameIntervalKind::FifteenMin => "15m",
     }
 }
 
-fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
+pub(crate) fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
     match side {
         CurrencyUpDownOutcome::Up => "up",
         CurrencyUpDownOutcome::Down => "down",
@@ -327,18 +351,17 @@ async fn tick_once(
         frame,
     } = lane_frame;
 
-    // `event_over` и `market_changed` считаем до early-return, т.к. они нужны
-    // и для bookkeeping-апдейта `events` ниже (а тот — обязан произойти даже
+    // `market_changed` считаем до early-return, т.к. он нужен и для
+    // bookkeeping-апдейта `events` ниже (а тот — обязан произойти даже
     // в кадрах без `currency_implied_prob`, иначе целые маркеты могут
     // «пропасть» из счётчика, если в их первом фрейме prob ещё не
     // подоспела).
     //
-    // Событие завершилось, как только `event_remaining_ms ≤ 0`
-    // (в `xframe.rs` значение всегда рассчитывается как `end_ms - now`,
-    // сентинел `-1` не используется). В этом случае `sell_gate` вместо
-    // TP/SL/EV закрывает все позиции по бинарной выплате CTF ($1/шер
-    // победителю, $0 проигравшему — без комиссии).
-    let event_over = frame.event_remaining_ms <= 0;
+    // На `event_remaining_ms ≤ 0` `tick_once` сам ничего не закрывает:
+    // `sell_gate` возвращает Hold для всех живых позиций, а резолюция
+    // (бинарная выплата CTF $1/$0 без комиссии) уезжает в отдельный
+    // колбек [`crate::account::Account::resolve_pending_market`],
+    // который дёргается из `xframe_dump` по реальному `final_price`.
     let market_changed = last_market_id.as_deref() != Some(market_id.as_str());
 
     // ── Bookkeeping #1: bump `events` ДО early-return ─────────────────────────
@@ -367,13 +390,6 @@ async fn tick_once(
         return Ok(());
     };
 
-    // Победителя определяем по `currency_implied_prob ≥ 0.5` (в реальности
-    // CLOB за секунды до резолюции уже схлопывается к 0/1) и только при
-    // `event_over` — пока событие идёт, исход неизвестен, `won = None`
-    // честно отражает это, а `sell_gate` на этой ветке к `won` вообще не
-    // обращается.
-    let won: Option<bool> = event_over.then(|| currency_implied_prob >= 0.5);
-
     let lane_key = (currency.to_string(), interval_kind, side);
 
     // ── Bookkeeping #2: записать last_prob в общий реестр Account ─────────────
@@ -394,13 +410,12 @@ async fn tick_once(
     // ── Снапшот состояния для гейтов ──────────────────────────────────────────
     // * `has_positions` — нужно ли **звать** `manage_positions`. Даже если
     //   ни одна позиция не закрывается по WS, вызов нужен для обновления
-    //   `frames_held`/`p_win_ema` и, на `event_over`, для Resolution (которой
-    //   HTTP не требуется — `close_position` не обращается к `strict_book`
-    //   в этой ветке).
+    //   `frames_held`/`p_win_ema` и для переноса stale-позиций в
+    //   `pending_resolution` при смене маркета.
     // * `needs_http` — нужен ли **HTTP-запрос** стакана. Дёргаем CLOB только
     //   когда реально будем исполнять ордер через `book_fill_*_strict`:
-    //     - `needs_sell` (см. `any_position_would_sell`) — любое закрытие,
-    //       кроме Resolution: TP/SL/Timeout/EV-exit — через strict-sell;
+    //     - `needs_sell` (см. `any_position_would_sell`) — рыночное
+    //       закрытие TP/SL/Timeout/EV-exit через strict-sell;
     //     - `buy_gate == Proceed` — модель хочет открыться (strict-buy).
     //   Если позиции просто висят без триггера и входить не планируем —
     //   HTTP не делаем; `manage_positions` отработает на WS-fallback для
@@ -427,7 +442,7 @@ async fn tick_once(
         let available = (account_guard.bankroll - total_locked).max(0.0);
         (
             !this_positions.is_empty(),
-            any_position_would_sell(this_positions, &frame, event_over),
+            any_position_would_sell(this_positions, &frame),
             available,
         )
     };
@@ -451,18 +466,29 @@ async fn tick_once(
         &models.booster_pnl,
         models.calibration_pnl.as_ref(),
     );
+    // `compute_p_win_now` больше не гейтится по `has_positions` —
+    // resolution-инференс считается каждый тик в hold-zone безусловно,
+    // чтобы у только что открытой позиции к следующему `manage_positions`
+    // EMA `p_win` уже стартовала с готовой инициализацией. Стоимость —
+    // не более одного inference resolution-модели на кадр в hold-zone
+    // даже при пустых позициях, что для real_sim вне локов пренебрежимо.
     let p_win_now = compute_p_win_now(
         &frame,
         models.booster_resolution.as_deref(),
         models.calibration_resolution.as_ref(),
-        has_positions,
     );
 
     // `buy_gate` сам отказывает, если событие уже завершилось или до резолюции;
     // `available_bankroll_pre` уже учитывает экспозицию всех лейнов всех валют,
     // так что Kelly не сможет раздуть позицию поверх занятого капитала.
+    //
+    // На этом первом вызове `strict_book = None` — мы ещё не сходили
+    // в HTTP, и решаем, нужен ли он вообще (`needs_http = needs_sell ||
+    // may_open`). Поэтому `buy_gate` использует `frame.currency_implied_prob`
+    // (WS-prob); strict-prob по mid HTTP-стакана будет передан в
+    // фактический `try_open_position` ниже, после `fetch_http_strict_book`.
     let may_open = matches!(
-        buy_gate(&frame, pnl_inference, available_bankroll_pre),
+        buy_gate(&frame, pnl_inference, available_bankroll_pre, None),
         BuyGate::Proceed { .. }
     );
     let needs_http = needs_sell || may_open;
@@ -523,13 +549,28 @@ async fn tick_once(
         if has_positions || may_open {
             // Lock на чужие лейны (cross-lane locked) — это сумма по ВСЕМ
             // лейнам ВСЕХ валют, кроме своего; считаем ДО split-borrow, пока
-            // `account_guard.positions` доступен только по `&`.
+            // `account_guard.{positions,pending_resolution}` доступны только по `&`.
+            //
+            // ВАЖНО: учитываем и `pending_resolution`-позиции. Их
+            // `entry_cost` физически всё ещё «работает» в ожидании
+            // post-resolution колбека — деньги в bankroll до закрытия
+            // не вернутся. Без этого учёта Kelly считал бы pending-капитал
+            // свободным и параллельно раздул бы экспозицию того же
+            // bankroll'а в новые позиции на других лейнах.
             let cross_lanes_locked: f64 = account_guard
                 .positions
                 .iter()
                 .filter(|(k, _)| *k != &lane_key)
                 .flat_map(|(_, v)| v.iter())
                 .map(|p| p.entry_cost)
+                .chain(
+                    account_guard
+                        .pending_resolution
+                        .iter()
+                        .filter(|(k, _)| *k != &lane_key)
+                        .flat_map(|(_, v)| v.iter())
+                        .map(|p| p.entry_cost),
+                )
                 .sum();
 
             // `stats` живёт в `RealSimState`, `bankroll`/`positions` — в
@@ -547,25 +588,48 @@ async fn tick_once(
             let Account {
                 bankroll,
                 positions: account_positions,
+                pending_resolution: account_pending,
                 ..
             } = &mut *account_guard;
+            // `get_many_mut` мы не имеем (msrv), но ключи заведомо разные
+            // («positions» и «pending_resolution» — это разные карты), и
+            // лейн-ключ один и тот же, так что коллизии нет: достаём
+            // мутабельные ссылки из РАЗНЫХ HashMap'ов независимо.
             let this_positions: &mut Vec<OpenPosition> = account_positions
                 .get_mut(&lane_key)
                 .expect("Account.positions pre-populated by run_real_sim");
+            let this_pending: &mut Vec<OpenPosition> = account_pending
+                .get_mut(&lane_key)
+                .expect("Account.pending_resolution pre-populated by run_real_sim");
 
             // 1) Жизненный цикл уже открытых позиций: инкремент `frames_held`,
-            //    EMA `p_win`, проверка TP/SL/Timeout/Resolution/EV. Вызываем
-            //    **всегда**, когда позиции есть, — даже без HTTP: Resolution
-            //    (`event_remaining_ms ≤ 0`) исполняется без `strict_book`, а
-            //    «тихий» тик сам ничего не закроет по WS-fallback, т.к.
-            //    предикат `needs_sell` симметричен условиям `manage_positions`.
-            //    `strict_book.as_ref()` будет `Some` только при `needs_http=true`.
+            //    EMA `p_win`, проверка TP/SL/Timeout/EV. Вызываем **всегда**,
+            //    когда позиции есть, — даже без HTTP: «тихий» тик сам ничего
+            //    не закроет по WS-fallback, т.к. предикат `needs_sell`
+            //    симметричен условиям `manage_positions`. `strict_book.as_ref()`
+            //    будет `Some` только при `needs_http=true`. Резолюция по
+            //    итогу события сюда не приходит: на `event_remaining_ms ≤ 0`
+            //    `sell_gate` возвращает Hold, а закрытие по бинарному
+            //    payout исполняет колбек
+            //    [`crate::account::Account::resolve_pending_market`].
+            //
+            //    Stale-позиции (asset_id ≠ frame.asset_id, например на смене
+            //    5m/15m раунда внутри лейна) на этом тике уезжают в
+            //    `this_pending` и больше не блокируют ни sell_gate, ни
+            //    Kelly-сайзинг этого лейна. На `event_remaining_ms ≤ 0`
+            //    `sell_gate` сама возвращает Hold — позиции дождутся
+            //    резолюционного колбека `Account::resolve_pending_market`,
+            //    который придёт от `xframe_dump` после реального
+            //    `final_price`.
             if has_positions {
                 sold = manage_positions(
                     this_positions,
+                    this_pending,
                     &frame,
-                    event_over,
-                    won,
+                    // `is_last = false`: real_sim — live-поток без
+                    // понятия «последний кадр». Параметр актуален
+                    // только для history_sim (truncated-дамп fallback).
+                    false,
                     p_win_now,
                     side_stats,
                     bankroll,
@@ -574,15 +638,23 @@ async fn tick_once(
                 );
             }
 
-            // 2) BUY: пропускаем, если WS отстаёт. На `event_over` `may_open`
-            //    уже `false` (внутри `buy_gate` сработал `LateEntry`).
+            // 2) BUY: пропускаем, если WS отстаёт. На `event_remaining_ms ≤ 0`
+            //    `may_open` уже `false` (внутри `buy_gate` сработал `LateEntry`).
             //    Пересчитываем `available_bankroll`: `manage_positions` мог
             //    закрыть нашу позицию — освободившийся entry_cost снова
             //    доступен Kelly. `cross_lanes_locked` зафиксирован снапшотом
             //    выше (другие лейны/валюты внутри ЭТОГО account.write()-блока
             //    не меняются — параллельные `tick_once` стоят на `account.write()`).
             if may_open && !ws_lagging {
-                let same_locked_post: f64 = this_positions.iter().map(|p| p.entry_cost).sum();
+                // Same-lane locked: активные + pending этого лейна. Те же
+                // мотивы, что и для cross-lane (см. комментарий выше) —
+                // pending'и держат `entry_cost`, считать их свободными
+                // нельзя.
+                let same_locked_post: f64 = this_positions
+                    .iter()
+                    .chain(this_pending.iter())
+                    .map(|p| p.entry_cost)
+                    .sum();
                 let available_bankroll_post = (*bankroll - cross_lanes_locked - same_locked_post).max(0.0);
                 bought = try_open_position(
                     &frame,
@@ -605,7 +677,7 @@ async fn tick_once(
         // Считается на КАЖДОМ тике, не только на сделке. Между open и close
         // реализованный bankroll не двигается, и без MtM `max_drawdown_pct`
         // системно занижен на длинных удержаниях, уходящих в красное и
-        // закрывающихся через Resolution.
+        // закрывающихся через резолюционный колбек.
         //
         // Поскольку `bankroll`, `positions` и `last_prob` живут в одном
         // `Account`, equity считается **истинно портфельный** — по всем
@@ -621,10 +693,11 @@ async fn tick_once(
         let total_value: f64 = {
             let Account {
                 positions: account_positions,
+                pending_resolution: account_pending,
                 last_prob,
                 ..
             } = &*account_guard;
-            account_positions
+            let active: f64 = account_positions
                 .iter()
                 .map(|((c, i, s), pos_vec)| {
                     let prob = if c.as_str() == currency && *i == interval_kind && *s == side {
@@ -637,7 +710,21 @@ async fn tick_once(
                     };
                     pos_vec.iter().map(|p| p.shares_held * prob).sum::<f64>()
                 })
-                .sum()
+                .sum();
+            // pending-позиции: текущий prob их СТАРОГО маркета мы не
+            // знаем (фреймов по нему больше не приходит, а `last_prob`
+            // лейна уже описывает новый маркет). Используем `entry_prob`
+            // как нейтральный mark-to-market — это фактически «капитал
+            // заблокирован, итог пока неизвестен». Даёт MtM, эквивалентный
+            // entry_cost (с точностью до комиссии): equity не двигается
+            // от факта перевода в pending, что и нужно — реальный PnL
+            // прилетит post-resolution колбеком.
+            let pending: f64 = account_pending
+                .values()
+                .flat_map(|v| v.iter())
+                .map(|p| p.shares_held * p.entry_prob)
+                .sum();
+            active + pending
         };
         let equity = account_guard.bankroll + total_value;
         account_guard.update_drawdown(equity);
@@ -718,11 +805,24 @@ async fn fetch_http_strict_book(
         );
         return None;
     }
-    match reply_rx.await {
-        Ok(book) => book,
-        Err(_) => {
+    // Тайм-аут страхует от ситуации, когда координатор ещё жив, но
+    // потерял наш `oneshot::Sender` (например, на нештатном выходе из
+    // батч-цикла) или его HTTP-запрос завис дольше `BOOK_HTTP_TIMEOUT_MS`,
+    // но по какой-то причине без явного ответа `None`. Без этого
+    // воркер блокировался бы на `reply_rx.await` бесконечно, копя кадры
+    // в `LANE_FRAME_CHANNEL_CAP` и в итоге роняя фанаут (`try_send` →
+    // `Full`).
+    match tokio::time::timeout(Duration::from_millis(BOOK_REPLY_TIMEOUT_MS), reply_rx).await {
+        Ok(Ok(book)) => book,
+        Ok(Err(_)) => {
             eprintln!(
                 "[real_sim] {tag}: book-coord уронил oneshot до ответа — strict-fill выключен на тик"
+            );
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "[real_sim] {tag}: ожидание ответа book-coord > {BOOK_REPLY_TIMEOUT_MS}ms — strict-fill выключен на тик"
             );
             None
         }
@@ -825,9 +925,17 @@ async fn run_book_coordinator(
         }
 
         // Один HTTP вместо 4: батч-эндпоинт CLOB `POST /books`.
+        // Заворачиваем в `tokio::time::timeout`, чтобы зависший
+        // сокет / 5xx без авторазрыва не блокировал координатор на
+        // десятки секунд (см. doc у `BOOK_HTTP_TIMEOUT_MS`).
         let n = requests.len();
-        match project_manager.clob.order_books(&requests).await {
-            Ok(responses) if responses.len() == n => {
+        let http_result = tokio::time::timeout(
+            Duration::from_millis(BOOK_HTTP_TIMEOUT_MS),
+            project_manager.clob.order_books(&requests),
+        )
+        .await;
+        match http_result {
+            Ok(Ok(responses)) if responses.len() == n => {
                 for (aid, resp) in valid_ids.iter().zip(responses.iter()) {
                     let (bids, asks) = parse_book_levels(resp);
                     let book = StrictBook { bids, asks };
@@ -844,7 +952,7 @@ async fn run_book_coordinator(
                     }
                 }
             }
-            Ok(responses) => {
+            Ok(Ok(responses)) => {
                 eprintln!(
                     "[real_sim/book-coord] order_books вернул {} ответов на {n} запросов — отбрасываем батч",
                     responses.len(),
@@ -855,9 +963,19 @@ async fn run_book_coordinator(
                     }
                 }
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 eprintln!(
                     "[real_sim/book-coord] order_books({n} assets) failed: {err:#}"
+                );
+                for senders in by_asset.into_values() {
+                    for s in senders {
+                        let _ = s.send(None);
+                    }
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "[real_sim/book-coord] order_books({n} assets) timed out > {BOOK_HTTP_TIMEOUT_MS}ms — отбрасываем батч"
                 );
                 for senders in by_asset.into_values() {
                     for s in senders {
