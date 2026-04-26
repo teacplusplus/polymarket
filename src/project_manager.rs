@@ -693,7 +693,7 @@ impl ProjectManager {
             }
         }
 
-        let mut xframes_by_market_lock = self.xframes_by_market[lane].write().await;
+        
         for entry in built_xframes {
             if entry.frame.stable {
                 run_log::xframe_stored(&entry.frame);
@@ -733,15 +733,15 @@ impl ProjectManager {
                     }
                 }
             }
-
+            let mut xframes_by_market_lock = self.xframes_by_market[lane].write().await;
             xframes_by_market_lock
                 .entry(entry.market_id)
                 .or_insert_with(HashMap::new)
                 .entry(entry.asset_id)
                 .or_insert_with(BTreeMap::new)
                 .insert(entry.aligned_ts, entry.frame);
-        }
-        drop(xframes_by_market_lock);
+            drop(xframes_by_market_lock);
+        }    
     }
 
     pub async fn run_currency_updown_interval(self: Arc<Self>, period_sec: i64, period: &'static str) {
