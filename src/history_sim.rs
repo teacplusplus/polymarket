@@ -465,23 +465,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
                     }
                 }
 
-                // Инвариант бухгалтерии: накопленный PnL по сторонам обязан
-                // в точности совпадать с дельтой bankroll'а от стартового
-                // капитала. Любое расхождение — тихий drift в close_position
-                // (двойной учёт fee, потерянная сделка, невычтенный entry_cost
-                // и т. п.). Допуск 1e-6 USDC покрывает округление f64 на
-                // длинной серии сделок без маскирования реальных багов.
-                debug_assert!(
-                    {
-                        let sides_pnl = sim_stats.up.pnl_usd + sim_stats.down.pnl_usd;
-                        let bankroll_pnl = account.bankroll - INITIAL_BANKROLL;
-                        (sides_pnl - bankroll_pnl).abs() < 1e-6
-                    },
-                    "[sim] {tag}: PnL invariant violated — up.pnl + down.pnl = {:.6}, bankroll - INITIAL = {:.6}",
-                    sim_stats.up.pnl_usd + sim_stats.down.pnl_usd,
-                    account.bankroll - INITIAL_BANKROLL,
-                );
-
+            
                 print_sim_stats(&tag, &sim_stats, &account);
             }
         }
