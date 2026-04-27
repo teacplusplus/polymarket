@@ -24,3 +24,4 @@ dotenvy = "0.15"
 xgb = { path = "./lib/xgb", default-features = false, features = ["local_build"] }
 optimizer = "0.3.0"
 rand = "0.8"
+indexmap = "2.14.0"

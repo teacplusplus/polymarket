@@ -51,10 +51,13 @@ use crate::util::current_timestamp_ms;
 use crate::xframe::{XFrame, SIZE};
 
 use anyhow::{anyhow, Result};
+use futures_util::FutureExt;
+use indexmap::IndexSet;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse;
 use polymarket_client_sdk::types::U256;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -110,6 +113,13 @@ const BOOK_HTTP_TIMEOUT_MS: u64 = 2000;
 /// (координатор завис или потерял запрос) — воркер выходит без
 /// strict_book на этом тике, не блокируя дальше всю свою цепочку.
 const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
+
+/// Максимум `market_id`, которые держим в [`RealSimState::seen_market_ids`]
+/// **на каждый** `XFrameIntervalKind`. При insert'е сверх этого порога
+/// самый старый (по порядку первой регистрации) вытесняется через
+/// `IndexSet::shift_remove_index(0)`, чтобы set не пух бесконечно за
+/// время жизни процесса.
+const SEEN_MARKET_IDS_CAP: usize = 8;
 
 /// Полный набор 4 ключей фанаута 1s-кадров: `(interval, side)`.
 const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
@@ -170,6 +180,37 @@ pub struct RealSimState {
     /// `get_mut(&kind).unwrap()`.
     pub stats: HashMap<XFrameIntervalKind, SimStats>,
     pub lane_frame_channels: LaneFrameChannels,
+    /// Множество уже посчитанных в `stats[interval].events` маркетов —
+    /// дедуп-щит для bump'а events. Инкрементируем `events` только если
+    /// `seen_market_ids[interval].insert(market_id)` вернул `true`.
+    ///
+    /// # Зачем
+    ///
+    /// Раньше `events += 1` бампился только Up-стороной. Это давало
+    /// двойной баг:
+    ///   1. Если Up-канал отстал и первой сменилась Down-сторона —
+    ///      `events` за этот маркет вообще не инкрементировался.
+    ///   2. Если первый кадр маркета приходил с `prob = None` (типично
+    ///      сразу после ws-reconnect), мы делали early-return ДО
+    ///      обновления `last_market_id`, и на следующем кадре того
+    ///      же маркета `market_changed = true` снова → дубль bump'а.
+    ///
+    /// `IndexSet` решает оба случая: первая сторона, увидевшая новый
+    /// `market_id` в этом интервале, инкрементирует; вторая (и любые
+    /// повторы) — нет. Идемпотентно.
+    ///
+    /// # Почему `IndexSet`, а не `HashSet`
+    ///
+    /// Для предотвращения неограниченного роста при долгой жизни
+    /// процесса: `IndexSet` сохраняет порядок вставки, что позволяет
+    /// дешево вытеснять «самый старый» маркет через
+    /// `shift_remove_index(0)` при превышении [`SEEN_MARKET_IDS_CAP`].
+    /// Семантика — FIFO-ring: всегда помним последние ~1024 маркетов на
+    /// интервал; более старые забываются. Цена забывания — теоретически
+    /// возможный лишний bump'а events для маркета, кадр которого
+    /// прилетел спустя сотни тиков (нереальный случай при
+    /// `BOOK_HTTP_TIMEOUT_MS = 2 сек`).
+    pub seen_market_ids: HashMap<XFrameIntervalKind, IndexSet<String>>,
 }
 
 impl RealSimState {
@@ -177,9 +218,13 @@ impl RealSimState {
         let mut stats = HashMap::with_capacity(2);
         stats.insert(XFrameIntervalKind::FiveMin, SimStats::new());
         stats.insert(XFrameIntervalKind::FifteenMin, SimStats::new());
+        let mut seen_market_ids = HashMap::with_capacity(2);
+        seen_market_ids.insert(XFrameIntervalKind::FiveMin, IndexSet::new());
+        seen_market_ids.insert(XFrameIntervalKind::FifteenMin, IndexSet::new());
         Self {
             stats,
             lane_frame_channels: LaneFrameChannels::new(),
+            seen_market_ids,
         }
     }
 }
@@ -312,7 +357,22 @@ fn spawn_side_worker(
         );
         let mut last_market_id: Option<String> = None;
         while let Some(lane_frame) = rx.recv().await {
-            if let Err(err) = tick_once(
+            // C6: оборачиваем тик в `catch_unwind`, чтобы паника внутри
+            // `tick_once` (например, в `predict_frame` на повреждённой
+            // модели или при integer overflow в EMA) не убивала весь
+            // tokio-таск воркера. Без этого один битый кадр уносил весь
+            // лейн до конца жизни процесса — фанаут продолжает писать
+            // в канал, кадры копятся до cap'а и теряются (см. C3).
+            //
+            // `AssertUnwindSafe` корректно: после паники мы не используем
+            // мутабельное состояние, которое могло остаться в неконсистентном
+            // виде, кроме `last_market_id` (просто `Option<String>`).
+            // Account / state защищены RwLock'ами — паника в середине
+            // write-секции освободит лок, и параллельные воркеры увидят
+            // частично-обновлённое состояние; это хуже, чем dataloss, но
+            // лучше «зависшего навсегда» лейна. Для проблем такого рода
+            // нужен на уровне выше healthcheck + restart процесса.
+            let result = AssertUnwindSafe(tick_once(
                 &book_tx,
                 &state,
                 &account,
@@ -323,12 +383,37 @@ fn spawn_side_worker(
                 &tag,
                 &mut last_market_id,
                 lane_frame,
-            ).await {
-                crate::tee_eprintln!("[real_sim] {tag}: tick error: {err:#}");
+            ))
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    crate::tee_eprintln!("[real_sim] {tag}: tick error: {err:#}");
+                }
+                Err(payload) => {
+                    let msg = panic_payload_message(&payload);
+                    crate::tee_eprintln!(
+                        "[real_sim] {tag}: tick PANIC ({msg}) — кадр пропущен, воркер живой"
+                    );
+                }
             }
         }
         crate::tee_eprintln!("[real_sim] {tag}: канал закрыт — воркер завершён");
     });
+}
+
+/// Извлекает текстовое сообщение из panic-payload, чтобы залогировать причину
+/// в C6-обёртке. `std::panic::catch_unwind` отдаёт `Box<dyn Any + Send>` —
+/// типичный кейс — `&'static str` или `String`.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }
 
 /// Один тик воркера: из пришедшего `LaneFrame` берём маркет/asset/frame,
@@ -365,31 +450,64 @@ async fn tick_once(
     // который дёргается из `xframe_dump` по реальному `final_price`.
     let market_changed = last_market_id.as_deref() != Some(market_id.as_str());
 
-    // ── Bookkeeping #1: bump `events` ДО early-return ─────────────────────────
+    // ── Bookkeeping #1: bump `events` через seen_market_ids dedupe ────────────
     // `events` отражает «сколько маркетов мы наблюдали для этого интервала».
-    // Делаем bump на смене `market_id`, ДО проверки `currency_implied_prob`:
-    // иначе маркет, у которого первый прилетевший кадр случайно пришёл с
-    // `prob=None` (типично сразу после ws-reconnect), просто не попадёт в
-    // счётчик. Сторона — только `Up`, потому что бинарный маркет общий
-    // для UP/DOWN-токенов: бамп с обоих сторон дал бы 2× event'ов.
+    // Раньше bump делал только Up-воркер — это давало два бага:
+    //   1. Если Up-канал отстал и Down первой увидел смену маркета,
+    //      `events` за этот маркет вообще не инкрементировался.
+    //   2. Если первый кадр маркета пришёл с `prob = None` (типично
+    //      сразу после ws-reconnect), мы делали early-return ДО апдейта
+    //      `last_market_id` — на следующем кадре того же маркета
+    //      `market_changed = true` снова, и был дубль bump'а.
     //
-    // `last_market_id` обновляем СРАЗУ (и здесь, и на early-return): пара
-    // `events ↔ last_market_id` обязана быть атомарной по отношению к
-    // `market_id`, иначе на следующем тике `market_changed` снова даст true
-    // и мы зальём событие повторно.
-    if market_changed && side == CurrencyUpDownOutcome::Up {
-        state
-            .write()
-            .await
-            .stats
-            .get_mut(&interval_kind)
-            .expect("stats map initialized for both intervals")
-            .events += 1;
+    // Теперь обе стороны (и любые их повторы) идут через dedupe: первая
+    // сторона, успевшая зарегистрировать `market_id` в
+    // `state.seen_market_ids[interval]`, инкрементирует. Все последующие
+    // (Down + повторы Up из-за пропущенного `prob`) — нет.
+    //
+    // `last_market_id` обновляем СРАЗУ (и здесь, и на early-return): он
+    // нужен для оптимизации (`market_changed` гасится на следующем тике
+    // того же маркета и мы не лезем в `state.write()` зря).
+    if market_changed {
+        let mut state_guard = state.write().await;
+        let RealSimState {
+            seen_market_ids,
+            stats,
+            ..
+        } = &mut *state_guard;
+        let seen = seen_market_ids.entry(interval_kind).or_default();
+        if seen.insert(market_id.clone()) {
+            // FIFO-вытеснение: вышли за cap → выкидываем самый старый.
+            // `shift_remove_index(0)` сохраняет порядок (O(n) копирование,
+            // но n ≤ SEEN_MARKET_IDS_CAP, так что для 1024 элементов это
+            // микросекунды и происходит максимум раз на тик).
+            while seen.len() > SEEN_MARKET_IDS_CAP {
+                seen.shift_remove_index(0);
+            }
+            stats
+                .get_mut(&interval_kind)
+                .expect("stats map initialized for both intervals")
+                .events += 1;
+        }
     }
 
-    let Some(currency_implied_prob) = frame.currency_implied_prob else {
+    let Some(raw_prob) = frame.currency_implied_prob else {
         return Ok(());
     };
+    // D4: защита от bogus prob (NaN / out-of-range). `effective_implied_prob`
+    // в `xframe.rs` уже clamp'ит свой результат, но кадр мог прийти с
+    // нефинитным значением через парсер ws (теоретически). Если так —
+    // пропускаем кадр целиком: писать NaN в `last_prob` нельзя — это
+    // отравит mark-to-market всех зависимых лейнов на следующих тиках.
+    if !raw_prob.is_finite() || raw_prob <= 0.0 || raw_prob >= 1.0 {
+        crate::tee_eprintln!(
+            "[real_sim] {tag}: bogus currency_implied_prob={raw_prob} \
+             (market={market_id}) — кадр пропущен"
+        );
+        *last_market_id = Some(market_id);
+        return Ok(());
+    }
+    let currency_implied_prob = raw_prob.clamp(0.001, 0.999);
 
     let lane_key = (currency.to_string(), interval_kind, side);
 
@@ -401,6 +519,13 @@ async fn tick_once(
     // в большой общий `account.write()` для торговли, она будет видна
     // только после HTTP-задержки (десятки ms на ордербук), что замусоривает
     // mark-to-market параллельных лейнов «старой» prob.
+    //
+    // Здесь пишем именно WS-prob: `effective_implied_prob` (HTTP-mid /
+    // last trade) станет доступен только после `fetch_http_strict_book`
+    // ниже, а другим лейнам нужно свежее значение СРАЗУ. После HTTP мы
+    // ПЕРЕПИШЕМ `last_prob` на effective под общим write-локом фазы 1
+    // (см. ниже), так что чужие лейны на следующих тиках уже увидят
+    // strict-prob.
     {
         let mut account_guard = account.write().await;
         account_guard
@@ -428,7 +553,14 @@ async fn tick_once(
     //   на ОБЩИЙ bankroll сразу со всех PM. Без этой агрегации `4×N`
     //   параллельных воркеров (4 лейна × N валют) раздули бы суммарную
     //   экспозицию до `4N × MAX_BET_FRACTION` исходного капитала.
-    let (has_positions, needs_sell, available_bankroll_pre, dd_halt_active, account_max_dd_pct) = {
+    let (
+        has_positions,
+        needs_sell,
+        available_bankroll_pre,
+        dd_halt_active,
+        account_max_dd_pct,
+        market_already_resolved,
+    ) = {
         let account_guard = account.read().await;
         let this_positions = account_guard
             .positions
@@ -452,12 +584,27 @@ async fn tick_once(
             Some(threshold) => account_guard.max_drawdown_pct >= threshold,
             None => false,
         };
+        // C2-защита: если этот `market_id` уже резолвнулся (колбек
+        // `xframe_dump::spawn_dump_market_xframes_binary` отработал), не
+        // открываем по нему новые позиции. Между приходом резолюционного
+        // колбека и возвратом нашего HTTP-запроса в `tick_once` мог
+        // образоваться зазор: HTTP подвис на пару секунд, за это время
+        // резолюция вызвала `Account::resolve_pending_market`, а кадры
+        // нашего лейна с этого маркета уже стоят в очереди воркера с
+        // `event_remaining_ms > 0` (CLOB закрыл маркет раньше, чем
+        // `sleep(max_step)` дорастил резолюционный колбек). Без этого
+        // фильтра `try_open_position` создал бы фантомную локальную
+        // позицию на маркете, который on-chain больше не торгуется.
+        let market_resolved = account_guard
+            .recently_resolved_markets
+            .contains(market_id.as_str());
         (
             !this_positions.is_empty(),
             any_position_would_sell(this_positions, &frame),
             available,
             dd_halt,
             account_guard.max_drawdown_pct,
+            market_resolved,
         )
     };
 
@@ -501,24 +648,30 @@ async fn tick_once(
     // may_open`). Поэтому `buy_gate` использует `frame.currency_implied_prob`
     // (WS-prob); strict-prob по mid HTTP-стакана будет передан в
     // фактический `try_open_position` ниже, после `fetch_http_strict_book`.
-    let may_open = !dd_halt_active
-        && matches!(
-            buy_gate(&frame, pnl_inference, available_bankroll_pre, None),
-            BuyGate::Proceed { .. }
-        );
-    if dd_halt_active && matches!(
+    let buy_gate_proceed = matches!(
         buy_gate(&frame, pnl_inference, available_bankroll_pre, None),
         BuyGate::Proceed { .. }
-    ) {
-        // Один лог на каждый «пропущенный по halt» вход. Альтернатива —
-        // `Once`-флаг через статик, но при многоинтервальном/мультивалютном
-        // деплое полезно видеть, что halt продолжает резать кандидатов
-        // (а не молча; проблему «спама» гасит то, что halt — необратимое
-        // состояние, и поток входов модели в просадке естественно скуднее).
+    );
+    let may_open = !dd_halt_active && !market_already_resolved && buy_gate_proceed;
+    if buy_gate_proceed && dd_halt_active {
+        // Один лог на каждый «пропущенный по halt» вход. Halt — необратимое
+        // состояние, и поток входов модели в просадке естественно скуднее,
+        // так что спама не будет.
         crate::tee_eprintln!(
             "[real_sim] {tag}: halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
             crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT,
             account_max_dd_pct
+        );
+    }
+    if buy_gate_proceed && market_already_resolved {
+        // Маркет уже резолвнулся (см. C2-фильтр выше). Логируем, чтобы было
+        // видно, что модель «промахивается» в окно после резолюции —
+        // обычно из-за HTTP-задержки `fetch_http_strict_book`. Если строк
+        // много — значит зазор между CLOB-закрытием маркета и нашим
+        // `xframe_dump`-колбеком слишком велик, и стоит уменьшить
+        // `BOOK_HTTP_TIMEOUT_MS` или ускорить `spawn_dump_market_xframes_binary`.
+        crate::tee_eprintln!(
+            "[real_sim] {tag}: skip open — market={market_id} уже резолвнулся, кадр пришёл с задержкой"
         );
     }
     let needs_http = needs_sell || may_open;
@@ -568,9 +721,45 @@ async fn tick_once(
     //     держать там write — большой штраф для других воркеров.
     let mut sold = false;
     let mut bought = false;
+    // B1: «эффективная» prob — Polymarket-style по HTTP-стакану (mid L1 при
+    // спреде ≤ 10¢, иначе last trade), с фоллбэком на WS-prob. Это ровно
+    // та же шкала, на которой `try_open_position` пишет `OpenPosition.entry_prob`,
+    // и на которой `sell_gate` считает `delta = current_prob − entry_prob`.
+    // Используем её и для перезаписи `last_prob` ниже, и для MtM нашего лейна
+    // в фазе 2 — чтобы entry/exit/MtM жили на одной шкале.
+    let effective_prob = crate::history_sim::effective_implied_prob(&frame, strict_book.as_ref())
+        .unwrap_or(currency_implied_prob);
     {
         let mut state_guard = state.write().await;
         let mut account_guard = account.write().await;
+
+        // B1: ПЕРЕзаписать `last_prob` на effective_prob. Первая (WS) запись
+        // была в bookkeeping #2 — она нужна параллельным воркерам, ждущим
+        // MtM прямо сейчас. Эта вторая запись даёт чужим лейнам уже
+        // strict-prob к их **следующему** тику, что ровняет шкалу
+        // entry_prob ↔ MtM по портфелю.
+        account_guard
+            .last_prob
+            .insert(lane_key.clone(), effective_prob);
+
+        // B2: re-check halt под write-локом. Snapshot `dd_halt_active` был
+        // сделан ДО HTTP (десятки/сотни ms назад). За это время параллельные
+        // воркеры могли пересчитать `update_drawdown` и пробить порог.
+        // Без re-check'а до 1 «лишнего» входа после фактического halt'а;
+        // под write-локом мы уже видим самое свежее значение и можем
+        // отказаться от открытия.
+        let dd_halt_now = match crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT {
+            Some(threshold) => account_guard.max_drawdown_pct >= threshold,
+            None => false,
+        };
+        if !dd_halt_active && dd_halt_now && may_open {
+            crate::tee_eprintln!(
+                "[real_sim] {tag}: halt by drawdown сработал между snapshot'ом и HTTP — \
+                 новый вход отменяем (max_dd_pct={:.2}%)",
+                account_guard.max_drawdown_pct
+            );
+        }
+        let may_open = may_open && !dd_halt_now;
 
         // ── Фаза 1: торговля ──────────────────────────────────────────────────
         // «Купили/продали» получаем напрямую из возвратов `manage_positions` /
@@ -713,13 +902,18 @@ async fn tick_once(
         // `Account`, equity считается **истинно портфельный** — по всем
         // валютам и всем 4 лейнам каждой:
         //     equity = account.bankroll + Σ_(c,i,s) Σ_pos shares_held × prob[c,i,s]
-        // Для текущего лейна prob — свежий `currency_implied_prob` из кадра;
-        // для остальных — `account.last_prob[(c, i, s)]`, который обновляется
-        // в начале каждого `tick_once` соответствующего лейна. Если записи
-        // ещё нет (старт процесса) и при этом там уже есть позиции — берём
-        // `0.5` (нейтрально), но в штатной работе позиции открываются только
-        // ПОСЛЕ хотя бы одного `tick_once`, так что fallback почти не
-        // срабатывает.
+        // Для текущего лейна prob — `effective_prob` (Polymarket-style по
+        // HTTP-стакану, fallback на WS), та же шкала, что у
+        // `OpenPosition.entry_prob`. Для чужих — `account.last_prob[(c,i,s)]`,
+        // который обновляется в начале каждого `tick_once` соответствующего
+        // лейна, плюс перезаписывается на effective ниже по этому же блоку
+        // (см. B1) — т.е. на следующих тиках чужие лейны увидят strict-prob.
+        // Каждое значение clamp'им (D4): защита от NaN/out-of-range, который
+        // мог проскочить в `last_prob` других лейнов до D4-фильтра.
+        // Если записи ещё нет (старт процесса) и при этом там уже есть
+        // позиции — берём `0.5` (нейтрально), но в штатной работе позиции
+        // открываются только ПОСЛЕ хотя бы одного `tick_once`, так что
+        // fallback почти не срабатывает.
         let total_value: f64 = {
             let Account {
                 positions: account_positions,
@@ -730,13 +924,18 @@ async fn tick_once(
             let active: f64 = account_positions
                 .iter()
                 .map(|((c, i, s), pos_vec)| {
-                    let prob = if c.as_str() == currency && *i == interval_kind && *s == side {
-                        currency_implied_prob
+                    let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
+                        effective_prob
                     } else {
                         last_prob
                             .get(&(c.clone(), *i, *s))
                             .copied()
                             .unwrap_or(0.5)
+                    };
+                    let prob = if prob_raw.is_finite() {
+                        prob_raw.clamp(0.001, 0.999)
+                    } else {
+                        0.5
                     };
                     pos_vec.iter().map(|p| p.shares_held * prob).sum::<f64>()
                 })

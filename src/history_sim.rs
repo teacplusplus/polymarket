@@ -318,20 +318,41 @@ pub(crate) fn book_fill_buy_strict(
 /// Строгая продажа `shares_to_sell` по `bids` [`StrictBook`] без fallback.
 ///
 /// Возвращает `Some(gross_usdc)` (до вычета taker-fee), если ликвидности
-/// достаточно **и** выполнены те же инвариантные условия живой торговли,
+/// достаточно **и** выполнены инвариантные условия живой торговли,
 /// что у [`book_fill_buy_strict`]:
 ///
-/// 1. **Slippage cap** ([`MAX_SLIPPAGE_FROM_L1_PCT`]): VWAP продажи
+/// 1. **Slippage cap** (`slippage_cap`): VWAP продажи
 ///    `(gross_usdc / shares_to_sell)` не должен быть ниже best bid
-///    больше, чем на `MAX_SLIPPAGE_FROM_L1_PCT`. Иначе — `None`,
+///    больше, чем на переданный процент. Иначе — `None`,
 ///    `manage_positions` оставит позицию открытой и попробует
 ///    повторно на следующем тике (`kelly_strict_sell_skips++`).
+///
+///    * `Some(pct)` — cap активен (типичное значение [`MAX_SLIPPAGE_FROM_L1_PCT`]).
+///      Используем для **добровольных** выходов (TP / EvExitProfit),
+///      где edge модели чувствителен к slippage и можно «передумать»,
+///      подождав лучшего стакана. Решение принимает
+///      [`CloseReason::is_voluntary_exit`].
+///    * `None` — cap отключён, выходим по любому VWAP. Используем для
+///      **обязательных** выходов (SL / Timeout / EvExitLoss): удерживать
+///      позицию из-за широкого стакана опаснее, чем пройти slippage,
+///      иначе позиция может уехать к резолюции проигравшего токена
+///      за $0.
+///
+///    Параметр `Option<f64>` (а не `bool`) намеренно: даёт возможность
+///    в будущем градуировать cap по reason (например, TP — 2%,
+///    EvExitProfit — 3%) без изменения сигнатуры.
 /// 2. **`min_order_size`**: `shares_to_sell` < `min_order_size` →
 ///    `None`, ровно по той же причине, что у buy: ордер CLOB бы
-///    отклонил.
+///    отклонил. Эта проверка независима от `slippage_cap` —
+///    CLOB ничего не примет ниже минимума, даже если мы готовы
+///    пройти любой slippage.
 ///
-/// Если `book.min_order_size = None` — проверка пропускается.
-pub(crate) fn book_fill_sell_strict(book: &StrictBook, shares_to_sell: f64) -> Option<f64> {
+/// Если `book.min_order_size = None` — проверка `min` пропускается.
+pub(crate) fn book_fill_sell_strict(
+    book: &StrictBook,
+    shares_to_sell: f64,
+    slippage_cap: Option<f64>,
+) -> Option<f64> {
     if shares_to_sell <= 0.0 {
         return Some(0.0);
     }
@@ -364,8 +385,10 @@ pub(crate) fn book_fill_sell_strict(book: &StrictBook, shares_to_sell: f64) -> O
         return None;
     }
     let vwap = total_usdc / shares_to_sell;
-    if (best_bid - vwap) / best_bid > MAX_SLIPPAGE_FROM_L1_PCT {
-        return None;
+    if let Some(cap) = slippage_cap {
+        if (best_bid - vwap) / best_bid > cap {
+            return None;
+        }
     }
     Some(total_usdc)
 }
@@ -444,6 +467,27 @@ pub enum CloseReason {
     /// продажа сейчас выгоднее ожидания резолюции, но ниже цены входа.
     /// Срабатывает, когда модель быстрее рынка увидела негативный исход.
     EvExitLoss,
+}
+
+impl CloseReason {
+    /// Можно ли «передумать» этот выход, если стакан слишком тонкий?
+    ///
+    /// `true` — выход **добровольный**: TP / EvExitProfit. Тут разумно
+    /// применять [`MAX_SLIPPAGE_FROM_L1_PCT`] и не выходить на VWAP, который
+    /// глубже best bid'а допустимого процента — ждём лучшего стакана в
+    /// следующем тике, edge сохраняется.
+    ///
+    /// `false` — **обязательный** выход: SL / Timeout / EvExitLoss. Здесь
+    /// удерживать позицию из-за широкого стакана опаснее, чем пройти
+    /// slippage: SL/Timeout срабатывают именно тогда, когда дальнейшее
+    /// удержание ухудшает PnL, а EvExitLoss — когда модель уже увидела
+    /// негативный исход и продажа сейчас лучше ожидания резолюции (где
+    /// `final_price` может быть $0). Slippage cap здесь намеренно
+    /// отключён: лучше выйти на 5–10¢ хуже mid, чем уехать к резолюции
+    /// проигравшего токена за $0.
+    pub fn is_voluntary_exit(&self) -> bool {
+        matches!(self, CloseReason::TakeProfit | CloseReason::EvExitProfit)
+    }
 }
 
 /// Статистика торговли по одной стороне (UP или DOWN).
@@ -1472,8 +1516,17 @@ pub(crate) fn sell_gate(
         let Some(p_ema) = new_p_win_ema else {
             return SellGate::HoldResolution { new_p_win_ema };
         };
+        // EV-оценка для решения «закрывать или ждать»: применяем cap
+        // (`Some(MAX_SLIPPAGE_FROM_L1_PCT)`), чтобы решение было
+        // **консервативным** — мы не хотим закрывать на слишком
+        // плохой цене, если на следующем тике стакан может улучшиться.
+        // Если cap зарезал — `gross_usdc_opt = None`, выход не считаем,
+        // позиция уезжает в `HoldResolution`. Если EV всё-таки
+        // сработает позже и закрытие пойдёт через `close_position` с
+        // `CloseReason::EvExitLoss` — там cap уже отключён (must-exit),
+        // см. doc у [`CloseReason::is_voluntary_exit`].
         let gross_usdc_opt = match strict_book {
-            Some(book) => book_fill_sell_strict(book, pos.shares_held),
+            Some(book) => book_fill_sell_strict(book, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
             None => Some(book_fill_sell(frame, pos.shares_held)),
         };
         let Some(gross_usdc) = gross_usdc_opt else {
@@ -1811,8 +1864,19 @@ fn close_position(
     stats: &mut SideStats,
     strict_book: Option<&StrictBook>,
 ) -> Option<f64> {
+    // Slippage cap включаем **только** для добровольных выходов
+    // (TP / EvExitProfit) — там есть смысл «передумать» и подождать
+    // лучшего стакана. Для SL / Timeout / EvExitLoss cap отключён
+    // (`None`): удерживание позиции из-за тонкого стакана хуже, чем
+    // выход с повышенным slippage, потому что эти причины именно
+    // сигнализируют о том, что дальнейшее ожидание ухудшает PnL.
+    let slippage_cap = if reason.is_voluntary_exit() {
+        Some(MAX_SLIPPAGE_FROM_L1_PCT)
+    } else {
+        None
+    };
     let gross_usdc = match strict_book {
-        Some(book) => book_fill_sell_strict(book, pos.shares_held)?,
+        Some(book) => book_fill_sell_strict(book, pos.shares_held, slippage_cap)?,
         None => book_fill_sell(frame, pos.shares_held),
     };
     let sell_price = if pos.shares_held > 0.0 {

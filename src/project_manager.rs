@@ -705,7 +705,7 @@ impl ProjectManager {
                 if let (Some(kind), Some(side)) = (kind, side) {
                     // Клонируем `Arc<RwLock<_>>` каналов из state под коротким
                     // read-локом, дальше работаем уже через него — так
-                    // `real_sim_state` не держим во время `try_send`.
+                    // `real_sim_state` не держим во время `send().await`.
                     let channels_arc = self
                         .real_sim_state
                         .read()
@@ -720,15 +720,25 @@ impl ProjectManager {
                             asset_id: entry.asset_id.clone(),
                             frame: entry.frame.clone(),
                         };
-                        match tx.try_send(lane_frame) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => eprintln!(
-                                "{} lane_frame fanout Full({:?},{:?}): worker lagging",
-                                current_timestamp_ms(),
-                                kind,
-                                side,
-                            ),
-                            Err(mpsc::error::TrySendError::Closed(_)) => {}
+                        // Ранее использовался `try_send` — на медленном
+                        // воркере `LANE_FRAME_CHANNEL_CAP` забивался, и
+                        // фанаут ТЕРЯЛ кадры (TrySendError::Full → silent
+                        // drop через eprintln). В реальной торговле потеря
+                        // кадра означает, что воркер не увидит TP/SL триггер
+                        // именно на этом тике — позиция уедет дальше с
+                        // неактуальным состоянием. Меняем на `send().await`:
+                        // если воркер тормозит, фанаут подождёт, кадры в
+                        // канале сохраняют свой порядок, ничего не теряется.
+                        // Цена — последовательная отправка по 4 каналам:
+                        // самый медленный воркер задерживает фанаут до
+                        // освобождения слота в его канале (не более 1 сек
+                        // в стационарном режиме, потому что воркер сам
+                        // вычитывает кадры в своём loop'е).
+                        if let Err(mpsc::error::SendError(_)) = tx.send(lane_frame).await {
+                            // Канал закрыт — воркер этого `(kind, side)`
+                            // завершился (нормально на shutdown). Молча
+                            // пропускаем; других сигналов о смерти воркера
+                            // у фанаута нет.
                         }
                     }
                 }

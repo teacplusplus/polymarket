@@ -47,9 +47,17 @@
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{INITIAL_BANKROLL, OpenPosition, SimStats};
 use crate::real_sim::{interval_label, side_label, RealSimState};
+use indexmap::IndexSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Максимум `market_id`, которые держим в
+/// [`Account::recently_resolved_markets`]. При insert'е сверх этого порога
+/// самый старый (по порядку первой регистрации) вытесняется через
+/// `IndexSet::shift_remove_index(0)`, чтобы set не пух бесконечно за
+/// время жизни процесса.
+pub const RECENTLY_RESOLVED_MARKETS_CAP: usize = 8;
 
 /// Удобный псевдоним для разделяемого счёта в async-контексте
 /// (`real_sim`, `ProjectManager`). Один и тот же `Arc` можно
@@ -150,6 +158,39 @@ pub struct Account {
     /// прочая аналитика по позиции продолжают принадлежать тому же
     /// лейну, даже если маркет в нём уже сменился.
     pub pending_resolution: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), Vec<OpenPosition>>,
+    /// Множество `condition_id` маркетов, которые уже резолвнулись в этом
+    /// процессе через [`Account::resolve_pending_market_sync`]. Заполняется
+    /// **там же**, где обновляется `bankroll` — атомарно с фактом «маркет
+    /// окончен», под тем же write-локом.
+    ///
+    /// # Зачем
+    ///
+    /// Защита от гонки в `real_sim`: между обработкой кадра воркером и
+    /// колбеком резолюции (`xframe_dump::spawn_dump_market_xframes_binary`)
+    /// есть зазор. Если HTTP-запрос ордербука в `tick_once` подвис на
+    /// несколько секунд, к моменту его возврата резолюция могла уже
+    /// пройти, а в очереди воркера всё ещё лежат «старые» кадры с
+    /// `frame.event_remaining_ms > 0` (CLOB закрыл маркет раньше нашего
+    /// `sleep(max_step)`). Без этого фильтра `try_open_position`
+    /// откроет позицию на **уже резолвнувшийся** маркет — она:
+    ///   * никогда не закроется (`resolve_pending_market` уже отработал
+    ///     и больше не вызовется по этому `market_id`);
+    ///   * в real-money: CLOB реджектнет `place_order` post-resolution,
+    ///     но локальная бухгалтерия уже создала «фантомную» `OpenPosition`
+    ///     и зарезервировала под неё капитал.
+    ///
+    /// # Жизненный цикл
+    ///
+    /// Растёт по мере резолюций; при превышении
+    /// [`RECENTLY_RESOLVED_MARKETS_CAP`] самый старый (по порядку первой
+    /// регистрации) вытесняется через `IndexSet::shift_remove_index(0)`.
+    /// `IndexSet` (а не `HashSet`) — именно ради этой FIFO-семантики:
+    /// `shift_remove_index(0)` сохраняет порядок и стабильно удаляет
+    /// «старейший». Cap подобран с большим запасом (`8192` ≈ недели
+    /// ротации даже для multi-currency сценария) — см. doc у константы.
+    /// При перезапуске процесса set очищается (нормально — кадры
+    /// подвисших HTTP за рестарт не переживут).
+    pub recently_resolved_markets: IndexSet<String>,
 }
 
 impl Account {
@@ -165,6 +206,7 @@ impl Account {
             last_prob: HashMap::new(),
             positions: HashMap::new(),
             pending_resolution: HashMap::new(),
+            recently_resolved_markets: IndexSet::new(),
         }
     }
 
@@ -372,6 +414,30 @@ impl Account {
         market_id: &str,
         up_won: bool,
     ) {
+        // Регистрируем `market_id` как резолвнутый ДО прохода по позициям.
+        // Делается под тем же `&mut self`, что и движение `bankroll`,
+        // поэтому атомарно: любой параллельный читатель `Account` либо
+        // увидит и факт резолюции в `recently_resolved_markets`, и
+        // обновлённый `bankroll`, либо ни того, ни другого. Решает гонку
+        // между `tick_once` (который мог подвиснуть на HTTP) и
+        // `xframe_dump::spawn_dump_market_xframes_binary` колбеком —
+        // воркер при возврате HTTP проверит set и не откроет позицию на
+        // уже резолвнувшийся маркет.
+        //
+        // FIFO-вытеснение: `IndexSet` хранит порядок первой регистрации,
+        // `shift_remove_index(0)` стабильно выкидывает самый старый
+        // market_id при превышении cap'а. `while` (а не `if`) —
+        // защита от теоретического рассинхрона; в штатной работе условие
+        // срабатывает максимум один раз за вставку.
+        if self
+            .recently_resolved_markets
+            .insert(market_id.to_string())
+        {
+            while self.recently_resolved_markets.len() > RECENTLY_RESOLVED_MARKETS_CAP {
+                self.recently_resolved_markets.shift_remove_index(0);
+            }
+        }
+
         // Split borrow: одновременно нужны `pending_resolution` (итерация)
         // и `bankroll` (PnL).
         let Account {
