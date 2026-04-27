@@ -548,6 +548,12 @@ pub struct SideStats {
     /// время идёт, и `manage_positions` отрабатывает TP/SL/Resolution
     /// как обычно. Только новые входы пропускаются.
     pub(crate) unstable_skips: usize,
+    /// Попытка второй раз открыть позицию на **тот же** `asset_id`, пока
+    /// первая ещё в `positions` (см. [`try_open_position`]: проверяется
+    /// только в ветке `BuyGate::Proceed`, поэтому считает **сигналы
+    /// Kelly**, а не каждый кадр удержания). Один токен = одна
+    /// `OpenPosition` за раз — проще CLOB, TP/SL, бухгалтерия.
+    pub(crate) same_asset_open_skips: usize,
     /// Число пропущенных входов из-за Kelly f* ≤ 0 (нет edge).
     pub(crate) kelly_skips: usize,
     /// Число пропущенных входов в **strict**-режиме ([`crate::real_sim`]):
@@ -620,6 +626,9 @@ impl SimStats {
     }
     pub(crate) fn total_kelly_strict_sell_skips(&self) -> usize {
         self.up.kelly_strict_sell_skips + self.down.kelly_strict_sell_skips
+    }
+    pub(crate) fn total_same_asset_open_skips(&self) -> usize {
+        self.up.same_asset_open_skips + self.down.same_asset_open_skips
     }
 }
 
@@ -1320,6 +1329,10 @@ pub(crate) fn try_open_position(
     // — это позволяет real_sim считать booster + калибровку ОДИН раз вне локов
     // и переиспользовать здесь, вместо повторного `predict_frame` /
     // `Calibration::apply` под write-локом.
+    //
+    // Второй вход на тот же `asset_id` запрещён: проверка в ветке
+    // `BuyGate::Proceed` (см. `same_asset_open_skips`), не на каждом кадре,
+    // чтобы не раздувать счётчик на всём удержании.
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return false;
     };
@@ -1347,6 +1360,13 @@ pub(crate) fn try_open_position(
             false
         }
         BuyGate::Proceed { raw, pred, kelly_f, size } => {
+            if positions
+                .iter()
+                .any(|p| p.asset_id == frame.asset_id)
+            {
+                stats.same_asset_open_skips += 1;
+                return false;
+            }
             stats.raw_above_threshold += 1;
             stats.diag_sum_raw += raw as f64;
             stats.diag_sum_calibrated += pred as f64;
@@ -2084,13 +2104,14 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
 pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
     let n = s.raw_above_threshold.max(1) as f64;
     let diag = format!(
-        "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
+        "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
         s.raw_above_threshold,
         s.diag_sum_raw / n,
         s.diag_sum_calibrated / n,
         s.diag_sum_entry_prob / n,
         s.diag_sum_kelly_f / n,
         s.kelly_skips,
+        s.same_asset_open_skips,
         s.kelly_strict_buy_skips,
         s.kelly_strict_sell_skips,
     );
@@ -2111,12 +2132,12 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
-         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={}(profit={}/loss={}) Res✗={} late_skips={} unstable_skips={}",
+         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={}(profit={}/loss={}) Res✗={} late_skips={} unstable_skips={} same_asset_open_skips={}",
         s.trades, win_rate, s.pnl_usd, avg_pnl, s.fees_paid,
         s.tp_count, s.sl_count, s.timeout_count,
         s.ev_exit_profit_count, s.ev_exit_loss_count,
         s.resolution_win, s.resolution_win_profit, s.resolution_win_loss,
-        s.resolution_loss, s.late_entry_skips, s.unstable_skips,
+        s.resolution_loss, s.late_entry_skips, s.unstable_skips, s.same_asset_open_skips,
     );
 }
 
@@ -2124,9 +2145,10 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
     let total_trades = sim_stats.total_trades();
     if total_trades == 0 {
         tee_println!(
-            "[sim] {tag}: нет сделок ({} событий, kelly_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={})",
+            "[sim] {tag}: нет сделок ({} событий, kelly_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={})",
             sim_stats.events,
             sim_stats.total_kelly_skips(),
+            sim_stats.total_same_asset_open_skips(),
             sim_stats.total_kelly_strict_buy_skips(),
             sim_stats.total_kelly_strict_sell_skips(),
         );
@@ -2153,9 +2175,10 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
          | events={} trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
          | wins={total_wins} losses={total_losses} \
-         | kelly_skips={ks} kelly_strict_buy_skips={ksb} kelly_strict_sell_skips={kss}",
+         | kelly_skips={ks} same_asset_open_skips={sas} kelly_strict_buy_skips={ksb} kelly_strict_sell_skips={kss}",
         sim_stats.events, total_trades, win_rate, total_pnl, avg_pnl, total_fees,
         ks = sim_stats.total_kelly_skips(),
+        sas = sim_stats.total_same_asset_open_skips(),
         ksb = sim_stats.total_kelly_strict_buy_skips(),
         kss = sim_stats.total_kelly_strict_sell_skips(),
     );

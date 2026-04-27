@@ -1,3 +1,7 @@
+//! Сообщения рантайма (WS, Gamma, RTDS). Печать через [`crate::tee_eprintln!`]:
+//! на экран (stderr) и в файл, если в точке входа вызван
+//! [`crate::tee_log::init_tee_log_file`]; иначе — как обычный `eprintln!`.
+
 pub const WS_LOG_ENABLED: bool = true;
 pub const XFRAME_LOG_ENABLED: bool = true;
 pub const RTDS_CURRENCY_SEC_BAR_LOG_ENABLED: bool = false;
@@ -18,7 +22,7 @@ pub fn currency_updown_sibling_slots_updated(
     if !pair_full {
         return;
     }
-    eprintln!(
+    crate::tee_eprintln!(
         "{ts_ms} currency_updown_sibling: оба слота выставлены | стало 15m={after_fifteen:?} 5m={after_five:?}"
     );
 }
@@ -27,21 +31,21 @@ pub fn gamma_fetch_err(period: &str, slug: &str, err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{period}] Gamma slug={slug}: {err}");
+    crate::tee_eprintln!("[{period}] Gamma slug={slug}: {err}");
 }
 
 pub fn gamma_event_data_from_cache(period: &str, slug: &str) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{period}] Gamma slug={slug}: данные из кеша");
+    crate::tee_eprintln!("[{period}] Gamma slug={slug}: данные из кеша");
 }
 
 pub fn gamma_event_prefetch_fetched(period: &str, slug: &str) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{period}] Gamma slug={slug}: prefetch — данные получены из Gamma");
+    crate::tee_eprintln!("[{period}] Gamma slug={slug}: prefetch — данные получены из Gamma");
 }
 
 pub fn price_to_beat_from_rtds(
@@ -59,7 +63,7 @@ pub fn price_to_beat_from_rtds(
     } else {
         market_ids.join(", ")
     };
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] price_to_beat из rtds_currency_prices_by_ms: slug={slug} market_id=[{markets}] start_ms={start_ms} price={price}"
     );
 }
@@ -73,7 +77,7 @@ pub fn price_to_beat_from_event_page(
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] price_to_beat со страницы polymarket event: slug={slug} price={price}"
     )
 }
@@ -88,7 +92,7 @@ pub fn rtds_currency_prices_lagging_for_xframe(
         return;
     }
     let lag = last_key_ms.map(|k| wall_now_ms.saturating_sub(k));
-    eprintln!(
+    crate::tee_eprintln!(
         "rtds_currency_prices: отстаёт для stable — wall_now_ms={wall_now_ms} last_key_ms={last_key_ms:?} lag_ms={lag:?} (порог {max_lag_ms} ms) → XFrame.stable=false"
     );
 }
@@ -97,7 +101,7 @@ pub fn ws_stop_replace(period: &str, slug: &str, prev_token_count: usize) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] ws: останавливаю прежнее подключение (смена подписки), slug={slug}, было {prev_token_count} clob token id"
     );
 }
@@ -128,7 +132,7 @@ pub fn ws_start(
     } else {
         asset_ids.join(", ")
     };
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
     );
 }
@@ -159,7 +163,7 @@ pub fn ws_subscribe_applied(
     } else {
         asset_ids.join(", ")
     };
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] ws: {phase} | slug={slug} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}]"
     );
 }
@@ -196,7 +200,7 @@ pub fn ws_subscription_rotated(
     } else {
         new_asset_ids.join(", ")
     };
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] ws: смена подписки на сокете | slug={slug} | было market=[{pm}] asset=[{pa}] | стало market=[{nm}] asset=[{na}]"
     );
 }
@@ -205,14 +209,14 @@ pub fn ws_spawn_err(period: &str, slug: &str, err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{period}] ws: ошибка spawn для slug={slug}: {err}");
+    crate::tee_eprintln!("[{period}] ws: ошибка spawn для slug={slug}: {err}");
 }
 
 pub fn ws_window_end_wait(period: &str, slug: &str, token_count: usize) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!(
+    crate::tee_eprintln!(
         "[{period}] ws: конец окна по времени (market ws остаётся открытым) | slug={slug} | {token_count} clob token id"
     );
 }
@@ -221,14 +225,14 @@ pub fn ws_task_joined(period: &str, slug: &str) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("[{period}] ws: task market ws завершён | slug={slug}");
+    crate::tee_eprintln!("[{period}] ws: task market ws завершён | slug={slug}");
 }
 
 pub fn market_ws_session_err(err: impl std::fmt::Display) {
     if !WS_LOG_ENABLED {
         return;
     }
-    eprintln!("market ws session ended with error: {err}");
+    crate::tee_eprintln!("market ws session ended with error: {err}");
 }
 
 /// Финальный кадр после merge other/sibling, непосредственно перед записью в `xframes_by_market`.
@@ -253,7 +257,7 @@ pub fn xframe_dump_written(
     if !XFRAME_DUMP_LOG_ENABLED {
         return;
     }
-    eprintln!(
+    crate::tee_eprintln!(
         "xframe_dump: wrote {bytes} bytes, {frame_count} frames | market_id={market_id} | path={}",
         path.display()
     );
@@ -261,8 +265,8 @@ pub fn xframe_dump_written(
 
 pub fn rtds_watchdog_reconnect(pair_symbol: &str, latest_ts_ms: Option<i64>, now_ms: i64) {
     match latest_ts_ms {
-        None => eprintln!("rtds watchdog ({pair_symbol}): нет данных — форсируем реконнект"),
-        Some(ts) => eprintln!(
+        None => crate::tee_eprintln!("rtds watchdog ({pair_symbol}): нет данных — форсируем реконнект"),
+        Some(ts) => crate::tee_eprintln!(
             "rtds watchdog ({pair_symbol}): данные устарели на {}ms (latest_ts_ms={ts}, now={now_ms}) — форсируем реконнект",
             now_ms - ts,
         ),
@@ -280,7 +284,7 @@ pub fn rtds_currency_sec_bar_inserted(
     if !RTDS_CURRENCY_SEC_BAR_LOG_ENABLED {
         return;
     }
-    eprintln!(
+    crate::tee_eprintln!(
         "rtds sec bar ({pair_symbol}): bucket_sec={bucket_sec} price={price} price_ts_ms={price_timestamp_ms} rtds_msg_ts_ms={message_timestamp_ms} bars_in_history={bars_in_history}"
     );
 }

@@ -79,6 +79,13 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
+            // Как в `RealSim`: `run_log` и прочий вывод через `tee_*` дублируется
+            // в файл (пока иначе при `Default` в лог на диск ничего не уходило).
+            tee_log::init_tee_log_file(
+                std::path::Path::new("xframes/last_default.txt"),
+                "default",
+            )?;
+
             // Единый счёт-капитал на все валюты процесса.
             // Создаётся ДО спавна `ProjectManager`-ов и клонируется в каждый
             // через `Arc` — drawdown/bankroll едины поверх всех 4 лейнов

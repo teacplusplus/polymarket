@@ -61,7 +61,7 @@ struct BuiltXframeEntry {
 }
 
 /// Период тика сборщика XFrame по лейну (секунды); каждый лейн собирает кадры для **всех** рынков (и 5m и 15m) с соответствующим шагом — для моделей XGBoost с разной частотой агрегации.
-pub const FRAME_BUILD_INTERVALS_SEC: [u64; 3] = [1, 2, 4];
+pub const FRAME_BUILD_INTERVALS_SEC: [u64; 1] = [1];
 /// Размер очереди команд смены подписки на единый market WS (5m и 15m вместе).
 const MARKET_WS_SUBSCRIPTION_CHANNEL_CAP: usize = 8;
 
