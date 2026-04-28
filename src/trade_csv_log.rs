@@ -43,9 +43,31 @@ use std::sync::Mutex;
 /// `write_trade_csv_row` молча пропускает. См. модульный комментарий.
 pub static TRADE_CSV_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
 
+/// Текущий режим симуляции для CSV-колонки `regime`.
+///
+/// Используется в `run_sim_mode(is_kelly)` (см. `history_sim.rs`):
+/// один и тот же CSV-файл (`xframes/last_history_sim_trades.csv`)
+/// заполняется обоими прогонами back-to-back, и `regime` —
+/// единственный способ их различить при анализе. Установка идёт
+/// через [`set_current_regime`] перед каждым прогоном; запись —
+/// в [`write_trade_csv_row`]. Значение по умолчанию (`""`) пишется,
+/// если режим не выставлен (например, в `real_sim`).
+static CURRENT_REGIME: Mutex<&'static str> = Mutex::new("");
+
+/// Устанавливает текущее значение колонки `regime`. Допустимые
+/// значения: `"kelly"` / `"raw"` / `""`. `&'static str` — потому что
+/// меняется буквально дважды за прогон и хранить динамические `String`
+/// в Mutex смысла нет.
+pub fn set_current_regime(regime: &'static str) {
+    if let Ok(mut guard) = CURRENT_REGIME.lock() {
+        *guard = regime;
+    }
+}
+
 /// CSV-заголовок: порядок колонок зафиксирован тут и должен совпадать
-/// с `write_trade_csv_row`.
-const TRADE_CSV_HEADER: &str = "currency,interval,side,market_id,asset_id,exit_reason,\
+/// с `write_trade_csv_row`. Первая колонка `regime` — `kelly` /
+/// `raw` / пусто (см. [`set_current_regime`]).
+const TRADE_CSV_HEADER: &str = "regime,currency,interval,side,market_id,asset_id,exit_reason,\
 entry_prob,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
 frames_held,p_win_ema_at_close,event_remaining_ms_at_open,event_remaining_ms_at_close";
 
@@ -130,9 +152,17 @@ pub fn write_trade_csv_row(row: TradeCsvRow<'_>) {
     let Some(w) = guard.as_mut() else {
         return;
     };
+    // Первая колонка — текущий regime (`kelly` / `raw` / `""`),
+    // снапшот из `CURRENT_REGIME` под отдельным локом — простой read,
+    // потому что `&'static str` копируется бесплатно.
+    let regime: &'static str = CURRENT_REGIME
+        .lock()
+        .map(|g| *g)
+        .unwrap_or("");
     let _ = writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        regime,
         csv_escape(row.currency),
         csv_escape(row.interval),
         csv_escape(row.side),

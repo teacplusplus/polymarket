@@ -622,10 +622,16 @@ async fn tick_once(
     //     внутри `manage_positions`.
     // На 4×N параллельных воркеров это материальная задержка критсекции —
     // выносим наружу.
+    // `real_sim` живёт только в kelly-режиме: и Kelly-сайзинг, и
+    // калибровка обоих моделей применяются как обычно. Диагностический
+    // raw-прогон (см. `history_sim::run_sim_mode(is_kelly=false)`) для
+    // live-торговли не имеет смысла — там нет «бесплатной» возможности
+    // экспериментировать с фиксированным $100 entry.
     let pnl_inference = compute_pnl_inference(
         &frame,
         &models.booster_pnl,
         models.calibration_pnl.as_ref(),
+        true,
     );
     // `compute_p_win_now` больше не гейтится по `has_positions` —
     // resolution-инференс считается каждый тик в hold-zone безусловно,
@@ -637,6 +643,7 @@ async fn tick_once(
         &frame,
         models.booster_resolution.as_deref(),
         models.calibration_resolution.as_ref(),
+        true,
     );
 
     // `buy_gate` сам отказывает, если событие уже завершилось или до резолюции;
@@ -649,7 +656,7 @@ async fn tick_once(
     // (WS-prob); strict-prob по mid HTTP-стакана будет передан в
     // фактический `try_open_position` ниже, после `fetch_http_strict_book`.
     let buy_gate_proceed = matches!(
-        buy_gate(&frame, pnl_inference, available_bankroll_pre, None),
+        buy_gate(&frame, pnl_inference, available_bankroll_pre, None, true),
         BuyGate::Proceed { .. }
     );
     let may_open = !dd_halt_active && !market_already_resolved && buy_gate_proceed;
@@ -854,6 +861,7 @@ async fn tick_once(
                     bankroll,
                     strict_book.as_ref(),
                     tag,
+                    true,
                 );
             }
 
@@ -884,6 +892,7 @@ async fn tick_once(
                     strict_book.as_ref(),
                     tag,
                     currency,
+                    true,
                 );
             }
         }
@@ -989,7 +998,9 @@ async fn tick_once(
             "[real_sim] {tag}: {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
             current_timestamp_ms(),
         );
-        print_sim_stats(tag, stats, &account_guard);
+        // real_sim всегда живёт в kelly-режиме (см. `compute_pnl_inference`
+        // call-site выше), поэтому печать форматируется как kelly.
+        print_sim_stats(tag, stats, &account_guard, true);
     }
 
     *last_market_id = Some(market_id);
