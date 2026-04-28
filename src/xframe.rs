@@ -1289,6 +1289,57 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
     Some(0.0)
 }
 
+
+// pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64) -> Option<f32> {
+//     let up_won = final_price >= price_to_beat;
+//     let current = x_frames.get(index)?;
+//     let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
+//
+//     let nominal_shares = 1.0 / p_buy;
+//     let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
+//     let fee_buy_shares = fee_buy_usdc / p_buy;
+//     let actual_shares  = nominal_shares - fee_buy_shares;
+//
+//     for i in 1..=n {
+//         // Отсутствие следующего кадра трактуется как конец маркета
+//         // (дампы обрезаются по реальному завершению события).
+//         let future_opt = x_frames.get(index + i);
+//         let reached_end = match future_opt {
+//             None => true,
+//             Some(f) => f.event_remaining_ms <= 0,
+//         };
+//
+//         let net_ret = if reached_end {
+//             // `currency_up_down_outcome` константен на протяжении маркета,
+//             // поэтому для определения токена берём текущий кадр.
+//             let won = y_train_resolution_token_won(current, up_won);
+//             if won {
+//                 actual_shares - 1.0
+//             } else {
+//                 -1.0
+//             }
+//         } else {
+//             let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
+//             let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
+//             let gross_usdc    = actual_shares * p_sell;
+//             let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
+//             (gross_usdc - fee_sell_usdc) - 1.0
+//         };
+//
+//         if net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
+//             return Some(1.0);
+//         } else if net_ret <= Y_TRAIN_STOP_LOSS_PP {
+//             return Some(0.0);
+//         }
+//
+//         // Кадры закончились — дальше смотреть некуда, ни TP/SL не сработал.
+//         if future_opt.is_none() {
+//             break;
+//         }
+//     }
+//     Some(0.0)
+// }
+
 /// Победил ли **этот** токен по итогу рынка.
 ///
 /// Победил ли **этот** токен по итогу рынка.
@@ -1380,6 +1431,53 @@ pub fn calc_y_train_resolution(
 
     None
 }
+
+
+// pub fn calc_y_train_resolution(
+//     n: usize,
+//     x_frames: &[XFrame<SIZE>],
+//     index: usize,
+//     price_to_beat: f64,
+//     final_price: f64,
+// ) -> Option<f32> {
+//     let up_won = final_price >= price_to_beat;
+//     let current = x_frames.get(index)?;
+//     let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
+//
+//     let nominal_shares = 1.0 / p_buy;
+//     let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
+//     let fee_buy_shares = fee_buy_usdc / p_buy;
+//     let actual_shares  = nominal_shares - fee_buy_shares;
+//
+//     for i in 1..=n {
+//         // Отсутствие следующего кадра трактуется как конец маркета
+//         // (дампы обрезаются по реальному завершению события).
+//         let future_opt = x_frames.get(index + i);
+//         let reached_end = match future_opt {
+//             None => true,
+//             Some(f) => f.event_remaining_ms <= 0,
+//         };
+//
+//         // Резолюция: комиссии нет, победитель получает $1/шер.
+//         // `currency_up_down_outcome` константен на протяжении маркета.
+//         if reached_end {
+//             let won = y_train_resolution_token_won(current, up_won);
+//             return Some(if won { 1.0 } else { 0.0 });
+//         }
+//
+//         // Промежуточный кадр — taker-продажа с fee, проверяем досрочный стоп.
+//         let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
+//         let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
+//         let gross_usdc    = actual_shares * p_sell;
+//         let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
+//         let net_ret = (gross_usdc - fee_sell_usdc) - 1.0;
+//         if net_ret <= Y_TRAIN_STOP_LOSS_PP {
+//             return Some(0.0);
+//         }
+//     }
+//
+//     None
+// }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.
 pub(crate) fn book_l1_mid_price(best_bid: Option<f64>, best_ask: Option<f64>) -> Option<f64> {

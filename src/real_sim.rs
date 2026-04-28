@@ -883,6 +883,7 @@ async fn tick_once(
                     available_bankroll_post,
                     strict_book.as_ref(),
                     tag,
+                    currency,
                 );
             }
         }

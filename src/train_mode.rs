@@ -523,6 +523,47 @@ struct MarketDataset {
     y: Vec<f32>,
 }
 
+/// Диагностика разметки кадров: сколько кадров пришло на вход, сколько было
+/// размечено, и распределение причин отказа от разметки. Заполняется в
+/// [`append_frames`] и агрегируется в [`build_market_datasets`].
+///
+/// # Зачем
+///
+/// `calc_y_train_pnl` / `calc_y_train_resolution` могут возвращать `None` для
+/// нескольких принципиально разных причин («тонкий стакан, не открыли позицию
+/// на $200 nominal», «slippage-cap зарезал вход», «не определена
+/// `currency_implied_prob`», «за горизонт ничего не случилось» — в зависимости
+/// от того, какая версия `y_train` активна). Без счётчика этих причин нельзя
+/// понять: упало ли распределение y из-за переключения функции, или из-за
+/// смены данных. Принт идёт строкой в `last_train_mode.txt`, рядом с
+/// `[train] {tag}: распределение y …`.
+#[derive(Debug, Default, Clone, Copy)]
+struct AppendStats {
+    /// Сколько кадров пришло на вход [`append_frames`] (до фильтров).
+    total_frames: usize,
+    /// Сколько кадров реально попали в обучающий вектор (`y_out`).
+    marked: usize,
+    /// Resolution-only: кадры вне hold-zone (`event_remaining_ms <= 0` или
+    /// `> HOLD_TO_END_THRESHOLD_SEC * 1000`).
+    out_of_hold_zone: usize,
+    /// `calc_y_*` вернул `None` (тонкий стакан / slippage cap / нет
+    /// `currency_implied_prob` / прочие причины внутри Y-функции).
+    y_none: usize,
+    /// Длина вектора признаков не совпала с ожидаемой `feature_count`
+    /// (теоретически — несконсистентный layout, на практике 0).
+    feature_mismatch: usize,
+}
+
+impl AppendStats {
+    fn merge(&mut self, other: &AppendStats) {
+        self.total_frames += other.total_frames;
+        self.marked += other.marked;
+        self.out_of_hold_zone += other.out_of_hold_zone;
+        self.y_none += other.y_none;
+        self.feature_mismatch += other.feature_mismatch;
+    }
+}
+
 /// Обучает модели для всех комбинаций `model_type × side` на одном
 /// `(currency, version, interval, step_sec)`. Каждая комбинация даёт отдельный
 /// файл `model_{interval}_{step_sec}s_{model_type}_{side}.ubj` — формат,
@@ -556,9 +597,9 @@ fn train_all_variants(
                 ModelType::Pnl => PNL_MAX_LAG,
             };
 
-            let train_markets = build_market_datasets(train_dumps, side, model_type, max_lag);
-            let val_markets   = build_market_datasets(val_dumps,   side, model_type, max_lag);
-            let test_markets  = build_market_datasets(test_dumps,  side, model_type, max_lag);
+            let (train_markets, train_stats) = build_market_datasets(train_dumps, side, model_type, max_lag);
+            let (val_markets, val_stats)     = build_market_datasets(val_dumps,   side, model_type, max_lag);
+            let (test_markets, test_stats)   = build_market_datasets(test_dumps,  side, model_type, max_lag);
 
             let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
             if total_markets == 0 {
@@ -578,6 +619,14 @@ fn train_all_variants(
                 train_markets.len(), val_markets.len(), test_markets.len(),
                 total_rows, feature_count,
             );
+
+            // Воронка разметки: сколько кадров отвалилось до попадания в y.
+            // Печатаем на каждом сплите отдельно, чтобы увидеть, не уехал ли,
+            // например, `y_none` в test (например, из-за переключения y_train
+            // на версию с walk-обходом — на тонком стакане `None` будет чаще).
+            print_append_stats(&tag, "train", &train_stats);
+            print_append_stats(&tag, "val",   &val_stats);
+            print_append_stats(&tag, "test",  &test_stats);
 
             let model_path = version_path.join(format!(
                 "model_{interval}_{step_sec}s_{}_{}.ubj",
@@ -655,27 +704,35 @@ fn load_dumps_for_paths(paths: &[PathBuf]) -> Vec<MarketXFramesDump> {
 
 /// Формирует `MarketDataset` для каждого дампа по заданной ноге и типу модели.
 /// `max_lag` — если `Some(n)`, лаговые массивы обрезаются до первых `n` элементов.
-fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_type: ModelType, max_lag: Option<usize>) -> Vec<MarketDataset> {
+///
+/// Возвращает агрегированный [`AppendStats`] по всем дампам — для печати
+/// диагностики «сколько кадров отвалилось до разметки». См. [`AppendStats`].
+fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_type: ModelType, max_lag: Option<usize>) -> (Vec<MarketDataset>, AppendStats) {
     let feature_count = match max_lag {
         Some(n) => XFrame::<SIZE>::count_features_n(n),
         None => XFrame::<SIZE>::count_features(),
     };
     let mut markets = Vec::new();
+    let mut total_stats = AppendStats::default();
 
     for dump in dumps {
         let mut x = Vec::new();
         let mut y = Vec::new();
-        append_frames(side.frames(dump), feature_count, model_type, dump.price_to_beat, dump.final_price, max_lag, &mut x, &mut y);
+        let stats = append_frames(side.frames(dump), feature_count, model_type, dump.price_to_beat, dump.final_price, max_lag, &mut x, &mut y);
+        total_stats.merge(&stats);
         if !y.is_empty() {
             markets.push(MarketDataset { x, y });
         }
     }
 
-    markets
+    (markets, total_stats)
 }
 
 /// Для каждого кадра в `frames` вычисляет метку по `model_type` и, если она есть,
 /// добавляет признаки и метку в `x_out` / `y_out`.
+///
+/// Возвращает [`AppendStats`] со счётчиками всех ветвей отказа: вне hold-zone
+/// (только Resolution), `calc_y_*` вернул `None`, и mismatch размера фич.
 fn append_frames(
     frames: &[XFrame<SIZE>],
     feature_count: usize,
@@ -685,7 +742,7 @@ fn append_frames(
     max_lag: Option<usize>,
     x_out: &mut Vec<f32>,
     y_out: &mut Vec<f32>,
-) {
+) -> AppendStats {
     // Граница hold zone в мс (условие идентично [`crate::history_sim::manage_positions`]:
     // `event_remaining_ms > 0 && event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000`).
     // Resolution-модель используется исключительно внутри hold zone, поэтому и
@@ -693,10 +750,14 @@ fn append_frames(
     // совпадает с инференс-распределением.
     let hold_zone_max_ms: i64 = HOLD_TO_END_THRESHOLD_SEC * 1000;
 
+    let mut stats = AppendStats::default();
+    stats.total_frames = frames.len();
+
     for index in 0..frames.len() {
         if matches!(model_type, ModelType::Resolution) {
             let remaining = frames[index].event_remaining_ms;
             if remaining <= 0 || remaining > hold_zone_max_ms {
+                stats.out_of_hold_zone += 1;
                 continue;
             }
         }
@@ -706,6 +767,7 @@ fn append_frames(
             ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
         };
         let Some(label) = label else {
+            stats.y_none += 1;
             continue;
         };
         let row = match max_lag {
@@ -713,11 +775,15 @@ fn append_frames(
             None => frames[index].to_x_train_with(apply_side_symmetry),
         };
         if row.len() != feature_count {
+            stats.feature_mismatch += 1;
             continue;
         }
         x_out.extend_from_slice(&row);
         y_out.push(label);
+        stats.marked += 1;
     }
+
+    stats
 }
 
 /// Сливает список маркет-датасетов в один плоский `(x, y)`.
@@ -898,6 +964,24 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str, max_lag: O
     }
     let bias = shap_values[num_cols - 1];
     tee_println!("  {:>8.4}           __bias__", bias);
+}
+
+/// Печатает воронку разметки: сколько кадров пришло, сколько размечено,
+/// и распределение причин пропуска. См. [`AppendStats`].
+fn print_append_stats(tag: &str, split: &str, s: &AppendStats) {
+    if s.total_frames == 0 {
+        return;
+    }
+    let marked_pct = s.marked as f64 / s.total_frames as f64 * 100.0;
+    let y_none_pct = s.y_none as f64 / s.total_frames as f64 * 100.0;
+    let out_pct = s.out_of_hold_zone as f64 / s.total_frames as f64 * 100.0;
+    tee_println!(
+        "[train] {tag}: append_stats ({split}): frames={} marked={} ({:.1}%) y_none={} ({:.1}%) out_of_hold_zone={} ({:.1}%) feature_mismatch={}",
+        s.total_frames, s.marked, marked_pct,
+        s.y_none, y_none_pct,
+        s.out_of_hold_zone, out_pct,
+        s.feature_mismatch,
+    );
 }
 
 /// Печатает распределение меток в train и test выборках.

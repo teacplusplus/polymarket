@@ -92,11 +92,6 @@ pub struct ProjectManager {
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub real_sim_state: Arc<RwLock<RealSimState>>,
-    /// Единый счёт-капитал всего процесса. См. [`crate::account::Account`].
-    /// Создаётся **снаружи** до спавна `ProjectManager`-ов и пробрасывается
-    /// клонированным `Arc`-ом — несколько PM (по одному на валюту) делят
-    /// один и тот же `bankroll/peak/max_drawdown` и не «дрейфуют»
-    /// независимыми псевдо-счетами.
     pub account: SharedAccount,
 }
 

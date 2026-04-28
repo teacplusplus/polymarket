@@ -492,6 +492,7 @@ impl Account {
                     }
                     if token_won {
                         side_stats.resolution_win += 1;
+                        side_stats.pnl_resolution_win += pnl;
                         // Разбивка по знаку pnl: `resolution_win` —
                         // token-outcome счётчик («токен победил»),
                         // но при дорогих входах (`entry_prob` ~ 1.0)
@@ -510,15 +511,13 @@ impl Account {
                         // `entry_cost`, дополнительной разбивки по
                         // знаку pnl не нужно.
                         side_stats.resolution_loss += 1;
+                        side_stats.pnl_resolution_loss += pnl;
                     }
 
                     {
-                        let tag = format!(
-                            "{}/{}/{}",
-                            cur,
-                            interval_label(*int_kind),
-                            side_label(*side),
-                        );
+                        let interval_str = interval_label(*int_kind);
+                        let side_str = side_label(*side);
+                        let tag = format!("{}/{}/{}", cur, interval_str, side_str);
                         let outcome = if token_won { "WIN" } else { "LOSS" };
                         crate::tee_println!(
                             "[resolve] {tag} market={market_id} {outcome} \
@@ -531,6 +530,39 @@ impl Account {
                             pnl = pnl,
                             bankroll = *bankroll,
                         );
+
+                        // Per-trade CSV: резолюционные закрытия идут
+                        // отдельным `exit_reason` (`ResolutionWin` /
+                        // `ResolutionLoss`), но колонки те же, что у
+                        // рыночных выходов в `close_position`. Цена
+                        // выхода — бинарная: $1 победителю, $0
+                        // проигравшему; fee = 0.
+                        let exit_reason = if token_won {
+                            "ResolutionWin"
+                        } else {
+                            "ResolutionLoss"
+                        };
+                        crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
+                            currency: cur,
+                            interval: interval_str,
+                            side: side_str,
+                            market_id,
+                            asset_id: &pos.asset_id,
+                            exit_reason,
+                            entry_prob: pos.entry_prob,
+                            raw_pred: pos.raw_pred_at_open,
+                            cal_pred: pos.cal_pred_at_open,
+                            kelly_f: pos.kelly_f_at_open,
+                            entry_cost: pos.entry_cost,
+                            shares_held: pos.shares_held,
+                            exit_price: if token_won { 1.0 } else { 0.0 },
+                            fee_usdc: 0.0,
+                            pnl,
+                            frames_held: pos.frames_held,
+                            p_win_ema_at_close: pos.p_win_ema,
+                            event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
+                            event_remaining_ms_at_close: 0,
+                        });
                     }
                 } else {
                     i += 1;

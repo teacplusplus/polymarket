@@ -15,6 +15,7 @@ pub mod history_sim;
 pub mod real_sim;
 pub mod account;
 pub mod migration;
+pub mod trade_csv_log;
 
 use anyhow::Result;
 use account::Account;
@@ -35,6 +36,15 @@ enum AppMode {
     Train,
     /// Историческая симуляция торговли по накопленным дампам с подсчётом P&L.
     HistorySim,
+    /// Сначала [`AppMode::Train`] (обучение по накопленным дампам),
+    /// потом сразу — [`AppMode::HistorySim`] (тест на test-сплите) в
+    /// одном процессе. Удобно для итераций «правлю гипотезы → смотрю,
+    /// что вышло», без ручной композиции `STATUS=train && STATUS=history_sim`.
+    /// Каждый шаг пишет свой отдельный tee-лог
+    /// (`xframes/last_train_mode.txt`, `xframes/last_history_sim.txt`),
+    /// чтобы анализ обучения и симуляции остался независимым; CSV-лог
+    /// per-trade (`last_history_sim_trades.csv`) пишет только sim-фаза.
+    TrainAndHistorySim,
     /// Реальная (виртуальная) торговля по живому WS потоку: поднимает тот же
     /// `ProjectManager` что и `Default`, плюс 4 tokio-воркера раз-в-секунду
     /// (5m × 15m × up/down) с логикой из `history_sim`.
@@ -48,11 +58,12 @@ enum AppMode {
 impl AppMode {
     fn from_env() -> Self {
         match std::env::var("STATUS").as_deref() {
-            Ok("train")         => AppMode::Train,
-            Ok("history_sim")   => AppMode::HistorySim,
-            Ok("real_sim")      => AppMode::RealSim,
-            Ok("migrate")       => AppMode::Migrate,
-            _                   => AppMode::Default,
+            Ok("train")                 => AppMode::Train,
+            Ok("history_sim")           => AppMode::HistorySim,
+            Ok("train_and_history_sim") => AppMode::TrainAndHistorySim,
+            Ok("real_sim")              => AppMode::RealSim,
+            Ok("migrate")               => AppMode::Migrate,
+            _                           => AppMode::Default,
         }
     }
 }
@@ -69,6 +80,16 @@ async fn main() -> Result<()> {
             train_mode::run_train_mode()?;
         }
         AppMode::HistorySim => {
+            history_sim::run_sim_mode()?;
+        }
+        AppMode::TrainAndHistorySim => {
+            // Train пишет в `xframes/last_train_mode.txt`, sim — в
+            // `xframes/last_history_sim.txt`. Между двумя фазами
+            // явно дёргаем `tee_log::finish_tee_log`, чтобы первый файл
+            // полностью смылся на диск (на случай if `run_sim_mode`
+            // упадёт — обучение всё равно сохранится).
+            train_mode::run_train_mode()?;
+            tee_log::finish_tee_log();
             history_sim::run_sim_mode()?;
         }
         AppMode::Migrate => {

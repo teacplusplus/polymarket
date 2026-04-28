@@ -440,6 +440,33 @@ pub struct OpenPosition {
     /// пока позиция ни разу не попадала в зону удержания / пока модель
     /// resolution не вернула валидного предсказания.
     pub(crate) p_win_ema: Option<f64>,
+    /// Сырое предсказание pnl-модели в момент открытия (`PnlInference::raw`).
+    /// Используется только для per-trade CSV-лога; в торговой логике не участвует.
+    pub(crate) raw_pred_at_open: f32,
+    /// Калиброванное предсказание pnl-модели в момент открытия
+    /// (`PnlInference::pred`). Только для per-trade CSV-лога.
+    pub(crate) cal_pred_at_open: f32,
+    /// «Сырой» Kelly f* (до `KELLY_MULTIPLIER` / `MAX_BET_FRACTION` /
+    /// min-size cap) в момент открытия. Только для per-trade CSV-лога.
+    pub(crate) kelly_f_at_open: f64,
+    /// `event_remaining_ms` на тике открытия. Помогает в анализе CSV
+    /// per-trade сопоставлять момент входа с фазой жизни маркета
+    /// (далеко до резолюции / hold-zone / late-entry).
+    pub(crate) event_remaining_ms_at_open: i64,
+    /// Дискриминант [`XFrameIntervalKind`] (`5m` / `15m`). Берётся из
+    /// `frame.xframe_interval_type` в момент открытия и переиспользуется
+    /// в per-trade CSV (чтобы CSV-строка несла лейн без проброса лишних
+    /// параметров вниз по `manage_positions`/`close_position`).
+    pub(crate) xframe_interval_type_at_open: i32,
+    /// Дискриминант [`CurrencyUpDownOutcome`] (`Up`/`Down`) — то же
+    /// назначение, что у [`Self::xframe_interval_type_at_open`].
+    pub(crate) currency_up_down_outcome_at_open: i32,
+    /// Лейбл валюты лейна (`btc` / …). Используется только для
+    /// per-trade CSV-лога; в торговой логике не участвует. Дублирует
+    /// `lane_key.0`, но избавляет `close_position` /
+    /// `resolve_pending_market_sync` от необходимости тащить
+    /// `lane_key` через всю цепочку вызовов.
+    pub(crate) currency: String,
 }
 
 /// Причина закрытия позиции.
@@ -585,6 +612,48 @@ pub struct SideStats {
     /// посчитанного как `kelly_fraction(pred, kelly_gain_ratio, kelly_loss_ratio)`.
     /// Среднее отражает, насколько «жирный» edge обычно видит модель.
     pub(crate) diag_sum_kelly_f: f64,
+    /// Гистограмма `entry_prob` в моменте успешного **открытия** позиции
+    /// (`BuyGate::Proceed` + `open_position` отработали). 5 бакетов по 0.2:
+    /// `[0.0..0.2)`, `[0.2..0.4)`, `[0.4..0.6)`, `[0.6..0.8)`, `[0.8..1.0]`.
+    /// Без этой разбивки нельзя понять, в какую часть распределения
+    /// «дешёвые / дорогие» входы перекошены — а это критично для оценки
+    /// корректности Kelly-сайзинга.
+    pub(crate) histogram_entry_prob: [usize; 5],
+    /// Гистограмма калиброванного `pred` в моменте открытия позиции,
+    /// та же сетка бакетов, что у [`Self::histogram_entry_prob`].
+    /// Сравнение этих двух гистограмм показывает, на каком «edge'е»
+    /// модели реально торгуем (в идеале `cal_pred > entry_prob`).
+    pub(crate) histogram_cal_pred: [usize; 5],
+    /// Кадры, в которых [`buy_gate`] вернул [`BuyGate::Proceed`], но
+    /// суммарной USDC-глубины на ask-стаке кадра (`book_asks` * price)
+    /// не хватило бы на `Y_TRAIN_NOMINAL_USDC = $200` номинала. Подсчёт
+    /// **независим** от `kelly_strict_buy_skips` (тот считает реальные
+    /// отказы `book_fill_buy_strict` в strict-режиме / `book_fill_buy`
+    /// с total_shares=0): тут просто диагностический сигнал «как часто
+    /// рынок недостаточно ликвиден для сценария Y-разметки».
+    pub(crate) thin_book_skips: usize,
+    /// Сумма PnL по позициям, закрытым по [`CloseReason::TakeProfit`].
+    /// Сейчас в [`Self::tp_count`] есть только число таких закрытий —
+    /// без знания P&L нельзя видеть, что одно «удачное» TP не съедает
+    /// 5 «неудачных» SL.
+    pub(crate) pnl_tp: f64,
+    /// Сумма PnL по позициям, закрытым по [`CloseReason::StopLoss`].
+    pub(crate) pnl_sl: f64,
+    /// Сумма PnL по позициям, закрытым по [`CloseReason::Timeout`].
+    pub(crate) pnl_timeout: f64,
+    /// Сумма PnL по позициям, закрытым по [`CloseReason::EvExitProfit`].
+    pub(crate) pnl_ev_exit_profit: f64,
+    /// Сумма PnL по позициям, закрытым по [`CloseReason::EvExitLoss`].
+    pub(crate) pnl_ev_exit_loss: f64,
+    /// Сумма PnL по позициям, закрытым через резолюцию маркета как
+    /// **победившие** (`Account::resolve_pending_market_sync`,
+    /// `token_won = true`). Может быть отрицательной при дорогих
+    /// входах (см. doc у `Self::resolution_win_loss`).
+    pub(crate) pnl_resolution_win: f64,
+    /// Сумма PnL по позициям, закрытым через резолюцию маркета как
+    /// **проигравшие** (`token_won = false`). Всегда `<= 0`
+    /// (теряется весь `entry_cost`).
+    pub(crate) pnl_resolution_loss: f64,
 }
 
 /// Накопленная статистика за версию (per-interval счётчики, без денег).
@@ -641,6 +710,12 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
     }
 
     crate::tee_log::init_tee_log_file(&xframes_root.join("last_history_sim.txt"), "sim")?;
+    // Per-trade CSV-лог: одна строка на каждое закрытие (рыночное и
+    // резолюционное). См. `crate::trade_csv_log` — анализируется отдельно
+    // от текстового лога (pandas/duckdb по `last_history_sim_trades.csv`).
+    crate::trade_csv_log::init_trade_csv_log_file(
+        &xframes_root.join("last_history_sim_trades.csv"),
+    )?;
 
     for currency_path in fs_sorted_dirs(xframes_root)? {
         let currency = dir_name(&currency_path);
@@ -773,6 +848,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
         }
     }
 
+    crate::trade_csv_log::finish_trade_csv_log();
     crate::tee_log::finish_tee_log();
 
     Ok(())
@@ -852,6 +928,7 @@ fn simulate_event(
             account,
             &lane_key_up,
             &mut sim_stats.up,
+            currency,
         );
     }
     {
@@ -864,6 +941,7 @@ fn simulate_event(
             account,
             &lane_key_down,
             &mut sim_stats.down,
+            currency,
         );
     }
 
@@ -952,6 +1030,7 @@ fn run_side_simulation(
     account: &mut Account,
     lane_key: &(String, XFrameIntervalKind, CurrencyUpDownOutcome),
     side_stats: &mut SideStats,
+    currency: &str,
 ) {
     if frames.is_empty() {
         return;
@@ -1025,6 +1104,7 @@ fn run_side_simulation(
             available,
             None,
             "",
+            currency,
         );
 
         // 3) Mark-to-market equity на каждом тике (а не только на сделке).
@@ -1301,6 +1381,10 @@ pub(crate) fn buy_gate(
 /// чтобы вызывающая сторона (см. `real_sim::tick_once`) могла
 /// триггерить вывод/`update_drawdown` без локального трекинга
 /// `positions.len()`/`stats.trades`.
+///
+/// `currency` — лейбл валюты лейна (`btc` и т.п.). Используется только
+/// для записи в `OpenPosition.currency` (нужна для per-trade CSV); на
+/// торговую логику не влияет.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_open_position(
     frame: &XFrame<SIZE>,
@@ -1310,6 +1394,7 @@ pub(crate) fn try_open_position(
     bankroll: f64,
     strict_book: Option<&StrictBook>,
     log_tag: &str,
+    currency: &str,
 ) -> bool {
     // Единая точка принятия решения о входе: ниже — только бухгалтерия
     // (счётчики пропусков + `open_position` при успехе). Вся логика
@@ -1372,8 +1457,36 @@ pub(crate) fn try_open_position(
             stats.diag_sum_calibrated += pred as f64;
             stats.diag_sum_entry_prob += entry_prob;
             stats.diag_sum_kelly_f += kelly_f;
-            match open_position(frame, size, stats, strict_book) {
+
+            // Диагностика «насколько тонкий стакан» — проверка независима
+            // от kelly_strict_buy_skips (тот ловит реальный отказ
+            // book_fill_buy/strict). Тут просто смотрим на `Y_TRAIN_NOMINAL_USDC`
+            // — тот же $200, под который размечается y_train. Если на
+            // ask'е суммарно меньше $200 USDC, исполнение по WS-лестнице
+            // частично «сожжёт» остаток (в book_fill_buy non-strict он
+            // не fallback'ится, см. doc у book_fill_buy).
+            if let Some(asks) = frame.book_asks.as_deref() {
+                let depth_usdc: f64 = asks
+                    .iter()
+                    .filter(|l| l.price > 0.0 && l.size > 0.0)
+                    .map(|l| l.price * l.size)
+                    .sum();
+                if depth_usdc < crate::xframe::Y_TRAIN_NOMINAL_USDC {
+                    stats.thin_book_skips += 1;
+                }
+            }
+            match open_position(frame, size, stats, strict_book, raw, pred, kelly_f, currency) {
                 Some(pos) => {
+                    // Гистограммы заполняем только для **успешно открытых**
+                    // позиций — нас интересует распределение реальных входов,
+                    // а не «kelly_skip / thin_book_skip». Бакет берём по
+                    // `pos.entry_prob` (фактическая цена входа после `effective_implied_prob`)
+                    // и `pred` (калиброванный); это две точки, между которыми
+                    // живёт edge модели.
+                    let bucket_entry = prob_bucket_index(pos.entry_prob);
+                    let bucket_pred = prob_bucket_index(pred as f64);
+                    stats.histogram_entry_prob[bucket_entry] += 1;
+                    stats.histogram_cal_pred[bucket_pred] += 1;
                     positions.push(pos);
                     true
                 }
@@ -1812,6 +1925,18 @@ fn kelly_fraction(p_win: f64, gain: f64, loss: f64) -> f64 {
     p_win / loss - q / gain
 }
 
+/// Бакет вероятности `[0..1]` в индекс `0..=4` для гистограмм
+/// [`SideStats::histogram_entry_prob`] / [`SideStats::histogram_cal_pred`].
+/// Сетка: `[0.0..0.2)`, `[0.2..0.4)`, `[0.4..0.6)`, `[0.6..0.8)`, `[0.8..1.0]`.
+/// Значения `< 0` или `NaN` уходят в бакет `0`, `>= 1.0` — в `4`.
+pub(crate) fn prob_bucket_index(p: f64) -> usize {
+    if !p.is_finite() || p < 0.0 {
+        return 0;
+    }
+    let idx = (p * 5.0).floor() as i64;
+    idx.clamp(0, 4) as usize
+}
+
 // ─── Торговые операции с учётом комиссий ──────────────────────────────────────
 
 /// Открывает виртуальную позицию за `position_size` USDC.
@@ -1820,11 +1945,25 @@ fn kelly_fraction(p_win: f64, gain: f64, loss: f64) -> f64 {
 /// ликвидности — добираем с L2, затем L3. VWAP покупки = `position_size / total_shares`.
 /// Taker-комиссия вычитается из полученных шерсов:
 /// `actual_shares = nominal_shares − nominal_shares × FEE_RATE × p × (1−p)`
+///
+/// Параметры `raw_pred_at_open`/`cal_pred_at_open`/`kelly_f_at_open` —
+/// диагностические значения decision-tree входа (`BuyGate::Proceed`),
+/// сохраняются в [`OpenPosition`] и потом печатаются в per-trade CSV-логе.
+/// На решение о торговле здесь не влияют (gate уже разрешил вход).
+///
+/// `currency` — лейбл валюты текущего лейна (`btc` и т.п.). Сохраняется
+/// в [`OpenPosition::currency`] для per-trade CSV; на торговую логику
+/// не влияет.
+#[allow(clippy::too_many_arguments)]
 fn open_position(
     frame: &XFrame<SIZE>,
     position_size: f64,
     stats: &mut SideStats,
     strict_book: Option<&StrictBook>,
+    raw_pred_at_open: f32,
+    cal_pred_at_open: f32,
+    kelly_f_at_open: f64,
+    currency: &str,
 ) -> Option<OpenPosition> {
     let (buy_price, nominal_shares) = match strict_book {
         Some(book) => book_fill_buy_strict(book, position_size)?,
@@ -1861,6 +2000,13 @@ fn open_position(
         entry_cost: position_size,
         frames_held: 0,
         p_win_ema: None,
+        raw_pred_at_open,
+        cal_pred_at_open,
+        kelly_f_at_open,
+        event_remaining_ms_at_open: frame.event_remaining_ms,
+        xframe_interval_type_at_open: frame.xframe_interval_type,
+        currency_up_down_outcome_at_open: frame.currency_up_down_outcome,
+        currency: currency.to_string(),
     })
 }
 
@@ -1915,14 +2061,72 @@ fn close_position(
     if pnl >= 0.0 { stats.wins += 1; } else { stats.losses += 1; }
 
     match reason {
-        CloseReason::TakeProfit   => stats.tp_count += 1,
-        CloseReason::StopLoss     => stats.sl_count += 1,
-        CloseReason::Timeout      => stats.timeout_count += 1,
-        CloseReason::EvExitProfit => stats.ev_exit_profit_count += 1,
-        CloseReason::EvExitLoss   => stats.ev_exit_loss_count += 1,
+        CloseReason::TakeProfit   => { stats.tp_count += 1;              stats.pnl_tp += pnl; }
+        CloseReason::StopLoss     => { stats.sl_count += 1;              stats.pnl_sl += pnl; }
+        CloseReason::Timeout      => { stats.timeout_count += 1;         stats.pnl_timeout += pnl; }
+        CloseReason::EvExitProfit => { stats.ev_exit_profit_count += 1;  stats.pnl_ev_exit_profit += pnl; }
+        CloseReason::EvExitLoss   => { stats.ev_exit_loss_count += 1;    stats.pnl_ev_exit_loss += pnl; }
     }
 
+    // Per-trade CSV-лог (если открыт через `init_trade_csv_log_file`).
+    // Пишется ровно одной строкой на закрытие; resolution-закрытия
+    // (бинарная выплата $1/$0) пишет `Account::resolve_pending_market_sync`.
+    let interval_str = position_interval_label(pos);
+    let side_str = position_side_label(pos);
+    crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
+        market_id: &pos.market_id,
+        asset_id: &pos.asset_id,
+        side: side_str,
+        interval: interval_str,
+        currency: &pos.currency,
+        exit_reason: trade_csv_close_reason_label(reason),
+        entry_prob: pos.entry_prob,
+        raw_pred: pos.raw_pred_at_open,
+        cal_pred: pos.cal_pred_at_open,
+        kelly_f: pos.kelly_f_at_open,
+        entry_cost: pos.entry_cost,
+        shares_held: pos.shares_held,
+        exit_price: sell_price,
+        fee_usdc,
+        pnl,
+        frames_held: pos.frames_held,
+        p_win_ema_at_close: pos.p_win_ema,
+        event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
+        event_remaining_ms_at_close: frame.event_remaining_ms,
+    });
+
     Some(pnl)
+}
+
+/// Лейбл интервала позиции для CSV: `"5m"` / `"15m"` / `"unknown"`.
+/// Использует [`XFrameIntervalKind::from_i32`] и общий
+/// [`crate::real_sim::interval_label`].
+pub(crate) fn position_interval_label(pos: &OpenPosition) -> &'static str {
+    match XFrameIntervalKind::from_i32(pos.xframe_interval_type_at_open) {
+        Some(kind) => crate::real_sim::interval_label(kind),
+        None => "unknown",
+    }
+}
+
+/// Лейбл стороны позиции для CSV: `"up"` / `"down"` / `"unknown"`.
+pub(crate) fn position_side_label(pos: &OpenPosition) -> &'static str {
+    match CurrencyUpDownOutcome::from_i32(pos.currency_up_down_outcome_at_open) {
+        Some(outcome) => crate::real_sim::side_label(outcome),
+        None => "unknown",
+    }
+}
+
+/// Текстовый лейбл [`CloseReason`] для CSV-колонки `exit_reason`.
+/// Стабильные значения (не меняются по локали / порядку enum'а) —
+/// чтобы внешний анализ CSV не зависел от Debug-печати.
+pub(crate) fn trade_csv_close_reason_label(reason: &CloseReason) -> &'static str {
+    match reason {
+        CloseReason::TakeProfit => "TP",
+        CloseReason::StopLoss => "SL",
+        CloseReason::Timeout => "Timeout",
+        CloseReason::EvExitProfit => "EvExitProfit",
+        CloseReason::EvExitLoss => "EvExitLoss",
+    }
 }
 
 // ─── Обход стакана ────────────────────────────────────────────────────────────
@@ -2104,7 +2308,7 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
 pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
     let n = s.raw_above_threshold.max(1) as f64;
     let diag = format!(
-        "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
+        "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={} thin_book_skips={}",
         s.raw_above_threshold,
         s.diag_sum_raw / n,
         s.diag_sum_calibrated / n,
@@ -2114,6 +2318,7 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         s.same_asset_open_skips,
         s.kelly_strict_buy_skips,
         s.kelly_strict_sell_skips,
+        s.thin_book_skips,
     );
     tee_println!("[sim] {tag} [{side_label}]   {diag}");
 
@@ -2138,6 +2343,40 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats) {
         s.ev_exit_profit_count, s.ev_exit_loss_count,
         s.resolution_win, s.resolution_win_profit, s.resolution_win_loss,
         s.resolution_loss, s.late_entry_skips, s.unstable_skips, s.same_asset_open_skips,
+    );
+
+    // Гистограмма `entry_prob` / калиброванного `pred` на момент входа
+    // — ровно на тех 5 бакетах по 0.2, что и [`prob_bucket_index`].
+    // Полезно для проверки: если все входы в `[0.6..0.8)`, edge модели
+    // мал, и любая ошибка калибровки немедленно «съедает» плюс.
+    tee_println!(
+        "[sim] {tag} [{side_label}] entry_prob hist (0..0.2 / 0.2..0.4 / 0.4..0.6 / 0.6..0.8 / 0.8..1): {} / {} / {} / {} / {}",
+        s.histogram_entry_prob[0], s.histogram_entry_prob[1], s.histogram_entry_prob[2],
+        s.histogram_entry_prob[3], s.histogram_entry_prob[4],
+    );
+    tee_println!(
+        "[sim] {tag} [{side_label}] cal_pred  hist (0..0.2 / 0.2..0.4 / 0.4..0.6 / 0.6..0.8 / 0.8..1): {} / {} / {} / {} / {}",
+        s.histogram_cal_pred[0], s.histogram_cal_pred[1], s.histogram_cal_pred[2],
+        s.histogram_cal_pred[3], s.histogram_cal_pred[4],
+    );
+
+    // PnL по причине закрытия. Считаем **средний** PnL на сделку для
+    // быстрой эвристики: «один TP компенсирует 5 SL?». Делим только на
+    // непустые причины, чтобы не печатать nan.
+    let avg = |sum: f64, cnt: usize| if cnt == 0 { 0.0 } else { sum / cnt as f64 };
+    tee_println!(
+        "[sim] {tag} [{side_label}] pnl_by_reason: \
+         TP={tp_pnl:+.2}$(avg={tp_avg:+.4}) SL={sl_pnl:+.2}$(avg={sl_avg:+.4}) \
+         Timeout={to_pnl:+.2}$(avg={to_avg:+.4}) \
+         EvExit✓={evp_pnl:+.2}$(avg={evp_avg:+.4}) EvExit✗={evl_pnl:+.2}$(avg={evl_avg:+.4}) \
+         Res✓={rw_pnl:+.2}$(avg={rw_avg:+.4}) Res✗={rl_pnl:+.2}$(avg={rl_avg:+.4})",
+        tp_pnl = s.pnl_tp,                tp_avg = avg(s.pnl_tp, s.tp_count),
+        sl_pnl = s.pnl_sl,                sl_avg = avg(s.pnl_sl, s.sl_count),
+        to_pnl = s.pnl_timeout,           to_avg = avg(s.pnl_timeout, s.timeout_count),
+        evp_pnl = s.pnl_ev_exit_profit,   evp_avg = avg(s.pnl_ev_exit_profit, s.ev_exit_profit_count),
+        evl_pnl = s.pnl_ev_exit_loss,     evl_avg = avg(s.pnl_ev_exit_loss, s.ev_exit_loss_count),
+        rw_pnl = s.pnl_resolution_win,    rw_avg = avg(s.pnl_resolution_win, s.resolution_win),
+        rl_pnl = s.pnl_resolution_loss,   rl_avg = avg(s.pnl_resolution_loss, s.resolution_loss),
     );
 }
 
