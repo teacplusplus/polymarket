@@ -6,8 +6,13 @@ use crate::run_log;
 use crate::util::current_timestamp_ms;
 use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Писать WS-стрим в `streams/...` после дампа xframes ([`dump_market_ws_stream_txt`]).
+const DUMP_MARKET_WS_STREAM_TXT: bool = false;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MarketXFramesDump {
@@ -104,6 +109,18 @@ pub fn spawn_dump_market_xframes_binary(
                 eprintln!("xframe_dump lane={lane}: {err:#}");
             }
         }
+        if DUMP_MARKET_WS_STREAM_TXT {
+            if let Err(err) = dump_market_ws_stream_txt(
+                project_manager.clone(),
+                market_id.clone(),
+                gamma_question.clone(),
+                interval_kind,
+            )
+            .await
+            {
+                eprintln!("stream_dump: {err:#}");
+            }
+        }
         project_manager.cleanup_stale_market_data(&market_id).await;
     });
 }
@@ -182,5 +199,90 @@ pub async fn dump_market_xframes_binary_lane(
     let byte_len = bytes.len();
     tokio::fs::write(&path, bytes).await?;
     run_log::xframe_dump_written(&path, &market_id, frame_count, byte_len);
+    Ok(())
+}
+
+pub async fn dump_market_ws_stream_txt(
+    project_manager: Arc<ProjectManager>,
+    market_id: String,
+    gamma_question: Option<String>,
+    interval_kind: XFrameIntervalKind,
+) -> anyhow::Result<()> {
+    let entries = {
+        let asset_ids = project_manager
+            .market_asset_ids_by_market
+            .read()
+            .await
+            .get(&market_id)
+            .cloned()
+            .unwrap_or_default();
+        let ws_stream_by_asset_id = project_manager.ws_stream_by_asset_id.read().await;
+        let mut out = Vec::new();
+        for asset_id in asset_ids {
+            if let Some(list) = ws_stream_by_asset_id.get(&asset_id) {
+                out.extend(list.iter().cloned());
+            }
+        }
+        out.sort_by_key(|e| (e.ingest_wall_ms, e.event_timestamp_ms));
+        out
+    };
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut entries_by_asset_id: BTreeMap<String, Vec<_>> = BTreeMap::new();
+    for entry in entries {
+        entries_by_asset_id
+            .entry(entry.asset_id.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let interval_label = match interval_kind {
+        XFrameIntervalKind::FiveMin => "5m",
+        XFrameIntervalKind::FifteenMin => "15m",
+    };
+
+    let schema_size = bincode::serialized_size(&XFrame::<SIZE>::default())
+        .expect("XFrame::<SIZE>::default() must be bincode-serializable")
+        as usize;
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let base: PathBuf = Path::new("streams")
+        .join(project_manager.currency.as_str())
+        .join(format!("{schema_size}"))
+        .join(interval_label)
+        .join(&date);
+
+    let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
+    let ts = current_timestamp_ms();
+
+    for (asset_id, asset_entries) in entries_by_asset_id {
+        let asset_dir = base.join(asset_id.as_str());
+        tokio::fs::create_dir_all(&asset_dir).await?;
+
+        let fname = format!("{stem}__{ts}.txt");
+        let path = asset_dir.join(&fname);
+
+        let mut out = String::new();
+        writeln!(&mut out, "# ws_stream_dump").ok();
+        writeln!(&mut out, "market_id={market_id}").ok();
+        writeln!(&mut out, "asset_id={asset_id}").ok();
+        writeln!(&mut out, "currency={}", project_manager.currency).ok();
+        writeln!(&mut out, "interval={interval_label}").ok();
+        writeln!(&mut out, "format=ingest_wall_ms|event_ts_ms|asset_id|event_type|payload_raw").ok();
+        for e in asset_entries {
+            let payload_one_line = e.payload_raw.replace('\n', "\\n");
+            writeln!(
+                &mut out,
+                "{}|{}|{}|{}|{}",
+                e.ingest_wall_ms,
+                e.event_timestamp_ms,
+                e.asset_id,
+                e.event_type,
+                payload_one_line
+            )
+            .ok();
+        }
+        tokio::fs::write(&path, out).await?;
+    }
     Ok(())
 }

@@ -52,6 +52,16 @@ pub struct LaneFrame {
     pub frame: XFrame<SIZE>,
 }
 
+#[derive(Clone, Debug)]
+pub struct WsStreamEntry {
+    pub market_id: String,
+    pub asset_id: String,
+    pub event_type: String,
+    pub ingest_wall_ms: i64,
+    pub event_timestamp_ms: i64,
+    pub payload_raw: String,
+}
+
 /// Кадр, собранный в этом тике `build_frames_from_buffer_lane_once`, до записи в соответствующий лейн `xframes_by_market`.
 struct BuiltXframeEntry {
     market_id: String,
@@ -76,6 +86,7 @@ pub struct ProjectManager {
     pub currency: Arc<String>,
     pub xframes_by_market: Vec<RwLock<MarketFrames>>,
     pub ws_buffer_by_market: Vec<RwLock<MarketSnapshotBuffer>>,
+    pub ws_stream_by_asset_id: Arc<RwLock<HashMap<String, Vec<WsStreamEntry>>>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub slug_to_market_id: Arc<RwLock<HashMap<String, String>>>,
     pub price_to_beat_by_market: Arc<RwLock<HashMap<String, f64>>>,
@@ -130,6 +141,7 @@ impl ProjectManager {
             ws_buffer_by_market: (0..FRAME_BUILD_INTERVALS_SEC.len())
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
+            ws_stream_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             slug_to_market_id: Arc::new(RwLock::new(HashMap::new())),
             price_to_beat_by_market: Arc::new(RwLock::new(HashMap::new())),
@@ -315,6 +327,12 @@ impl ProjectManager {
         for ws_buffer_by_market in &self.ws_buffer_by_market {
             ws_buffer_by_market.write().await.remove(market_id);
         }
+        {
+            let mut ws_stream_by_asset_id = self.ws_stream_by_asset_id.write().await;
+            for asset_id in &asset_ids {
+                ws_stream_by_asset_id.remove(asset_id);
+            }
+        }
         self.event_data_by_market.write().await.remove(market_id);
         self.price_to_beat_by_market.write().await.remove(market_id);
 
@@ -339,6 +357,19 @@ impl ProjectManager {
         {
             let mut slugs = self.slug_to_market_id.write().await;
             slugs.retain(|_, v| v != market_id);
+        }
+    }
+
+    pub async fn append_ws_stream_entries(&self, entries: Vec<WsStreamEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut ws_stream_by_asset_id = self.ws_stream_by_asset_id.write().await;
+        for entry in entries {
+            ws_stream_by_asset_id
+                .entry(entry.asset_id.clone())
+                .or_default()
+                .push(entry);
         }
     }
 

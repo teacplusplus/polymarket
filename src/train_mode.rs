@@ -23,8 +23,10 @@ use xgb::parameters::tree::{TreeBoosterParametersBuilder, TreeMethod};
 use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersBuilder};
 use xgb::{Booster, DMatrix};
 
-/// Число итераций байесовского оптимизатора.
-const OPTIMIZER_TRIALS: usize = 100;
+/// Число итераций байесовского оптимизатора (TPE) для PnL-модели.
+const OPTIMIZER_TRIALS_PNL: usize = 150;
+/// Число итераций байесовского оптимизатора (TPE) для Resolution-модели.
+const OPTIMIZER_TRIALS_RESOLUTION: usize = 1000;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -45,13 +47,13 @@ const EVAL_REFERENCE_ETA: f32 = 0.1;
 /// при фиксированном `EVAL_BOOST_ROUNDS` гарантированно не сходятся и
 /// приводят к вырожденным «лучшим» trial'ам (AUC пробы близок к константе,
 /// early stopping финального обучения останавливается на первых раундах).
-const ETA_MIN: f32 = 0.03;
+const ETA_MIN: f32 = 0.01;
 /// Верхняя граница `eta` — соответствует прежнему поведению.
-const ETA_MAX: f32 = 0.3;
+const ETA_MAX: f32 = 0.5;
 /// Доля валидационной выборки (для optimizer + early stopping).
-pub const VAL_FRACTION: f64 = 0.1;
+pub const VAL_FRACTION: f64 = 0.2;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
-pub const TEST_FRACTION: f64 = 0.1;
+pub const TEST_FRACTION: f64 = 0.2;
 /// Понижающий коэффициент `feature_weights` для конкретных фич из [`DOWNWEIGHTED_FEATURES`].
 const DOWNWEIGHT_FACTOR: f32 = 0.1;
 /// Понижающий коэффициент для лаговых фич (массивы `delta_n_*[i]`).
@@ -71,14 +73,91 @@ const CALIBRATION_EPS: f32 = 1e-3;
 /// остаётся в интервале [prev, next]).
 const CALIBRATION_MIN_BLOCK_WEIGHT: f64 = 50.0;
 
+/// Базовый уровень logloss для штрафа в [`TuneObjective::MaximizeAucWithPenalty`].
+/// При типичном дисбалансе классов (~25% y=1) константная модель даёт logloss
+/// около 0.55, поэтому штрафуем только то, что хуже этого уровня. Если AUC
+/// высокий, но `logloss > baseline`, модель «угадывает» порядок, но
+/// откалибрована плохо — это снижает usability для Kelly-сайзинга.
+const AUC_PENALTY_LOGLOSS_BASELINE: f64 = 0.55;
+/// Насколько сильно высокий logloss вычитается из AUC в objective:
+/// `score = auc - max(0, logloss - baseline) * weight`. Подобран так, чтобы
+/// разница в `0.1` logloss «съедала» примерно `0.005` AUC — соизмеримо с
+/// шумом trial-to-trial разброса AUC, но достаточно, чтобы TPE предпочёл
+/// калиброванные модели при равном AUC.
+const AUC_PENALTY_LOGLOSS_WEIGHT: f64 = 0.05;
+
+/// Цель байесовской оптимизации гиперпараметров XGBoost. Переключается через
+/// константу [`TUNE_OBJECTIVE`] — параметризовать через env / CLI смысла нет,
+/// решение про objective привязано к билду модели и попадает в обучающий лог.
+///
+/// * [`TuneObjective::MaximizeAuc`] — классический критерий ranking-power.
+///   Игнорирует калибровку: модель может давать высокий AUC, но смещённые
+///   probability'ы (например, средняя `cal_pred` ≪ базовая частота),
+///   что ломает Kelly. Полезен, если калибровка делается отдельным шагом
+///   (как в `xframe.rs` через isotonic) и от booster'а нужна только
+///   способность сортировать сэмплы.
+///
+/// * [`TuneObjective::MinimizeLogLoss`] — оптимизирует именно вероятностные
+///   предсказания. На сильно несбалансированных классах (`scale_pos_weight ≫ 1`)
+///   часто загоняет модель в константный режим (logloss ≈ baseline), потому
+///   что AUC он не контролирует.
+///
+/// * [`TuneObjective::MaximizeAucWithPenalty`] — компромисс: максимизирует AUC,
+///   но вычитает штраф за logloss выше [`AUC_PENALTY_LOGLOSS_BASELINE`]
+///   с весом [`AUC_PENALTY_LOGLOSS_WEIGHT`]. Защищает от «high-AUC,
+///   broken-calibration»-trial'ов и обычно совпадает с `MaximizeAuc` на
+///   хорошо откалиброванных trial'ах (penalty=0). Это default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuneObjective {
+    MinimizeLogLoss,
+    MaximizeAuc,
+    MaximizeAucWithPenalty,
+}
+
+impl TuneObjective {
+    /// Краткое имя метрики, печатается в TPE-логах рядом с `auc`/`logloss`.
+    fn label(&self) -> &'static str {
+        match self {
+            TuneObjective::MinimizeLogLoss => "logloss",
+            TuneObjective::MaximizeAuc => "auc",
+            TuneObjective::MaximizeAucWithPenalty => "auc_with_logloss_penalty",
+        }
+    }
+
+    /// Направление оптимизации для [`Study`]: `MaximizeAuc` /
+    /// `MaximizeAucWithPenalty` — `Direction::Maximize`,
+    /// `MinimizeLogLoss` — `Direction::Minimize`.
+    fn direction(&self) -> Direction {
+        match self {
+            TuneObjective::MinimizeLogLoss => Direction::Minimize,
+            TuneObjective::MaximizeAuc => Direction::Maximize,
+            TuneObjective::MaximizeAucWithPenalty => Direction::Maximize,
+        }
+    }
+
+    /// Сравнение свёрнутого скора для early stopping: согласовано с
+    /// [`TrialMetrics::score_for`] и [`direction`] (лучше выше при maximize,
+    /// лучше ниже при minimize).
+    fn score_improved(self, new_score: f64, best_score: f64) -> bool {
+        match self.direction() {
+            Direction::Maximize => new_score > best_score,
+            Direction::Minimize => new_score < best_score,
+        }
+    }
+}
+
+/// Активная цель байесовской оптимизации. Меняется одной правкой константы;
+/// см. doc у [`TuneObjective`] для разбора вариантов.
+const TUNE_OBJECTIVE: TuneObjective = TuneObjective::MinimizeLogLoss;
+
 /// Максимальный лаг `delta_n_*` для PnL-модели: `None` — полный вектор
 /// [`XFrame::to_x_train_with`]; `Some(n)` — обрезка лагов до `n` первых
 /// элементов через [`XFrame::to_x_train_n_with`]. Общий источник истины
 /// для тренера и [`crate::history_sim`]: один и тот же feature layout
 /// на обучении и инференсе.
-pub const PNL_MAX_LAG: Option<usize> = Some(5);
+pub const PNL_MAX_LAG: Option<usize> = Some(3);
 /// Максимальный лаг `delta_n_*` для Resolution-модели (см. [`PNL_MAX_LAG`]).
-pub const RESOLUTION_MAX_LAG: Option<usize> = None;
+pub const RESOLUTION_MAX_LAG: Option<usize> = Some(3);
 
 // ─── Калибровка (Isotonic Regression) ────────────────────────────────────────
 
@@ -846,15 +925,19 @@ fn train_and_save(
     // Optimizer и early stopping работают на val (названа "test" для совместимости с eval_xgboost).
     let eval_sets: [(&DMatrix, &str); 2] = [(&dtrain, "train"), (&dval, "test")];
 
+    let optimizer_trials = match model_type {
+        ModelType::Pnl => OPTIMIZER_TRIALS_PNL,
+        ModelType::Resolution => OPTIMIZER_TRIALS_RESOLUTION,
+    };
     match model_type {
         ModelType::Pnl => tee_println!(
-            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({OPTIMIZER_TRIALS} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
+            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({optimizer_trials} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
         ),
         ModelType::Resolution => tee_println!(
-            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({OPTIMIZER_TRIALS} итераций)…"
+            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({optimizer_trials} итераций)…"
         ),
     }
-    let params = tune_xgboost_optimizer(&eval_sets, &dtrain, OPTIMIZER_TRIALS, tag)?;
+    let params = tune_xgboost_optimizer(&eval_sets, &dtrain, optimizer_trials, tag)?;
     tee_println!("[train] {tag}: лучшие параметры: {params:?}");
 
     let booster = fit_booster_with_early_stopping(&params, &dtrain, &dval, tag)?;
@@ -1011,7 +1094,37 @@ fn print_y_distribution(y_train: &[f32], y_val: &[f32], y_test: &[f32], tag: &st
 }
 
 
-/// Байесовская оптимизация гиперпараметров XGBoost (максимизация AUC на тесте).
+/// Метрики одного TPE-trial'а на eval-сете (имя сета — `"test"`, см. caller'а
+/// `tune_xgboost_optimizer`). Считаются за одно обучение в [`eval_xgboost`]
+/// и затем сворачиваются в скаляр для [`Study`] через [`Self::score_for`].
+#[derive(Debug, Clone, Copy)]
+struct TrialMetrics {
+    auc: f64,
+    logloss: f64,
+}
+
+impl TrialMetrics {
+    /// Сворачивает метрики в одно число для оптимизатора согласно
+    /// активной [`TuneObjective`]. Для `MaximizeAucWithPenalty` штраф
+    /// линеен по превышению `logloss` над [`AUC_PENALTY_LOGLOSS_BASELINE`]
+    /// с весом [`AUC_PENALTY_LOGLOSS_WEIGHT`]; ниже baseline — штраф 0.
+    fn score_for(&self, obj: TuneObjective) -> f64 {
+        match obj {
+            TuneObjective::MaximizeAuc => self.auc,
+            TuneObjective::MinimizeLogLoss => self.logloss,
+            TuneObjective::MaximizeAucWithPenalty => {
+                let penalty = (self.logloss - AUC_PENALTY_LOGLOSS_BASELINE).max(0.0)
+                    * AUC_PENALTY_LOGLOSS_WEIGHT;
+                self.auc - penalty
+            }
+        }
+    }
+}
+
+/// Байесовская оптимизация гиперпараметров XGBoost. Метрика-цель и направление
+/// берутся из [`TUNE_OBJECTIVE`] (см. doc у [`TuneObjective`]). Каждый trial
+/// измеряет AUC и LogLoss на eval-сете `"test"`; сворачиваются в `score`
+/// через [`TrialMetrics::score_for`], TPE оптимизирует по нему.
 fn tune_xgboost_optimizer(
     eval_sets: &[(&DMatrix, &str); 2],
     dtrain: &DMatrix,
@@ -1019,39 +1132,53 @@ fn tune_xgboost_optimizer(
     tag: &str,
 ) -> anyhow::Result<XgbParams> {
     let sampler = TpeSampler::new();
-    // Максимизируем AUC на тестовой выборке: для торговой модели с дисбалансом классов
-    // AUC лучше отражает способность разделять классы, чем logloss.
-    let study: Study<f64> = Study::with_sampler(Direction::Maximize, sampler);
+    let objective = TUNE_OBJECTIVE;
+    let study: Study<f64> = Study::with_sampler(objective.direction(), sampler);
 
     study.optimize_with_sampler(trials, |trial| {
         let params = XgbParams {
             eta: trial.suggest_float("eta", ETA_MIN as f64, ETA_MAX as f64)? as f32,
-            max_depth: trial.suggest_int("max_depth", 2, 8)? as u32,
-            min_child_weight: trial.suggest_float("min_child_weight", 1.0, 20.0)? as f32,
+            max_depth: trial.suggest_int("max_depth", 2, 40)? as u32,
+            min_child_weight: trial.suggest_float("min_child_weight", 0.0, 20.0)? as f32,
             gamma: trial.suggest_float("gamma", 0.0, 10.0)? as f32,
-            subsample: trial.suggest_float("subsample", 0.5, 1.0)? as f32,
-            colsample_bytree: trial.suggest_float("colsample_bytree", 0.5, 1.0)? as f32,
+            subsample: trial.suggest_float("subsample", 0.1, 1.0)? as f32,
+            colsample_bytree: trial.suggest_float("colsample_bytree", 0.1, 1.0)? as f32,
             lambda: trial.suggest_float("lambda", 0.0, 20.0)? as f32,
             alpha: trial.suggest_float("alpha", 0.0, 80.0)? as f32,
-            scale_pos_weight: trial.suggest_float("scale_pos_weight", 5.0, 30.0)? as f32,
+            scale_pos_weight: trial.suggest_float("scale_pos_weight", 4.0, 30.0)? as f32,
         };
-        let score = eval_xgboost(&params, eval_sets, dtrain)
+        let metrics = eval_xgboost(&params, eval_sets, dtrain)
             .map_err(|_err| optimizer::Error::InvalidStep)?;
-        tee_println!("[train] {tag} trial #{}: auc={score:.6}", trial.id());
+        let score = metrics.score_for(objective);
+        tee_println!(
+            "[train] {tag} trial #{}: {label}={score:.6} (auc={auc:.6} logloss={logloss:.6})",
+            trial.id(),
+            label = objective.label(),
+            score = score,
+            auc = metrics.auc,
+            logloss = metrics.logloss,
+        );
         Ok::<f64, optimizer::Error>(score)
     })?;
 
     let best = study.best_trial()?;
-    tee_println!("[train] {tag}: лучший trial: value={} params={:?}", best.value, best.params);
+    tee_println!(
+        "[train] {tag}: лучший trial ({label}): value={} params={:?}",
+        best.value,
+        best.params,
+        label = objective.label(),
+    );
     Ok(params_from_map(&best.params))
 }
 
-/// Быстрое обучение для оценки параметров.
+/// Быстрое обучение для оценки параметров: возвращает AUC и LogLoss на
+/// eval-сете `"test"` (`eval_sets[1]` в caller'е). Сворачивание в скаляр
+/// для TPE — [`TrialMetrics::score_for`].
 fn eval_xgboost(
     params: &XgbParams,
     eval_sets: &[(&DMatrix, &str); 2],
     dtrain: &DMatrix,
-) -> Result<f64, Box<dyn std::error::Error>> {
+) -> Result<TrialMetrics, Box<dyn std::error::Error>> {
     let rounds = eval_boost_rounds(params.eta);
     let booster = fit_booster(params, dtrain, eval_sets, rounds)?;
     let auc = booster
@@ -1060,7 +1187,13 @@ fn eval_xgboost(
         .and_then(|metric| metric.get("test"))
         .copied()
         .unwrap_or(0.0) as f64;
-    Ok(auc)
+    let logloss = booster
+        .eval_dmat_results
+        .get("logloss")
+        .and_then(|metric| metric.get("test"))
+        .copied()
+        .unwrap_or(f32::INFINITY) as f64;
+    Ok(TrialMetrics { auc, logloss })
 }
 
 /// Бюджет раундов на TPE-пробу: обратная пропорция к `eta` относительно
@@ -1075,19 +1208,23 @@ fn eval_boost_rounds(eta: f32) -> u32 {
     (scaled as u32).clamp(EVAL_BOOST_ROUNDS, EVAL_BOOST_ROUNDS_MAX)
 }
 
-/// Обучение с early stopping: останавливается, когда AUC на тесте не улучшается
-/// `EARLY_STOPPING_PATIENCE` раундов подряд; возвращает booster с лучшим AUC.
+/// Обучение с early stopping: критерий улучшения совпадает с [`TUNE_OBJECTIVE`]
+/// (через [`TrialMetrics::score_for`], как в [`tune_xgboost_optimizer`]);
+/// останавливается после `EARLY_STOPPING_PATIENCE` раундов без улучшения на val
+/// (`dtest`); возвращает booster с лучшим снимком по этому критерию.
 fn fit_booster_with_early_stopping(
     params: &XgbParams,
     dtrain: &DMatrix,
     dtest: &DMatrix,
     tag: &str,
 ) -> anyhow::Result<Booster> {
+    let objective = TUNE_OBJECTIVE;
     let booster_params = build_booster_params(params)?;
     let cached = [dtrain, dtest];
     let mut bst = Booster::new_with_cached_dmats(&booster_params, &cached)?;
 
-    let mut best_auc: f32 = 0.0;
+    let mut best_score: Option<f64> = None;
+    let mut best_metrics: Option<TrialMetrics> = None;
     let mut best_snapshot: Vec<u8> = Vec::new();
     let mut best_round: u32 = 0;
     let mut rounds_without_improvement: u32 = 0;
@@ -1101,15 +1238,23 @@ fn fit_booster_with_early_stopping(
         bst.update(dtrain, round as i32)?;
 
         let test_metrics = bst.evaluate(dtest)?;
-        let auc = test_metrics.get("auc").copied().unwrap_or(0.0);
+        let auc = test_metrics.get("auc").copied().unwrap_or(0.0) as f64;
+        let logloss = test_metrics
+            .get("logloss")
+            .copied()
+            .unwrap_or(f32::INFINITY) as f64;
+        let metrics = TrialMetrics { auc, logloss };
+        let score = metrics.score_for(objective);
 
-        if auc > best_auc {
-            best_auc = auc;
+        let improved = best_score.map_or(true, |b| objective.score_improved(score, b));
+        if improved {
+            best_score = Some(score);
+            best_metrics = Some(metrics);
             best_round = round;
             rounds_without_improvement = 0;
             best_snapshot = bst.save_buffer(true)?;
 
-            // Сохраняем метрики train и test в момент лучшего AUC
+            // Сохраняем метрики train и test в момент лучшего раунда по objective
             best_eval_results.clear();
             let train_metrics = bst.evaluate(dtrain)?;
             for (metric, val) in train_metrics {
@@ -1121,8 +1266,15 @@ fn fit_booster_with_early_stopping(
         } else {
             rounds_without_improvement += 1;
             if rounds_without_improvement >= EARLY_STOPPING_PATIENCE {
+                let metrics_at_best =
+                    best_metrics.expect("best_metrics after at least one improving round");
+                let best_objective_score =
+                    best_score.expect("best_score after at least one improving round");
                 tee_println!(
-                    "[train] {tag}: early stopping на раунде {round}: лучший AUC={best_auc:.6} на раунде {best_round}"
+                    "[train] {tag}: early stopping на раунде {round}: лучший {label}={best_objective_score:.6} (auc={val_auc:.6} logloss={val_logloss:.6}) на раунде {best_round}",
+                    label = objective.label(),
+                    val_auc = metrics_at_best.auc,
+                    val_logloss = metrics_at_best.logloss,
                 );
                 break;
             }

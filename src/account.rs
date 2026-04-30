@@ -446,8 +446,8 @@ impl Account {
             ..
         } = self;
 
-        let mut closed = 0usize;
-        let mut total_pnl = 0.0_f64;
+        // let mut closed = 0usize;
+        // let mut total_pnl = 0.0_f64;
 
         for ((cur, int_kind, side), vec) in pending_resolution.iter_mut() {
             // Фильтр по `(currency, interval)`: 5m и 15m раунды независимы
@@ -478,8 +478,8 @@ impl Account {
                         -pos.entry_cost
                     };
                     *bankroll += pnl;
-                    total_pnl += pnl;
-                    closed += 1;
+                    // total_pnl += pnl;
+                    // closed += 1;
 
                     // Симметрично c прежней `close_position` веткой
                     // `CloseReason::Resolution`: те же поля SideStats.
@@ -517,19 +517,19 @@ impl Account {
                     {
                         let interval_str = interval_label(*int_kind);
                         let side_str = side_label(*side);
-                        let tag = format!("{}/{}/{}", cur, interval_str, side_str);
-                        let outcome = if token_won { "WIN" } else { "LOSS" };
-                        crate::tee_println!(
-                            "[resolve] {tag} market={market_id} {outcome} \
-                             shares={shares:.4} cost={cost:.4} pnl={pnl:+.4} bankroll={bankroll:.4}",
-                            tag = tag,
-                            market_id = market_id,
-                            outcome = outcome,
-                            shares = pos.shares_held,
-                            cost = pos.entry_cost,
-                            pnl = pnl,
-                            bankroll = *bankroll,
-                        );
+                        // let tag = format!("{}/{}/{}", cur, interval_str, side_str);
+                        // let outcome = if token_won { "WIN" } else { "LOSS" };
+                        // crate::tee_println!(
+                        //     "[resolve] {tag} market={market_id} {outcome} \
+                        //      shares={shares:.4} cost={cost:.4} pnl={pnl:+.4} bankroll={bankroll:.4}",
+                        //     tag = tag,
+                        //     market_id = market_id,
+                        //     outcome = outcome,
+                        //     shares = pos.shares_held,
+                        //     cost = pos.entry_cost,
+                        //     pnl = pnl,
+                        //     bankroll = *bankroll,
+                        // );
 
                         // Per-trade CSV: резолюционные закрытия идут
                         // отдельным `exit_reason` (`ResolutionWin` /
@@ -570,18 +570,28 @@ impl Account {
             }
         }
 
-        if closed > 0 {
-            crate::tee_println!(
-                "[resolve] {currency}/{interval} market={market_id} closed={closed} \
-                 total_pnl={total_pnl:+.4} bankroll={bankroll:.4}",
-                currency = currency,
-                interval = interval_label(interval),
-                market_id = market_id,
-                closed = closed,
-                total_pnl = total_pnl,
-                bankroll = *bankroll,
-            );
-        }
+        // if closed > 0 {
+        //     crate::tee_println!(
+        //         "[resolve] {currency}/{interval} market={market_id} closed={closed} \
+        //          total_pnl={total_pnl:+.4} bankroll={bankroll:.4}",
+        //         currency = currency,
+        //         interval = interval_label(interval),
+        //         market_id = market_id,
+        //         closed = closed,
+        //         total_pnl = total_pnl,
+        //         bankroll = *bankroll,
+        //     );
+        // }
+
+        // Финализируем CSV-строки этого маркета: достаём буферизованные
+        // рыночные выходы (TP/SL/Timeout/EvExit*) + только что записанные
+        // резолюционные строки (ResolutionWin/ResolutionLoss) и
+        // выписываем их с `final_outcome` (`win` / `loss`), вычисленным
+        // из `up_won` × `side`. См. `crate::trade_csv_log` о буферизации.
+        // Не зависит от `closed > 0`: даже если по этому маркету не было
+        // открытых позиций (resolution-колбек на пустой `pending_resolution`),
+        // вызов идемпотентен — буфер для `market_id` пуст → no-op.
+        crate::trade_csv_log::record_market_outcome(market_id, up_won);
     }
 
     /// Удобный конструктор для async-контекста: сразу оборачивает

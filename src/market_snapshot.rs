@@ -150,3 +150,81 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, bucket_start_ms: i64) -> Op
     }
     Some(aggregated_market_snapshot)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_snapshot(ts: i64) -> MarketSnapshot {
+        MarketSnapshot {
+            market_id: "m1".to_string(),
+            asset_id: "a1".to_string(),
+            xframe_interval_kind: XFrameIntervalKind::FiveMin,
+            currency_up_down_outcome: CurrencyUpDownOutcome::Up,
+            timestamp_ms: ts,
+            book_bid_l1_price: None,
+            book_bid_l1_size: None,
+            book_ask_l1_price: None,
+            book_ask_l1_size: None,
+            book_bid_l2_price: None,
+            book_bid_l2_size: None,
+            book_bid_l3_price: None,
+            book_bid_l3_size: None,
+            book_ask_l2_price: None,
+            book_ask_l2_size: None,
+            book_ask_l3_price: None,
+            book_ask_l3_size: None,
+            book_bids: None,
+            book_asks: None,
+            tick_size: None,
+            spread: None,
+            last_trade_price: None,
+            last_trade_size: None,
+            trade_volume_bucket: None,
+            trade_side: None,
+            market_resolved: false,
+        }
+    }
+
+    #[test]
+    fn aggregate_events_uses_latest_fields_and_sums_trade_volume() {
+        let mut e1 = base_snapshot(1_000);
+        e1.book_bid_l1_price = Some(0.41);
+        e1.book_ask_l1_price = Some(0.59);
+        e1.last_trade_price = Some(0.42);
+        e1.last_trade_size = Some(10.0);
+        e1.trade_side = Some(TradeSide::Buy);
+
+        let mut e2 = base_snapshot(1_150);
+        e2.book_bid_l1_price = Some(0.43);
+        e2.last_trade_price = Some(0.44);
+        e2.last_trade_size = Some(7.0);
+        e2.trade_side = Some(TradeSide::Sell);
+        e2.market_resolved = true;
+
+        let agg = aggregate_events(vec![e1, e2], 900).expect("aggregate should exist");
+        assert_eq!(agg.timestamp_ms, 1_150);
+        assert_eq!(agg.book_bid_l1_price, Some(0.43));
+        assert_eq!(agg.book_ask_l1_price, Some(0.59));
+        assert_eq!(agg.last_trade_price, Some(0.44));
+        assert_eq!(agg.trade_volume_bucket, Some(17.0));
+        assert!(matches!(agg.trade_side, Some(TradeSide::Sell)));
+        assert!(agg.market_resolved);
+    }
+
+    #[test]
+    fn aggregate_events_ignores_non_positive_trade_size() {
+        let mut e1 = base_snapshot(1_000);
+        e1.last_trade_size = Some(0.0);
+        e1.trade_side = Some(TradeSide::Buy);
+
+        let mut e2 = base_snapshot(1_100);
+        e2.last_trade_size = Some(-2.0);
+        e2.trade_side = Some(TradeSide::Sell);
+
+        let agg = aggregate_events(vec![e1, e2], 900).expect("aggregate should exist");
+        assert_eq!(agg.trade_volume_bucket, None);
+        assert_eq!(agg.last_trade_size, None);
+        assert!(agg.trade_side.is_none());
+    }
+}

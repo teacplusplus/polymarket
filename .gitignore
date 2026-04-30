@@ -1,6 +1,7 @@
 /target
 /errors
 /xframes
+/streams
 .env
 deploy/libxgboost.so
 deploy/poly

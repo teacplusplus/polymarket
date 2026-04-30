@@ -1,5 +1,5 @@
 use crate::currency_updown_sibling::update_currency_updown_sibling_slots;
-use crate::project_manager::ProjectManager;
+use crate::project_manager::{ProjectManager, WsStreamEntry};
 use crate::run_log;
 use crate::util::current_timestamp_ms;
 use anyhow::{anyhow, Result};
@@ -220,15 +220,11 @@ async fn run_persistent_interval_market_ws_inner(
                             last_message_wall_ms = current_timestamp_ms();
                             match message {
                             Message::Text(text) => {
-                                if let Ok(json_value) = serde_json::from_str::<Value>(&text) {
-                                    let _ = ingest_json_event(&project_manager, &json_value).await;
-                                }
+                                let _ = ingest_json_event(&project_manager, &text).await;
                             }
                             Message::Binary(binary) => {
-                                if let Ok(text) = String::from_utf8(binary.to_vec())
-                                    && let Ok(json_value) = serde_json::from_str::<Value>(&text)
-                                {
-                                    let _ = ingest_json_event(&project_manager, &json_value).await;
+                                if let Ok(text) = String::from_utf8(binary.to_vec()) {
+                                    let _ = ingest_json_event(&project_manager, &text).await;
                                 }
                             }
                             Message::Ping(payload) => {
@@ -372,20 +368,24 @@ async fn run_persistent_interval_market_ws_inner(
 
 async fn ingest_json_event(
     project_manager: &Arc<ProjectManager>,
-    value: &Value,
+    raw_payload: &str,
 ) -> Result<()> {
+    let Ok(value) = serde_json::from_str::<Value>(raw_payload) else {
+        return Ok(());
+    };
     if let Some(events) = value.as_array() {
         for event in events {
-            ingest_single(project_manager, event).await?;
+            ingest_single(project_manager, event, raw_payload).await?;
         }
         return Ok(());
     }
-    ingest_single(project_manager, value).await
+    ingest_single(project_manager, &value, raw_payload).await
 }
 
 async fn ingest_single(
     project_manager: &Arc<ProjectManager>,
     value: &Value,
+    raw_payload: &str,
 ) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
@@ -404,6 +404,21 @@ async fn ingest_single(
         &interval_by_asset,
         &currency_up_down_by_asset_id,
     );
+    if !snapshots.is_empty() {
+        let ingest_wall_ms = current_timestamp_ms();
+        let entries: Vec<WsStreamEntry> = snapshots
+            .iter()
+            .map(|snapshot| WsStreamEntry {
+                market_id: snapshot.market_id.clone(),
+                asset_id: snapshot.asset_id.clone(),
+                event_type: event_type.to_string(),
+                ingest_wall_ms,
+                event_timestamp_ms: snapshot.timestamp_ms,
+                payload_raw: raw_payload.to_string(),
+            })
+            .collect();
+        project_manager.append_ws_stream_entries(entries).await;
+    }
     for snapshot in snapshots {
         project_manager
             .ws
@@ -769,5 +784,91 @@ fn parse_i64(json_field: Option<&Value>) -> Option<i64> {
         Some(Value::Number(number)) => number.as_i64(),
         Some(Value::String(text)) => text.parse::<i64>().ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn base_maps() -> (
+        HashMap<String, XFrameIntervalKind>,
+        HashMap<String, CurrencyUpDownOutcome>,
+    ) {
+        let mut interval_by_asset = HashMap::new();
+        interval_by_asset.insert("a_up".to_string(), XFrameIntervalKind::FiveMin);
+        interval_by_asset.insert("a_down".to_string(), XFrameIntervalKind::FiveMin);
+
+        let mut outcome_by_asset = HashMap::new();
+        outcome_by_asset.insert("a_up".to_string(), CurrencyUpDownOutcome::Up);
+        outcome_by_asset.insert("a_down".to_string(), CurrencyUpDownOutcome::Down);
+        (interval_by_asset, outcome_by_asset)
+    }
+
+    #[test]
+    fn parse_book_event_sorts_levels_and_builds_l123() {
+        let (interval_by_asset, outcome_by_asset) = base_maps();
+        let msg = json!({
+            "market": "m1",
+            "asset_id": "a_up",
+            "timestamp": 12345,
+            "bids": [
+                {"price": "0.40", "size": "8"},
+                {"price": "0.45", "size": "10"},
+                {"price": "0.43", "size": "9"}
+            ],
+            "asks": [
+                {"price": "0.61", "size": "7"},
+                {"price": "0.59", "size": "11"},
+                {"price": "0.60", "size": "12"}
+            ],
+            "new_tick_size": "0.01",
+            "spread": "0.14"
+        });
+
+        let out = parse_snapshots_from_event(
+            &msg,
+            "book",
+            &interval_by_asset,
+            &outcome_by_asset,
+        );
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        assert_eq!(s.timestamp_ms, 12345);
+        assert_eq!(s.book_bid_l1_price, Some(0.45));
+        assert_eq!(s.book_bid_l2_price, Some(0.43));
+        assert_eq!(s.book_bid_l3_price, Some(0.40));
+        assert_eq!(s.book_ask_l1_price, Some(0.59));
+        assert_eq!(s.book_ask_l2_price, Some(0.60));
+        assert_eq!(s.book_ask_l3_price, Some(0.61));
+        assert_eq!(s.book_bids.as_ref().map(|v| v.len()), Some(3));
+        assert_eq!(s.book_asks.as_ref().map(|v| v.len()), Some(3));
+    }
+
+    #[test]
+    fn parse_price_change_event_filters_unknown_assets() {
+        let (interval_by_asset, outcome_by_asset) = base_maps();
+        let msg = json!({
+            "market": "m1",
+            "timestamp": 22334,
+            "price_changes": [
+                {"asset_id": "a_up", "best_bid": "0.48", "best_ask": "0.52", "side": "BUY"},
+                {"asset_id": "unknown", "best_bid": "0.10", "best_ask": "0.90"}
+            ]
+        });
+
+        let out = parse_snapshots_from_event(
+            &msg,
+            "price_change",
+            &interval_by_asset,
+            &outcome_by_asset,
+        );
+        assert_eq!(out.len(), 1);
+        let s = &out[0];
+        assert_eq!(s.asset_id, "a_up");
+        assert_eq!(s.book_bid_l1_price, Some(0.48));
+        assert_eq!(s.book_ask_l1_price, Some(0.52));
+        assert!(matches!(s.trade_side, Some(TradeSide::Buy)));
     }
 }

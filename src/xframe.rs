@@ -9,7 +9,7 @@ use xframe_features_derive::XFeatures;
 pub use crate::constants::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind,
 };
-pub use crate::history_sim::{MAX_SLIPPAGE_FROM_L1_PCT, POLYMARKET_CRYPTO_TAKER_FEE_RATE};
+pub use crate::history_sim::{POLYMARKET_CRYPTO_TAKER_FEE_RATE};
 use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
 
 pub const SIZE: usize = 15;
@@ -42,7 +42,7 @@ const CURRENCY_PRICE_ZSCORE_MIN_POINTS: usize = 2;
 ///
 /// `xframe_interval_type`: дискриминант [`XFrameIntervalKind`] ([XFRAME_INTERVAL_TYPE_15M] / [XFRAME_INTERVAL_TYPE_5M]). `currency_up_down_outcome`: дискриминант [`CurrencyUpDownOutcome`] ([`CurrencyUpDownOutcome::Up`] / [`CurrencyUpDownOutcome::Down`] как `i32`).
 /// `currency_implied_prob` — как отображаемая на Polymarket вероятность исхода **этого** токена: mid L1 при спреде ≤ 10¢, иначе last trade (см. `currency_implied_prob_polymarket_style`).
-/// Поля `other_*` — микроструктура противоположной ноги на тот же бакет; подмешиваются через [XFrame::merge_other_leg_features_from] в `ProjectManager` после вставки пары кадров.
+/// Поля `other_*` — микроструктура противоположной ноги на тот же бакет; подмешиваются через [XFrame::merge_other_leg_features_from] в `ProjectManager` после вставки пары кадров. Без `#[xfeature]` — в вектор XGBoost не входят (только дамп/merge).
 ///
 /// Поля `sibling_*` — кадр токена **того же** исхода Up/Down на **парном** `market_id` (другой горизонт 5m↔15m); момент снапшота тот же, бакет — по сетке интервала sibling-лейна ([`crate::project_manager::FRAME_BUILD_INTERVALS_SEC`]); подмешиваются через [XFrame::merge_sibling_market_features_from]. Без валидной пары в [crate::project_manager::ProjectManager::currency_updown_sibling_state] (см. [crate::currency_updown_sibling::CurrencyUpDownSiblingState::paired_five_and_fifteen_market_ids]) остаются значения по умолчанию.
 #[serde_as]
@@ -58,11 +58,11 @@ pub struct XFrame<const N: usize> {
     #[serde(default)]
     pub stable: bool,
     /// Тип окна up/down по валюте: `0` — 15 мин ([XFRAME_INTERVAL_TYPE_15M]), `1` — 5 мин ([XFRAME_INTERVAL_TYPE_5M]).
-    #[xfeature]
+    // #[xfeature]
     #[derivative(Default(value = "0"))]
     pub xframe_interval_type: i32,
     /// Исход токена по Gamma (`outcomes` + `clobTokenIds`): [CurrencyUpDownOutcome] → [XFRAME_BTC_OUTCOME_UP] / [XFRAME_BTC_OUTCOME_DOWN].
-    #[xfeature]
+    //#[xfeature]
     #[derivative(Default(value = "0"))]
     pub currency_up_down_outcome: i32,
     /// Дискриминант [`CurrencyUpDownDelayClass`] по Gamma `question` (см. [crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question]): [XFRAME_BTC_5M_DELAY_CLASS_DELAY_5MIN] / [XFRAME_BTC_5M_DELAY_CLASS_DELAY_10MIN]. Для 15m — [XFRAME_BTC_15M_DELAY_CLASS_ALIGNED].
@@ -228,109 +228,88 @@ pub struct XFrame<const N: usize> {
     #[serde_as(as = "[_; N]")]
     pub delta_n_sell_count_window: [Option<i64>; N],
     // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до `currency_price_z_score`. ---
-    #[xfeature]
     pub other_book_bid_l1_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l1_price: [Option<f64>; N],
-    #[xfeature]
     pub other_book_ask_l1_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l1_price: [Option<f64>; N],
-    #[xfeature]
     pub other_tick_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_tick_size: [Option<f64>; N],
-    #[xfeature]
     pub other_spread: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_spread: [Option<f64>; N],
-    #[xfeature]
     pub other_book_bid_l1_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l1_size: [Option<f64>; N],
-    #[xfeature]
     pub other_book_ask_l1_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l1_size: [Option<f64>; N],
-    #[xfeature]
     pub other_book_bid_l2_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l2_price: [Option<f64>; N],
-    #[xfeature]
     pub other_book_bid_l2_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l2_size: [Option<f64>; N],
-    #[xfeature]
     pub other_book_bid_l3_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l3_price: [Option<f64>; N],
-    #[xfeature]
     pub other_book_bid_l3_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l3_size: [Option<f64>; N],
-    #[xfeature]
     pub other_book_ask_l2_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l2_price: [Option<f64>; N],
-    #[xfeature]
     pub other_book_ask_l2_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l2_size: [Option<f64>; N],
-    #[xfeature]
     pub other_book_ask_l3_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l3_price: [Option<f64>; N],
-    #[xfeature]
     pub other_book_ask_l3_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l3_size: [Option<f64>; N],
-    #[xfeature]
     pub other_last_trade_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_last_trade_price: [Option<f64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0.0"))]
     pub other_trade_size: f64,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_trade_size: [Option<f64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0.0"))]
     pub other_trade_volume_bucket: f64,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_trade_volume_bucket: [Option<f64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0"))]
     pub other_buy_count_window: u64,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_buy_count_window: [Option<i64>; N],
-    #[xfeature]
     #[derivative(Default(value = "0"))]
     pub other_sell_count_window: u64,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_sell_count_window: [Option<i64>; N],
-    #[xfeature]
     pub other_burstiness_transactions_count: Option<f64>,
     /// Как [`Self::currency_implied_prob`], для противоположной ноги (`other` кадр).
-    #[xfeature]
     pub other_currency_implied_prob: Option<f64>,
     /// Z-score цены спота: `(p - mu) / sigma`; история — `ProjectManager::rtds_currency_prices_by_sec` (ключ Unix-секунда); `p` — последняя точка в окне, `mu`/`sigma` — по всем ценам окна.
     #[xfeature]
@@ -982,7 +961,7 @@ pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
 pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
 /// Горизонт [`calc_y_train_pnl`] / [`calc_y_train_resolution`]: сколько следующих кадров смотреть.
 /// В [`crate::history_sim`] то же значение используется как лимит кадров до таймаут-выхода (`frames_held`).
-pub const Y_TRAIN_HORIZON_FRAMES: usize = 15;
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 10;
 
 /// Целевой нотионал позиции (gross USDC), под который размечаются Y-метки
 /// [`calc_y_train_pnl`] / [`calc_y_train_resolution`]. Совпадает с типичным
@@ -994,6 +973,36 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 15;
 /// `MAX_SLIPPAGE_FROM_L1_PCT` — такие кадры размечаются как `None`
 /// (модель их не учит).
 pub const Y_TRAIN_NOMINAL_USDC: f64 = 200.0;
+
+/// Максимально допустимое отклонение VWAP fill'а от лучшей цены (L1) в
+/// долях. `0.02` = 2%: если для покупки за `position_size` USDC VWAP
+/// `(position_size / total_shares)` уходит больше чем на 2% выше лучшего
+/// ask — [`crate::history_sim::book_fill_buy`] / [`book_fill_buy_strict`] возвращают `None`,
+/// позиция не открывается. Симметрично для продажи: VWAP ниже best bid
+/// больше чем на 2% → `None`, продажа откладывается на следующий тик.
+///
+/// **Применяется на обоих путях**:
+/// * `real_sim` — strict-режим: [`book_fill_buy_strict`] /
+///   [`book_fill_sell_strict`] идут по полной HTTP-лестнице CLOB; без
+///   cap'а Kelly мог бы «доедать» позицию L4–L20 на тонком маркете,
+///   выкупая шерсы на 5–20¢ хуже mid и сжигая весь edge модели.
+/// * `history_sim` — non-strict: [`crate::history_sim::book_fill_buy`] / [`crate::history_sim::book_fill_sell`]
+///   идут по WS-кадру (`book_asks`/`book_bids`). Cap критичен **для
+///   симметрии с y_train-разметкой**: `walk_buy_xfeatures` /
+///   `walk_sell_xfeatures` в [`crate::xframe`] применяют тот же cap,
+///   и без него `history_sim` бы исполнял тики, на которых обучение
+///   y_train-метку ставит `None` (или `0` для SL по cap'у), создавая
+///   расхождение между обещаниями модели и фактическим backtest'ом.
+///
+/// Cap включается **только для добровольных выходов** (TP / EvExitProfit /
+/// вход): на обязательных (SL / Timeout / EvExitLoss) `slippage_cap = None`,
+/// иначе позиция могла бы уехать к резолюции проигравшего токена за $0
+/// из-за слишком широкого стакана. См. [`CloseReason::is_voluntary_exit`].
+///
+/// Значение 2% выбрано как «хуже типичного спреда (≤ 10¢ → mid), но
+/// ещё в пределах сделок, где fee + slippage не съедают edge модели
+/// (`SIM_BUY_THRESHOLD = 0.6`, после калибровки edge ~ 1–3%)».
+pub const MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Результат walk'а через L1/L2/L3 ask из xframe для покупки `target_usdc`.
 ///
@@ -1227,13 +1236,16 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
     // skip, чтобы поведение совпадало с прежним «нет цены — нет y».
     let _ = current.currency_implied_prob?;
 
-    let buy = walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC)?;
+    let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
+        None => return Some(0.0),
+        Some(buy) => buy
+    };
     // Slippage cap на входе: реальный `book_fill_buy_strict` зарубил бы
     // такой ордер. Семантически это «позиция не открылась» → сэмпл не
     // учим (а не размечаем как лосс — лосс это уже про *открытую*
     // позицию, которая выбила SL).
     if (buy.vwap - buy.best_ask) / buy.best_ask > MAX_SLIPPAGE_FROM_L1_PCT {
-        return None;
+        return Some(0.0)
     }
     let actual_shares = buy.actual_shares;
 
@@ -1250,15 +1262,7 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
             // Резолюция: победитель получает $1/шер без fee.
             // `currency_up_down_outcome` константен на протяжении маркета.
             let won = y_train_resolution_token_won(current, up_won);
-            let payout = if won { actual_shares } else { 0.0 };
-            let net_ret = (payout - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
-            return Some(if net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
-                1.0
-            } else if net_ret <= Y_TRAIN_STOP_LOSS_PP {
-                0.0
-            } else {
-                0.0
-            });
+            return if won { Some(1.0) } else { Some(0.0) };
         }
 
         let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
@@ -1270,7 +1274,7 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
         // на SL-ветке тоже).
         let sell = match walk_sell_xfeatures(future, actual_shares) {
             Some(s) => s,
-            None => continue,
+            None => return Some(0.0),
         };
         let net_ret = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
 
@@ -1393,9 +1397,13 @@ pub fn calc_y_train_resolution(
     let current = x_frames.get(index)?;
     let _ = current.currency_implied_prob?;
 
-    let buy = walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC)?;
+    let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
+        None => return Some(0.0),
+        Some(buy) => buy
+    };
+
     if (buy.vwap - buy.best_ask) / buy.best_ask > MAX_SLIPPAGE_FROM_L1_PCT {
-        return None;
+        return Some(0.0)
     }
     let actual_shares = buy.actual_shares;
 
@@ -1420,7 +1428,7 @@ pub fn calc_y_train_resolution(
         // до следующего кадра.
         let sell = match walk_sell_xfeatures(future, actual_shares) {
             Some(s) => s,
-            None => continue,
+            None => return Some(0.0),
         };
         let net_ret = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
         // SL — mandatory exit без cap'а.
@@ -1429,7 +1437,7 @@ pub fn calc_y_train_resolution(
         }
     }
 
-    None
+    Some(0.0)
 }
 
 
@@ -1517,5 +1525,96 @@ pub(crate) fn currency_implied_prob_polymarket_style(
             .or(mid)
     } else {
         mid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(ts: i64) -> MarketSnapshot {
+        MarketSnapshot {
+            market_id: "m1".to_string(),
+            asset_id: "a1".to_string(),
+            xframe_interval_kind: XFrameIntervalKind::FiveMin,
+            currency_up_down_outcome: CurrencyUpDownOutcome::Up,
+            timestamp_ms: ts,
+            book_bid_l1_price: None,
+            book_bid_l1_size: None,
+            book_ask_l1_price: None,
+            book_ask_l1_size: None,
+            book_bid_l2_price: None,
+            book_bid_l2_size: None,
+            book_bid_l3_price: None,
+            book_bid_l3_size: None,
+            book_ask_l2_price: None,
+            book_ask_l2_size: None,
+            book_ask_l3_price: None,
+            book_ask_l3_size: None,
+            book_bids: None,
+            book_asks: None,
+            tick_size: None,
+            spread: None,
+            last_trade_price: None,
+            last_trade_size: None,
+            trade_volume_bucket: None,
+            trade_side: None,
+            market_resolved: false,
+        }
+    }
+
+    #[test]
+    fn xframe_new_forward_fills_and_computes_delta() {
+        let mut frames = BTreeMap::new();
+        let mut prev = XFrame::<2>::default();
+        prev.book_bid_l1_price = Some(0.40);
+        prev.book_ask_l1_price = Some(0.60);
+        prev.spread = Some(0.20);
+        prev.tick_size = Some(0.01);
+        prev.trade_size = 2.0;
+        prev.bucket_flow_sign = 1;
+        frames.insert(1_000, prev);
+
+        let mut s = snapshot(1_500);
+        s.book_ask_l1_price = Some(0.58);
+        s.last_trade_size = Some(3.0);
+        s.trade_side = Some(TradeSide::Sell);
+
+        let frame = XFrame::<2>::new(
+            s,
+            &frames,
+            Some(2_000),
+            None,
+            Some(0.5),
+            Some(-1.2),
+            1_000,
+            true,
+        );
+        assert_eq!(frame.book_bid_l1_price, Some(0.40));
+        assert_eq!(frame.book_ask_l1_price, Some(0.58));
+        let d = frame.delta_n_book_ask_l1_price[0].expect("delta should exist");
+        assert!((d - (-0.02)).abs() < 1e-9);
+        assert_eq!(frame.trade_size, 3.0);
+        assert_eq!(frame.bucket_flow_sign, -1);
+        assert_eq!(frame.event_remaining_ms, 500);
+        assert_eq!(frame.buy_count_window, 1);
+        assert_eq!(frame.sell_count_window, 1);
+    }
+
+    #[test]
+    fn xframe_feature_count_matches_serialization_length() {
+        let frame = XFrame::<SIZE>::default();
+        let all = frame.to_x_train_with(apply_side_symmetry);
+        assert_eq!(all.len(), XFrame::<SIZE>::count_features());
+
+        let n = 7usize;
+        let cropped = frame.to_x_train_n_with(n, apply_side_symmetry);
+        assert_eq!(cropped.len(), XFrame::<SIZE>::count_features_n(n));
+    }
+
+    #[test]
+    fn compute_xframe_stable_returns_true_after_warmup() {
+        let stable = compute_xframe_stable("m1", 15_000, None, Some(0));
+        assert!(stable);
     }
 }

@@ -24,6 +24,7 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
+use crate::xframe::MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::account::Account;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
@@ -41,12 +42,12 @@ use xgb::{Booster, DMatrix};
 /// Порог сырого предсказания модели (0.0–1.0) для рассмотрения входа в позицию.
 /// Дальнейшую селекцию делает Kelly (`f* > 0`), поэтому порог служит только
 /// грубым префильтром, отсекающим заведомо шумовые сигналы.
-pub const SIM_BUY_THRESHOLD: f32 = 0.6;
+pub const SIM_BUY_THRESHOLD: f32 = 0.80;
 
 /// Стартовый виртуальный банкролл (USDC).
 pub const INITIAL_BANKROLL: f64 = 1000.0;
 /// Множитель Келли: `1.0` = full-Kelly, `0.5` = half-Kelly (меньше размер — меньше volatility).
-pub const KELLY_MULTIPLIER: f64 = 1.0;
+pub const KELLY_MULTIPLIER: f64 = 0.50;
 /// Максимальная доля банкролла на одну сделку.
 pub const MAX_BET_FRACTION: f64 = 0.10;
 /// Минимальный размер позиции в USDC (меньше — не торгуем).
@@ -62,7 +63,18 @@ pub const MIN_POSITION_USD: f64 = 0.10;
 /// Используется только в `run_sim_mode(is_kelly=false)`; в `real_sim`
 /// и в `run_sim_mode(is_kelly=true)` сайзинг по-прежнему через Kelly
 /// + `MAX_BET_FRACTION` + `KELLY_MULTIPLIER`.
-pub const NO_KELLY_POSITION_SIZE_USD: f64 = 100.0;
+///
+/// **Почему $30, а не $100**: при walk_sell на тонкой стороне стакана
+/// абсолютная просадка VWAP ниже L1 best bid пропорциональна числу
+/// шеров `shares = nominal / price`. На $100 за токен по 0.5 это 200
+/// шеров — обычно хватает, чтобы пройти L1 насквозь и упасть на
+/// L2/L3, отдавая 5–15¢ slippage. На $30 шеров ~60 — большинство
+/// фиксов укладывается в L1. По CSV per-trade prev-итерации:
+/// avg SL на $100-входах = −$42 при exit 0.30–0.45; на $30 ожидаемо
+/// останется ~−$12–15 (та же относительная дельта, абсолютная меньше
+/// втрое). EvExit✓ тоже масштабируется вниз пропорционально, ROI%
+/// сохраняется.
+pub const NO_KELLY_POSITION_SIZE_USD: f64 = 30.0;
 
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
 /// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
@@ -78,7 +90,7 @@ pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
 ///   resolution-модели;
 /// * **EV-правило** (см. [`EV_EXIT_MARGIN`]): `EV_sell · (1 − MARGIN) > EV_hold` —
 ///   мягкий выход, когда рыночная продажа выгоднее ожидаемой резолюции.
-pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 45;
+pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 30;
 
 /// Коэффициент EMA для сглаживания `p_win` от resolution-модели в зоне
 /// удержания: `p_ema = α · p_now + (1 − α) · p_prev`. Чем меньше α, тем
@@ -95,101 +107,20 @@ pub const EV_EXIT_MARGIN: f64 = 0.01;
 /// 1s-моделях = 15 с. Ближе к резолюции TP/SL за горизонт физически не
 /// успевают сработать — вход вырождается в лотерею с уплатой taker-fee.
 /// Используется в [`buy_gate`] как ранний отказ под именем `LateEntry`.
-pub const MIN_ENTRY_REMAINING_MS: i64 = 15 * 1000;
+pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
 
 /// Минимальный `entry_prob` для открытия новой позиции (включительно).
 /// Минимум вместе с [`MAX_ENTRY_PROB_FOR_TRADE`] задаёт «торговое окно»
-/// по цене входа.
-///
-/// **Зачем фильтр на хвостах**:
-/// На крайних `entry_prob` (близко к 0 или к 1) `p × (1−p) → 0`, fees
-/// формально становятся ничтожными. Но при тонком стакане Polymarket
-/// SL = ±`Y_TRAIN_STOP_LOSS_PP` (например, 3pp) превращается в
-/// ликвидационный обвал по всей лестнице L1→L20: cap отключён на
-/// mandatory exits ([`CloseReason::is_voluntary_exit`] → `None`),
-/// VWAP продажи может уйти на 5–20¢ ниже mid, и одна сделка в этом
-/// бакете легко съедает $30–$50. По CSV per-trade видно: бакет
-/// `[0.85..1.0]` в raw-режиме давал avg SL = −$42, что резко тянет
-/// общий ROI в минус. Калибровка в kelly-режиме эти сигналы и так
-/// блокировала, но в raw — нет.
-///
-/// Значение `0.15` / `0.85` выбрано как граница, после которой
-/// `Y_TRAIN_STOP_LOSS_PP` (~3pp) меньше типичного «удара по стакану»
-/// при walk_sell без cap'а. Внутри окна fees выше, но SL остаётся
-/// контролируемым.
-pub const MIN_ENTRY_PROB_FOR_TRADE: f64 = 0.15;
+/// по цене входа. Значения `0.0` / `1.0` фактически отключают фильтр —
+/// `BuyGate::EntryProbOutOfRange` никогда не срабатывает, любая прошедшая
+/// модельный порог `entry_prob` принимается. Сами счётчики
+/// `entry_prob_skips` остаются для совместимости логов (всегда `0`).
+pub const MIN_ENTRY_PROB_FOR_TRADE: f64 = 0.0;
 
 /// Максимальный `entry_prob` для открытия новой позиции (включительно).
 /// См. [`MIN_ENTRY_PROB_FOR_TRADE`] для обоснования.
-pub const MAX_ENTRY_PROB_FOR_TRADE: f64 = 0.85;
+pub const MAX_ENTRY_PROB_FOR_TRADE: f64 = 1.0;
 
-/// Включает классическую TP/SL/Timeout-логику в **PnL-зоне**
-/// (`event_remaining_ms > HOLD_TO_END_THRESHOLD_SEC × 1000`).
-///
-/// `false` (default сейчас) — режим **«hold-to-resolution»**:
-/// в pnl-зоне [`sell_gate`] всегда возвращает [`SellGate::HoldPnl`],
-/// никаких рыночных выходов нет. Позиция держится до `hold-zone`
-/// (последние [`HOLD_TO_END_THRESHOLD_SEC`] секунд), там работает
-/// обычная EV-exit логика, либо ждёт резолюции. Это режим
-/// **минимальных fees**: одна покупка на входе + одна резолюция
-/// (бинарная выплата $1/$0 за share без taker-fee).
-///
-/// **Зачем default `false`**:
-/// При `entry_prob ≈ 0.55` fees roundtrip ≈ 3.6pp (formula
-/// `p × (1−p) × FEE_RATE × 2`). [`Y_TRAIN_TAKE_PROFIT_PP`] = 5pp
-/// → net edge на TP = +1.4pp; [`Y_TRAIN_STOP_LOSS_PP`] = −3pp
-/// → net edge на SL = −6.6pp. Для безубытка нужен **win rate > 82%**.
-/// По CSV per-trade видно, что фактическая частота TP в raw-режиме
-/// ~17%, SL/Timeout доминируют, итог: рыночные выходы в pnl-зоне
-/// дают −$2…−$10 на сделку. Резолюционные же сделки дают +$104 на
-/// победившем токене / −$entry_cost на проигравшем — без fees.
-/// Уход из pnl-зоны убирает источник fee-bleed без отказа от
-/// модельного входа.
-///
-/// **Что НЕ выключается**:
-/// * Hold-zone EV-exit (`new_p_win_ema * shares < ev_sell` через
-///   `book_fill_sell` с cap'ом). Резолюционная модель в hold-zone
-///   статистически прибыльна (см. CSV: EvExit✓ avg = +$14).
-/// * Hard SL в hold-zone (предохранитель от переуверенной
-///   resolution-модели).
-/// * Резолюционные закрытия через
-///   [`crate::account::Account::resolve_pending_market`]
-///   (бинарная выплата $1/$0).
-///
-/// **Где переключать**: компилируется в бинарь, не env-флаг — режим
-/// нужно проверить в комплекте train+sim, переключение в рантайме не
-/// предусмотрено.
-pub const PNL_ZONE_TP_SL_ENABLED: bool = false;
-
-/// Максимально допустимое отклонение VWAP fill'а от лучшей цены (L1) в
-/// долях. `0.02` = 2%: если для покупки за `position_size` USDC VWAP
-/// `(position_size / total_shares)` уходит больше чем на 2% выше лучшего
-/// ask — [`book_fill_buy`] / [`book_fill_buy_strict`] возвращают `None`,
-/// позиция не открывается. Симметрично для продажи: VWAP ниже best bid
-/// больше чем на 2% → `None`, продажа откладывается на следующий тик.
-///
-/// **Применяется на обоих путях**:
-/// * `real_sim` — strict-режим: [`book_fill_buy_strict`] /
-///   [`book_fill_sell_strict`] идут по полной HTTP-лестнице CLOB; без
-///   cap'а Kelly мог бы «доедать» позицию L4–L20 на тонком маркете,
-///   выкупая шерсы на 5–20¢ хуже mid и сжигая весь edge модели.
-/// * `history_sim` — non-strict: [`book_fill_buy`] / [`book_fill_sell`]
-///   идут по WS-кадру (`book_asks`/`book_bids`). Cap критичен **для
-///   симметрии с y_train-разметкой**: `walk_buy_xfeatures` /
-///   `walk_sell_xfeatures` в [`crate::xframe`] применяют тот же cap,
-///   и без него `history_sim` бы исполнял тики, на которых обучение
-///   y_train-метку ставит `None` (или `0` для SL по cap'у), создавая
-///   расхождение между обещаниями модели и фактическим backtest'ом.
-///
-/// Cap включается **только для добровольных выходов** (TP / EvExitProfit /
-/// вход): на обязательных (SL / Timeout / EvExitLoss) `slippage_cap = None`,
-/// иначе позиция могла бы уехать к резолюции проигравшего токена за $0
-/// из-за слишком широкого стакана. См. [`CloseReason::is_voluntary_exit`].
-///
-/// Значение 2% выбрано как «хуже типичного спреда (≤ 10¢ → mid), но
-/// ещё в пределах сделок, где fee + slippage не съедают edge модели
-/// (`SIM_BUY_THRESHOLD = 0.6`, после калибровки edge ~ 1–3%)».
-pub const MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Аварийный halt новых входов по mark-to-market drawdown (`Account::max_drawdown_pct`).
 /// `Some(pct)` — при `max_drawdown_pct ≥ pct` `try_open_position` отклоняет
@@ -1266,7 +1197,6 @@ fn run_side_simulation(
             side_stats,
             available,
             None,
-            "",
             currency,
             is_kelly,
         );
@@ -1620,7 +1550,6 @@ pub(crate) fn try_open_position(
     stats: &mut SideStats,
     bankroll: f64,
     strict_book: Option<&StrictBook>,
-    log_tag: &str,
     currency: &str,
     is_kelly: bool,
 ) -> bool {
@@ -1733,14 +1662,6 @@ pub(crate) fn try_open_position(
                     // Считаем все три под `kelly_strict_buy_skips`: это
                     // «вход пропустили из-за стакана, не из-за Kelly».
                     stats.kelly_strict_buy_skips += 1;
-                    let prefix = if log_tag.is_empty() {
-                        String::new()
-                    } else {
-                        format!("[{log_tag}] ")
-                    };
-                    tee_eprintln!(
-                        "{prefix}buy skip: ask-стакан не закрывает size={size:.4} USDC — пропускаем вход"
-                    );
                     false
                 }
             }
@@ -1869,57 +1790,57 @@ pub(crate) fn sell_gate(
 
         // В зоне удержания TP и Timeout отключены (модель резолюции лучше
         // оценивает P(win) вблизи конца события), но остаются два выхода:
-        // 1) hard SL — предохранитель от переуверенной resolution-модели
-        //    (цена уходит вниз быстрее, чем EMA успевает на это среагировать);
-        // 2) EV-exit — мягкий выход, если рыночная продажа после fee
-        //    строго выгоднее ожидаемого удержания до резолюции.
+        //
+        // 1) **Hard SL** — предохранитель от переуверенной
+        //    resolution-модели: при `delta ≤ Y_TRAIN_STOP_LOSS_PP` цена
+        //    ушла настолько, что лучше зафиксировать убыток сейчас, чем
+        //    ждать резолюции проигравшего токена за $0. Mandatory exit
+        //    без cap'а: может выходить по плохому VWAP на тонком
+        //    стакане, но альтернатива (досидеть до $0-выплаты) хуже.
+        //
+        // 2) **EV-exit** — мягкий выход через `book_fill_sell` с cap'ом
+        //    (`MAX_SLIPPAGE_FROM_L1_PCT`), если рыночная продажа после
+        //    fee строго выгоднее ожидаемого удержания до резолюции.
+        //
+        // Порядок: SL → EV-exit. SL стоит первым как hard safety net:
+        // на `delta ≤ −SL_PP` мы выходим немедленно, не доверяя
+        // resolution-модели (которая может быть переуверена).
         if delta <= Y_TRAIN_STOP_LOSS_PP {
             return SellGate::Close { exit_price: current_prob, reason: CloseReason::StopLoss };
         }
-        let Some(p_ema) = new_p_win_ema else {
-            return SellGate::HoldResolution { new_p_win_ema };
-        };
-        // EV-оценка для решения «закрывать или ждать»: применяем cap
-        // (`Some(MAX_SLIPPAGE_FROM_L1_PCT)`) на обоих путях, чтобы
-        // решение было **консервативным** — мы не хотим закрывать
-        // на слишком плохой цене, если на следующем тике стакан может
-        // улучшиться. Если cap зарезал — `gross_usdc_opt = None`,
-        // выход не считаем, позиция уезжает в `HoldResolution`.
-        //
-        // На WS-пути (`history_sim`-`manage_positions` и `real_sim`-
-        // `any_position_would_sell` с `strict_book = None`) cap тот же:
-        // в history_sim это нужно для симметрии с `close_position` (он
-        // тоже применит cap), в real_sim — это лишь WS-предикат «надо
-        // ли тащить HTTP», и пессимистичный WS = меньше лишних HTTP.
-        // Если EV всё-таки сработает позже и закрытие пойдёт через
-        // `close_position` с `CloseReason::EvExitLoss` — там cap уже
-        // отключён (must-exit), см. doc у
-        // [`CloseReason::is_voluntary_exit`].
-        let gross_usdc_opt = match strict_book {
-            Some(book) => book_fill_sell_strict(book, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
-            None => book_fill_sell(frame, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
-        };
-        let Some(gross_usdc) = gross_usdc_opt else {
-            return SellGate::HoldResolution { new_p_win_ema };
-        };
-        let sell_vwap = if pos.shares_held > 0.0 {
-            (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
-        } else {
-            current_prob.clamp(0.001, 0.999)
-        };
-        let fee = pos.shares_held
-            * POLYMARKET_CRYPTO_TAKER_FEE_RATE
-            * sell_vwap
-            * (1.0 - sell_vwap);
-        let ev_sell = gross_usdc - fee;
-        let ev_hold = p_ema * pos.shares_held;
-        if ev_sell * (1.0 - EV_EXIT_MARGIN) > ev_hold {
-            let reason = if ev_sell > pos.entry_cost {
-                CloseReason::EvExitProfit
-            } else {
-                CloseReason::EvExitLoss
+        let ev_close: Option<(f64, CloseReason)> = if let Some(p_ema) = new_p_win_ema {
+            let gross_usdc_opt = match strict_book {
+                Some(book) => book_fill_sell_strict(book, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
+                None => book_fill_sell(frame, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
             };
-            return SellGate::Close { exit_price: current_prob, reason };
+            gross_usdc_opt.and_then(|gross_usdc| {
+                let sell_vwap = if pos.shares_held > 0.0 {
+                    (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
+                } else {
+                    current_prob.clamp(0.001, 0.999)
+                };
+                let fee = pos.shares_held
+                    * POLYMARKET_CRYPTO_TAKER_FEE_RATE
+                    * sell_vwap
+                    * (1.0 - sell_vwap);
+                let ev_sell = gross_usdc - fee;
+                let ev_hold = p_ema * pos.shares_held;
+                if ev_sell * (1.0 - EV_EXIT_MARGIN) > ev_hold {
+                    let reason = if ev_sell > pos.entry_cost {
+                        CloseReason::EvExitProfit
+                    } else {
+                        CloseReason::EvExitLoss
+                    };
+                    Some((current_prob, reason))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some((exit_price, reason)) = ev_close {
+            return SellGate::Close { exit_price, reason };
         }
         return SellGate::HoldResolution { new_p_win_ema };
     }
@@ -1927,16 +1848,6 @@ pub(crate) fn sell_gate(
     // PnL-зона: классический TP/SL/Timeout по ценовой дельте и горизонту
     // pnl-модели. EMA `p_win` здесь не трогается и в возврат не
     // включается — это исключительно резолюционный концепт hold-zone.
-    //
-    // При `PNL_ZONE_TP_SL_ENABLED = false` pnl-зона **выключена**:
-    // позиция держится без рыночных выходов до hold-zone (последние
-    // `HOLD_TO_END_THRESHOLD_SEC` сек), там — обычная EV-exit логика.
-    // Это режим «hold-to-resolution» — fees платим только на входе,
-    // выход через резолюцию ($1/$0 без taker-fee). См. doc у
-    // [`PNL_ZONE_TP_SL_ENABLED`].
-    if !PNL_ZONE_TP_SL_ENABLED {
-        return SellGate::HoldPnl;
-    }
     if delta >= Y_TRAIN_TAKE_PROFIT_PP {
         return SellGate::Close { exit_price: current_prob, reason: CloseReason::TakeProfit };
     }
@@ -2042,7 +1953,7 @@ pub(crate) fn manage_positions(
     stats: &mut SideStats,
     bankroll: &mut f64,
     strict_book: Option<&StrictBook>,
-    log_tag: &str,
+    _log_tag: &str,
     // is_kelly попадает сюда, чтобы downstream-вызовы (sell_gate /
     // close_position) могли при необходимости адаптировать поведение,
     // но прямо сейчас ни одна из этих функций его не использует —
@@ -2116,11 +2027,11 @@ pub(crate) fn manage_positions(
                 }
                 None => {
                     stats.kelly_strict_sell_skips += 1;
-                    let prefix = if log_tag.is_empty() { String::new() } else { format!("[{log_tag}] ") };
-                    tee_eprintln!(
-                        "{prefix}sell skip ({reason:?}): стакана не хватает на shares={:.4}; держим позицию и ретраим в след. тике",
-                        pos.shares_held,
-                    );
+                    // let prefix = if log_tag.is_empty() { String::new() } else { format!("[{log_tag}] ") };
+                    // tee_eprintln!(
+                    //     "{prefix}sell skip ({reason:?}): стакана не хватает на shares={:.4}; держим позицию и ретраим в след. тике",
+                    //     pos.shares_held,
+                    // );
                     remaining.push(pos);
                 }
             }
