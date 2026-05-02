@@ -16,6 +16,7 @@ pub mod real_sim;
 pub mod account;
 pub mod migration;
 pub mod trade_csv_log;
+pub mod poly_chain;
 
 use anyhow::Result;
 use account::Account;
@@ -71,6 +72,15 @@ impl AppMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+
+    match util::detect_country_and_ip().await {
+        Some(info) => {
+            let country = info.country.as_deref().unwrap_or("?");
+            let ip      = info.ip.as_deref().unwrap_or("?");
+            println!("Страна: {country}, IP: {ip}");
+        }
+        None => println!("Страна: не удалось определить (ifconfig.co/json)"),
+    }
 
     let mode = AppMode::from_env();
     println!("Режим запуска: {mode:?}");

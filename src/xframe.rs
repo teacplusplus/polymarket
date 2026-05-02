@@ -228,10 +228,12 @@ pub struct XFrame<const N: usize> {
     #[serde_as(as = "[_; N]")]
     pub delta_n_sell_count_window: [Option<i64>; N],
     // --- Противоположный токен в том же `market_id` (Up ↔ Down), те же поля, что выше до `currency_price_z_score`. ---
+    #[xfeature]
     pub other_book_bid_l1_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l1_price: [Option<f64>; N],
+    #[xfeature]
     pub other_book_ask_l1_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
@@ -244,46 +246,57 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_spread: [Option<f64>; N],
+    #[xfeature]
     pub other_book_bid_l1_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l1_size: [Option<f64>; N],
+    #[xfeature]
     pub other_book_ask_l1_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l1_size: [Option<f64>; N],
+    #[xfeature]
     pub other_book_bid_l2_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l2_price: [Option<f64>; N],
+    #[xfeature]
     pub other_book_bid_l2_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l2_size: [Option<f64>; N],
+    #[xfeature]
     pub other_book_bid_l3_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l3_price: [Option<f64>; N],
+    #[xfeature]
     pub other_book_bid_l3_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_bid_l3_size: [Option<f64>; N],
+    #[xfeature]
     pub other_book_ask_l2_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l2_price: [Option<f64>; N],
+    #[xfeature]
     pub other_book_ask_l2_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l2_size: [Option<f64>; N],
+    #[xfeature]
     pub other_book_ask_l3_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l3_price: [Option<f64>; N],
+    #[xfeature]
     pub other_book_ask_l3_size: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_book_ask_l3_size: [Option<f64>; N],
+    #[xfeature]
     pub other_last_trade_price: Option<f64>,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
@@ -298,11 +311,13 @@ pub struct XFrame<const N: usize> {
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_trade_volume_bucket: [Option<f64>; N],
+    #[xfeature]
     #[derivative(Default(value = "0"))]
     pub other_buy_count_window: u64,
     #[derivative(Default(value = "[None; N]"))]
     #[serde_as(as = "[_; N]")]
     pub other_delta_n_buy_count_window: [Option<i64>; N],
+    #[xfeature]
     #[derivative(Default(value = "0"))]
     pub other_sell_count_window: u64,
     #[derivative(Default(value = "[None; N]"))]
@@ -969,40 +984,10 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 10;
 /// в коридоре `MIN_POSITION_USD..MAX_POSITION_USD`); $200 — медиана этого
 /// коридора. Размечать Y под фиксированный нотионал, а не «1 nominal USDC
 /// по mid», нужно, чтобы разметка отражала **реально достижимый** PnL: на
-/// тонком маркете $200 могут не пройти L1+L2+L3 ask и съесть VWAP за
-/// `MAX_SLIPPAGE_FROM_L1_PCT` — такие кадры размечаются как `None`
-/// (модель их не учит).
+/// тонком маркете $200 могут не пройти L1+L2+L3 ask и съесть VWAP за пределами
+/// порога из [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`] (передаётся
+/// в [`calc_y_train_pnl`] / [`calc_y_train_resolution`]) — такие кадры отфильтровываются.
 pub const Y_TRAIN_NOMINAL_USDC: f64 = 200.0;
-
-/// Максимально допустимое отклонение VWAP fill'а от лучшей цены (L1) в
-/// долях. `0.02` = 2%: если для покупки за `position_size` USDC VWAP
-/// `(position_size / total_shares)` уходит больше чем на 2% выше лучшего
-/// ask — [`crate::history_sim::book_fill_buy`] / [`book_fill_buy_strict`] возвращают `None`,
-/// позиция не открывается. Симметрично для продажи: VWAP ниже best bid
-/// больше чем на 2% → `None`, продажа откладывается на следующий тик.
-///
-/// **Применяется на обоих путях**:
-/// * `real_sim` — strict-режим: [`book_fill_buy_strict`] /
-///   [`book_fill_sell_strict`] идут по полной HTTP-лестнице CLOB; без
-///   cap'а Kelly мог бы «доедать» позицию L4–L20 на тонком маркете,
-///   выкупая шерсы на 5–20¢ хуже mid и сжигая весь edge модели.
-/// * `history_sim` — non-strict: [`crate::history_sim::book_fill_buy`] / [`crate::history_sim::book_fill_sell`]
-///   идут по WS-кадру (`book_asks`/`book_bids`). Cap критичен **для
-///   симметрии с y_train-разметкой**: `walk_buy_xfeatures` /
-///   `walk_sell_xfeatures` в [`crate::xframe`] применяют тот же cap,
-///   и без него `history_sim` бы исполнял тики, на которых обучение
-///   y_train-метку ставит `None` (или `0` для SL по cap'у), создавая
-///   расхождение между обещаниями модели и фактическим backtest'ом.
-///
-/// Cap включается **только для добровольных выходов** (TP / EvExitProfit /
-/// вход): на обязательных (SL / Timeout / EvExitLoss) `slippage_cap = None`,
-/// иначе позиция могла бы уехать к резолюции проигравшего токена за $0
-/// из-за слишком широкого стакана. См. [`CloseReason::is_voluntary_exit`].
-///
-/// Значение 2% выбрано как «хуже типичного спреда (≤ 10¢ → mid), но
-/// ещё в пределах сделок, где fee + slippage не съедают edge модели
-/// (`SIM_BUY_THRESHOLD = 0.6`, после калибровки edge ~ 1–3%)».
-pub const MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Результат walk'а через L1/L2/L3 ask из xframe для покупки `target_usdc`.
 ///
@@ -1027,7 +1012,18 @@ struct WalkBuyResult {
 /// Семантика fee «в шерсах» симметричная: на каждом уровне списывается
 /// `level_shares × fee × p × (1 − p)` USDC, итог вычитается из выручки.
 struct WalkSellResult {
-    /// Чистая выручка: `gross_usdc − fee_usdc`. Это то, что приходит на bankroll.
+    /// Брутто-выручка: `Σ level_shares × level_price` без вычета fee.
+    /// Эквивалент того, что получил бы **maker**, чья resting-лимитка
+    /// была бы хитнута таker-ом: maker fee = 0, поэтому брутто = нетто.
+    /// Используется в TP-детекции / max-progress y-разметки и в
+    /// `close_position` для voluntary-exit-ов (TP / EvExitProfit).
+    gross_usdc: f64,
+    /// Чистая выручка **taker-варианта**: `gross_usdc − fee_usdc_taker`,
+    /// где `fee_usdc_taker = Σ level_shares × rate × p × (1 − p)`
+    /// (per-level, не на VWAP'е). Эквивалент urgent-выхода через
+    /// bid-walk: пересекаем спред, реально платим taker-fee. Используется
+    /// в SL-детекции / drawdown-проверке y-разметки и в принудительных
+    /// закрытиях `close_position` (SL / Timeout / EvExitLoss).
     net_usdc: f64,
     /// VWAP на проданных шерсах: `gross_usdc / shares`. Для slippage-чека.
     vwap: f64,
@@ -1159,10 +1155,11 @@ fn walk_sell_xfeatures<const N: usize>(
     }
     let vwap = gross_usdc / shares;
     let net_usdc = gross_usdc - fee_usdc_total;
-    if !net_usdc.is_finite() {
+    if !net_usdc.is_finite() || !gross_usdc.is_finite() {
         return None;
     }
     Some(WalkSellResult {
+        gross_usdc,
         net_usdc,
         vwap,
         best_bid,
@@ -1185,8 +1182,8 @@ fn walk_sell_xfeatures<const N: usize>(
 ///    Кадр размечается как `None`, если:
 ///    - в L1+L2+L3 ask нет валидного уровня, либо суммарной глубины не
 ///      хватило, чтобы потратить $200 (тонкий маркет);
-///    - VWAP покупки уехал от best ask больше, чем на
-///      [`MAX_SLIPPAGE_FROM_L1_PCT`] (реальный исполнитель такой ордер
+///    - VWAP покупки уехал от best ask больше, чем на переданный
+///      `max_slippage_from_l1_pct` (реальный исполнитель такой ордер
 ///      бы зарубил → семантически это «вход не открылся»).
 ///
 /// 2. **Шаги горизонта** (1..=n): на каждом будущем кадре —
@@ -1203,7 +1200,7 @@ fn walk_sell_xfeatures<const N: usize>(
 ///      `Some(0.0)`. На SL-выходе реальный исполнитель не применяет
 ///      cap, иначе позиция могла бы доехать до $0 при тонком стакане.
 ///    * **TP** (voluntary exit, **с** cap'ом): если slippage от best bid
-///      ≤ [`MAX_SLIPPAGE_FROM_L1_PCT`] **и** `net_ret ≥ TP_PP` →
+///      ≤ `max_slippage_from_l1_pct` **и** `net_ret ≥ TP_PP` →
 ///      `Some(1.0)`. Если cap не соблюдён — TP «не сработал на этом
 ///      тике» (как `manage_positions` в реальности — ждём следующего).
 ///
@@ -1221,85 +1218,146 @@ fn walk_sell_xfeatures<const N: usize>(
 ///
 /// * `Some(1.0)` — позиция $200 успела бы добежать до TP (с реальным
 ///   исполнителем) или выиграть резолюцию.
-/// * `Some(0.0)` — позиция упала бы в SL раньше или проиграла резолюцию,
-///   либо за `n` кадров ничего не произошло.
-/// * `None` — кадр не размечается: нельзя открыть позицию (тонкий ask,
-///   slippage cap при покупке) или не определена `currency_implied_prob`
+/// * `Some(0.0)` — позиция упала бы в SL раньше, проиграла резолюцию,
+///   либо не смогла открыться/выйти из-за тонкого стакана
+///   (`walk_buy_xfeatures`/`walk_sell_xfeatures` вернули `None`,
+///   slippage-cap на входе) — это всё «реальный исполнитель не дал бы
+///   позиции жить», поэтому метим как полный лосс.
+/// * `Some(0.5 + value)`, где `value ∈ [0, 0.5]` — за весь горизонт `n`
+///   `net_ret` **ни разу не уходил в минус** (никакой просадки, даже
+///   мелкой, не до SL), и при этом ни SL, ни TP не сработали. `value`
+///   линейно интерполирует максимально достигнутый `net_ret` между
+///   `0` (стояли около нуля → лейбл `0.5`) и `Y_TRAIN_TAKE_PROFIT_PP`
+///   (почти дотянули до TP → лейбл `1.0`). Если хоть на одном тике
+///   `net_ret < 0` — лейбл `Some(0.0)` (любая просадка убивает
+///   мягкий исход). XGBoost при `binary:logistic` принимает мягкие
+///   цели в `[0,1]` (это становится cross-entropy с soft target) и
+///   учится предсказывать вероятность «исход — спокойное восходящее
+///   движение».
+/// * `None` — кадр не размечается: не определена `currency_implied_prob`
 ///   (ранее использовалась как fallback при отсутствии стакана; больше
 ///   не нужно, оставлено как формальный инвариант).
-pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64) -> Option<f32> {
-    let up_won = final_price >= price_to_beat;
-    let current = x_frames.get(index)?;
-    // currency_implied_prob больше не участвует в расчёте PnL, но его
-    // отсутствие — индикатор «кадр без книги», такие кадры мы и без того
-    // отвалим в `walk_buy_xfeatures`. Оставлено намеренно как ранний
-    // skip, чтобы поведение совпадало с прежним «нет цены — нет y».
-    let _ = current.currency_implied_prob?;
+// pub fn calc_y_train_pnl(
+//     n: usize,
+//     x_frames: &[XFrame<SIZE>],
+//     index: usize,
+//     price_to_beat: f64,
+//     final_price: f64,
+//     max_slippage_from_l1_pct: f64,
+// ) -> Option<f32> {
+//     let up_won = final_price >= price_to_beat;
+//     let current = x_frames.get(index)?;
+//     // currency_implied_prob больше не участвует в расчёте PnL, но его
+//     // отсутствие — индикатор «кадр без книги», такие кадры мы и без того
+//     // отвалим в `walk_buy_xfeatures`. Оставлено намеренно как ранний
+//     // skip, чтобы поведение совпадало с прежним «нет цены — нет y».
+//     let _ = current.currency_implied_prob?;
+//
+//     let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
+//         None => return Some(0.0),
+//         Some(buy) => buy
+//     };
+//     // Slippage cap на входе: реальный `book_fill_buy_strict` зарубил бы
+//     // такой ордер. Семантически это «позиция не открылась» → сэмпл не
+//     // учим (а не размечаем как лосс — лосс это уже про *открытую*
+//     // позицию, которая выбила SL).
+//     if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
+//         return Some(0.0)
+//     }
+//     let actual_shares = buy.actual_shares;
+//     // Maker-проверка решается **в момент входа**: сразу после buy-walk-а
+//     // мы выставляем resting-лимитку на TP-таргет, и в этот же момент
+//     // фиксируется её maker-/taker-статус. Если `tp_target > best_bid_at_entry`
+//     // — лимитка ложится в книгу как resting ask (maker, fee = 0). Если
+//     // `tp_target ≤ best_bid_at_entry` — лимитка пересекает спред при
+//     // постановке (taker, fee применяется). Состояние стакана в будущих
+//     // кадрах (когда лимитку реально хитнут) уже не меняет maker-статус
+//     // ордера. Без best_bid в `current` (одностронний стакан без bid'ов) —
+//     // нашему ask не на что было бы кросснуться, лимитка резинг-ит как maker.
+//     let tp_target = Y_TRAIN_NOMINAL_USDC * (1.0 + Y_TRAIN_TAKE_PROFIT_PP) / actual_shares;
+//     let tp_is_maker = match current.book_bid_l1_price {
+//         Some(best_bid_at_entry) => tp_target > best_bid_at_entry,
+//         None => true,
+//     };
+//
+//     for i in 1..=n {
+//         // Отсутствие следующего кадра трактуется как конец маркета
+//         // (дампы обрезаются по реальному завершению события).
+//         let future_opt = x_frames.get(index + i);
+//         let reached_end = match future_opt {
+//             None => true,
+//             Some(f) => f.event_remaining_ms <= 0,
+//         };
+//
+//         if reached_end {
+//             // Резолюция: победитель получает $1/шер без fee.
+//             // `currency_up_down_outcome` константен на протяжении маркета.
+//             let won = y_train_resolution_token_won(current, up_won);
+//             let payout = if won { actual_shares } else { 0.0 };
+//             return Some(if (payout - Y_TRAIN_NOMINAL_USDC) > 0.0 {
+//                 1.0
+//             } else {
+//                 0.0
+//             });
+//         }
+//
+//         let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
+//         // Книга на этом тике может не пропускать `actual_shares` — тогда
+//         // выйти нельзя ни добровольно, ни принудительно; держим до
+//         // следующего кадра. Это **не** SL (SL — это про цену, а не про
+//         // ликвидность); в реальности `manage_positions` тоже бы
+//         // продолжил держать (`book_fill_sell_strict` вернул бы None и
+//         // на SL-ветке тоже).
+//         let sell = match walk_sell_xfeatures(future, actual_shares) {
+//             Some(s) => s,
+//             None => return Some(0.0),
+//         };
+//         // SL / drawdown — это «urgent-выход через bid-walk», т.е.
+//         // **taker-сценарий**: мы пересекаем спред, реально платим fee.
+//         // TP / max-progress — это «resting-лимитка над текущим mid»,
+//         // т.е. **maker-сценарий**: fee = 0, в карман падает gross_usdc.
+//         // См. `CloseReason::is_voluntary_exit` в `history_sim.rs` для
+//         // той же дихотомии в runtime-симуляторе.
+//         let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
+//         let net_ret_maker = (sell.gross_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
+//
+//         // SL — mandatory exit, slippage cap отключён, taker-fee.
+//         if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP {
+//             return Some(0.0);
+//         }
+//         // TP — voluntary exit. Maker-/taker-статус ордера зафиксирован
+//         // в момент входа (`tp_is_maker`, см. выше): мы выставляем
+//         // resting-лимитку сразу после buy-walk-а, и её роль решается
+//         // тогда же. В будущих кадрах смотрим только, дотянул ли
+//         // gross-/net-ret до порога TP_PP.
+//         //
+//         // Slippage cap включён в обеих ветках: симметрично с
+//         // [`crate::history_sim::SellGate`], где voluntary-exit по
+//         // слишком тонкому стакану ждёт следующего тика.
+//         let cap_ok = (sell.best_bid - sell.vwap) / sell.best_bid <= max_slippage_from_l1_pct;
+//         if tp_is_maker {
+//             if cap_ok && net_ret_maker >= Y_TRAIN_TAKE_PROFIT_PP {
+//                 return Some(1.0);
+//             }
+//         } else if cap_ok && net_ret_taker >= Y_TRAIN_TAKE_PROFIT_PP {
+//             return Some(1.0);
+//         }
+//     }
+//     Some(0.0)
+// }
 
-    let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
-        None => return Some(0.0),
-        Some(buy) => buy
-    };
-    // Slippage cap на входе: реальный `book_fill_buy_strict` зарубил бы
-    // такой ордер. Семантически это «позиция не открылась» → сэмпл не
-    // учим (а не размечаем как лосс — лосс это уже про *открытую*
-    // позицию, которая выбила SL).
-    if (buy.vwap - buy.best_ask) / buy.best_ask > MAX_SLIPPAGE_FROM_L1_PCT {
-        return Some(0.0)
-    }
-    let actual_shares = buy.actual_shares;
 
-    for i in 1..=n {
-        // Отсутствие следующего кадра трактуется как конец маркета
-        // (дампы обрезаются по реальному завершению события).
-        let future_opt = x_frames.get(index + i);
-        let reached_end = match future_opt {
-            None => true,
-            Some(f) => f.event_remaining_ms <= 0,
-        };
-
-        if reached_end {
-            // Резолюция: победитель получает $1/шер без fee.
-            // `currency_up_down_outcome` константен на протяжении маркета.
-            let won = y_train_resolution_token_won(current, up_won);
-            return if won { Some(1.0) } else { Some(0.0) };
-        }
-
-        let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
-        // Книга на этом тике может не пропускать `actual_shares` — тогда
-        // выйти нельзя ни добровольно, ни принудительно; держим до
-        // следующего кадра. Это **не** SL (SL — это про цену, а не про
-        // ликвидность); в реальности `manage_positions` тоже бы
-        // продолжил держать (`book_fill_sell_strict` вернул бы None и
-        // на SL-ветке тоже).
-        let sell = match walk_sell_xfeatures(future, actual_shares) {
-            Some(s) => s,
-            None => return Some(0.0),
-        };
-        let net_ret = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
-
-        // SL — mandatory exit, slippage cap отключён.
-        if net_ret <= Y_TRAIN_STOP_LOSS_PP {
-            return Some(0.0);
-        }
-        // TP — voluntary exit, slippage cap **включён**: даже при
-        // достижении ценового уровня выходим, только если VWAP не
-        // уехал от best bid дальше cap'а; иначе ждём следующего тика.
-        let cap_ok = (sell.best_bid - sell.vwap) / sell.best_bid <= MAX_SLIPPAGE_FROM_L1_PCT;
-        if cap_ok && net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
-            return Some(1.0);
-        }
-    }
-    Some(0.0)
-}
-
-
-// pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64) -> Option<f32> {
+// pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64, _: f64) -> Option<f32> {
 //     let up_won = final_price >= price_to_beat;
 //     let current = x_frames.get(index)?;
 //     let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
 //
-//     let nominal_shares = 1.0 / p_buy;
+//     // Размечаем PnL «$1 USDC gross» — после деления получаем долю в [-1.0, +∞),
+//     // так что `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` — это сразу
+//     // проценты доходности от потраченного.
+//     let entry_cost_usdc: f64 = 1.0;
+//
+//     let nominal_shares = entry_cost_usdc / p_buy;
 //     let fee_buy_usdc   = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_buy * (1.0 - p_buy);
 //     let fee_buy_shares = fee_buy_usdc / p_buy;
 //     let actual_shares  = nominal_shares - fee_buy_shares;
@@ -1313,22 +1371,26 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
 //             Some(f) => f.event_remaining_ms <= 0,
 //         };
 //
-//         let net_ret = if reached_end {
+//         // Считаем сколько USDC реально получим на выходе на этом тике
+//         // (или на резолюции). `net_ret` — доля изменения относительно
+//         // потраченного на входе: `(received - entry) / entry`. Сравнение с
+//         // `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` — в тех же
+//         // долях.
+//         let received_usdc = if reached_end {
+//             // Резолюция: победитель получает $1/шер без fee
+//             // (Polymarket CTF redemption бескомиссионный).
 //             // `currency_up_down_outcome` константен на протяжении маркета,
 //             // поэтому для определения токена берём текущий кадр.
 //             let won = y_train_resolution_token_won(current, up_won);
-//             if won {
-//                 actual_shares - 1.0
-//             } else {
-//                 -1.0
-//             }
+//             if won { actual_shares * 1.0 } else { 0.0 }
 //         } else {
 //             let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
 //             let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
 //             let gross_usdc    = actual_shares * p_sell;
 //             let fee_sell_usdc = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * p_sell * (1.0 - p_sell);
-//             (gross_usdc - fee_sell_usdc) - 1.0
+//             gross_usdc - fee_sell_usdc
 //         };
+//         let net_ret = (received_usdc - entry_cost_usdc) / entry_cost_usdc;
 //
 //         if net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
 //             return Some(1.0);
@@ -1341,8 +1403,59 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
 //             break;
 //         }
 //     }
-//     Some(0.0)
+//    Some(0.0)
 // }
+
+pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64, _: f64) -> Option<f32> {
+    let up_won = final_price >= price_to_beat;
+    let current = x_frames.get(index)?;
+    let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
+
+    // Размечаем PnL «$1 USDC gross» — после деления получаем долю в [-1.0, +∞),
+    // так что `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` — это сразу
+    // проценты доходности от потраченного.
+    let entry_cost_usdc: f64 = 1.0;
+
+    let actual_shares = entry_cost_usdc / p_buy;
+
+    for i in 1..=n {
+        // Отсутствие следующего кадра трактуется как конец маркета
+        // (дампы обрезаются по реальному завершению события).
+        let future_opt = x_frames.get(index + i);
+        let reached_end = match future_opt {
+            None => true,
+            Some(f) => f.event_remaining_ms <= 0,
+        };
+
+        // Считаем сколько USDC реально получим на выходе на этом тике
+        // (или на резолюции). `net_ret` — доля изменения относительно
+        // потраченного на входе: `(received - entry) / entry`. Сравнение с
+        // `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` — в тех же
+        // долях.
+        let received_usdc = if reached_end {
+            // Резолюция: победитель получает $1/шер без fee
+            // (Polymarket CTF redemption бескомиссионный).
+            // `currency_up_down_outcome` константен на протяжении маркета,
+            // поэтому для определения токена берём текущий кадр.
+            let won = y_train_resolution_token_won(current, up_won);
+            if won { actual_shares * 1.0 } else { 0.0 }
+        } else {
+            let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
+            let p_sell = future.currency_implied_prob?.clamp(0.001, 0.999);
+            let gross_usdc = actual_shares * p_sell;
+            gross_usdc
+        };
+        let net_ret = (received_usdc - entry_cost_usdc) / entry_cost_usdc;
+
+        if net_ret >= Y_TRAIN_TAKE_PROFIT_PP {
+            return Some(1.0);
+        } else if net_ret <= Y_TRAIN_STOP_LOSS_PP {
+            return Some(0.0);
+        }
+
+    }
+    Some(0.0)
+}
 
 /// Победил ли **этот** токен по итогу рынка.
 ///
@@ -1380,18 +1493,22 @@ fn y_train_resolution_token_won(frame: &XFrame<SIZE>, up_won: bool) -> bool {
 ///
 /// # Возврат
 ///
-/// * `Some(1.0)` — позиция доехала до резолюции победителем без SL.
-/// * `Some(0.0)` — позиция выбила SL раньше или проиграла резолюцию.
-/// * `None` — кадр не размечается: либо вход невозможен (тонкий ask /
-///   slippage cap), либо за `n` кадров **ни** резолюция, **ни** SL не
-///   наступили (сэмпл считается шумным и пропускается, как в исходной
-///   формулировке).
+/// * `Some(1.0)` — позиция доехала до резолюции победителем без SL,
+///   **или** прошла весь горизонт `n` кадров без просадки в минус
+///   (зеркало [`calc_y_train_pnl`]: «спокойный восходящий исход»).
+/// * `Some(0.0)` — позиция выбила SL, проиграла резолюцию, не смогла
+///   открыться/выйти из-за тонкого стакана, **или** прошла весь
+///   горизонт без SL/резолюции, но с хотя бы одной просадкой
+///   `net_ret < 0`.
+/// * `None` — `currency_implied_prob` не определена (формальный
+///   инвариант, фактически отсекается раньше через `walk_buy_xfeatures`).
 pub fn calc_y_train_resolution(
     n: usize,
     x_frames: &[XFrame<SIZE>],
     index: usize,
     price_to_beat: f64,
     final_price: f64,
+    max_slippage_from_l1_pct: f64,
 ) -> Option<f32> {
     let up_won = final_price >= price_to_beat;
     let current = x_frames.get(index)?;
@@ -1402,10 +1519,14 @@ pub fn calc_y_train_resolution(
         Some(buy) => buy
     };
 
-    if (buy.vwap - buy.best_ask) / buy.best_ask > MAX_SLIPPAGE_FROM_L1_PCT {
+    if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
         return Some(0.0)
     }
     let actual_shares = buy.actual_shares;
+    // Был ли хоть один тик с `net_ret < 0`. Любая просадка в минус
+    // (даже мелкая, не дотянувшая до SL) убивает «положительный»
+    // лейбл — синхронно с [`calc_y_train_pnl`]. Семантика:
+    // «выделяем только спокойные восходящие исходы».
 
     for i in 1..=n {
         // Отсутствие следующего кадра трактуется как конец маркета
@@ -1420,7 +1541,12 @@ pub fn calc_y_train_resolution(
             // Резолюция: победитель получает $1/шер без fee.
             // `currency_up_down_outcome` константен на протяжении маркета.
             let won = y_train_resolution_token_won(current, up_won);
-            return Some(if won { 1.0 } else { 0.0 });
+            let payout = if won { actual_shares } else { 0.0 };
+            return Some(if (payout - Y_TRAIN_NOMINAL_USDC) > 0.0 {
+                1.0
+            } else {
+                0.0
+            });
         }
 
         let future = future_opt.expect("reached_end == false implies future_opt.is_some()");
@@ -1430,14 +1556,22 @@ pub fn calc_y_train_resolution(
             Some(s) => s,
             None => return Some(0.0),
         };
-        let net_ret = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
-        // SL — mandatory exit без cap'а.
-        if net_ret <= Y_TRAIN_STOP_LOSS_PP {
+        // SL — urgent-выход через bid-walk: пересекаем спред,
+        // применяется taker-fee. Maker-альтернативы у SL нет —
+        // невозможно «спокойно ждать» в просадке, в реальной торговле
+        // это всегда market-sell. Поэтому используем
+        // `sell.net_usdc` (= gross − taker-fee) без maker-ветки.
+        // Симметрично с обработкой SL в [`calc_y_train_pnl`].
+        let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
+        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP {
             return Some(0.0);
         }
     }
 
-    Some(0.0)
+    // Горизонт прошёл, ни SL, ни резолюция не сработали. Зеркало
+    // концовки [`calc_y_train_pnl`]: любая просадка в минус ⇒
+    // `Some(0.0)`, иначе ⇒ `Some(1.0)`.
+    Some(1.0)
 }
 
 
@@ -1447,6 +1581,7 @@ pub fn calc_y_train_resolution(
 //     index: usize,
 //     price_to_beat: f64,
 //     final_price: f64,
+//     _: f64
 // ) -> Option<f32> {
 //     let up_won = final_price >= price_to_beat;
 //     let current = x_frames.get(index)?;
@@ -1484,7 +1619,7 @@ pub fn calc_y_train_resolution(
 //         }
 //     }
 //
-//     None
+//     Some(1.0)
 // }
 
 /// Mid L1: (лучший bid + лучший ask) / 2.

@@ -2,7 +2,7 @@
 //! строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
 //! и сохраняет модель рядом с папкой версии.
 
-use crate::history_sim::HOLD_TO_END_THRESHOLD_SEC;
+use crate::history_sim::{HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS};
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::tee_log::TEE_LOG;
 use crate::xframe::{
@@ -24,9 +24,9 @@ use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersB
 use xgb::{Booster, DMatrix};
 
 /// Число итераций байесовского оптимизатора (TPE) для PnL-модели.
-const OPTIMIZER_TRIALS_PNL: usize = 150;
+const OPTIMIZER_TRIALS_PNL: usize = 100;
 /// Число итераций байесовского оптимизатора (TPE) для Resolution-модели.
-const OPTIMIZER_TRIALS_RESOLUTION: usize = 1000;
+const OPTIMIZER_TRIALS_RESOLUTION: usize = 100;
 /// Максимальное число раундов бустинга при финальном обучении.
 const BOOST_ROUNDS: u32 = 500;
 /// Число раундов без улучшения AUC до остановки (early stopping).
@@ -149,6 +149,12 @@ impl TuneObjective {
 /// Активная цель байесовской оптимизации. Меняется одной правкой константы;
 /// см. doc у [`TuneObjective`] для разбора вариантов.
 const TUNE_OBJECTIVE: TuneObjective = TuneObjective::MinimizeLogLoss;
+
+/// Макс. отклонение VWAP от L1 при разметке y_train (вход TP / добровольные
+/// выходы): передаётся в [`crate::xframe::calc_y_train_pnl`] /
+/// [`crate::xframe::calc_y_train_resolution`]. Симуляция исполнения —
+/// [`crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT`].
+pub const Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.2;
 
 /// Максимальный лаг `delta_n_*` для PnL-модели: `None` — полный вектор
 /// [`XFrame::to_x_train_with`]; `Some(n)` — обрезка лагов до `n` первых
@@ -625,6 +631,12 @@ struct AppendStats {
     /// Resolution-only: кадры вне hold-zone (`event_remaining_ms <= 0` или
     /// `> HOLD_TO_END_THRESHOLD_SEC * 1000`).
     out_of_hold_zone: usize,
+    /// Pnl-only: кадры со слишком малым остатком до резолюции
+    /// (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`, включая `<= 0`).
+    /// Совпадает с ранним отказом [`crate::history_sim::buy_gate`]
+    /// `BuyGate::LateEntry`: модель PnL не должна учиться на тиках,
+    /// где исполнитель в любом случае не открывает позицию.
+    late_entry: usize,
     /// `calc_y_*` вернул `None` (тонкий стакан / slippage cap / нет
     /// `currency_implied_prob` / прочие причины внутри Y-функции).
     y_none: usize,
@@ -638,6 +650,7 @@ impl AppendStats {
         self.total_frames += other.total_frames;
         self.marked += other.marked;
         self.out_of_hold_zone += other.out_of_hold_zone;
+        self.late_entry += other.late_entry;
         self.y_none += other.y_none;
         self.feature_mismatch += other.feature_mismatch;
     }
@@ -833,17 +846,43 @@ fn append_frames(
     stats.total_frames = frames.len();
 
     for index in 0..frames.len() {
-        if matches!(model_type, ModelType::Resolution) {
-            let remaining = frames[index].event_remaining_ms;
-            if remaining <= 0 || remaining > hold_zone_max_ms {
-                stats.out_of_hold_zone += 1;
-                continue;
+        let remaining = frames[index].event_remaining_ms;
+        match model_type {
+            ModelType::Resolution => {
+                if remaining <= 0 || remaining > hold_zone_max_ms {
+                    stats.out_of_hold_zone += 1;
+                    continue;
+                }
+            }
+            ModelType::Pnl => {
+                // Симметрично `buy_gate::LateEntry` в `history_sim`: при
+                // `event_remaining_ms < MIN_ENTRY_REMAINING_MS` исполнитель
+                // не открывает позицию — учить PnL-модель на этих кадрах
+                // тоже нечему (распределение разъезжается с инференсом).
+                if remaining < MIN_ENTRY_REMAINING_MS {
+                    stats.late_entry += 1;
+                    continue;
+                }
             }
         }
 
         let label = match model_type {
-            ModelType::Pnl => calc_y_train_pnl(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
-            ModelType::Resolution => calc_y_train_resolution(Y_TRAIN_HORIZON_FRAMES, frames, index, price_to_beat, final_price),
+            ModelType::Pnl => calc_y_train_pnl(
+                Y_TRAIN_HORIZON_FRAMES,
+                frames,
+                index,
+                price_to_beat,
+                final_price,
+                Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT,
+            ),
+            ModelType::Resolution => calc_y_train_resolution(
+                Y_TRAIN_HORIZON_FRAMES,
+                frames,
+                index,
+                price_to_beat,
+                final_price,
+                Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT,
+            ),
         };
         let Some(label) = label else {
             stats.y_none += 1;
@@ -1058,11 +1097,13 @@ fn print_append_stats(tag: &str, split: &str, s: &AppendStats) {
     let marked_pct = s.marked as f64 / s.total_frames as f64 * 100.0;
     let y_none_pct = s.y_none as f64 / s.total_frames as f64 * 100.0;
     let out_pct = s.out_of_hold_zone as f64 / s.total_frames as f64 * 100.0;
+    let late_entry_pct = s.late_entry as f64 / s.total_frames as f64 * 100.0;
     tee_println!(
-        "[train] {tag}: append_stats ({split}): frames={} marked={} ({:.1}%) y_none={} ({:.1}%) out_of_hold_zone={} ({:.1}%) feature_mismatch={}",
+        "[train] {tag}: append_stats ({split}): frames={} marked={} ({:.1}%) y_none={} ({:.1}%) out_of_hold_zone={} ({:.1}%) late_entry={} ({:.1}%) feature_mismatch={}",
         s.total_frames, s.marked, marked_pct,
         s.y_none, y_none_pct,
         s.out_of_hold_zone, out_pct,
+        s.late_entry, late_entry_pct,
         s.feature_mismatch,
     );
 }

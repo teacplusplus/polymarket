@@ -450,3 +450,47 @@ fn parse_clob_token_ids_from_gamma_market(v: &Value) -> anyhow::Result<Vec<Strin
         _ => Ok(Vec::new()),
     }
 }
+
+/// Результат [`detect_country_and_ip`] — страна и внешний IP исходящего
+/// соединения, оба поля независимо опциональны (если в ответе отсутствует).
+pub struct CountryAndIp {
+    pub country: Option<String>,
+    pub ip:      Option<String>,
+}
+
+/// Узнаёт страну и внешний IP через `https://ifconfig.co/json`
+/// (тот же сервис, что `curl -s https://ifconfig.co/json`). Используется
+/// только для печати в самом начале запуска — чтобы по логу было сразу
+/// видно, через какую гео-точку (VPN/прокси) сейчас стучимся к биржам.
+/// Любая ошибка (нет сети, таймаут, не-200, кривой JSON) не должна валить
+/// запуск, поэтому возвращаем [`Option<CountryAndIp>`] и обрабатываем `None`
+/// как «определить не удалось».
+pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://ifconfig.co/json")
+        // Без `User-Agent: curl/...` сервис отдаёт HTML по этому URL,
+        // а не JSON; ставим явный «curl-подобный» UA, чтобы получить JSON.
+        .header(reqwest::header::USER_AGENT, "curl/8.9.1")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: Value = resp.json().await.ok()?;
+    let pick = |k: &str| -> Option<String> {
+        body.get(k)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    Some(CountryAndIp {
+        country: pick("country"),
+        ip:      pick("ip"),
+    })
+}

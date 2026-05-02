@@ -44,6 +44,8 @@ use crate::history_sim::{
     load_booster, manage_positions, print_sim_stats, try_open_position, OpenPosition,
     SimStats, StrictBook,
 };
+/// Тот же cap, что в [`crate::history_sim::manage_positions`] / `book_fill_*`.
+pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::xframe::BookLevel;
 use crate::project_manager::{LaneFrame, ProjectManager};
 use crate::train_mode::{load_calibration, Calibration};

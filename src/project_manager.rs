@@ -104,6 +104,7 @@ pub struct ProjectManager {
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub real_sim_state: Arc<RwLock<RealSimState>>,
     pub account: SharedAccount,
+    pub split_done_by_market_id: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl ProjectManager {
@@ -159,6 +160,7 @@ impl ProjectManager {
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state,
             account,
+            split_done_by_market_id: Arc::new(RwLock::new(HashMap::new())),
         });
 
         spawn_persistent_interval_market_ws(project_manager.clone(), market_ws_rx);
@@ -833,10 +835,38 @@ impl ProjectManager {
                         if project_manager_cloned.slug_currency_event_fully_cached(&prefetch_slug).await {
                             continue;
                         }
-                        if let Some((_, _, _, ref currency_up_down_by_asset_id)) =
+                        if let Some((ref market_event_start_ms, _, _, ref currency_up_down_by_asset_id)) =
                             project_manager_cloned.fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period).await
                         {
                             run_log::gamma_event_prefetch_fetched(period, &prefetch_slug);
+                            // Хук: для каждого свежеподтянутого future-маркета планируем
+                            // on-chain `splitPosition` через `CtfCollateralAdapter`
+                            // Polymarket-а на Polygon. Гейтинг — compile-time константы
+                            // `poly_chain::SPLIT_ENABLED` / `SPLIT_CURRENCY` /
+                            // `SPLIT_PERIOD` + наличие `POLY_PRIVATE_KEY`, дедуп —
+                            // `split_done_by_market_id`. Currency и period передаём
+                            // явно, чтобы `poly_chain` сам решил, подходит ли пара.
+                            //
+                            // Фильтруем строго **из будущего**: `start_ms > now_ms`.
+                            // Маркеты без известного `start_ms` или уже стартовавшие
+                            // (`start_ms <= now_ms`) пропускаются — для них split-арбитраж
+                            // не имеет смысла (стакан уже на полпути к резолюции).
+                            // Ключи `market_event_start_ms` — это `conditionId`-ы
+                            // (см. `fetch_gamma_event_data_for_slug` в `util.rs`).
+                            let now_ms = current_timestamp_ms();
+                            for (condition_id, start_ms_opt) in market_event_start_ms.iter() {
+                                let Some(start_ms) = *start_ms_opt else { continue };
+                                if start_ms <= now_ms {
+                                    continue;
+                                }
+                                crate::poly_chain::schedule_split_for_future_market(
+                                    project_manager_cloned.http.clone(),
+                                    &currency_lower,
+                                    period,
+                                    condition_id.clone(),
+                                    project_manager_cloned.split_done_by_market_id.clone(),
+                                );
+                            }
                             {
                                 let mut xframe_interval_kind_by_asset_id_lock = project_manager_cloned
                                     .xframe_interval_kind_by_asset_id

@@ -24,7 +24,6 @@
 //! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
 //! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
 
-use crate::xframe::MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::account::Account;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
@@ -44,14 +43,19 @@ use xgb::{Booster, DMatrix};
 /// грубым префильтром, отсекающим заведомо шумовые сигналы.
 pub const SIM_BUY_THRESHOLD: f32 = 0.50;
 
+/// Максимально допустимое отклонение VWAP от лучшей цены L1 (доля) при
+/// симуляции исполнения ([`book_fill_buy`], [`book_fill_sell`], strict-ветки).
+/// Разметка y_train использует [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`].
+pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
+
 /// Стартовый виртуальный банкролл (USDC).
 pub const INITIAL_BANKROLL: f64 = 1000.0;
 /// Множитель Келли: `1.0` = full-Kelly, `0.5` = half-Kelly (меньше размер — меньше volatility).
-pub const KELLY_MULTIPLIER: f64 = 0.50;
+pub const KELLY_MULTIPLIER: f64 = 0.1;
 /// Максимальная доля банкролла на одну сделку.
 pub const MAX_BET_FRACTION: f64 = 0.10;
 /// Минимальный размер позиции в USDC (меньше — не торгуем).
-pub const MIN_POSITION_USD: f64 = 0.10;
+pub const MIN_POSITION_USD: f64 = 0.00;
 
 /// Базовый размер позиции в USDC для **диагностического** прогона
 /// `is_kelly = false` (см. [`run_sim_mode`]). В этом режиме отключены и
@@ -90,7 +94,7 @@ pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
 ///   resolution-модели;
 /// * **EV-правило** (см. [`EV_EXIT_MARGIN`]): `EV_sell · (1 − MARGIN) > EV_hold` —
 ///   мягкий выход, когда рыночная продажа выгоднее ожидаемой резолюции.
-pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 30;
+pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 0;
 
 /// Коэффициент EMA для сглаживания `p_win` от resolution-модели в зоне
 /// удержания: `p_ema = α · p_now + (1 − α) · p_prev`. Чем меньше α, тем
@@ -148,8 +152,9 @@ pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
 ///
 /// В `history_sim` исполнение идёт по полному WS-стаку кадра
 /// (`book_asks`/`book_bids` или L1/L2/L3 фоллбэк для легаси-дампов)
-/// с обязательной проверкой [`MAX_SLIPPAGE_FROM_L1_PCT`] — симметрично
-/// с y_train-разметкой ([`crate::xframe::calc_y_train_pnl`]). В живой
+/// с обязательной проверкой [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] (константа
+/// симуляции; разметка y_train использует
+/// [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`]). В живой
 /// торговле ([`crate::real_sim`]) WS-кадра недостаточно: он отстаёт
 /// на буфер реконнекта/тики, и нужен свежий HTTP-снимок CLOB.
 ///
@@ -270,8 +275,8 @@ pub(crate) fn effective_implied_prob(
 /// `position_size` фактическими уровнями стакана **и** выполнены оба
 /// инвариативных условия живой торговли:
 ///
-/// 1. **Slippage cap** ([`MAX_SLIPPAGE_FROM_L1_PCT`]): VWAP не должен
-///    отклоняться от лучшего ask больше, чем на `MAX_SLIPPAGE_FROM_L1_PCT`.
+/// 1. **Slippage cap** ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]): VWAP не должен
+///    отклоняться от лучшего ask больше, чем на `SIM_MAX_SLIPPAGE_FROM_L1_PCT`.
 ///    На полной лестнице CLOB без cap'а Kelly мог бы доедать L4–L20 на
 ///    тонком маркете и платить на 5–20¢ выше mid — это сжигает edge
 ///    модели и в `real_sim` представляет реальный финансовый риск.
@@ -322,7 +327,7 @@ pub(crate) fn book_fill_buy_strict(
     // **выше** best ask — это и есть проскальзывание; считаем по `vwap`,
     // не по последнему сожранному уровню, потому что fee/EV-расчёты
     // ниже по стеку идут от VWAP.
-    if (vwap - best_ask) / best_ask > MAX_SLIPPAGE_FROM_L1_PCT {
+    if (vwap - best_ask) / best_ask > SIM_MAX_SLIPPAGE_FROM_L1_PCT {
         return None;
     }
     if let Some(min) = book.min_order_size {
@@ -345,7 +350,7 @@ pub(crate) fn book_fill_buy_strict(
 ///    `manage_positions` оставит позицию открытой и попробует
 ///    повторно на следующем тике (`kelly_strict_sell_skips++`).
 ///
-///    * `Some(pct)` — cap активен (типичное значение [`MAX_SLIPPAGE_FROM_L1_PCT`]).
+///    * `Some(pct)` — cap активен (типичное значение [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]).
 ///      Используем для **добровольных** выходов (TP / EvExitProfit),
 ///      где edge модели чувствителен к slippage и можно «передумать»,
 ///      подождав лучшего стакана. Решение принимает
@@ -451,6 +456,18 @@ pub struct OpenPosition {
     pub(crate) entry_prob: f64,
     /// USDC потраченные на покупку (= POSITION_SIZE_USD).
     pub(crate) entry_cost: f64,
+    /// `book_bid_l1_price` на момент `try_open_position` (в `real_sim`
+    /// — лучший bid из `strict_book.bids`, в `history_sim` — L1 из
+    /// WS-кадра). Используется в `close_position` для maker-/taker-
+    /// классификации voluntary-выхода: сразу после buy-walk-а мы
+    /// модельно выставляем resting-лимитку на TP-таргет, и её статус
+    /// решается **в этот момент**: если `tp_target > best_bid_at_entry`
+    /// — лимитка ложится в книгу как maker (fee = 0). Дальнейшие
+    /// движения best_bid не меняют maker-статуса уже стоящего ордера.
+    /// `None` — на entry-кадре не было валидного bid'а (одностронний
+    /// стакан); консервативно трактуется как taker (fee применяется
+    /// даже на TP-выходе).
+    pub(crate) best_bid_at_entry: Option<f64>,
     /// Сколько кадров позиция уже удерживается (для таймаута).
     pub(crate) frames_held: usize,
     /// EMA вероятности выигрыша от resolution-модели, используется для
@@ -518,7 +535,7 @@ impl CloseReason {
     /// Можно ли «передумать» этот выход, если стакан слишком тонкий?
     ///
     /// `true` — выход **добровольный**: TP / EvExitProfit. Тут разумно
-    /// применять [`MAX_SLIPPAGE_FROM_L1_PCT`] и не выходить на VWAP, который
+    /// применять [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] и не выходить на VWAP, который
     /// глубже best bid'а допустимого процента — ждём лучшего стакана в
     /// следующем тике, edge сохраняется.
     ///
@@ -1482,6 +1499,7 @@ pub(crate) fn buy_gate(
     let Some(PnlInference { raw, pred }) = pnl_inference else {
         return BuyGate::BelowThreshold;
     };
+
     if raw < SIM_BUY_THRESHOLD {
         return BuyGate::BelowThreshold;
     }
@@ -1489,7 +1507,15 @@ pub(crate) fn buy_gate(
     // `kelly_f` считается **всегда** — нужен и для kelly-сайзинга, и для
     // диагностических сумм во всех skip-ветках ниже (раз модель сигналит,
     // мы хотим видеть среднее edge'а, а не только успешных входов).
-    let kelly_gain = kelly_gain_ratio(entry_prob);
+    // `best_bid_at_entry` идёт в `kelly_gain_ratio` для определения
+    // maker-/taker-статуса будущей TP-лимитки: real_sim путь — лучший bid
+    // из HTTP-snapshot CLOB (`strict_book.bids[0]`), history_sim путь —
+    // L1 из WS-кадра.
+    let best_bid_at_entry = match strict_book {
+        Some(book) => book.bids.first().map(|lvl| lvl.price),
+        None => frame.book_bid_l1_price,
+    };
+    let kelly_gain = kelly_gain_ratio(entry_prob, best_bid_at_entry);
     let kelly_loss = kelly_loss_ratio(entry_prob);
     let kelly_f = kelly_fraction(pred as f64, kelly_gain, kelly_loss);
 
@@ -1523,7 +1549,7 @@ pub(crate) fn buy_gate(
     }
 
     let kelly_f_adj = kelly_f * KELLY_MULTIPLIER;
-    if kelly_f_adj <= 0.0 {
+    if kelly_f_adj <= MIN_POSITION_USD {
         return BuyGate::KellySkip { raw, pred, kelly_f };
     }
     let size = kelly_f_adj.min(MAX_BET_FRACTION) * bankroll;
@@ -1647,7 +1673,7 @@ pub(crate) fn try_open_position(
                     // Сюда попадаем в трёх случаях:
                     //   * strict-режим (real_sim): HTTP-стакана не хватило
                     //     для покупки на `size` USDC, либо VWAP уехал за
-                    //     [`MAX_SLIPPAGE_FROM_L1_PCT`] cap, либо
+                    //     [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] cap, либо
                     //     `total_shares < min_order_size` ([`book_fill_buy_strict`]
                     //     вернула `None`).
                     //   * non-strict (history_sim) — нехватка глубины:
@@ -1656,7 +1682,7 @@ pub(crate) fn try_open_position(
                     //     incomplete fill).
                     //   * non-strict (history_sim) — превышен cap: VWAP
                     //     обхода уехал больше чем на
-                    //     [`MAX_SLIPPAGE_FROM_L1_PCT`] от best ask. Симметрично
+                    //     [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] от best ask. Симметрично
                     //     с y_train-разметкой `walk_buy_xfeatures`: на тех же
                     //     тиках y_train ставит `None` → не учим, не торгуем.
                     // Считаем все три под `kelly_strict_buy_skips`: это
@@ -1769,8 +1795,7 @@ pub(crate) fn sell_gate(
         return SellGate::HoldPnl;
     };
 
-    let in_hold_zone = frame.event_remaining_ms > 0
-        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+    let in_hold_zone = frame.event_remaining_ms > 0 && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
     let delta = current_prob - pos.entry_prob;
 
     if in_hold_zone {
@@ -1781,9 +1806,7 @@ pub(crate) fn sell_gate(
         // известному `pos.p_win_ema`. Сам инференс делает вызывающий
         // (`manage_positions`) **один раз на кадр**, см. контракт.
         let new_p_win_ema: Option<f64> = match (p_win_now, pos.p_win_ema) {
-            (Some(p), Some(prev)) => Some(
-                EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev,
-            ),
+            (Some(p), Some(prev)) => Some(EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev),
             (Some(p), None) => Some(p),
             (None, existing) => existing,
         };
@@ -1799,7 +1822,7 @@ pub(crate) fn sell_gate(
         //    стакане, но альтернатива (досидеть до $0-выплаты) хуже.
         //
         // 2) **EV-exit** — мягкий выход через `book_fill_sell` с cap'ом
-        //    (`MAX_SLIPPAGE_FROM_L1_PCT`), если рыночная продажа после
+        //    (`SIM_MAX_SLIPPAGE_FROM_L1_PCT`), если рыночная продажа после
         //    fee строго выгоднее ожидаемого удержания до резолюции.
         //
         // Порядок: SL → EV-exit. SL стоит первым как hard safety net:
@@ -1810,8 +1833,8 @@ pub(crate) fn sell_gate(
         }
         let ev_close: Option<(f64, CloseReason)> = if let Some(p_ema) = new_p_win_ema {
             let gross_usdc_opt = match strict_book {
-                Some(book) => book_fill_sell_strict(book, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
-                None => book_fill_sell(frame, pos.shares_held, Some(MAX_SLIPPAGE_FROM_L1_PCT)),
+                Some(book) => book_fill_sell_strict(book, pos.shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
+                None => book_fill_sell(frame, pos.shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
             };
             gross_usdc_opt.and_then(|gross_usdc| {
                 let sell_vwap = if pos.shares_held > 0.0 {
@@ -1823,10 +1846,40 @@ pub(crate) fn sell_gate(
                     * POLYMARKET_CRYPTO_TAKER_FEE_RATE
                     * sell_vwap
                     * (1.0 - sell_vwap);
-                let ev_sell = gross_usdc - fee;
+                // EV-exit — реактивное решение в hold-zone: лимитка
+                // ставится **в этот же момент** на `current_prob`, поэтому
+                // maker-/taker-проверка идёт от **текущего** best_bid (не
+                // от entry'шного, как у TP — там лимитка ставилась один
+                // раз на входе и зафиксировалась как maker). Источник
+                // best_bid: real_sim — HTTP-snapshot CLOB, history_sim —
+                // L1 WS-кадра.
+                let current_best_bid = match strict_book {
+                    Some(book) => book.bids.first().map(|lvl| lvl.price),
+                    None => frame.book_bid_l1_price,
+                };
+                let ev_is_maker = match current_best_bid {
+                    Some(b) => current_prob > b,
+                    None => true,
+                };
+                // `ev_sell_taker` — выручка при urgent-выходе через
+                // bid-walk (cross-spread, taker-fee). Используется как
+                // **порог принятия решения**: «выходим, только если
+                // даже консервативный taker-сценарий обгоняет hold-EV».
+                let ev_sell_taker = gross_usdc - fee;
+                // `ev_sell_maker` — выручка при resting-лимитке над
+                // current_prob (maker-fee = 0 = gross_usdc), но только
+                // если такая лимитка действительно ляжет как maker
+                // (`ev_is_maker == true`). Иначе наша лимитка пересекла
+                // бы спред = taker, и maker-сценарий вырождается в
+                // taker. Используется **только** для классификации
+                // reason → если без fee мы в плюсе, это voluntary
+                // EvExitProfit, и `close_position` тоже не возьмёт fee
+                // (см. `is_voluntary_exit`). Если maker-cценарий уже не
+                // прибылен — cut-losses через taker (EvExitLoss).
+                let ev_sell_maker = if ev_is_maker { gross_usdc } else { ev_sell_taker };
                 let ev_hold = p_ema * pos.shares_held;
-                if ev_sell * (1.0 - EV_EXIT_MARGIN) > ev_hold {
-                    let reason = if ev_sell > pos.entry_cost {
+                if ev_sell_taker * (1.0 - EV_EXIT_MARGIN) > ev_hold {
+                    let reason = if ev_sell_maker > pos.entry_cost {
                         CloseReason::EvExitProfit
                     } else {
                         CloseReason::EvExitLoss
@@ -2048,32 +2101,55 @@ pub(crate) fn manage_positions(
 
 /// Ожидаемая доля выигрыша при срабатывании Take Profit.
 ///
-/// Моделирует покупку $1 токена по `entry_prob`, продажу по `entry_prob + TP`,
-/// с учётом taker-fee на обоих концах.
-fn kelly_gain_ratio(entry_prob: f64) -> f64 {
+/// Моделирует покупку $1 токена по `entry_prob` (taker — вход через ask-walk)
+/// и продажу по `entry_prob + TP`. Maker-/taker-статус выходного ордера
+/// определяется по фактическому состоянию стакана **на entry-кадре**: сразу
+/// после покупки мы выставляем resting ask на `tp_target = entry_prob +
+/// Y_TRAIN_TAKE_PROFIT_PP`, и его роль решается в этот же момент:
+///   • `tp_target > best_bid_at_entry` — лимитка ложится как maker
+///     (fee = 0 на выходе, согласовано с `close_position` для voluntary).
+///   • `tp_target ≤ best_bid_at_entry` — лимитка пересекает спред при
+///     постановке = taker, fee применяется.
+///   • `best_bid_at_entry = None` (одностронний стакан без bid'ов) —
+///     нашему ask не на что кросснуться, лимитка резинг-ит как maker.
+fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
-    let net = net_round_trip(entry_prob, sell_price);
+    let tp_is_maker = match best_bid_at_entry {
+        Some(best_bid) => sell_price > best_bid,
+        None => true,
+    };
+    let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ !tp_is_maker);
     (net - 1.0).max(1e-9)
 }
 
 /// Ожидаемая доля убытка при срабатывании Stop Loss.
 ///
-/// Моделирует покупку $1 токена по `entry_prob`, продажу по `entry_prob + SL`,
-/// с учётом taker-fee на обоих концах.
+/// Моделирует покупку $1 токена по `entry_prob` (taker) и продажу по
+/// `entry_prob + SL` как **taker** (urgent-выход через bid-walk: SL реагирует
+/// на просадку, ждать резинг-лимитки нельзя — maker-альтернативы у SL нет).
+/// Согласовано с `close_position`, который на StopLoss/Timeout/EvExitLoss
+/// применяет taker-fee безусловно.
 fn kelly_loss_ratio(entry_prob: f64) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_STOP_LOSS_PP).clamp(0.001, 0.999);
-    let net = net_round_trip(entry_prob, sell_price);
+    let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ true);
     (1.0 - net).max(1e-9)
 }
 
-/// Чистый возврат на $1 при покупке по `buy` и продаже по `sell` (с fee на обоих концах).
-fn net_round_trip(buy: f64, sell: f64) -> f64 {
+/// Чистый возврат на $1 при покупке по `buy` (всегда taker — вход через
+/// книгу) и продаже по `sell`. `sell_is_taker = true` соответствует
+/// urgent-выходу (SL/Timeout/EvExitLoss): бид-walk + fee. `sell_is_taker =
+/// false` — voluntary-выход (TP/EvExitProfit): resting maker-лимитка, fee = 0.
+fn net_round_trip(buy: f64, sell: f64, sell_is_taker: bool) -> f64 {
     let nominal_shares = 1.0 / buy;
     let buy_fee = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy * (1.0 - buy);
     let actual_shares = nominal_shares - buy_fee / buy;
 
     let gross = actual_shares * sell;
-    let sell_fee = actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell * (1.0 - sell);
+    let sell_fee = if sell_is_taker {
+        actual_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell * (1.0 - sell)
+    } else {
+        0.0
+    };
     gross - sell_fee
 }
 
@@ -2134,7 +2210,7 @@ fn open_position(
 ) -> Option<OpenPosition> {
     let (buy_price, nominal_shares) = match strict_book {
         Some(book) => book_fill_buy_strict(book, position_size)?,
-        None => book_fill_buy(frame, position_size, Some(MAX_SLIPPAGE_FROM_L1_PCT))?,
+        None => book_fill_buy(frame, position_size, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT))?,
     };
     if nominal_shares <= 0.0 {
         return None;
@@ -2155,12 +2231,22 @@ fn open_position(
     // частичном `asks`-стаке без bid'ов), `buy_price` лучше дефолтного 0.5.
     let entry_prob = effective_implied_prob(frame, strict_book).unwrap_or(buy_price);
 
+    // Best_bid в момент входа — определяет maker-/taker-статус
+    // resting-лимитки на TP-выходе (см. doc у `OpenPosition::best_bid_at_entry`).
+    // Источник: real_sim путь — HTTP-snapshot CLOB (`strict_book.bids`),
+    // history_sim путь — L1 из WS-кадра.
+    let best_bid_at_entry = match strict_book {
+        Some(book) => book.bids.first().map(|lvl| lvl.price),
+        None => frame.book_bid_l1_price,
+    };
+
     Some(OpenPosition {
         asset_id: frame.asset_id.clone(),
         market_id: frame.market_id.clone(),
         shares_held: actual_shares,
         entry_prob,
         entry_cost: position_size,
+        best_bid_at_entry,
         frames_held: 0,
         p_win_ema: None,
         raw_pred_at_open,
@@ -2200,7 +2286,7 @@ fn close_position(
     // выход с повышенным slippage, потому что эти причины именно
     // сигнализируют о том, что дальнейшее ожидание ухудшает PnL.
     let slippage_cap = if reason.is_voluntary_exit() {
-        Some(MAX_SLIPPAGE_FROM_L1_PCT)
+        Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
     } else {
         None
     };
@@ -2213,7 +2299,51 @@ fn close_position(
     } else {
         exit_price.clamp(0.001, 0.999)
     };
-    let fee_usdc = pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price);
+    // Voluntary-выход — maker-fee = 0 при условии, что наша resting
+    // лимитка действительно легла в книгу как maker (не пересекла спред
+    // при постановке). У двух voluntary-причин maker-проверка считается
+    // в **разный момент времени**, поэтому источник best_bid разный:
+    //
+    //   • **TakeProfit** — TP-лимитка ставилась один раз сразу после
+    //     buy-walk-а на `pos.entry_prob + Y_TRAIN_TAKE_PROFIT_PP`.
+    //     Maker-/taker-статус зафиксирован тогда же; используем
+    //     `pos.best_bid_at_entry` (захвачен в `try_open_position`).
+    //
+    //   • **EvExitProfit** — реактивное решение в hold-zone: лимитка
+    //     ставится прямо сейчас на `exit_price` (= `current_prob`).
+    //     Maker-проверка идёт от **текущего** best_bid (из `strict_book`
+    //     или `frame.book_bid_l1_price`); согласовано с
+    //     `ev_is_maker` в EV-decision выше.
+    //
+    // Без best_bid (одностронний стакан без bid'ов) — нашему ask не на
+    // что было бы кросснуться, лимитка резинг-ит как maker.
+    let voluntary_is_maker = match reason {
+        CloseReason::TakeProfit => {
+            let tp_target = (pos.entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
+            match pos.best_bid_at_entry {
+                Some(b) => tp_target > b,
+                None => true,
+            }
+        }
+        CloseReason::EvExitProfit => {
+            let exit_clamped = exit_price.clamp(0.001, 0.999);
+            let current_best_bid = match strict_book {
+                Some(book) => book.bids.first().map(|lvl| lvl.price),
+                None => frame.book_bid_l1_price,
+            };
+            match current_best_bid {
+                Some(b) => exit_clamped > b,
+                None => true,
+            }
+        }
+        // SL / Timeout / EvExitLoss — urgent-выход, maker-альтернативы нет.
+        _ => false,
+    };
+    let fee_usdc = if voluntary_is_maker {
+        0.0
+    } else {
+        pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price)
+    };
     stats.fees_paid += fee_usdc;
     let net_usdc = gross_usdc - fee_usdc;
 
@@ -2305,7 +2435,7 @@ pub(crate) fn trade_csv_close_reason_label(reason: &CloseReason) -> &'static str
 /// **Симметрия с [`book_fill_buy_strict`] и `walk_buy_xfeatures` (y_train)**:
 /// y_train (`calc_y_train_pnl` / `calc_y_train_resolution`) размечает кадр
 /// как `None`, если `walk_buy_xfeatures` не закрыл $200 нотинала по L1+L2+L3
-/// или VWAP уехал больше [`MAX_SLIPPAGE_FROM_L1_PCT`] от best ask. Раньше
+/// или VWAP уехал больше [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] от best ask. Раньше
 /// `book_fill_buy` (non-strict) на тех же тиках спокойно открывал позицию
 /// на «частичном fill'е» с burn'ом остатка USDC по `0.5` VWAP — и
 /// `history_sim` получал торговые сигналы там, где обучение их **не
@@ -2498,7 +2628,7 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_ke
     //   * `kelly_strict_buy_skips` / `kelly_strict_sell_skips` —
     //     отказы исполнения (book_fill_buy/sell вернул `None`):
     //     либо стакан слишком тонкий для полного fill'а, либо VWAP
-    //     превысил `MAX_SLIPPAGE_FROM_L1_PCT` cap. Имеют смысл и
+    //     превысил `SIM_MAX_SLIPPAGE_FROM_L1_PCT` cap. Имеют смысл и
     //     в history_sim (после введения cap'а на non-strict путь),
     //     и в real_sim (через book_fill_*_strict).
     let diag = if is_kelly {
