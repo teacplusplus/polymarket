@@ -56,6 +56,10 @@ pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
 /// Асинхронно пишет дамп **каждого лейна** в `xframes/{currency}/{count_features}/{interval}/{step}s/{YYYY-MM-DD}/{name}.bin`,
 /// а после завершения (успех или ошибка) вызывает `cleanup_stale_market_data`
 /// чтобы освободить память, занятую данными завершённого маркета.
+// `slug` — slug дампируемого окна (формат `{currency}-updown-{period}-{window_start_sec}`).
+// Нужен только для диагностического `eprintln!`: собираем `polymarket_event_url`,
+// чтобы по логу можно было кликнуть на маркет и сравнить `price_to_beat` /
+// `final_price` с тем, что показывает Polymarket.
 pub fn spawn_dump_market_xframes_binary(
     project_manager: Arc<ProjectManager>,
     market_id: String,
@@ -63,6 +67,7 @@ pub fn spawn_dump_market_xframes_binary(
     period_sec: i64,
     price_to_beat: f64,
     final_price: f64,
+    slug: String,
 ) {
     tokio::spawn(async move {
         let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
@@ -70,7 +75,10 @@ pub fn spawn_dump_market_xframes_binary(
         tokio::time::sleep(std::time::Duration::from_secs(max_step)).await;
 
         let up_won = final_price >= price_to_beat;
-        eprintln!("xframe_dump: market_id={market_id} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}");
+        let polymarket_event_url = format!("https://polymarket.com/event/{slug}");
+        eprintln!(
+            "xframe_dump: market_id={market_id} polymarket={polymarket_event_url} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}"
+        );
 
         // Резолюционный колбек по `final_price`: закрывает все
         // pending-позиции этого маркета (Up/Down обоих лейнов, что

@@ -51,20 +51,16 @@ pub fn gamma_event_prefetch_fetched(period: &str, slug: &str) {
 pub fn price_to_beat_from_rtds(
     period: &str,
     slug: &str,
-    market_ids: &[String],
+    market_id: Option<&str>,
     start_ms: i64,
     price: f64,
 ) {
     if !WS_LOG_ENABLED {
         return;
     }
-    let markets = if market_ids.is_empty() {
-        String::from("(нет)")
-    } else {
-        market_ids.join(", ")
-    };
+    let market = market_id.unwrap_or("(нет)");
     crate::tee_eprintln!(
-        "[{period}] price_to_beat из rtds_currency_prices_by_ms: slug={slug} market_id=[{markets}] start_ms={start_ms} price={price}"
+        "[{period}] price_to_beat из rtds_currency_prices_by_ms: slug={slug} market_id={market} start_ms={start_ms} price={price}"
     );
 }
 
@@ -110,7 +106,7 @@ pub fn ws_start(
     period: &str,
     slug: &str,
     price_to_beat: Option<f64>,
-    market_ids: &[String],
+    market_id: Option<&str>,
     asset_ids: &[String],
     remain_ms: u64,
     wall_end_ms: i64,
@@ -122,18 +118,14 @@ pub fn ws_start(
     let price_to_beat_str = price_to_beat
         .map(|p| format!("{p}"))
         .unwrap_or_else(|| "—".to_string());
-    let markets = if market_ids.is_empty() {
-        String::from("(нет condition_id в Gamma)")
-    } else {
-        market_ids.join(", ")
-    };
+    let market = market_id.unwrap_or("(нет condition_id в Gamma)");
     let assets = if asset_ids.is_empty() {
         String::from("(нет)")
     } else {
         asset_ids.join(", ")
     };
     crate::tee_eprintln!(
-        "[{period}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
+        "[{period}] ws: запускаю market ws | polymarket={polymarket_event_url} | price_to_beat={price_to_beat_str} | market (condition_id)={market} | asset_id (clob)=[{assets}] | session ~{remain_ms} ms до wall_end_ms={wall_end_ms}"
     );
 }
 
@@ -141,7 +133,7 @@ pub fn ws_start(
 pub fn ws_subscribe_applied(
     period: &str,
     slug: &str,
-    market_ids: &[String],
+    market_id: Option<&str>,
     asset_ids: &[String],
     after_reconnect: bool,
 ) {
@@ -153,18 +145,14 @@ pub fn ws_subscribe_applied(
     } else {
         "подписка применена (первое соединение)"
     };
-    let markets = if market_ids.is_empty() {
-        String::from("(нет condition_id)")
-    } else {
-        market_ids.join(", ")
-    };
+    let market = market_id.unwrap_or("(нет condition_id)");
     let assets = if asset_ids.is_empty() {
         String::from("(нет)")
     } else {
         asset_ids.join(", ")
     };
     crate::tee_eprintln!(
-        "[{period}] ws: {phase} | slug={slug} | market (condition_id)=[{markets}] | asset_id (clob)=[{assets}]"
+        "[{period}] ws: {phase} | slug={slug} | market (condition_id)={market} | asset_id (clob)=[{assets}]"
     );
 }
 
@@ -172,36 +160,28 @@ pub fn ws_subscribe_applied(
 pub fn ws_subscription_rotated(
     period: &str,
     slug: &str,
-    prev_market_ids: &[String],
+    prev_market_id: Option<&str>,
     prev_asset_ids: &[String],
-    new_market_ids: &[String],
+    new_market_id: Option<&str>,
     new_asset_ids: &[String],
 ) {
     if !WS_LOG_ENABLED {
         return;
     }
-    let pm = if prev_market_ids.is_empty() {
-        "(нет)".into()
-    } else {
-        prev_market_ids.join(", ")
-    };
+    let pm = prev_market_id.unwrap_or("(нет)");
     let pa = if prev_asset_ids.is_empty() {
         "(нет)".into()
     } else {
         prev_asset_ids.join(", ")
     };
-    let nm = if new_market_ids.is_empty() {
-        "(нет)".into()
-    } else {
-        new_market_ids.join(", ")
-    };
+    let nm = new_market_id.unwrap_or("(нет)");
     let na = if new_asset_ids.is_empty() {
         "(нет)".into()
     } else {
         new_asset_ids.join(", ")
     };
     crate::tee_eprintln!(
-        "[{period}] ws: смена подписки на сокете | slug={slug} | было market=[{pm}] asset=[{pa}] | стало market=[{nm}] asset=[{na}]"
+        "[{period}] ws: смена подписки на сокете | slug={slug} | было market={pm} asset=[{pa}] | стало market={nm} asset=[{na}]"
     );
 }
 

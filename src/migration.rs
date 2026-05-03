@@ -474,7 +474,7 @@ fn legacy_to_current(legacy: LegacyXFrame<SIZE>) -> XFrame<SIZE> {
     }
 }
 
-fn current_schema_size() -> usize {
+pub fn current_schema_size() -> usize {
     bincode::serialized_size(&XFrame::<SIZE>::default())
         .expect("XFrame::<SIZE>::default() must be bincode-serializable") as usize
 }

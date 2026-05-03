@@ -15,6 +15,7 @@ pub mod history_sim;
 pub mod real_sim;
 pub mod account;
 pub mod migration;
+pub mod migration_price_to_beat;
 pub mod trade_csv_log;
 pub mod poly_chain;
 
@@ -54,6 +55,15 @@ enum AppMode {
     /// `XFrame` (см. `migration::run_migration`). Вызывается вручную через
     /// `STATUS=migrate`; идемпотентна — повторный запуск ничего не сделает.
     Migrate,
+    /// Одноразовая миграция `price_to_beat` уже сохранённых дампов
+    /// `xframes/{currency}/<size>/...` (см.
+    /// `migration_price_to_beat::run_price_to_beat_migration`). Перетягивает
+    /// точный `priceToBeat` со страницы `polymarket.com/event/{slug}` (HTTP,
+    /// не Gamma API) и пересчитывает зависимые поля кадра
+    /// (`currency_price_vs_beat_pct`, `sibling_currency_price_vs_beat_pct`).
+    /// Запускается через `STATUS=migrate_price_to_beat`; идемпотентна —
+    /// повторный запуск на уже исправленных дампах их не меняет.
+    MigratePriceToBeat,
 }
 
 impl AppMode {
@@ -64,6 +74,7 @@ impl AppMode {
             Ok("train_and_history_sim") => AppMode::TrainAndHistorySim,
             Ok("real_sim")              => AppMode::RealSim,
             Ok("migrate")               => AppMode::Migrate,
+            Ok("migrate_price_to_beat") => AppMode::MigratePriceToBeat,
             _                           => AppMode::Default,
         }
     }
@@ -104,6 +115,14 @@ async fn main() -> Result<()> {
         }
         AppMode::Migrate => {
             migration::run_migration()?;
+        }
+        AppMode::MigratePriceToBeat => {
+            // rustls нужен для HTTPS-запросов на polymarket.com через
+            // `reqwest`; ставим default-провайдер один раз на процесс.
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("rustls: install ring CryptoProvider (needed for HTTPS)");
+            migration_price_to_beat::run_price_to_beat_migration().await?;
         }
         AppMode::Default => {
             rustls::crypto::ring::default_provider()

@@ -53,10 +53,10 @@ pub async fn update_currency_updown_sibling_slots(
     sibling_state: Arc<RwLock<CurrencyUpDownSiblingState>>,
     interval_sec: i64,
     slug_window_start_unix_sec: i64,
-    market_ids: &[String],
+    market_id: Option<&str>,
     gamma_question: Option<&str>,
 ) {
-    let Some(condition_id) = market_ids.iter().filter(|s| !s.is_empty()).min().cloned() else {
+    let Some(condition_id) = market_id.filter(|s| !s.is_empty()).map(|s| s.to_string()) else {
         return;
     };
 

@@ -35,7 +35,9 @@ pub struct MarketWsSubscription {
     pub period: &'static str,
     pub slug: String,
     pub asset_ids: Vec<String>,
-    pub market_ids: Vec<String>,
+    /// `condition_id` маркета. У up/down ровно один на окно (две стороны YES/NO
+    /// живут под одним `market_id`); `None` — если Gamma не вернула condition_id.
+    pub market_id: Option<String>,
     pub period_sec: i64,
     pub window_start_sec: i64,
     pub gamma_question: Option<String>,
@@ -159,7 +161,7 @@ async fn run_persistent_interval_market_ws_inner(
             run_log::ws_subscribe_applied(
                 cmd.period,
                 &cmd.slug,
-                &cmd.market_ids,
+                cmd.market_id.as_deref(),
                 &active_asset_ids.iter().cloned().collect::<Vec<_>>(),
                 had_prior_successful_market_subscription,
             );
@@ -167,7 +169,7 @@ async fn run_persistent_interval_market_ws_inner(
                 project_manager.currency_updown_sibling_state.clone(),
                 cmd.period_sec,
                 cmd.window_start_sec,
-                &cmd.market_ids,
+                cmd.market_id.as_deref(),
                 cmd.gamma_question.as_deref(),
             )
             .await;
@@ -272,9 +274,9 @@ async fn run_persistent_interval_market_ws_inner(
                                     run_log::ws_subscription_rotated(
                                         next_command.period,
                                         &next_command.slug,
-                                        &prev.market_ids,
+                                        prev.market_id.as_deref(),
                                         &prev.asset_ids,
-                                        &next_command.market_ids,
+                                        next_command.market_id.as_deref(),
                                         &next_command.asset_ids,
                                     );
                                 }
@@ -283,7 +285,7 @@ async fn run_persistent_interval_market_ws_inner(
                                 project_manager.currency_updown_sibling_state.clone(),
                                 next_command.period_sec,
                                 next_command.window_start_sec,
-                                &next_command.market_ids,
+                                next_command.market_id.as_deref(),
                                 next_command.gamma_question.as_deref(),
                             )
                             .await;
