@@ -31,7 +31,7 @@ use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
     Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
 };
-use crate::xframe::{apply_side_symmetry, BookLevel, XFrame, SIZE, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
+use crate::xframe::{apply_side_symmetry, BookLevel, XFrame, SIZE, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP};
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println};
 use std::fs;
@@ -41,7 +41,7 @@ use xgb::{Booster, DMatrix};
 /// Порог сырого предсказания модели (0.0–1.0) для рассмотрения входа в позицию.
 /// Дальнейшую селекцию делает Kelly (`f* > 0`), поэтому порог служит только
 /// грубым префильтром, отсекающим заведомо шумовые сигналы.
-pub const SIM_BUY_THRESHOLD: f32 = 0.50;
+pub const SIM_BUY_THRESHOLD: f32 = 0.65;
 
 /// Максимально допустимое отклонение VWAP от лучшей цены L1 (доля) при
 /// симуляции исполнения ([`book_fill_buy`], [`book_fill_sell`], strict-ветки).
@@ -49,13 +49,13 @@ pub const SIM_BUY_THRESHOLD: f32 = 0.50;
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый виртуальный банкролл (USDC).
-pub const INITIAL_BANKROLL: f64 = 1000.0;
+pub const INITIAL_BANKROLL: f64 = 50.0;
 /// Множитель Келли: `1.0` = full-Kelly, `0.5` = half-Kelly (меньше размер — меньше volatility).
 pub const KELLY_MULTIPLIER: f64 = 0.1;
 /// Максимальная доля банкролла на одну сделку.
 pub const MAX_BET_FRACTION: f64 = 0.10;
 /// Минимальный размер позиции в USDC (меньше — не торгуем).
-pub const MIN_POSITION_USD: f64 = 0.00;
+pub const MIN_POSITION_USD: f64 = 0.01;
 
 /// Базовый размер позиции в USDC для **диагностического** прогона
 /// `is_kelly = false` (см. [`run_sim_mode`]). В этом режиме отключены и
@@ -106,8 +106,19 @@ pub const EV_EXIT_P_WIN_EMA_ALPHA: f64 = 0.3;
 /// эффекты (шум модели, неполнота bid-стака, погрешность калибровки).
 pub const EV_EXIT_MARGIN: f64 = 0.01;
 
+/// Максимальное число кадров, которое позиция может удерживаться без
+/// срабатывания TP/SL/EV-правила. По достижении этого предела
+/// [`sell_gate`] возвращает [`CloseReason::Timeout`] — боковик дольше
+/// этого срока торговать невыгодно (ML-модель размечена на горизонте
+/// той же длины: y-метку выдаёт [`crate::xframe::calc_y_train_pnl`] /
+/// [`crate::xframe::calc_y_train_resolution`] на их собственном
+/// `n = Y_TRAIN_HORIZON_FRAMES`). Совпадает по значению с y-разметкой
+/// **намеренно**: на за-горизонтных кадрах модель не обучалась, её
+/// предсказание там некалибровано — лучше выйти по рынку.
+pub const POSITION_TIMEOUT_FRAMES: usize = 20;
+
 /// Минимальный остаток времени до конца маркета (мс) для открытия НОВОЙ
-/// позиции: `Y_TRAIN_HORIZON_FRAMES × step_sec × 1000` при симуляции на
+/// позиции: `POSITION_TIMEOUT_FRAMES × step_sec × 1000` при симуляции на
 /// 1s-моделях = 15 с. Ближе к резолюции TP/SL за горизонт физически не
 /// успевают сработать — вход вырождается в лотерею с уплатой taker-fee.
 /// Используется в [`buy_gate`] как ранний отказ под именем `LateEntry`.
@@ -519,7 +530,7 @@ pub struct OpenPosition {
 pub enum CloseReason {
     TakeProfit,
     StopLoss,
-    /// Позиция удерживалась больше [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL — боковик, выход по рынку.
+    /// Позиция удерживалась больше [`POSITION_TIMEOUT_FRAMES`] кадров без TP/SL — боковик, выход по рынку.
     Timeout,
     /// EV-правило сработало в hold zone **с прибылью** (`EV_sell > entry_cost`):
     /// рыночный выход даёт больше USDC, чем вложили на вход. Рыночный выход
@@ -595,7 +606,7 @@ pub struct SideStats {
     /// Всегда `pnl < 0` (теряется весь `entry_cost`), отдельной
     /// разбивки по знаку pnl не нужно.
     pub(crate) resolution_loss: usize,
-    /// Число выходов по таймауту: позиция удерживалась >= [`crate::xframe::Y_TRAIN_HORIZON_FRAMES`] кадров без TP/SL.
+    /// Число выходов по таймауту: позиция удерживалась >= [`POSITION_TIMEOUT_FRAMES`] кадров без TP/SL.
     pub(crate) timeout_count: usize,
     /// Число прибыльных EV-exit-ов (см. [`CloseReason::EvExitProfit`]).
     pub(crate) ev_exit_profit_count: usize,
@@ -1907,7 +1918,7 @@ pub(crate) fn sell_gate(
     if delta <= Y_TRAIN_STOP_LOSS_PP {
         return SellGate::Close { exit_price: current_prob, reason: CloseReason::StopLoss };
     }
-    if frames_held >= Y_TRAIN_HORIZON_FRAMES {
+    if frames_held >= POSITION_TIMEOUT_FRAMES {
         return SellGate::Close { exit_price: current_prob, reason: CloseReason::Timeout };
     }
     SellGate::HoldPnl
