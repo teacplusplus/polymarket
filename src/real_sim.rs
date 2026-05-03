@@ -246,6 +246,40 @@ pub(crate) fn interval_label(kind: XFrameIntervalKind) -> &'static str {
     }
 }
 
+/// Восстанавливает Polymarket-URL события для текущего тика real_sim:
+/// `https://polymarket.com/event/{currency}-updown-{period}-{window_start_sec}`.
+///
+/// `event_start_ms` приходит из [`crate::project_manager::LaneFrame`] —
+/// это `start_ms` события из Gamma API
+/// ([`crate::project_manager::MarketEventData`]), снапшоченный в момент
+/// фанаута. Polymarket выравнивает окна по UTC-сетке (`window_start_sec`
+/// кратен `300` / `900`), поэтому из `start_ms` `window_start_sec`
+/// получается простым делением — никаких округлений и риска
+/// промахнуться на соседнее окно.
+///
+/// Возвращает пустую строку, если `event_start_ms = None` (Gamma-fetch
+/// для маркета ещё не пришёл к моменту фанаута); в этом случае
+/// `OpenPosition.polymarket_url` ляжет пустой.
+///
+/// Slug-формат симметричен с
+/// [`crate::history_sim::polymarket_event_url_from_dump_path`], так что
+/// per-trade CSV из real_sim и history_sim джойнятся по `polymarket_url`.
+fn polymarket_event_url_from_frame(
+    currency: &str,
+    interval_kind: XFrameIntervalKind,
+    event_start_ms: Option<i64>,
+) -> String {
+    let Some(start_ms) = event_start_ms else {
+        return String::new();
+    };
+    let window_start_sec = start_ms / 1_000;
+    format!(
+        "https://polymarket.com/event/{currency}-updown-{interval}-{window_start_sec}",
+        currency = currency.to_lowercase(),
+        interval = interval_label(interval_kind),
+    )
+}
+
 pub(crate) fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
     match side {
         CurrencyUpDownOutcome::Up => "up",
@@ -436,6 +470,8 @@ async fn tick_once(
     let LaneFrame {
         market_id,
         asset_id,
+        event_start_ms,
+        price_to_beat,
         frame,
     } = lane_frame;
 
@@ -885,6 +921,19 @@ async fn tick_once(
                     .map(|p| p.entry_cost)
                     .sum();
                 let available_bankroll_post = (*bankroll - cross_lanes_locked - same_locked_post).max(0.0);
+                // URL события для per-trade CSV: берём `event_start_ms`,
+                // который пришёл вместе с фреймом из фанаута
+                // [`crate::project_manager::LaneFrame::event_start_ms`].
+                // На текущей конфигурации `init_trade_csv_log_file`
+                // real_sim не открывает — `write_trade_csv_row` в
+                // no-op'е, но поле `OpenPosition.polymarket_url` всё
+                // равно полезно для локальных eprintln-дебагов и при
+                // включении CSV в real_sim в будущем.
+                let polymarket_url = polymarket_event_url_from_frame(
+                    currency,
+                    interval_kind,
+                    event_start_ms,
+                );
                 bought = try_open_position(
                     &frame,
                     pnl_inference,
@@ -894,6 +943,14 @@ async fn tick_once(
                     strict_book.as_ref(),
                     currency,
                     true,
+                    &polymarket_url,
+                    // `price_to_beat` снапшочится фанаутом из
+                    // [`crate::project_manager::ProjectManager::price_to_beat_by_market`]
+                    // и приезжает сюда в `LaneFrame`. `final_price`
+                    // на момент входа физически неизвестен — маркет
+                    // ещё не разрешён, и пишется на резолюции.
+                    price_to_beat,
+                    None,
                 );
             }
         }

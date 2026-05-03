@@ -87,7 +87,12 @@ pub fn set_current_regime(regime: &'static str) {
 /// с `write_pending_row_to_file`. Первая колонка `regime` — `kelly` /
 /// `raw` / пусто (см. [`set_current_regime`]). Последняя — `final_outcome`
 /// (`win` / `loss` / `unknown`), см. [`record_market_outcome`].
-const TRADE_CSV_HEADER: &str = "regime,currency,interval,side,market_id,asset_id,exit_reason,\
+///
+/// `polymarket_url`, `price_to_beat` и `final_price` идут блоком после
+/// `regime` — это **per-market** контекст (одинаков для всех трейдов
+/// одного дампа). Удобно для группировки в pandas / визуального чтения.
+const TRADE_CSV_HEADER: &str = "regime,polymarket_url,price_to_beat,final_price,\
+currency,interval,side,market_id,asset_id,exit_reason,\
 entry_prob,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
 frames_held,p_win_ema_at_close,event_remaining_ms_at_open,event_remaining_ms_at_close,\
 final_outcome";
@@ -150,6 +155,17 @@ pub fn finish_trade_csv_log() {
 /// (стандартное поведение для NULL).
 #[derive(Debug, Clone, Copy)]
 pub struct TradeCsvRow<'a> {
+    /// Polymarket-URL события (`https://polymarket.com/event/<slug>`),
+    /// см. [`crate::history_sim::OpenPosition::polymarket_url`]. Пустая
+    /// строка — URL не известен (real_sim / распарсить имя дампа не
+    /// удалось); в этом случае колонка пишется пустой.
+    pub polymarket_url: &'a str,
+    /// `priceToBeat` маркета (см. [`crate::history_sim::OpenPosition::price_to_beat`]).
+    /// `None` пишется пустой ячейкой.
+    pub price_to_beat: Option<f64>,
+    /// `finalPrice` маркета (см. [`crate::history_sim::OpenPosition::final_price`]).
+    /// `None` пишется пустой ячейкой.
+    pub final_price: Option<f64>,
     /// Валюта (`btc` / …). Берётся из `lane_key.0` или `frame.asset_id`-mapping.
     pub currency: &'a str,
     /// Лейбл интервала (`5m` / `15m`).
@@ -189,6 +205,9 @@ pub struct TradeCsvRow<'a> {
 #[derive(Debug, Clone)]
 struct PendingTradeRow {
     regime: &'static str,
+    polymarket_url: String,
+    price_to_beat: Option<f64>,
+    final_price: Option<f64>,
     currency: String,
     interval: String,
     side: String,
@@ -225,6 +244,9 @@ pub fn write_trade_csv_row(row: TradeCsvRow<'_>) {
         .unwrap_or("");
     let owned = PendingTradeRow {
         regime,
+        polymarket_url: row.polymarket_url.to_string(),
+        price_to_beat: row.price_to_beat,
+        final_price: row.final_price,
         currency: row.currency.to_string(),
         interval: row.interval.to_string(),
         side: row.side.to_string(),
@@ -311,8 +333,11 @@ fn write_pending_row_to_file(
 ) {
     let _ = writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         row.regime,
+        csv_escape(&row.polymarket_url),
+        row.price_to_beat.map(fmt_f64).unwrap_or_default(),
+        row.final_price.map(fmt_f64).unwrap_or_default(),
         csv_escape(&row.currency),
         csv_escape(&row.interval),
         csv_escape(&row.side),

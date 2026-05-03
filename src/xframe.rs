@@ -987,7 +987,30 @@ pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
 /// Если эта связка нарушится (значения разойдутся), runtime будет
 /// торговать на тиках, которые модель не видела при обучении, — это
 /// прямой источник bias'а между симуляцией и live-режимом.
-pub const Y_TRAIN_HORIZON_FRAMES: usize = 10;
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 5;
+
+/// Нижняя граница **исключённого** центра распределения `currency_implied_prob`
+/// для [`calc_y_train_pnl`]: модель учится **только на хвостах** —
+/// `p_buy ≤ Y_TRAIN_NO_TRADE_PROB_LOW` или `p_buy ≥ Y_TRAIN_NO_TRADE_PROB_HIGH`.
+/// Кадры с `p_buy ∈ (LOW, HIGH)` (центр) возвращают `None` и в train/val
+/// не попадают.
+///
+/// Семантика: «торгуем только направленные рынки». В центре `[0.3..0.7]`
+/// рынок balanced — обе стороны примерно равновероятны, edge модели
+/// размазан, шум резолюции преобладает. На хвостах же доминирующая
+/// сторона уже выявлена ценой (`p_buy ≥ 0.7` ⇒ market priced YES win),
+/// и y-метка более чисто отражает «оправдалась ли market expectation».
+///
+/// Runtime-фильтр в [`crate::history_sim::buy_gate`] синхронизирован
+/// с этой константой: при `entry_prob ∈ (LOW, HIGH)` возвращается
+/// `BuyGate::EntryProbOutOfRange` и инкрементируется `entry_prob_skips`,
+/// поэтому inference происходит только на хвостах — на том же
+/// распределении, на котором училась модель.
+pub const Y_TRAIN_NO_TRADE_PROB_LOW: f64 = 0.3;
+
+/// Верхняя граница исключённого центра для y-разметки.
+/// См. [`Y_TRAIN_NO_TRADE_PROB_LOW`] для обоснования.
+pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.7;
 
 /// Целевой нотионал позиции (gross USDC), под который размечаются Y-метки
 /// [`calc_y_train_pnl`] / [`calc_y_train_resolution`]. Совпадает с типичным
@@ -1421,6 +1444,16 @@ pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price
     let up_won = final_price >= price_to_beat;
     let current = x_frames.get(index)?;
     let p_buy = current.currency_implied_prob?.clamp(0.001, 0.999);
+
+    // Фильтр «только хвосты»: учим модель на направленных рынках,
+    // где доминирующая сторона уже выявлена ценой
+    // (`p_buy ≤ NO_TRADE_LOW` или `p_buy ≥ NO_TRADE_HIGH`).
+    // В центре `(LOW..HIGH)` рынок balanced, шум резолюции преобладает
+    // над edge'ем модели — кадры центра возвращают `None` и в train/val
+    // не попадают. См. doc у `Y_TRAIN_NO_TRADE_PROB_LOW`.
+    if p_buy > Y_TRAIN_NO_TRADE_PROB_LOW && p_buy < Y_TRAIN_NO_TRADE_PROB_HIGH {
+        return Some(0.0);
+    }
 
     // Размечаем PnL «$1 USDC gross» — после деления получаем долю в [-1.0, +∞),
     // так что `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` — это сразу

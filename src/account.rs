@@ -543,6 +543,9 @@ impl Account {
                             "ResolutionLoss"
                         };
                         crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
+                            polymarket_url: &pos.polymarket_url,
+                            price_to_beat: pos.price_to_beat,
+                            final_price: pos.final_price,
                             currency: cur,
                             interval: interval_str,
                             side: side_str,

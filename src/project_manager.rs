@@ -49,6 +49,19 @@ struct PrevMarket {
 pub struct LaneFrame {
     pub market_id: String,
     pub asset_id: String,
+    /// `start_ms` события из [`MarketEventData`] (Gamma `startDate`).
+    /// Используется в [`crate::real_sim::tick_once`] для построения
+    /// Polymarket-URL без обращения к wall-clock — т.е. без округления
+    /// и риска промахнуться на соседнее окно. `None`, если на момент
+    /// фанаута `event_data_by_market[market_id].start_ms` ещё не
+    /// заполнен (Gamma-fetch не пришёл / отстал).
+    pub event_start_ms: Option<i64>,
+    /// `priceToBeat` маркета (спот-цена базового актива на старте окна).
+    /// Снапшочится из [`ProjectManager::price_to_beat_by_market`] в
+    /// момент фанаута. Используется в `try_open_position` →
+    /// `OpenPosition.price_to_beat` для per-trade CSV. `None`, если
+    /// `priceToBeat` ещё не заехал в кэш (event-page fetch отстал).
+    pub price_to_beat: Option<f64>,
     pub frame: XFrame<SIZE>,
 }
 
@@ -721,7 +734,29 @@ impl ProjectManager {
             }
         }
 
-        
+        // Снапшот per-market метаданных для фанаута `LaneFrame` — один
+        // read-lock на каждый источник, дальше мапа отдаётся в цикл.
+        // Без этого пришлось бы лочить `event_data_by_market` /
+        // `price_to_beat_by_market` на каждый кадр.
+        let event_start_ms_by_market: HashMap<String, Option<i64>> = {
+            let guard = self.event_data_by_market.read().await;
+            let mut map: HashMap<String, Option<i64>> = HashMap::new();
+            for entry in &built_xframes {
+                map.entry(entry.market_id.clone())
+                    .or_insert_with(|| guard.get(&entry.market_id).and_then(|d| d.start_ms));
+            }
+            map
+        };
+        let price_to_beat_by_market_snapshot: HashMap<String, Option<f64>> = {
+            let guard = self.price_to_beat_by_market.read().await;
+            let mut map: HashMap<String, Option<f64>> = HashMap::new();
+            for entry in &built_xframes {
+                map.entry(entry.market_id.clone())
+                    .or_insert_with(|| guard.get(&entry.market_id).copied());
+            }
+            map
+        };
+
         for entry in built_xframes {
             if entry.frame.stable {
                 run_log::xframe_stored(&entry.frame);
@@ -743,9 +778,19 @@ impl ProjectManager {
                         .clone();
                     let channels_guard = channels_arc.read().await;
                     if let Some(tx) = channels_guard.get(&(kind, side)) {
+                        let event_start_ms = event_start_ms_by_market
+                            .get(&entry.market_id)
+                            .copied()
+                            .flatten();
+                        let price_to_beat = price_to_beat_by_market_snapshot
+                            .get(&entry.market_id)
+                            .copied()
+                            .flatten();
                         let lane_frame = LaneFrame {
                             market_id: entry.market_id.clone(),
                             asset_id: entry.asset_id.clone(),
+                            event_start_ms,
+                            price_to_beat,
                             frame: entry.frame.clone(),
                         };
                         // Ранее использовался `try_send` — на медленном
