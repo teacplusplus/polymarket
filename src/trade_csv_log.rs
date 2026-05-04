@@ -91,11 +91,16 @@ pub fn set_current_regime(regime: &'static str) {
 /// `polymarket_url`, `price_to_beat` и `final_price` идут блоком после
 /// `regime` — это **per-market** контекст (одинаков для всех трейдов
 /// одного дампа). Удобно для группировки в pandas / визуального чтения.
+///
+/// `open_unix_ms` / `close_unix_ms` — wall-clock метки входа и выхода
+/// (UTC, ms). В history_sim рассчитываются из имени `.bin`-дампа
+/// (см. [`crate::history_sim::window_bounds_from_dump_path`]) и
+/// `event_remaining_ms_at_*`; в real_sim выходят пустыми.
 const TRADE_CSV_HEADER: &str = "regime,polymarket_url,price_to_beat,final_price,\
 currency,interval,side,market_id,asset_id,exit_reason,\
-entry_prob,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
+buy_price,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
 frames_held,p_win_ema_at_close,event_remaining_ms_at_open,event_remaining_ms_at_close,\
-final_outcome";
+open_unix_ms,close_unix_ms,final_outcome";
 
 /// Открывает / перезаписывает файл `path` и записывает CSV-заголовок.
 /// Идемпотентен в смысле «последний победил»: повторный вызов закроет
@@ -177,7 +182,13 @@ pub struct TradeCsvRow<'a> {
     /// `TP` / `SL` / `Timeout` / `EvExitProfit` / `EvExitLoss` /
     /// `ResolutionWin` / `ResolutionLoss`.
     pub exit_reason: &'static str,
-    pub entry_prob: f64,
+    /// Фактический VWAP заполнения buy-ордера (`book_fill_buy` /
+    /// `book_fill_buy_strict`) — реальная цена, по которой купили шеры.
+    /// Берётся из [`crate::history_sim::OpenPosition::buy_price`]. Это
+    /// «честная» цена входа для оценки сделки: при широком спреде
+    /// `currency_implied_prob` (mid/last_trade) может далеко расходиться
+    /// с фактическим ask, по которому проходил fill.
+    pub buy_price: f64,
     pub raw_pred: f32,
     pub cal_pred: f32,
     pub kelly_f: f64,
@@ -196,6 +207,14 @@ pub struct TradeCsvRow<'a> {
     /// Текущий `event_remaining_ms` (на момент закрытия). `0` если
     /// резолюция уже состоялась.
     pub event_remaining_ms_at_close: i64,
+    /// Wall-clock UTC ms открытия позиции (см.
+    /// [`crate::history_sim::OpenPosition::event_end_ms`]). `None` —
+    /// wall-clock не известен (real_sim или имя дампа не распарсилось);
+    /// в этом случае колонка пишется пустой.
+    pub open_unix_ms: Option<i64>,
+    /// Wall-clock UTC ms закрытия позиции. Семантика `None` —
+    /// та же, что у [`Self::open_unix_ms`].
+    pub close_unix_ms: Option<i64>,
 }
 
 /// Owned-копия [`TradeCsvRow`] для буферизации до момента, когда
@@ -214,7 +233,7 @@ struct PendingTradeRow {
     market_id: String,
     asset_id: String,
     exit_reason: &'static str,
-    entry_prob: f64,
+    buy_price: f64,
     raw_pred: f32,
     cal_pred: f32,
     kelly_f: f64,
@@ -227,6 +246,8 @@ struct PendingTradeRow {
     p_win_ema_at_close: Option<f64>,
     event_remaining_ms_at_open: i64,
     event_remaining_ms_at_close: i64,
+    open_unix_ms: Option<i64>,
+    close_unix_ms: Option<i64>,
 }
 
 /// Кладёт одну строку в in-memory буфер [`TRADE_CSV_PENDING`]. Не пишет
@@ -253,7 +274,7 @@ pub fn write_trade_csv_row(row: TradeCsvRow<'_>) {
         market_id: row.market_id.to_string(),
         asset_id: row.asset_id.to_string(),
         exit_reason: row.exit_reason,
-        entry_prob: row.entry_prob,
+        buy_price: row.buy_price,
         raw_pred: row.raw_pred,
         cal_pred: row.cal_pred,
         kelly_f: row.kelly_f,
@@ -266,6 +287,8 @@ pub fn write_trade_csv_row(row: TradeCsvRow<'_>) {
         p_win_ema_at_close: row.p_win_ema_at_close,
         event_remaining_ms_at_open: row.event_remaining_ms_at_open,
         event_remaining_ms_at_close: row.event_remaining_ms_at_close,
+        open_unix_ms: row.open_unix_ms,
+        close_unix_ms: row.close_unix_ms,
     };
     if let Ok(mut pending) = TRADE_CSV_PENDING.lock() {
         pending.push(owned);
@@ -305,6 +328,7 @@ pub fn record_market_outcome(market_id: &str, up_won: bool) {
     if to_flush.is_empty() {
         return;
     }
+
     let Ok(mut guard) = TRADE_CSV_LOG.lock() else {
         return;
     };
@@ -312,14 +336,19 @@ pub fn record_market_outcome(market_id: &str, up_won: bool) {
         return;
     };
     for row in to_flush {
-        let outcome = match row.side.as_str() {
-            "up" => if up_won { "win" } else { "loss" },
-            "down" => if up_won { "loss" } else { "win" },
-            _ => "unknown",
-        };
+        let outcome = outcome_for_side(&row.side, up_won);
         write_pending_row_to_file(w, &row, outcome);
     }
     let _ = w.flush();
+}
+
+/// Вспомогательная: маппинг `side` → `win`/`loss` по флагу `up_won`.
+fn outcome_for_side(side: &str, up_won: bool) -> &'static str {
+    match side {
+        "up" => if up_won { "win" } else { "loss" },
+        "down" => if up_won { "loss" } else { "win" },
+        _ => "unknown",
+    }
 }
 
 /// Сериализует одну [`PendingTradeRow`] в CSV-файл. `final_outcome` —
@@ -333,7 +362,7 @@ fn write_pending_row_to_file(
 ) {
     let _ = writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         row.regime,
         csv_escape(&row.polymarket_url),
         row.price_to_beat.map(fmt_f64).unwrap_or_default(),
@@ -344,7 +373,7 @@ fn write_pending_row_to_file(
         csv_escape(&row.market_id),
         csv_escape(&row.asset_id),
         row.exit_reason,
-        fmt_f64(row.entry_prob),
+        fmt_f64(row.buy_price),
         fmt_f32(row.raw_pred),
         fmt_f32(row.cal_pred),
         fmt_f64(row.kelly_f),
@@ -357,6 +386,8 @@ fn write_pending_row_to_file(
         row.p_win_ema_at_close.map(fmt_f64).unwrap_or_default(),
         row.event_remaining_ms_at_open,
         row.event_remaining_ms_at_close,
+        row.open_unix_ms.map(|v| v.to_string()).unwrap_or_default(),
+        row.close_unix_ms.map(|v| v.to_string()).unwrap_or_default(),
         csv_escape(final_outcome),
     );
 }

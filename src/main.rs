@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
             // Train пишет в `xframes/last_train_mode.txt`, sim — в
             // `xframes/last_history_sim.txt`. Между двумя фазами
             // явно дёргаем `tee_log::finish_tee_log`, чтобы первый файл
-            // полностью смылся на диск (на случай if `run_sim_mode`
+            // полностью смылся на диск (на случай если `run_sim_mode`
             // упадёт — обучение всё равно сохранится).
             train_mode::run_train_mode()?;
             tee_log::finish_tee_log();

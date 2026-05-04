@@ -31,52 +31,24 @@ use tokio::time::{self, Duration};
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
 
-/// Состояние предыдущего маркета: передаётся в [`spawn_bg_price_to_beat_refine`],
-/// который при дампе использует `final_price = current_exact` (свой fetch) и
-/// `price_to_beat = prev_exact`, **полученный по `oneshot`-каналу от refine
-/// предыдущей итерации** (а не повторным HTTP-fetch'ом — это была лишняя
-/// работа: каждая итерация и так фетчит exact для своего окна, и этот же
-/// `current_exact` через `exact_price_to_beat_rx` достаётся следующей итерации).
+/// Prev-маркет для дампа: `final_price` = exact текущего окна, `price_to_beat` = exact из `exact_price_to_beat_rx` (без повторного HTTP).
 struct PrevMarket {
     market_id: Option<String>,
     gamma_question: Option<String>,
-    /// `window_start_sec` prev-окна. refine следующей итерации сверяет, что
-    /// `current_window_start_sec - prev.window_start_sec == period_sec`: если
-    /// главный цикл «отстал» и перепрыгнул через окна (тяжёлый тик +
-    /// `continue`-ветки между `prev_market.take()` и переприсваиванием),
-    /// `current_exact` будет относиться не к концу prev-окна, а к концу более
-    /// позднего — `final_price` дампа prev'a получился бы рассогласованным.
-    /// Чтобы не писать такой битый дамп, проверка триггерит skip+cleanup.
+    /// Для проверки `current_window_start_sec == prev + period` — иначе дамп prev пропускаем.
     window_start_sec: i64,
-    /// Receiver на exact `priceToBeat` от refine **этой же** итерации (prev).
-    /// Sender хранится в bg-таске prev'a и кладёт значение после успешного
-    /// retry-fetch'а; refine следующей итерации `await`-ит и использует
-    /// результат как `prev_price_to_beat` для дампа. `Err(RecvError)` — если
-    /// prev-refine не достал exact и дропнул sender (тогда дамп пропускается).
+    /// Exact PTB от refine этой итерации; следующий refine ждёт для пары в дампе.
     exact_price_to_beat_rx: oneshot::Receiver<f64>,
 }
 
-/// Свежесобранный `stable` [`XFrame`] лейна 1s, который фанаутится
-/// подписчикам через [`ProjectManager::real_sim_state`] →
-/// [`crate::real_sim::RealSimState::lane_frame_channels`] сразу после
-/// записи в `xframes_by_market[0]`. Используется в [`crate::real_sim`] как
-/// push-источник кадров (вместо поллинга `xframes_by_market` раз в секунду).
+/// Стабильный кадр лейна 1s → [`real_sim`](crate::real_sim) по каналам (без поллинга `xframes_by_market`).
 #[derive(Clone, Debug)]
 pub struct LaneFrame {
     pub market_id: String,
     pub asset_id: String,
-    /// `start_ms` события из [`MarketEventData`] (Gamma `startDate`).
-    /// Используется в [`crate::real_sim::tick_once`] для построения
-    /// Polymarket-URL без обращения к wall-clock — т.е. без округления
-    /// и риска промахнуться на соседнее окно. `None`, если на момент
-    /// фанаута `event_data_by_market[market_id].start_ms` ещё не
-    /// заполнен (Gamma-fetch не пришёл / отстал).
+    /// Gamma `startDate` для URL в [`tick_once`](crate::real_sim::tick_once); `None`, если Gamma ещё не подтянулся.
     pub event_start_ms: Option<i64>,
-    /// `priceToBeat` маркета (спот-цена базового актива на старте окна).
-    /// Снапшочится из [`ProjectManager::price_to_beat_by_market`] в
-    /// момент фанаута. Используется в `try_open_position` →
-    /// `OpenPosition.price_to_beat` для per-trade CSV. `None`, если
-    /// `priceToBeat` ещё не заехал в кэш (event-page fetch отстал).
+    /// Кэш PTB на момент фанаута → CSV; `None`, если страница ещё не дала значение.
     pub price_to_beat: Option<f64>,
     pub frame: XFrame<SIZE>,
 }
@@ -91,7 +63,7 @@ pub struct WsStreamEntry {
     pub payload_raw: String,
 }
 
-/// Кадр, собранный в этом тике `build_frames_from_buffer_lane_once`, до записи в соответствующий лейн `xframes_by_market`.
+/// Результат одного тика сборщика до записи в `xframes_by_market`.
 struct BuiltXframeEntry {
     market_id: String,
     asset_id: String,
@@ -99,9 +71,9 @@ struct BuiltXframeEntry {
     frame: XFrame<SIZE>,
 }
 
-/// Период тика сборщика XFrame по лейну (секунды); каждый лейн собирает кадры для **всех** рынков (и 5m и 15m) с соответствующим шагом — для моделей XGBoost с разной частотой агрегации.
+/// Интервал(s) тика сборщика по лейну; один лейн — все маркеты на этом шаге.
 pub const FRAME_BUILD_INTERVALS_SEC: [u64; 1] = [1];
-/// Размер очереди команд смены подписки на единый market WS (5m и 15m вместе).
+/// Очередь команд единого market WS (5m+15m).
 const MARKET_WS_SUBSCRIPTION_CHANNEL_CAP: usize = 8;
 
 #[derive(Debug, Clone, Default)]
@@ -137,15 +109,7 @@ pub struct ProjectManager {
 }
 
 impl ProjectManager {
-    /// Создаёт `ProjectManager` и запускает фоновые таски (WS, сборщик фреймов,
-    /// up/down-интервалы).
-    ///
-    /// `RealSimState` создаётся всегда с пустой картой каналов
-    /// [`crate::real_sim::LaneFrameChannels`]: в режиме `real_sim`
-    /// ([`crate::real_sim::run_real_sim`]) воркеры сами создают свои каналы и
-    /// регистрируют `(Sender, dummy_rx)` в карте, а в остальных режимах карта
-    /// так и остаётся пустой — фанаут `get` возвращает `None` и кадры молча
-    /// отбрасываются (без спама `Full`/`Closed`).
+    /// WS, сборщик XFrame, циклы 5m/15m. Карта каналов [`LaneFrameChannels`](crate::real_sim::LaneFrameChannels) пуста до регистрации воркерами `real_sim`.
     pub fn new(currency: String, account: SharedAccount) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
@@ -271,8 +235,7 @@ impl ProjectManager {
         }
     }
 
-    /// Восстанавливает те же поля, что даёт [`fetch_gamma_event_data_for_slug`], из кэшей
-    /// [`Self::slug_to_market_id`], [`Self::event_data_by_market`], [`Self::market_asset_ids_by_market`], [`Self::currency_up_down_by_asset_id`].
+    /// Как [`fetch_gamma_event_data_for_slug`](crate::util::fetch_gamma_event_data_for_slug), но из кэшей PM.
     async fn try_restore_currency_event_from_slug_cache(
         &self,
         slug: &str,
@@ -343,7 +306,7 @@ impl ProjectManager {
         asset_ids.iter().all(|aid| cu.contains_key(aid))
     }
 
-    /// Удаляет все данные, накопленные для завершённого маркета, из всех кешей `ProjectManager`.
+    /// Снос всех кэшей по `market_id`.
     pub async fn cleanup_stale_market_data(&self, market_id: &str) {
         let asset_ids: HashSet<String> = self
             .market_asset_ids_by_market
@@ -404,7 +367,7 @@ impl ProjectManager {
         }
     }
 
-    /// Загружает данные окна из Gamma, вызывает [`Self::merge_market_event_data`] и возвращает те же поля, что [`Self::try_restore_currency_event_from_slug_cache`].
+    /// Gamma + [`merge_market_event_data`]; возврат как у [`try_restore_currency_event_from_slug_cache`](Self::try_restore_currency_event_from_slug_cache).
     async fn fetch_currency_event_from_gamma_and_merge(
         &self,
         slug: &str,
@@ -443,16 +406,13 @@ impl ProjectManager {
         ))
     }
 
-    /// Перезаписывает `priceToBeat` для **одного** маркета. У up/down-маркетов
-    /// `condition_id` всегда один на окно (две стороны YES/NO живут под одним и
-    /// тем же `market_id`), поэтому интерфейс принимает `&str`, а не множество —
-    /// батчевое обновление здесь не требуется.
+    /// Один `market_id` на окно up/down — одно значение PTB в кэше.
     pub async fn merge_market_price_to_beat(&self, price_to_beat: f64, market_id: &str) {
         let mut map = self.price_to_beat_by_market.write().await;
         map.insert(market_id.to_string(), price_to_beat);
     }
 
-    /// Вызывать после успешной подписки на CLOB market WS: записывает `ws_connect_wall_ms` по каждому `asset_id` для [`crate::xframe::compute_xframe_stable`].
+    /// После подписки на market WS — wall time для [`compute_xframe_stable`](crate::xframe::compute_xframe_stable).
     pub async fn record_ws_connect_wall_ms_for_asset_ids(&self, asset_ids: &[String]) {
         let now_ms = current_timestamp_ms();
         let mut ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.write().await;
@@ -482,10 +442,7 @@ impl ProjectManager {
         Ok(())
     }
 
-    /// Единый цикл сборки фреймов: тикает каждую секунду.
-    /// Лейн `i` собирает фреймы на каждый `FRAME_BUILD_INTERVALS_SEC[i]`-й тик.
-    /// При завершении маркета (`now_ms >= event_end_ms`) — досрочно собирает все лейны
-    /// и дампит накопленные фреймы, чтобы данные нового маркета не смешались со старым.
+    /// Спавнит цикл на каждый лейн: тик раз в `FRAME_BUILD_INTERVALS_SEC[i]` с.
     pub fn run_frame_builder_loop(self: Arc<Self>) {
         for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
             let project_manager = self.clone();
@@ -748,10 +705,6 @@ impl ProjectManager {
             }
         }
 
-        // Снапшот per-market метаданных для фанаута `LaneFrame` — один
-        // read-lock на каждый источник, дальше мапа отдаётся в цикл.
-        // Без этого пришлось бы лочить `event_data_by_market` /
-        // `price_to_beat_by_market` на каждый кадр.
         let event_start_ms_by_market: HashMap<String, Option<i64>> = {
             let guard = self.event_data_by_market.read().await;
             let mut map: HashMap<String, Option<i64>> = HashMap::new();
@@ -780,9 +733,6 @@ impl ProjectManager {
                 let kind = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type);
                 let side = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome);
                 if let (Some(kind), Some(side)) = (kind, side) {
-                    // Клонируем `Arc<RwLock<_>>` каналов из state под коротким
-                    // read-локом, дальше работаем уже через него — так
-                    // `real_sim_state` не держим во время `send().await`.
                     let channels_arc = self
                         .real_sim_state
                         .read()
@@ -807,26 +757,7 @@ impl ProjectManager {
                             price_to_beat,
                             frame: entry.frame.clone(),
                         };
-                        // Ранее использовался `try_send` — на медленном
-                        // воркере `LANE_FRAME_CHANNEL_CAP` забивался, и
-                        // фанаут ТЕРЯЛ кадры (TrySendError::Full → silent
-                        // drop через eprintln). В реальной торговле потеря
-                        // кадра означает, что воркер не увидит TP/SL триггер
-                        // именно на этом тике — позиция уедет дальше с
-                        // неактуальным состоянием. Меняем на `send().await`:
-                        // если воркер тормозит, фанаут подождёт, кадры в
-                        // канале сохраняют свой порядок, ничего не теряется.
-                        // Цена — последовательная отправка по 4 каналам:
-                        // самый медленный воркер задерживает фанаут до
-                        // освобождения слота в его канале (не более 1 сек
-                        // в стационарном режиме, потому что воркер сам
-                        // вычитывает кадры в своём loop'е).
-                        if let Err(mpsc::error::SendError(_)) = tx.send(lane_frame).await {
-                            // Канал закрыт — воркер этого `(kind, side)`
-                            // завершился (нормально на shutdown). Молча
-                            // пропускаем; других сигналов о смерти воркера
-                            // у фанаута нет.
-                        }
+                        let _ = tx.send(lane_frame).await;
                     }
                 }
             }
@@ -898,20 +829,6 @@ impl ProjectManager {
                             project_manager_cloned.fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period).await
                         {
                             run_log::gamma_event_prefetch_fetched(period, &prefetch_slug);
-                            // Хук: для каждого свежеподтянутого future-маркета планируем
-                            // on-chain `splitPosition` через `CtfCollateralAdapter`
-                            // Polymarket-а на Polygon. Гейтинг — compile-time константы
-                            // `poly_chain::SPLIT_ENABLED` / `SPLIT_CURRENCY` /
-                            // `SPLIT_PERIOD` + наличие `POLY_PRIVATE_KEY`, дедуп —
-                            // `split_done_by_market_id`. Currency и period передаём
-                            // явно, чтобы `poly_chain` сам решил, подходит ли пара.
-                            //
-                            // Фильтруем строго **из будущего**: `start_ms > now_ms`.
-                            // Маркеты без известного `start_ms` или уже стартовавшие
-                            // (`start_ms <= now_ms`) пропускаются — для них split-арбитраж
-                            // не имеет смысла (стакан уже на полпути к резолюции).
-                            // Ключи `market_event_start_ms` — это `conditionId`-ы
-                            // (см. `fetch_gamma_event_data_for_slug` в `util.rs`).
                             let now_ms = current_timestamp_ms();
                             for (condition_id, start_ms_opt) in market_event_start_ms.iter() {
                                 let Some(start_ms) = *start_ms_opt else { continue };
@@ -960,11 +877,6 @@ impl ProjectManager {
                 .max()
                 .unwrap_or(ws_end_sec * 1000);
 
-            // У up/down ровно один `condition_id` на окно — мапа
-            // `market_event_end_ms` собрана в [`Self::merge_market_event_data`]
-            // из единственного `market_id` (см. документацию [`PrevMarket`]).
-            // Поэтому держим `Option<String>`, а не `Vec<String>`: это убирает
-            // все `.first()`/`HashSet`-обвязки в дальнейшем коде.
             let market_id: Option<String> = market_event_end_ms.keys().next().cloned();
 
             let market_start_ms = market_event_start_ms
@@ -976,13 +888,7 @@ impl ProjectManager {
             let project_manager_cloned = self.clone();
             let currency = self.currency.clone();
 
-            // Phase A: быстрый получаемый «inexact» price_to_beat (RTDS или page fetch
-            // с `fallback_to_latest=true`). Цель — как можно раньше положить хоть какое-то
-            // значение в `price_to_beat_by_market`, чтобы текущие xframes этого окна
-            // уже могли заполнять `currency_price_vs_beat_pct`. Если RTDS-кэш не имеет
-            // ключа `start_ms` (а его почти никогда нет — это требование точного
-            // совпадения mс) — падаем в page fetch с fallback. exact-флаг здесь
-            // игнорируем: ниже Phase B всё равно дёргает страницу до точного матча.
+            // Быстрый PTB в кэш (RTDS по start_ms или страница с fallback); exact подтянет фон.
             let inline_ptb_opt: Option<f64> = match market_start_ms {
                 Some(start_ms) => {
                     let rtds_currency_prices_by_ms_lock = project_manager_cloned.rtds_currency_prices_by_ms.read().await;
@@ -1026,23 +932,7 @@ impl ProjectManager {
                 self.merge_market_price_to_beat(ptb, mid).await;
             }
 
-            // Phase B: фоновый refine до exact `priceToBeat` для текущего окна — НЕ
-            // блокируем основной цикл, иначе следующая `WsCommand::ActivateWindow`
-            // не успеет уйти к началу окна (см. ниже). Refine:
-            //   1) делает retry-fetch `priceToBeat` со страницы маркета до exact
-            //      и **перезаписывает** `price_to_beat_by_market[market_id]` —
-            //      чтобы более поздние кадры окна посчитали
-            //      `currency_price_vs_beat_pct` точно;
-            //   2) отправляет exact в `current_exact_tx` — refine **следующей**
-            //      итерации `await`-ит этот sender как `prev_price_to_beat`
-            //      для дампа (без повторного HTTP-fetch'а на тот же slug —
-            //      каждая итерация фетчит exact ровно один раз);
-            //   3) если есть `prev_market` — `await`-ит уже его
-            //      `exact_price_to_beat_rx` (sender хранится у refine'а
-            //      предыдущей итерации) и пишет дамп с парой
-            //      `(prev_exact, current_exact)`.
-            // Если refine за `MAX_ATTEMPTS` не достал exact — sender дропается,
-            // следующая итерация получит `Err(RecvError)` и пропустит дамп.
+            // Фон: exact PTB → кэш + oneshot для следующей итерации; дамп prev по паре exact.
             let (current_exact_tx, current_exact_rx) = oneshot::channel::<f64>();
             spawn_bg_price_to_beat_refine(
                 self.clone(),
@@ -1055,8 +945,6 @@ impl ProjectManager {
                 window_start_sec,
                 current_exact_tx,
             );
-            // Для логирования / `ws_start` / активации WS-подписки используем
-            // inline-значение (RTDS / fallback). Refine допишет exact в кэш позже.
             let price_to_beat = inline_ptb_opt;
 
             {
@@ -1086,10 +974,6 @@ impl ProjectManager {
                     continue;
                 }
 
-                // `prev_market` для следующей итерации: market_id + gamma_question
-                // (нужны для дампа), `window_start_sec` (для sanity-check
-                // непрерывности окон в refine) и `Receiver` exact `priceToBeat`,
-                // который отправит refine **этой** итерации после успешного fetch.
                 prev_market = Some(PrevMarket {
                     market_id: market_id.clone(),
                     gamma_question: gamma_question.clone(),
@@ -1120,40 +1004,7 @@ impl ProjectManager {
     }
 }
 
-/// Фоновый refine точного `priceToBeat` со страницы Polymarket.
-///
-/// Жизненный цикл одной таски:
-///   1. Делает до [`MAX_REFINE_ATTEMPTS`] retry-фетчей с
-///      `fallback_to_latest = false` — Ok приходит только на exact-матче.
-///      Перезаписывает `price_to_beat_by_market[market_id]` exact-значением,
-///      чтобы более поздние кадры окна посчитали `currency_price_vs_beat_pct`
-///      точно (до этого там лежит inline-приближение, см. Phase A).
-///   2. Отправляет exact в `current_exact_tx` — refine **следующей** итерации
-///      `await`-нет этот sender как `prev_price_to_beat` для дампа. Так каждая
-///      итерация фетчит exact ровно **один раз**: то же значение служит и
-///      `current.price_to_beat`, и `prev.price_to_beat` для следующей итерации
-///      (повторный HTTP не нужен).
-///   3. Если есть `prev_market` — `await`-ит `prev.exact_price_to_beat_rx`
-///      (его заполняет refine prev-итерации шагом 2 выше) и пишет дамп с
-///      гарантированно exact-парой `(prev_exact, current_exact)`.
-///
-/// Failure modes:
-/// — refine не достал exact за [`MAX_REFINE_ATTEMPTS`] попыток: `current_exact_tx`
-///   дропается → следующая итерация получит `Err(RecvError)` и пропустит дамп.
-/// — refine prev-итерации не достал exact: `prev.exact_price_to_beat_rx.await`
-///   возвращает `Err(RecvError)` → текущая итерация пропускает дамп.
-///
-/// `market_id` — `condition_id` текущего окна (у up/down ровно один на окно).
-/// `None` — если `merge_market_event_data` не вернул ни одного маркета: тогда
-/// refine всё равно фетчит exact для лога/sender'а, но кэш
-/// `price_to_beat_by_market` обновлять не для кого.
-// `current_window_start_sec` — start_sec **текущего** окна (нужен для
-// sanity-check `current_window_start_sec - prev.window_start_sec == period_sec`).
-// Если главный цикл «отстал» и перепрыгнул через окна (тяжёлый тик +
-// `continue` между `prev_market.take()` и переприсваиванием в основном цикле),
-// эта проверка отрубит дамп: `prev_exact` ещё корректен, но `current_exact`
-// уже относится не к концу prev-окна, и `final_price` дампа prev'a получился
-// бы рассогласованным.
+/// Exact PTB со страницы (retry, без fallback): обновляет кэш, шлёт в oneshot, дампит prev при непрерывности окон.
 fn spawn_bg_price_to_beat_refine(
     project_manager: Arc<ProjectManager>,
     slug: String,
@@ -1165,17 +1016,10 @@ fn spawn_bg_price_to_beat_refine(
     current_window_start_sec: i64,
     current_exact_tx: oneshot::Sender<f64>,
 ) {
-    /// Сколько попыток refine за окно (с паузой [`REFINE_RETRY_DELAY`]). Если
-    /// за это время `past-results` страницы так и не догнал спот — лучше
-    /// потерять файл, чем записать сдвинутый `priceToBeat`.
     const MAX_REFINE_ATTEMPTS: u32 = 30;
-    /// Пауза между попытками. 5с × 30 ≈ 2,5 минуты — пятиминутное окно
-    /// успевает догнаться, более долгие задержки — аномалия.
     const REFINE_RETRY_DELAY: Duration = Duration::from_secs(5);
 
     tokio::spawn(async move {
-        // Phase 1: exact `priceToBeat` для текущего окна → перезаписываем кэш
-        // и сразу публикуем в `current_exact_tx` для refine следующей итерации.
         let current_exact = match retry_fetch_exact_price_to_beat(
             project_manager.http.as_ref(),
             &slug,
@@ -1192,10 +1036,6 @@ fn spawn_bg_price_to_beat_refine(
                         .merge_market_price_to_beat(exact_price, market_id)
                         .await;
                 }
-                // Отправляем exact в oneshot — refine следующей итерации
-                // прочитает его как `prev_price_to_beat` и не будет фетчить
-                // повторно. `Err` означает, что Receiver уже дропнут (например,
-                // основной цикл вышел) — игнорируем.
                 let _ = current_exact_tx.send(exact_price);
                 exact_price
             }
@@ -1203,8 +1043,6 @@ fn spawn_bg_price_to_beat_refine(
                 eprintln!(
                     "xframe_dump: slug={slug}: refine не получил exact priceToBeat за {MAX_REFINE_ATTEMPTS} попыток, дамп prev пропущен"
                 );
-                // Sender дропается с возвратом — следующая итерация получит
-                // `Err(RecvError)` на своём `await` и пропустит дамп этого окна.
                 if let Some(prev) = prev_market.as_ref() {
                     if let Some(prev_market_id) = prev.market_id.as_ref() {
                         project_manager
@@ -1216,8 +1054,6 @@ fn spawn_bg_price_to_beat_refine(
             }
         };
 
-        // Phase 2: дожидаемся exact `priceToBeat` от refine prev-итерации
-        // (через `oneshot`), без повторного HTTP-fetch'а.
         let Some(prev) = prev_market else {
             return;
         };
@@ -1225,11 +1061,6 @@ fn spawn_bg_price_to_beat_refine(
             return;
         };
 
-        // Sanity-check непрерывности: refine prev-итерации мог отдать exact для
-        // **своего** окна, но если основной цикл проскочил через одно (или
-        // больше) окон между prev и current, наш `current_exact` относится не
-        // к концу prev-окна → `final_price` дампа prev'a получился бы битым.
-        // Лучше пропустить дамп, чем зафиксировать рассинхрон.
         let expected_current_window_start_sec = prev.window_start_sec.saturating_add(period_sec);
         if current_window_start_sec != expected_current_window_start_sec {
             eprintln!(
@@ -1259,9 +1090,6 @@ fn spawn_bg_price_to_beat_refine(
             }
         };
 
-        // Slug **prev** окна (не current!), чтобы дамп залогировал URL именно
-        // того маркета, который дампится. `period` — &'static str ("5m"/"15m"),
-        // `currency` уже в нижнем регистре в slug-формате Polymarket.
         let prev_slug = format!(
             "{}-updown-{period}-{}",
             currency.to_lowercase(),
@@ -1279,9 +1107,7 @@ fn spawn_bg_price_to_beat_refine(
     });
 }
 
-/// Цикл фетча exact `priceToBeat` со страницы маркета. Возвращает `Some(price)`
-/// только при exact-матче (`fallback_to_latest = false` гарантирует, что Ok
-/// в этом случае действительно exact); `None` — если попытки исчерпаны.
+/// Страница маркета, `fallback=false`; `None` после исчерпания попыток.
 async fn retry_fetch_exact_price_to_beat(
     http: &reqwest::Client,
     slug: &str,
@@ -1302,7 +1128,7 @@ async fn retry_fetch_exact_price_to_beat(
     None
 }
 
-/// Противоположная нога / sibling: кадр из текущего батча, иначе уже сохранённый с тем же `aligned_ts`, иначе последний с `aligned_ts` ≤ запрошенного.
+/// Кадр другой ноги: батч → хранилище того же ts → последний ≤ ts.
 fn lookup_frame_for_leg_merge<'a>(
     market_id: &str,
     asset_id: &str,
@@ -1321,7 +1147,7 @@ fn lookup_frame_for_leg_merge<'a>(
     by_ts.range(..=aligned_ts).next_back().map(|(_, frame)| frame)
 }
 
-/// `(price_to_beat - currency_spot) / price_to_beat * 100` — отклонение спота от уровня «beat» в процентах; знак «+», если спот ниже beat.
+/// `(beat - spot) / beat * 100`; положительно, если spot ниже beat.
 fn currency_price_vs_price_to_beat_pct(
     price_to_beat: Option<f64>,
     currency_spot_usd: Option<f64>,
@@ -1338,7 +1164,7 @@ fn currency_price_vs_price_to_beat_pct(
     Some((beat - spot) / beat * 100.0)
 }
 
-/// Ключ бакета: `timestamp_ms` кратен `interval_secs * 1000` (начало интервала в мс).
+/// Округление `timestamp_ms` вниз к границе интервала (мс).
 fn align_timestamp_ms_to_interval(timestamp_ms: i64, interval_secs: u64) -> i64 {
     let bucket_ms = (interval_secs as i64).saturating_mul(1000);
     if bucket_ms <= 0 {

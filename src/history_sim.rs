@@ -20,13 +20,11 @@
 //!
 //! # Торговая логика
 //!
-//! Один синхронный цикл по парным кадрам (UP[i], DOWN[i]).
-//! Если модель выдаёт `prediction >= SIM_BUY_THRESHOLD` для токена — открывается позиция.
-//! Позиция закрывается по TP/SL (те же пороги что в `calc_y_train_pnl`) или при окончании события.
+//! Синхронный цикл UP/DOWN по кадрам; вход при проходе Kelly/gates; выход TP/SL/timeout/EV или резолюция (`calc_y_train_pnl`-пороги).
 
 use crate::account::Account;
 use crate::constants::{
-    CurrencyUpDownOutcome, XFrameIntervalKind, FIVE_MIN_SEC, FIFTEEN_MIN_SEC,
+    CurrencyUpDownOutcome, XFrameIntervalKind,
 };
 use crate::real_sim::interval_label;
 use crate::train_mode::{
@@ -44,63 +42,26 @@ use std::fs;
 use std::path::Path;
 use xgb::{Booster, DMatrix};
 
-/// Порог сырого предсказания модели (0.0–1.0) для рассмотрения входа в позицию.
-/// Дальнейшую селекцию делает Kelly (`f* > 0`), поэтому порог служит только
-/// грубым префильтром, отсекающим заведомо шумовые сигналы.
+/// Префильтр raw-предикта перед Kelly (`f* > 0`).
 pub const SIM_BUY_THRESHOLD: f32 = 0.70;
 
-/// Максимально допустимое отклонение VWAP от лучшей цены L1 (доля) при
-/// симуляции исполнения ([`book_fill_buy`], [`book_fill_sell`], strict-ветки).
-/// Разметка y_train использует [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`].
+/// Cap проскальзывания VWAP от L1 при `book_fill_*` (см. y_train в train_mode).
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый виртуальный банкролл (USDC).
 pub const INITIAL_BANKROLL: f64 = 50.0;
-/// Множитель Келли: `1.0` = full-Kelly, `0.5` = half-Kelly (меньше размер — меньше volatility).
+/// Множитель Келли (<1 — fractional Kelly).
 pub const KELLY_MULTIPLIER: f64 = 0.1;
 /// Максимальная доля банкролла на одну сделку.
 pub const MAX_BET_FRACTION: f64 = 0.10;
 /// Минимальный размер позиции в USDC (меньше — не торгуем).
 pub const MIN_POSITION_USD: f64 = 0.01;
 
-/// Максимальный размер Kelly-позиции в USDC (жёсткий cap по номиналу,
-/// поверх `MAX_BET_FRACTION × bankroll`). Если Kelly-сайзинг
-/// (`kelly_f_adj.min(MAX_BET_FRACTION) × bankroll`) выдал значение
-/// больше — оно **срезается** до `MAX_POSITION_USD` (без `KellySkip`,
-/// т.е. сделка всё равно открывается).
-///
-/// **Зачем дублировать `MAX_BET_FRACTION`**: фракционный cap
-/// автоматически масштабируется с bankroll'ом (на $1000 при
-/// `MAX_BET_FRACTION = 0.10` — это уже $100 на сделку), а абсолютная
-/// просадка VWAP ниже L1 best bid пропорциональна **числу шеров**,
-/// а не доли банкролла. На тонкой стороне стакана $100 за токен по
-/// 0.5 = 200 шеров — обычно проходит L1 насквозь и проседает на
-/// L2/L3 с 5–15¢ slippage. Этот cap в долларах удерживает количество
-/// шеров в зоне, где walk_sell укладывается в L1 (см. ту же
-/// аргументацию у [`NO_KELLY_POSITION_SIZE_USD`]).
+/// Жёсткий cap номинала сделки (USDC) поверх `MAX_BET_FRACTION × bankroll`:
+/// ограничивает число шеров на тонком стакане (слиппедж walk по bid/ask).
 pub const MAX_POSITION_USD: f64 = 300.0;
 
-/// Базовый размер позиции в USDC для **диагностического** прогона
-/// `is_kelly = false` (см. [`run_sim_mode`]). В этом режиме отключены и
-/// Kelly-сайзинг, и калибровка моделей: каждый прошедший порог сигнал
-/// открывает позицию **фиксированного** номинала, а predict идёт
-/// «как есть» (raw), без `Calibration::apply`. Если bankroll меньше
-/// этой суммы — вход открывается на остаток bankroll'а (cap `≤ bankroll`).
-///
-/// Используется только в `run_sim_mode(is_kelly=false)`; в `real_sim`
-/// и в `run_sim_mode(is_kelly=true)` сайзинг по-прежнему через Kelly
-/// + `MAX_BET_FRACTION` + `KELLY_MULTIPLIER`.
-///
-/// **Почему $30, а не $100**: при walk_sell на тонкой стороне стакана
-/// абсолютная просадка VWAP ниже L1 best bid пропорциональна числу
-/// шеров `shares = nominal / price`. На $100 за токен по 0.5 это 200
-/// шеров — обычно хватает, чтобы пройти L1 насквозь и упасть на
-/// L2/L3, отдавая 5–15¢ slippage. На $30 шеров ~60 — большинство
-/// фиксов укладывается в L1. По CSV per-trade prev-итерации:
-/// avg SL на $100-входах = −$42 при exit 0.30–0.45; на $30 ожидаемо
-/// останется ~−$12–15 (та же относительная дельта, абсолютная меньше
-/// втрое). EvExit✓ тоже масштабируется вниз пропорционально, ROI%
-/// сохраняется.
+/// Фиксированный размер входа в режиме `run_sim_mode(is_kelly=false)` (без Kelly/калибровки; raw pred).
 pub const NO_KELLY_POSITION_SIZE_USD: f64 = 30.0;
 
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
@@ -108,167 +69,38 @@ pub const NO_KELLY_POSITION_SIZE_USD: f64 = 30.0;
 /// См. [Polymarket: Fees](https://docs.polymarket.com/trading/fees).
 pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
 
-/// Порог «удержания до конца» в секундах: когда `event_remaining_ms` ≤
-/// `HOLD_TO_END_THRESHOLD_SEC × 1000`, активируется зона удержания — TP и
-/// Timeout перестают закрывать позицию (ждём резолюцию ради выплаты $1 без
-/// fee). Основания для выхода в зоне:
-/// * **SL** по ценовой дельте (`current_prob − entry_prob ≤ Y_TRAIN_STOP_LOSS_PP`) —
-///   жёсткий предохранитель от catastrophic loss при переуверенной
-///   resolution-модели;
-/// * **EV-правило** (см. [`EV_EXIT_MARGIN`]): `EV_sell · (1 − MARGIN) > EV_hold` —
-///   мягкий выход, когда рыночная продажа выгоднее ожидаемой резолюции.
+/// Hold-zone: конец окна по времени; TP/timeout off; остаются hard SL и EV-exit по resolution-модели.
 pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 0;
 
-/// Коэффициент EMA для сглаживания `p_win` от resolution-модели в зоне
-/// удержания: `p_ema = α · p_now + (1 − α) · p_prev`. Чем меньше α, тем
-/// плавнее и менее чувствителен EV-exit к одиночному выбросу модели.
+/// EMA по `p_win` resolution-модели в hold-zone (`α` мало → плавнее EV-exit).
 pub const EV_EXIT_P_WIN_EMA_ALPHA: f64 = 0.3;
 
-/// Защитный зазор EV-exit: продаём только если `EV_sell · (1 − MARGIN) >
-/// EV_hold`. Сглаживает границу равенства EV и компенсирует неучтённые
-/// эффекты (шум модели, неполнота bid-стака, погрешность калибровки).
+/// Зазор EV-exit: `EV_sell × (1 − margin) > EV_hold`.
 pub const EV_EXIT_MARGIN: f64 = 0.01;
 
-/// Максимальное число кадров, которое позиция может удерживаться без
-/// срабатывания TP/SL/EV-правила. По достижении этого предела
-/// [`sell_gate`] возвращает [`CloseReason::Timeout`] — боковик дольше
-/// этого срока торговать невыгодно (ML-модель размечена на горизонте
-/// той же длины: y-метку выдаёт [`crate::xframe::calc_y_train_pnl`] /
-/// [`crate::xframe::calc_y_train_resolution`] на их собственном
-/// `n = Y_TRAIN_HORIZON_FRAMES`). Совпадает по значению с y-разметкой
-/// **намеренно**: на за-горизонтных кадрах модель не обучалась, её
-/// предсказание там некалибровано — лучше выйти по рынку.
+/// Лимит кадров без TP/SL → [`CloseReason::Timeout`]. Должен совпадать с `Y_TRAIN_HORIZON_FRAMES` в xframe.
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
 
-/// Минимальный остаток времени до конца маркета (мс) для открытия НОВОЙ
-/// позиции: `POSITION_TIMEOUT_FRAMES × step_sec × 1000` при симуляции на
-/// 1s-моделях = 15 с. Ближе к резолюции TP/SL за горизонт физически не
-/// успевают сработать — вход вырождается в лотерею с уплатой taker-fee.
-/// Используется в [`buy_gate`] как ранний отказ под именем `LateEntry`.
+/// Минимум `event_remaining_ms` для нового входа ([`buy_gate`] LateEntry).
 pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
 
-// Раньше здесь жили локальные константы `MIN_ENTRY_PROB_FOR_TRADE` /
-// `MAX_ENTRY_PROB_FOR_TRADE` (торговое окно). Теперь runtime-фильтр
-// синхронизирован с y-разметкой и берёт пороги из
-// [`crate::xframe::Y_TRAIN_NO_TRADE_PROB_LOW`] /
-// [`crate::xframe::Y_TRAIN_NO_TRADE_PROB_HIGH`]: вход разрешён
-// **только на хвостах** распределения `entry_prob`
-// (`≤ NO_TRADE_LOW` или `≥ NO_TRADE_HIGH`). В центре `(LOW..HIGH)`
-// `BuyGate::EntryProbOutOfRange` блокирует открытие.
-
-
-/// Аварийный halt новых входов по mark-to-market drawdown (`Account::max_drawdown_pct`).
-/// `Some(pct)` — при `max_drawdown_pct ≥ pct` `try_open_position` отклоняет
-/// все новые позиции до конца жизни процесса (drawdown — историческая
-/// величина, не сбрасывается). `None` — kill-switch выключен.
-///
-/// **Что не трогает**: ведение/закрытие уже открытых позиций
-/// ([`manage_positions`], TP/SL/EV-exit/Timeout, резолюционный колбек).
-/// Выйти из позиции важнее, чем дождаться улучшения equity.
-///
-/// **Где проверяется**: только в `real_sim::tick_once` перед
-/// `try_open_position` — `history_sim` это offline-backtest, halt по
-/// drawdown'у искажал бы итоговую метрику модели.
-///
-/// Значение по умолчанию (30%) — точка, после которой Kelly-сайзинг
-/// на оставшемся капитале математически даёт ROI restoration ≥ 43%
-/// от текущего bankroll (1 / (1 − 0.30) − 1), что заведомо вне
-/// статпредсказуемости моделей такого типа: дальше «лезть в позиции»
-/// — это азартное усреднение в просадке, не торговля.
+/// Halt новых входов при `max_drawdown_pct ≥ pct` (только `real_sim`; закрытие позиций не трогает).
 pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
 
-// ─── Типы ─────────────────────────────────────────────────────────────────────
-
-/// Реальный срез стакана для исполнения по HTTP-снимку CLOB.
-///
-/// В `history_sim` исполнение идёт по полному WS-стаку кадра
-/// (`book_asks`/`book_bids` или L1/L2/L3 фоллбэк для легаси-дампов)
-/// с обязательной проверкой [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] (константа
-/// симуляции; разметка y_train использует
-/// [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`]). В живой
-/// торговле ([`crate::real_sim`]) WS-кадра недостаточно: он отстаёт
-/// на буфер реконнекта/тики, и нужен свежий HTTP-снимок CLOB.
-///
-/// Поэтому [`try_open_position`] / [`manage_positions`] принимают
-/// `Option<&StrictBook>`:
-/// * `None` → `history_sim`-путь: исполнение по WS-кадру через
-///   [`book_fill_buy`] / [`book_fill_sell`] (cap-respected, full-fill).
-/// * `Some(book)` → `real_sim`-путь: исполнение по HTTP-стакану через
-///   [`book_fill_buy_strict`] / [`book_fill_sell_strict`] (cap-respected,
-///   full-fill, плюс проверка [`StrictBook::min_order_size`]).
-///
-/// На любом отказе (тонкий стакан / cap превышен / min_order_size
-/// меньше требуемого) функции возвращают `None`: позиция не открывается
-/// (вход), либо продажа откладывается до следующего тика (выход).
-///
-/// Уровни внутри `Vec`-ов ожидаются **от лучшего к худшему** (для asks — по
-/// возрастанию цены, для bids — по убыванию). Ответственность вызывающего.
-///
-/// `StrictBook` сам **владеет** двумя лестницами (`Vec<BookLevel>`), а не
-/// одалживает их — это убирает лайфтайм из сигнатур `book_fill_*_strict` /
-/// `manage_positions` / `try_open_position` и снимает нужду в промежуточном
-/// кортеже `(Vec, Vec)` на вызывающей стороне. Аллокация та же (два `Vec`
-/// раз на кадр), но форма данных совпадает с [`crate::real_sim`]-снимком
-/// HTTP-стакана без лишней обёртки.
+/// HTTP-снимок CLOB для `real_sim`: `Some` → `book_fill_*_strict` + slippage cap + `min_order_size`; `None` → WS `book_fill_*` в history_sim.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StrictBook {
     /// Уровни спроса (bids), лучший bid = первый.
     pub(crate) bids: Vec<BookLevel>,
     /// Уровни предложения (asks), лучший ask = первый.
     pub(crate) asks: Vec<BookLevel>,
-    /// `OrderBookSummaryResponse.last_trade_price` Polymarket CLOB —
-    /// цена последней сделки по этому asset_id на момент HTTP-снимка.
-    /// Нужна, чтобы воспроизвести логику
-    /// [`crate::xframe::currency_implied_prob_polymarket_style`]:
-    /// при широком спреде (`> POLYMARKET_WIDE_SPREAD_USD = 10¢`) UI
-    /// Polymarket показывает не mid L1, а last trade. Без этого поля
-    /// HTTP-выведенная implied_prob систематически расходилась бы
-    /// с `XFrame.currency_implied_prob` (mid вместо last trade) на
-    /// тонких маркетах — а именно она используется как фича модели
-    /// и как oporная вероятность для Kelly-расчёта в `open_position`
-    /// и `sell_gate`. `None` если CLOB не вернул `last_trade_price`
-    /// (новый рынок без сделок).
+    /// Last trade CLOB (wide spread → как в `currency_implied_prob_polymarket_style`).
     pub(crate) last_trade_price: Option<f64>,
-    /// `OrderBookSummaryResponse.min_order_size` Polymarket CLOB —
-    /// **минимальный размер ордера в шерсах**, который маркет принимает
-    /// (статичный атрибут маркета). Используется в
-    /// [`book_fill_buy_strict`] / [`book_fill_sell_strict`]: если число
-    /// шерсов меньше `min_order_size` — strict-исполнение отказывает
-    /// (`None`), потому что в реальной торговле такой ордер CLOB
-    /// отклонил бы, а локальная бухгалтерия должна симметрично не
-    /// открывать/не закрывать позицию.
-    ///
-    /// **Не приходит из WS**: market WS-канал Polymarket публикует
-    /// только динамику (`book`, `price_change`, `tick_size_change`,
-    /// `last_trade_price`, `market_resolved`), а статика маркета
-    /// (`min_order_size`, `neg_risk`, фактический `tick_size` на
-    /// старте) живёт в HTTP CLOB. Поэтому `XFrame` это поле не
-    /// содержит — `history_sim` идёт через
-    /// `book_fill_buy`/`book_fill_sell` без min-проверки. На
-    /// `real_sim`-пути значение заполняется в [`crate::real_sim::parse_book_levels`]
-    /// из ответа `clob.order_books(&[...])`. `None` — CLOB не вернул
-    /// поле (теоретически не должно случаться, но защитно — пропускаем
-    /// проверку, чтобы не зарубить торговлю на пустом значении).
+    /// Мин. размер ордера в шерах (HTTP); strict-fill без этого не открывает/не закрывает.
     pub(crate) min_order_size: Option<f64>,
 }
 
-/// Эффективная `currency_implied_prob` для текущего тика.
-///
-/// Если в тике передан HTTP-стакан ([`StrictBook`], только real_sim) —
-/// считаем «отображаемую на UI Polymarket» вероятность по тем же
-/// правилам, что и WS-фича `XFrame.currency_implied_prob` (см.
-/// [`crate::xframe::currency_implied_prob_polymarket_style`]):
-/// при спреде `≤ 10¢` — mid L1, при широком — `last_trade_price`
-/// (с фоллбэком на mid, если last trade неизвестен). Это критично:
-/// `XFrame.currency_implied_prob` уходит в модель как фича и как
-/// «опорная цена» для Kelly. Если бы тут было «всегда mid», на тонких
-/// маркетах HTTP-prob и WS-prob систематически расходились бы — Kelly
-/// в `open_position` и delta в `sell_gate` начали бы считаться в
-/// другой шкале, чем та, на которой обучалась модель.
-///
-/// HTTP всё равно свежее WS-кадра (нет буфера/реконнекта), поэтому
-/// при наличии strict_book берём именно его. Иначе — `frame.currency_implied_prob`
-/// как было. На `history_sim`-пути `strict_book = None` всегда.
+/// Polymarket-style implied prob: из [`StrictBook`] как `currency_implied_prob_polymarket_style`, иначе `frame.currency_implied_prob`.
 pub(crate) fn effective_implied_prob(
     frame: &XFrame<SIZE>,
     strict_book: Option<&StrictBook>,
@@ -300,28 +132,7 @@ pub(crate) fn effective_implied_prob(
     frame.currency_implied_prob
 }
 
-/// Строгая покупка `position_size` USDC по `asks` [`StrictBook`] без fallback.
-///
-/// Возвращает `Some((vwap, total_shares))`, если удалось полностью заполнить
-/// `position_size` фактическими уровнями стакана **и** выполнены оба
-/// инвариативных условия живой торговли:
-///
-/// 1. **Slippage cap** ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]): VWAP не должен
-///    отклоняться от лучшего ask больше, чем на `SIM_MAX_SLIPPAGE_FROM_L1_PCT`.
-///    На полной лестнице CLOB без cap'а Kelly мог бы доедать L4–L20 на
-///    тонком маркете и платить на 5–20¢ выше mid — это сжигает edge
-///    модели и в `real_sim` представляет реальный финансовый риск.
-/// 2. **`min_order_size`** (`StrictBook.min_order_size`, статичный атрибут
-///    маркета из `OrderBookSummaryResponse.min_order_size`): итоговое
-///    `total_shares` не должно быть меньше этого значения. Иначе CLOB
-///    отклонил бы ордер, а локальная бухгалтерия зеркалом должна не
-///    создавать «фантомную» позицию.
-///
-/// На любом из этих отказов возвращаем `None` — позиция не открывается,
-/// `try_open_position` инкрементирует `kelly_strict_buy_skips` и
-/// печатает skip-лог. Если `book.min_order_size = None` (CLOB не вернул
-/// поле) — проверка `min_order_size` пропускается; защитный fallback,
-/// чтобы случайно не зарубить торговлю при отсутствии данных.
+/// Покупка по HTTP asks: полный fill `position_size`, cap от L1 ask, опционально `min_order_size`.
 pub(crate) fn book_fill_buy_strict(
     book: &StrictBook,
     position_size: f64,
@@ -354,10 +165,6 @@ pub(crate) fn book_fill_buy_strict(
         return None;
     }
     let vwap = position_size / total_shares;
-    // Slippage cap: VWAP относительно best ask. Покупка тейкером
-    // **выше** best ask — это и есть проскальзывание; считаем по `vwap`,
-    // не по последнему сожранному уровню, потому что fee/EV-расчёты
-    // ниже по стеку идут от VWAP.
     if (vwap - best_ask) / best_ask > SIM_MAX_SLIPPAGE_FROM_L1_PCT {
         return None;
     }
@@ -369,39 +176,7 @@ pub(crate) fn book_fill_buy_strict(
     Some((vwap, total_shares))
 }
 
-/// Строгая продажа `shares_to_sell` по `bids` [`StrictBook`] без fallback.
-///
-/// Возвращает `Some(gross_usdc)` (до вычета taker-fee), если ликвидности
-/// достаточно **и** выполнены инвариантные условия живой торговли,
-/// что у [`book_fill_buy_strict`]:
-///
-/// 1. **Slippage cap** (`slippage_cap`): VWAP продажи
-///    `(gross_usdc / shares_to_sell)` не должен быть ниже best bid
-///    больше, чем на переданный процент. Иначе — `None`,
-///    `manage_positions` оставит позицию открытой и попробует
-///    повторно на следующем тике (`kelly_strict_sell_skips++`).
-///
-///    * `Some(pct)` — cap активен (типичное значение [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]).
-///      Используем для **добровольных** выходов (TP / EvExitProfit),
-///      где edge модели чувствителен к slippage и можно «передумать»,
-///      подождав лучшего стакана. Решение принимает
-///      [`CloseReason::is_voluntary_exit`].
-///    * `None` — cap отключён, выходим по любому VWAP. Используем для
-///      **обязательных** выходов (SL / Timeout / EvExitLoss): удерживать
-///      позицию из-за широкого стакана опаснее, чем пройти slippage,
-///      иначе позиция может уехать к резолюции проигравшего токена
-///      за $0.
-///
-///    Параметр `Option<f64>` (а не `bool`) намеренно: даёт возможность
-///    в будущем градуировать cap по reason (например, TP — 2%,
-///    EvExitProfit — 3%) без изменения сигнатуры.
-/// 2. **`min_order_size`**: `shares_to_sell` < `min_order_size` →
-///    `None`, ровно по той же причине, что у buy: ордер CLOB бы
-///    отклонил. Эта проверка независима от `slippage_cap` —
-///    CLOB ничего не примет ниже минимума, даже если мы готовы
-///    пройти любой slippage.
-///
-/// Если `book.min_order_size = None` — проверка `min` пропускается.
+/// Продажа по HTTP bids: gross USDC до fee; `Some(cap)` — voluntary (TP/EvProfit), `None` — urgent (SL/timeout/…); проверка `min_order_size`.
 pub(crate) fn book_fill_sell_strict(
     book: &StrictBook,
     shares_to_sell: f64,
@@ -447,136 +222,47 @@ pub(crate) fn book_fill_sell_strict(
     Some(total_usdc)
 }
 
-/// Открытая виртуальная позиция в одном токене.
-///
-/// `asset_id` / `market_id` — **обязательные якоря** на конкретный
-/// CTF-токен. Без них в `real_sim`-сценарии длинная позиция могла
-/// «осиротеть» при смене маркета внутри лейна (5m/15m раунды
-/// сменяются), и `manage_positions` начал бы прогонять её через
-/// `sell_gate` вместе с фреймом уже **другого** маркета — entry/exit
-/// цены и hold-zone окно у нового маркета свои, к этой позиции
-/// нерелевантны. Фильтр `pos.asset_id != frame.asset_id` в
-/// `manage_positions` пропускает такие позиции на текущем тике (они
-/// дождутся явной resolution-обработки через post-resolution
-/// колбек final_price).
-///
-/// В `history_sim` практически любой проход — это один маркет, поэтому
-/// все позиции одного `run_side_simulation` имеют одинаковый
-/// `asset_id`, и фильтр на них тождественен. Поле всё равно несём,
-/// чтобы `OpenPosition` имел один и тот же контракт во всех режимах.
+/// Открытая позиция; в `real_sim` фильтр `asset_id == frame.asset_id` от чужого маркета.
 #[derive(Debug, Clone)]
 pub struct OpenPosition {
-    /// Идентификатор CTF-токена, на котором открыта позиция (
-    /// `frame.asset_id` в момент входа). Используется для фильтрации
-    /// в `manage_positions`: при смене маркета в лейне (`real_sim`)
-    /// мы НЕ применяем `sell_gate` нового маркета к старой позиции.
     pub(crate) asset_id: String,
-    /// Идентификатор маркета (`condition_id`), на котором открыта
-    /// позиция. Дублирует данные `asset_id` (1:1 mapping в Polymarket
-    /// Up/Down рынках, см. `currency_up_down_by_asset_id`), но
-    /// удобен для логов и для post-resolution callback'а: маркет
-    /// резолвится «целиком», поэтому при поиске `final_price` для
-    /// «осиротевших» позиций удобнее матчить по `market_id`.
-    ///
-    /// Чтение этого поля появится в #2 (resolution callback).
     #[allow(dead_code)]
     pub(crate) market_id: String,
     /// Количество шерсов после вычета комиссии при покупке.
     pub(crate) shares_held: f64,
-    /// Цена входа (prob) — для TP/SL-слежения.
+    /// Отображаемая prob на входе; пайплайн оценки использует только [`Self::buy_price`].
+    #[allow(dead_code)]
     pub(crate) entry_prob: f64,
+    /// VWAP покупки — база для TP/SL, pending MtM, CSV `buy_price`, гистограмма входов.
+    pub(crate) buy_price: f64,
     /// USDC потраченные на покупку (= POSITION_SIZE_USD).
     pub(crate) entry_cost: f64,
-    /// `book_bid_l1_price` на момент `try_open_position` (в `real_sim`
-    /// — лучший bid из `strict_book.bids`, в `history_sim` — L1 из
-    /// WS-кадра). Используется в `close_position` для maker-/taker-
-    /// классификации voluntary-выхода: сразу после buy-walk-а мы
-    /// модельно выставляем resting-лимитку на TP-таргет, и её статус
-    /// решается **в этот момент**: если `tp_target > best_bid_at_entry`
-    /// — лимитка ложится в книгу как maker (fee = 0). Дальнейшие
-    /// движения best_bid не меняют maker-статуса уже стоящего ордера.
-    /// `None` — на entry-кадре не было валидного bid'а (одностронний
-    /// стакан); консервативно трактуется как taker (fee применяется
-    /// даже на TP-выходе).
+    /// L1 bid на входе: maker vs taker для модельной TP-лимитки в [`close_position`].
     pub(crate) best_bid_at_entry: Option<f64>,
     /// Сколько кадров позиция уже удерживается (для таймаута).
     pub(crate) frames_held: usize,
-    /// EMA вероятности выигрыша от resolution-модели, используется для
-    /// EV-exit в зоне удержания (см. [`EV_EXIT_P_WIN_EMA_ALPHA`]). `None`,
-    /// пока позиция ни разу не попадала в зону удержания / пока модель
-    /// resolution не вернула валидного предсказания.
+    /// EMA `p_win` resolution-модели (hold-zone EV-exit).
     pub(crate) p_win_ema: Option<f64>,
-    /// Сырое предсказание pnl-модели в момент открытия (`PnlInference::raw`).
-    /// Используется только для per-trade CSV-лога; в торговой логике не участвует.
+    /// CSV only: raw/cal/kelly на открытии.
     pub(crate) raw_pred_at_open: f32,
-    /// Калиброванное предсказание pnl-модели в момент открытия
-    /// (`PnlInference::pred`). Только для per-trade CSV-лога.
     pub(crate) cal_pred_at_open: f32,
-    /// «Сырой» Kelly f* (до `KELLY_MULTIPLIER` / `MAX_BET_FRACTION` /
-    /// `MAX_POSITION_USD` / min-size cap) в момент открытия. Только
-    /// для per-trade CSV-лога.
     pub(crate) kelly_f_at_open: f64,
-    /// `event_remaining_ms` на тике открытия. Помогает в анализе CSV
-    /// per-trade сопоставлять момент входа с фазой жизни маркета
-    /// (далеко до резолюции / hold-zone / late-entry).
     pub(crate) event_remaining_ms_at_open: i64,
-    /// Дискриминант [`XFrameIntervalKind`] (`5m` / `15m`). Берётся из
-    /// `frame.xframe_interval_type` в момент открытия и переиспользуется
-    /// в per-trade CSV (чтобы CSV-строка несла лейн без проброса лишних
-    /// параметров вниз по `manage_positions`/`close_position`).
     pub(crate) xframe_interval_type_at_open: i32,
-    /// Дискриминант [`CurrencyUpDownOutcome`] (`Up`/`Down`) — то же
-    /// назначение, что у [`Self::xframe_interval_type_at_open`].
     pub(crate) currency_up_down_outcome_at_open: i32,
-    /// Лейбл валюты лейна (`btc` / …). Используется только для
-    /// per-trade CSV-лога; в торговой логике не участвует. Дублирует
-    /// `lane_key.0`, но избавляет `close_position` /
-    /// `resolve_pending_market_sync` от необходимости тащить
-    /// `lane_key` через всю цепочку вызовов.
     pub(crate) currency: String,
-    /// Polymarket-URL события, на котором открыта позиция (`https://
-    /// polymarket.com/event/{currency}-updown-{period}-{window_start_sec}`).
-    /// В history_sim рассчитывается из имени `.bin`-дампа
-    /// (см. [`polymarket_event_url_from_dump_path`]); в real_sim — из
-    /// `frame.event_remaining_ms` + wall-clock с округлением к UTC-сетке
-    /// окна (см. [`crate::real_sim::polymarket_event_url_from_frame`]).
-    /// Используется в per-trade CSV-логе и удобен в локальных
-    /// eprintln-дебагах для пост-фактум сопоставления позиции с
-    /// маркетом без обращения к Gamma API.
     pub(crate) polymarket_url: String,
-    /// `priceToBeat` — спот-цена базового актива в момент открытия
-    /// окна (Up если final ≥ price_to_beat, иначе Down). В history_sim
-    /// берётся из [`MarketXFramesDump::price_to_beat`]; в real_sim — из
-    /// [`crate::project_manager::LaneFrame::price_to_beat`] (фанаут
-    /// снапшочит её из `price_to_beat_by_market`). `None`, если на
-    /// момент открытия event-page fetch ещё не отстрелял
-    /// `priceToBeat` в кэш. Только для per-trade CSV.
     pub(crate) price_to_beat: Option<f64>,
-    /// `finalPrice` — спот-цена базового актива в момент закрытия окна
-    /// (определяет резолюцию). В history_sim берётся из
-    /// [`MarketXFramesDump::final_price`] (известно сразу — мы
-    /// читаем дамп после резолюции); в real_sim `None` — на момент
-    /// открытия позиции маркет ещё не разрешён. Только для per-trade
-    /// CSV.
     pub(crate) final_price: Option<f64>,
+    /// Конец окна UTC (мс) для `open_unix_ms`/`close_unix_ms` в CSV.
+    pub(crate) event_end_ms: Option<i64>,
 }
 
-/// Причина закрытия позиции.
-///
-/// Внимание: вариант `Resolution` намеренно отсутствует. Закрытие по
-/// итогу события (бинарная выплата CTF $1/$0) происходит в отдельном
-/// пути [`crate::account::Account::resolve_pending_market`] — там же,
-/// где живёт обновление `bankroll` и `SideStats.resolution_win/loss`.
-/// `sell_gate`/`manage_positions`/`close_position` отвечают только за
-/// **рыночные** выходы (TP/SL/Timeout/EV) **внутри** жизни маркета,
-/// до резолюции; на `event_remaining_ms <= 0` они просто перестают
-/// действовать (см. doc у `sell_gate`), а позиция дожидается
-/// колбека резолюции.
+/// Рыночный выход до резолюции; бинарное закрытие — в [`crate::account::Account::resolve_pending_market`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum CloseReason {
     TakeProfit,
     StopLoss,
-    /// Позиция удерживалась больше [`POSITION_TIMEOUT_FRAMES`] кадров без TP/SL — боковик, выход по рынку.
     Timeout,
     /// EV-правило сработало в hold zone **с прибылью** (`EV_sell > entry_cost`):
     /// рыночный выход даёт больше USDC, чем вложили на вход. Рыночный выход
@@ -589,27 +275,13 @@ pub enum CloseReason {
 }
 
 impl CloseReason {
-    /// Можно ли «передумать» этот выход, если стакан слишком тонкий?
-    ///
-    /// `true` — выход **добровольный**: TP / EvExitProfit. Тут разумно
-    /// применять [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] и не выходить на VWAP, который
-    /// глубже best bid'а допустимого процента — ждём лучшего стакана в
-    /// следующем тике, edge сохраняется.
-    ///
-    /// `false` — **обязательный** выход: SL / Timeout / EvExitLoss. Здесь
-    /// удерживать позицию из-за широкого стакана опаснее, чем пройти
-    /// slippage: SL/Timeout срабатывают именно тогда, когда дальнейшее
-    /// удержание ухудшает PnL, а EvExitLoss — когда модель уже увидела
-    /// негативный исход и продажа сейчас лучше ожидания резолюции (где
-    /// `final_price` может быть $0). Slippage cap здесь намеренно
-    /// отключён: лучше выйти на 5–10¢ хуже mid, чем уехать к резолюции
-    /// проигравшего токена за $0.
+    /// TP / EvExitProfit — можно отложить выход при слишком глубоком slippage (`SIM_MAX_SLIPPAGE_FROM_L1_PCT`).
     pub fn is_voluntary_exit(&self) -> bool {
         matches!(self, CloseReason::TakeProfit | CloseReason::EvExitProfit)
     }
 }
 
-/// Статистика торговли по одной стороне (UP или DOWN).
+/// Статистика по одной стороне (UP/DOWN).
 #[derive(Debug, Default)]
 pub struct SideStats {
     /// Общее число закрытых сделок (каждая открытая позиция — одна сделка).
@@ -624,7 +296,6 @@ pub struct SideStats {
     pub(crate) fees_paid: f64,
     /// Число закрытий по Take Profit (delta >= `Y_TRAIN_TAKE_PROFIT_PP`).
     pub(crate) tp_count: usize,
-    /// Число закрытий по Stop Loss (delta <= `Y_TRAIN_STOP_LOSS_PP`).
     pub(crate) sl_count: usize,
     /// Число погашений победившего токена при резолюции события (exit = 1.0, без fee).
     /// Это **token-outcome** счётчик: ставка зашла, как мы и ставили.
@@ -748,13 +419,7 @@ pub struct SideStats {
     pub(crate) pnl_resolution_loss: f64,
 }
 
-/// Накопленная статистика за версию (per-interval счётчики, без денег).
-///
-/// **Денежные** поля (bankroll/peak_bankroll/max_drawdown_pct) и
-/// `update_drawdown` вынесены в [`crate::account::Account`] — он один на
-/// процесс/группу `ProjectManager`-ов, чтобы экспозиция и drawdown
-/// считались по единому счёту, а не по «параллельным» псевдо-счетам
-/// каждого интервала.
+/// Статистика симуляции по версии; деньги/dd — в [`crate::account::Account`].
 #[derive(Debug)]
 pub struct SimStats {
     /// Число обработанных событий (файлов `.bin`) за версию.
@@ -796,25 +461,7 @@ impl SimStats {
     }
 }
 
-// ─── Точка входа ──────────────────────────────────────────────────────────────
-
-/// Главная точка входа симуляции. Запускает back-to-back два прогона по одним
-/// и тем же тестовым маркетам, в одни и те же файлы (`xframes/last_history_sim.txt`
-/// и `xframes/last_history_sim_trades.csv`):
-///
-/// * `is_kelly = true`  — нормальный режим: Kelly-сайзинг, калибровка
-///   PnL/Resolution-моделей, `min(MAX_BET_FRACTION × bankroll,
-///   MAX_POSITION_USD)` на сделку.
-/// * `is_kelly = false` — диагностический режим: ни Kelly, ни калибровки;
-///   `pred = raw` для обеих моделей; фиксированный $100 на сделку
-///   (см. [`NO_KELLY_POSITION_SIZE_USD`]). Полезен, чтобы отделить
-///   качество предиктов от вклада калибровки/сайзинга.
-///
-/// CSV различает два прогона колонкой `regime` (значения `kelly` /
-/// `raw`); в текстовом логе оба прогона помечаются префиксом тега
-/// (`btc/1051/5m/kelly` vs `btc/1051/5m/raw`). Все логи и счёт
-/// (bankroll/dd) у каждого прогона **независимы** — у каждого свой
-/// `Account::new()`, ROI измеряется от стартового `INITIAL_BANKROLL`.
+/// Два прогона подряд: `kelly` и `raw` ([`NO_KELLY_POSITION_SIZE_USD`]). Колонка CSV `regime`; свой [`Account`] на прогон.
 pub fn run_sim_mode() -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     if !xframes_root.exists() {
@@ -822,19 +469,14 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
     }
 
     crate::tee_log::init_tee_log_file(&xframes_root.join("last_history_sim.txt"), "sim")?;
-    // Per-trade CSV-лог: одна строка на каждое закрытие (рыночное и
-    // резолюционное). См. `crate::trade_csv_log` — анализируется отдельно
-    // от текстового лога (pandas/duckdb по `last_history_sim_trades.csv`).
     crate::trade_csv_log::init_trade_csv_log_file(
         &xframes_root.join("last_history_sim_trades.csv"),
     )?;
 
-    // 1) Нормальный прогон с Kelly + калибровкой.
     crate::trade_csv_log::set_current_regime("kelly");
     tee_println!("[sim] === regime=kelly (Kelly + calibration, min(MAX_BET_FRACTION × bankroll, MAX_POSITION_USD)) ===");
     run_sim_mode_inner(true)?;
 
-    // 2) Диагностический прогон: raw predictions, фиксированный $100 entry.
     crate::trade_csv_log::set_current_regime("raw");
     tee_println!("[sim] === regime=raw (no Kelly, no calibration, ${NO_KELLY_POSITION_SIZE_USD} entry) ===");
     run_sim_mode_inner(false)?;
@@ -846,13 +488,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Один прогон симуляции с заданным `is_kelly`. Логи (tee + CSV) уже
-/// инициализированы caller'ом ([`run_sim_mode`]); тут только обход
-/// дампов, simulate_event и печать `print_sim_stats`.
-///
-/// Каждый вызов поднимает СВОЙ [`Account::new()`] — bankroll/dd между
-/// прогонами не общие, чтобы первый «удачный» прогон не пере-нагружал
-/// drawdown второго.
+/// Один режим `is_kelly`; свой свежий [`Account::new()`].
 fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     let regime_label = if is_kelly { "kelly" } else { "raw" };
@@ -866,29 +502,8 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 continue;
             }
 
-            // Один `Account` на пару `(currency, version)`: общий
-            // bankroll/peak/drawdown между 5m и 15m интервалами,
-            // зеркало real_sim-инварианта «единый кошелёк на PM».
-            // Без этого 5m и 15m получали независимые псевдо-счета с
-            // одинаковым стартовым `INITIAL_BANKROLL`, и итоговые
-            // PnL/ROI/DD по интервалам было нельзя суммировать в одну
-            // картину (см. account.rs). Сейчас `print_sim_stats` в
-            // конце каждого интервала печатает CUMULATIVE состояние
-            // одного и того же счёта.
-            //
-            // Между прогонами `kelly`/`raw` Account создаётся заново,
-            // поэтому второй прогон стартует со свежим `INITIAL_BANKROLL`
-            // и не «помнит» drawdown первого.
             let mut account = Account::new();
 
-            // Итерируемся непосредственно по `XFrameIntervalKind`, а
-            // строковую метку (`"5m"` / `"15m"`) для путей и логов
-            // получаем через единый `interval_label` (см. `real_sim.rs`).
-            // Раньше шёл обратный путь — литерал `"5m"`/`"15m"` →
-            // `XFrameIntervalKind` через `match` с `unreachable!`-веткой:
-            // регресс «добавили новый интервал в литералах, забыли в
-            // match'е» снимался только в рантайме. Теперь источник
-            // истины — сам `enum`, а строка генерится из него.
             for interval_kind in [XFrameIntervalKind::FiveMin, XFrameIntervalKind::FifteenMin] {
                 let interval = interval_label(interval_kind);
                 let interval_path = version_path.join(interval);
@@ -901,9 +516,6 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 let model_resolution_up_path   = version_path.join(format!("model_{interval}_1s_resolution_up.ubj"));
                 let model_resolution_down_path = version_path.join(format!("model_{interval}_1s_resolution_down.ubj"));
 
-                // В тег прогона зашиваем regime (`kelly`/`raw`), чтобы
-                // существующие `tee_println!("[sim] {tag} ...")` строки
-                // отличались между прогонами без правки call-site'ов.
                 let tag = format!("{currency}/{version}/{interval}/{regime_label}");
 
                 let booster_up = match load_booster(&model_up_path) {
@@ -921,17 +533,9 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     }
                 };
 
-                // В режиме `is_kelly = false` калибровка **не применяется**
-                // (см. `compute_pnl_inference` / `compute_p_win_now`),
-                // но грузим её всегда — печать `cal_info` информативна и
-                // в raw-прогоне (видно, что калибровка лежит, просто не
-                // используется).
                 let calibration_up = load_calibration(&model_up_path).ok();
                 let calibration_down = load_calibration(&model_down_path).ok();
 
-                // Resolution-модели (1s) используются только для EV-exit в зоне удержания.
-                // Их отсутствие не блокирует симуляцию — в зоне удержания без них позиция
-                // просто ждёт резолюции (TP/SL/Timeout в зоне всё равно отключены).
                 let booster_resolution_up   = load_booster(&model_resolution_up_path);
                 let booster_resolution_down = load_booster(&model_resolution_down_path);
                 let calibration_resolution_up   = load_calibration(&model_resolution_up_path).ok();
@@ -962,9 +566,6 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                         if booster_resolution_down.is_some() { "✓" } else { "✗" },
                     );
                 } else {
-                    // В raw-прогоне калибровка/Kelly не задействованы — печатаем
-                    // только то, что реально работает: предсказательные модели
-                    // и фиксированный entry size.
                     tee_println!(
                         "[sim] {tag}: модели pnl загружены | resolution: up={} down={} \
                          | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s ev_margin={EV_EXIT_MARGIN} ema_α={EV_EXIT_P_WIN_EMA_ALPHA} \
@@ -991,13 +592,11 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 for file_path in test_paths {
                     match load_market_xframes(file_path) {
                         Ok(market_xframes) => {
-                            // URL события восстанавливается из `dump_ts_ms`
-                            // в имени `.bin`-файла — пустая строка означает
-                            // «не удалось распарсить» и в CSV ляжет пустой
-                            // ячейкой (см. `polymarket_event_url_from_dump_path`).
                             let polymarket_url =
                                 polymarket_event_url_from_dump_path(file_path, &currency, interval_kind)
                                     .unwrap_or_default();
+                            let event_end_ms = window_bounds_from_dump_path(file_path, interval_kind)
+                                .map(|b| b.event_end_ms);
                             simulate_event(
                                 &market_xframes,
                                 &currency,
@@ -1012,6 +611,7 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                                 &mut account,
                                 is_kelly,
                                 &polymarket_url,
+                                event_end_ms,
                             );
                             sim_stats.events += 1;
                         }
@@ -1027,19 +627,8 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── Симуляция события ────────────────────────────────────────────────────────
-
-/// Симулирует один маркет: **два независимых прохода** по кадрам — сначала
-/// сторона UP, затем сторона DOWN. Связи между кадрами UP/DOWN по индексу
-/// нет (они хранятся в `MarketXFramesDump` как два независимых временных
-/// ряда, и любая попытка пройти их «параллельно по `idx`» десинхронизуется
-/// при первом же пропуске кадра у одной из сторон).
-///
-/// Bankroll шарится между двумя проходами: после прохода UP все его позиции
-/// закрыты по Resolution (либо естественно при `event_remaining_ms ≤ 0`,
-/// либо через `last_idx`-fallback на битом буфере), и DOWN стартует с
-/// post-UP-bankroll. Это совпадает с фактической бухгалтерией live-режима
-/// для ОДНОГО интервала (см. [`crate::real_sim`]).
+/// Один маркет: последовательные проходы UP и DOWN по двум независимым рядам кадров.
+/// Общий банкролл (как в [`crate::real_sim`]).
 #[allow(clippy::too_many_arguments)]
 fn simulate_event(
     market_xframes: &MarketXFramesDump,
@@ -1057,48 +646,22 @@ fn simulate_event(
     account: &mut Account,
     is_kelly: bool,
     polymarket_url: &str,
+    event_end_ms: Option<i64>,
 ) {
-    // `price_to_beat` / `final_price` дампа известны на момент вызова
-    // `simulate_event` — пробрасываем их в каждую открытую позицию,
-    // чтобы per-trade CSV содержал контекст резолюции маркета без
-    // отдельного джойна по `market_id`.
     let price_to_beat = Some(market_xframes.price_to_beat);
     let final_price = Some(market_xframes.final_price);
-    // Лейн-ключи для `Account.pending_resolution` (см. также real_sim).
-    // history_sim всегда работает за один маркет, поэтому stale-позиций
-    // на этих ключах быть не должно — это проверяет debug_assert! в
-    // конце `run_side_simulation`.
     let lane_key_up = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Up);
     let lane_key_down = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Down);
-    // Дамп `xframe_dump.rs` уже отфильтрован по `stable=true` (см.
-    // `dump_market_xframes_binary_lane` → `if !frame.stable { continue; }`),
-    // поэтому повторный filter здесь был бы no-op'ом и лишним аллоком.
-    // Стабильность всё равно перепроверяется в `buy_gate` через
-    // `BuyGate::Unstable` — это симметрично с `real_sim` (там кадры
-    // приходят из live-фанаута без предварительного фильтра).
     let frames_up: Vec<&XFrame<SIZE>>   = market_xframes.frames_up.iter().collect();
     let frames_down: Vec<&XFrame<SIZE>> = market_xframes.frames_down.iter().collect();
 
-    // Бинарная выплата на резолюции: победивший токен → $1, проигравший → $0.
-    // Используется только в финальном `resolve_pending_market_sync`
-    // ниже; сами `sell_gate`/`manage_positions` про резолюцию ничего
-    // не знают (см. doc у `CloseReason`).
     let up_won = market_xframes.up_won();
 
-    // `market_id` дампа: оба `frames_up` / `frames_down` относятся к
-    // одному CTF-маркету, поэтому достаточно взять у первого
-    // непустого ряда. Если оба пусты — резолюция не нужна (ниже —
-    // ранний выход).
     let market_id_opt: Option<String> = frames_up
         .first()
         .map(|f| f.market_id.clone())
         .or_else(|| frames_down.first().map(|f| f.market_id.clone()));
 
-    // Сначала UP: все его surviving-позиции уезжают в pending, потом
-    // DOWN. На обоих сторонах резолюция выполняется одним вызовом
-    // `resolve_pending_market_sync` ниже — атомарная картина:
-    // bankroll/stats обновляются вместе, как реальный CTF-payout
-    // обоих токенов одного маркета.
     {
         let mut positions_up: Vec<OpenPosition> = Vec::new();
         run_side_simulation(
@@ -1114,6 +677,7 @@ fn simulate_event(
             polymarket_url,
             price_to_beat,
             final_price,
+            event_end_ms,
         );
     }
     {
@@ -1131,24 +695,11 @@ fn simulate_event(
             polymarket_url,
             price_to_beat,
             final_price,
+            event_end_ms,
         );
     }
 
-    // Финальная резолюция: на этом моменте `account.pending_resolution`
-    // по обоим лейн-ключам содержит ВСЕ surviving-позиции (run_side_simulation
-    // переносит их туда после своего цикла). Sync-ядро Account'а
-    // закроет их по бинарной выплате `up_won` и обновит stats обеих
-    // сторон одним проходом — точно так же, как async-обёртка делает
-    // в real_sim после колбека `xframe_dump`.
     if let Some(market_id) = market_id_opt {
-        // `resolve_pending_market_sync` всегда печатает
-        // `[resolve]`-строки через `tee_println!` (в файл
-        // `xframes/last_history_sim.txt`). Раньше тут стоял `log=false`,
-        // чтобы не забивать stdout history_sim'а сотнями маркетов;
-        // сейчас логи идут в файл, в stdout всё равно дублируются —
-        // но трассировка per-market PnL критичнее, чем компактный
-        // вывод (агрегаты `print_sim_stats` показывают ИТОГ, но не
-        // отдельные win/loss-сделки, по которым он сложился).
         account.resolve_pending_market_sync(
             sim_stats,
             currency,
@@ -1158,17 +709,7 @@ fn simulate_event(
         );
     }
 
-    // После резолюции pending обоих лейн-ключей обязан опустеть:
-    // history_sim — один симулируемый маркет за вызов, и
-    // `resolve_pending_market_sync` фильтрует ровно по этому
-    // `(currency, interval, market_id)`. Если что-то осталось — это
-    // либо bug дампа (чужой `market_id` в `frames_*`), либо bug
-    // sync-ядра. Ловим в release-сборках тоже (раньше был
-    // `debug_assert!`): тихая утечка stale-позиций в `pending_resolution`
-    // от маркета к маркету «капает» в bankroll следующих маркетов
-    // через cross-lane Kelly-сайзинг, и пропустить такой регресс при
-    // прогоне в `--release` — дороже, чем падение симулятора с
-    // понятным сообщением.
+    // После resolve pending по этому маркету должен быть пуст (иначе утечка между маркетами).
     assert!(
         account
             .pending_resolution
@@ -1186,28 +727,10 @@ fn simulate_event(
     );
 }
 
-/// Один проход одной стороны (UP или DOWN) по своему временно́му ряду
-/// кадров. Внутри: `manage_positions` → `try_open_position` →
-/// **mark-to-market equity** drawdown. После завершения цикла все
-/// surviving-позиции переезжают в `account.pending_resolution[lane_key]`
-/// — оттуда их закроет финальный `Account::resolve_pending_market_sync`
-/// в `simulate_event` по бинарному CTF-payout.
+/// Один проход стороны (UP/DOWN) по ряду кадров: manage/open → MtM equity.
+/// Живые позиции в локальной `Vec`; после цикла — в `pending_resolution`, финальный payout в `simulate_event`.
 ///
-/// Equity на каждом тике считается как
-/// `bankroll + Σ(local pos × current_prob) + Σ(pending × entry_prob)`,
-/// симметрично `real_sim::tick_once` (фаза 2). Это критично: между
-/// `open` и `close` реализованный `bankroll` не двигается, поэтому
-/// если считать drawdown только по `bankroll`, метрика системно
-/// занижается на длинных удержаниях, уходящих в красное и
-/// закрывающихся через резолюцию. Pending-слагаемое нужно, чтобы
-/// surviving UP-позиции, переехавшие после UP-прохода в
-/// `account.pending_resolution[lane_key_up]`, не «исчезали» из equity
-/// на DOWN-проходе и не давали искусственный drawdown.
-///
-/// Сайзинг новых позиций идёт от **available capital** =
-/// `bankroll − Σ(open.entry_cost)` той же стороны (cross-side для
-/// history_sim не нужен, т.к. UP и DOWN запускаются последовательно и
-/// другая сторона на данном проходе всегда пуста).
+/// Equity: `bankroll + Σ(local×prob) + Σ(pending×buy_price)` (как `real_sim::tick_once`). Сайзинг от `bankroll − Σ(entry_cost)` на этой стороне.
 #[allow(clippy::too_many_arguments)]
 fn run_side_simulation(
     frames: &[&XFrame<SIZE>],
@@ -1224,27 +747,15 @@ fn run_side_simulation(
     polymarket_url: &str,
     price_to_beat: Option<f64>,
     final_price: Option<f64>,
+    event_end_ms: Option<i64>,
 ) {
     if frames.is_empty() {
         return;
     }
-    // Fallback на «битый» буфер: в штатных прогонах последний кадр уже
-    // в резолюции (`event_remaining_ms ≤ 0`), и условие `is_last` ничего
-    // нового не даёт. На truncated-дампах (writer оборвался раньше
-    // резолюции) `is_last_idx` гарантирует, что surviving-позиции уйдут
-    // в pending без попытки рыночного выхода — финальная бинарная
-    // выплата делается через `resolve_pending_market_sync` в
-    // `simulate_event` по реальному `up_won` маркета.
     let last_idx = frames.len().saturating_sub(1);
 
     for (idx, frame) in frames.iter().enumerate() {
         let is_last_idx = idx == last_idx;
-        // Booster-инференсы считаем ОДИН раз за кадр, перед передачей в
-        // `manage_positions` / `try_open_position`. На однопоточном пути
-        // history_sim это просто аккуратнее — общая API с real_sim, где
-        // тот же предвычисленный `pnl_raw` / `p_win_now` живёт ВНЕ
-        // write-локов (без него 4×N воркеров блокировали бы друг друга
-        // на время `predict_frame`).
         let p_win_now = compute_p_win_now(
             frame,
             booster_resolution,
@@ -1253,14 +764,6 @@ fn run_side_simulation(
         );
         let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl, is_kelly);
 
-        // 1) Рыночные закрытия (TP/SL/Timeout/EV). Split-borrow по
-        //    `account`: одновременно нужен `&mut bankroll` (PnL
-        //    закрытий) и `&mut pending_resolution[lane_key]` (sink
-        //    stale-позиций — ловит асимметричные дампы, по контракту
-        //    history_sim всегда пуст до финального переноса ниже).
-        //    На `event_remaining_ms ≤ 0` `manage_positions` сама
-        //    ничего не закрывает — `sell_gate` возвращает Hold,
-        //    и позиция дождётся `resolve_pending_market_sync`.
         {
             let Account {
                 bankroll,
@@ -1284,11 +787,6 @@ fn run_side_simulation(
             );
         }
 
-        // 2) Открытие новой позиции — от available_bankroll, иначе Kelly
-        //    раздувает экспозицию: bankroll не уменьшается на open
-        //    (всё списание идёт через PnL на close), и без этой коррекции
-        //    последовательные сигналы открыли бы 5×10% = 50% bankroll
-        //    параллельно вместо одного 10%.
         let same_side_locked: f64 = positions.iter().map(|p| p.entry_cost).sum();
         let available = (account.bankroll - same_side_locked).max(0.0);
         try_open_position(
@@ -1303,36 +801,10 @@ fn run_side_simulation(
             polymarket_url,
             price_to_beat,
             final_price,
+            event_end_ms,
         );
 
-        // 3) Mark-to-market equity на каждом тике (а не только на сделке).
-        //    Не используем `currency_implied_prob.unwrap_or(0.0)` бездумно:
-        //    `None` означает «mark-to-market неизвестен», и оценивать
-        //    позицию в нуль — это занижение equity на ровном месте; в
-        //    таком кадре пропускаем апдейт, метрика подождёт следующего.
-        //
-        //    Equity-формула симметрична `real_sim::tick_once` (фаза 2):
-        //      equity = bankroll
-        //             + Σ(local positions × current_prob)
-        //             + Σ(account.pending_resolution[*] × entry_prob)
-        //
-        //    Pending-учёт критичен на DOWN-проходе: к этому моменту
-        //    surviving позиции UP-стороны уже переехали в
-        //    `account.pending_resolution[lane_key_up]` (см. блок ниже,
-        //    после цикла), и без них equity занижен на стоимость
-        //    UP-pending → искусственный drawdown, которого реально нет
-        //    (mark-to-market при переезде в pending не двигается:
-        //    `entry_prob × shares ≈ entry_cost`, реальный PnL прилетит
-        //    в `resolve_pending_market_sync` после обоих side-проходов).
-        //
-        //    `account.positions` в history_sim во время `run_side_simulation`
-        //    всегда пуст (UP/DOWN запускаются последовательно, и каждый
-        //    держит свои живые позиции в **локальной** Vec, не в
-        //    `account.positions`; между `simulate_event`-ами
-        //    `assert!`-инвариант ниже гарантирует пустое pending).
-        //    Поэтому `account.positions`-слагаемое тут опускаем — оно
-        //    тождественно ноль; в real_sim'е оно нужно потому, что там
-        //    позиции 4×N лейнов реально живут в `account.positions`.
+        // MtM equity (как real_sim): без prob на кадре тик пропускаем.
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
             let positions_value: f64 = positions.iter().map(|p| p.shares_held * prob).sum();
@@ -1340,18 +812,13 @@ fn run_side_simulation(
                 .pending_resolution
                 .values()
                 .flat_map(|v| v.iter())
-                .map(|p| p.shares_held * p.entry_prob)
+                .map(|p| p.shares_held * p.buy_price)
                 .sum();
             let equity = account.bankroll + positions_value + pending_value;
             account.update_drawdown(equity);
         }
     }
 
-    // Перенос surviving-позиций в pending: их финал-резолюция —
-    // ответственность `Account::resolve_pending_market_sync`, который
-    // вызывает `simulate_event` сразу после возврата из обоих
-    // `run_side_simulation` (UP и DOWN). На этом этапе `positions`
-    // обнуляется — дальше им жить уже в `Account.pending_resolution`.
     if !positions.is_empty() {
         let pending = account
             .pending_resolution
@@ -1361,70 +828,15 @@ fn run_side_simulation(
     }
 }
 
-/// Решение об открытии новой позиции для одной стороны на одном кадре.
-///
-/// Сигнал входа берётся у **pnl-модели** (большая обучающая выборка,
-/// стабильный AUC), сайзинг — через классический TP/SL Kelly
-/// ([`kelly_gain_ratio`] / [`kelly_loss_ratio`]).
-///
-/// В hold zone TP по ценовой дельте отключён, зато доступны SL как
-/// catastrophic-предохранитель и мягкий EV-exit (см. `manage_positions`).
-/// TP/SL-Kelly здесь даёт **более консервативный** сайз, чем
-/// резолюционная формула — это осознанный выбор: в переобученных/
-/// нестационарных окнах мы не хотим раздувать позиции под ожидание
-/// полной выплаты резолюции.
-///
-/// При `event_remaining_ms < MIN_ENTRY_REMAINING_MS` вход пропускается
-/// (`late_entry_skips++`): за оставшееся время TP/SL физически не
-/// успевают сработать, вход вырождается в лотерею.
-///
-/// При `!frame.stable` вход также пропускается (`unstable_skips++`):
-/// фичи такого кадра не покрываются обучением (поздний WS-коннект),
-/// pnl-модель нельзя считать применимой.
-/// Результат «сухого» прогона всех ранних `return`-ов [`try_open_position`].
-///
-/// Нужен, чтобы одна и та же цепочка проверок (late-entry → predict →
-/// threshold → Kelly → min size) жила в одном месте ([`buy_gate`]), а её
-/// потребители — настоящий вход (`try_open_position`, мутирует `stats`) и
-/// дешёвый предикат для `real_sim` (`matches!(buy_gate(..), Proceed)` до
-/// HTTP-запроса стакана) — не копипастили одни и те же условия.
-///
-/// Варианты упорядочены от самого раннего отказа к успеху; каждый несёт
-/// ровно те промежуточные значения, которые нужны дальше (для `diag_sum_*`
-/// и вызова `open_position`), чтобы `try_open_position` не пересчитывал их
-/// повторно.
-/// Результат предвычисленного booster + калибровка-прохода PnL-модели:
-/// `raw` — сырой инференс (используется для проверки `SIM_BUY_THRESHOLD`),
-/// `pred` — после применения [`Calibration`] (идёт в Kelly-формулу).
-///
-/// Оба значения нужны на одном тике: порог сравнивается с `raw` (как и было
-/// до выноса), а Kelly использует калиброванное `pred`. Возвращаем парой,
-/// чтобы caller считал инференс ОДИН раз и не повторял `Calibration::apply`
-/// внутри [`buy_gate`].
+/// Сырой скор (`raw`) для порога и калиброванный (`pred`) для Kelly; считаются одним вызовом [`compute_pnl_inference`].
 #[derive(Clone, Copy, Debug)]
 pub struct PnlInference {
     pub raw: f32,
     pub pred: f32,
 }
 
-/// Booster-инференс + калибровка PnL-модели для текущего кадра — основной
-/// «дорогой» шаг buy-decision'а. Возвращает `None`, если входить заведомо
-/// нельзя (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`, `!frame.stable`,
-/// нет `currency_implied_prob`) или если `predict_frame` отказался (лаг
-/// превысил [`PNL_MAX_LAG`]).
-///
-/// Калибровку считаем **здесь же**, а не в [`buy_gate`]: она тоже
-/// детерминирована от `raw` и не зависит от состояния (`Calibration` —
-/// иммутабельная map / spline). Тогда `buy_gate` совсем не видит `&Booster`
-/// / `Option<&Calibration>` и под write-локами в `real_sim::tick_once`
-/// никаких CPU-инференсов не остаётся.
-///
-/// Вынесен из [`buy_gate`], чтобы [`crate::real_sim::tick_once`] мог делать
-/// инференс **до** взятия write-локов (`state.write() + account.write()`):
-/// один predict за кадр против двух раньше (один ради `may_open` снаружи,
-/// второй внутри `try_open_position` под локами). На однопоточном пути
-/// `history_sim` разницы нет — call-site вызывает `compute_pnl_inference`
-/// сразу перед `buy_gate` / `try_open_position`.
+/// Booster + калибровка PnL на кадр. `None`: поздний вход / unstable / нет prob / лаг > [`PNL_MAX_LAG`].
+/// Калибровка здесь, не в [`buy_gate`], чтобы real_sim считал инференс до write-локов.
 pub(crate) fn compute_pnl_inference(
     frame: &XFrame<SIZE>,
     booster_pnl: &Booster,
@@ -1441,11 +853,6 @@ pub(crate) fn compute_pnl_inference(
         return None;
     }
     let raw = predict_frame(booster_pnl, frame, PNL_MAX_LAG)?;
-    // `is_kelly = false` — диагностический режим: калибровка отключена,
-    // `pred = raw`. См. `run_sim_mode` и `NO_KELLY_POSITION_SIZE_USD`.
-    // Kelly не считается ниже по стэку, и без калиб'овки порог `raw ≥
-    // SIM_BUY_THRESHOLD` сравнивается с тем же `raw`, что был на
-    // `predict_frame`-выходе — без перетягивания вниз изотонной регрессией.
     let pred = if is_kelly {
         calibration_pnl.map_or(raw, |c| c.apply(raw))
     } else {
@@ -1454,26 +861,8 @@ pub(crate) fn compute_pnl_inference(
     Some(PnlInference { raw, pred })
 }
 
-/// Резолюционная вероятность победы для активного hold-zone — booster +
-/// калибровка одной командой. `None`, если вызывать модель не имеет смысла
-/// (вне hold-zone, нет `booster_resolution`, predict отказался из-за
-/// [`RESOLUTION_MAX_LAG`]).
-///
-/// Аналогично [`compute_pnl_raw`], вынесено для real_sim — чтобы
-/// resolution-инференс уходил **до** write-локов. На history_sim это
-/// один и тот же кадр × все позиции одной стороны, и `manage_positions`
-/// раньше делал predict внутри себя; теперь предвычисление делает caller.
-///
-/// **Гейт `has_positions` убран намеренно**: раньше при `positions=[]`
-/// resolution-инференс пропускался, и на тике, где позиция только что
-/// открывалась в hold-zone, `pos.p_win_ema` сидел `None` весь этот тик.
-/// EMA `p_win` могла сидеть «недосвезенной» лишний тик, EV-exit
-/// откладывался. Теперь predict считается каждый тик в hold-zone
-/// безусловно, и при `try_open_position` создающем позицию её
-/// первый же `manage_positions` следующего тика стартует с уже
-/// инициализированной EMA. Стоимость: ~1 inference resolution-модели
-/// на кадр в hold-zone (до 45 тиков на маркет) даже без активных
-/// позиций — пренебрежимо для real_sim/history_sim.
+/// P(win) resolution-модели в hold-zone; `None` вне зоны / нет booster / лаг > [`RESOLUTION_MAX_LAG`].
+/// Без гейта «есть позиции»: predict каждый тик в зоне — EMA не отстаёт на тик открытия.
 pub(crate) fn compute_p_win_now(
     frame: &XFrame<SIZE>,
     booster_resolution: Option<&Booster>,
@@ -1487,10 +876,6 @@ pub(crate) fn compute_p_win_now(
     }
     booster_resolution.and_then(|b| {
         predict_frame(b, frame, RESOLUTION_MAX_LAG).map(|raw| {
-            // Симметрично с `compute_pnl_inference`: `is_kelly = false`
-            // отключает калибровку и для resolution-модели — EV-exit
-            // в hold-zone сравнивает EMA(raw_p_win) с ценой stake/payout,
-            // т.е. та же «как-есть» вероятность от booster'а.
             if is_kelly {
                 calibration_resolution.map_or(raw, |c| c.apply(raw)) as f64
             } else {
@@ -1536,25 +921,11 @@ pub enum BuyGate {
     /// Срезание сверху до `MAX_POSITION_USD` сюда **не** попадает —
     /// это не отказ, а сужение позиции (см. [`MAX_POSITION_USD`]).
     KellySkip { raw: f32, pred: f32, kelly_f: f64 },
-    /// Все проверки пройдены — есть смысл звать `open_position(size)`.
+    /// Успех → вызов `open_position(size)` ниже по модулю.
     Proceed { raw: f32, pred: f32, kelly_f: f64, size: f64 },
 }
 
-/// Прогоняет весь decision-tree входа **без** побочных эффектов и возвращает
-/// стадию, на которой он остановился (см. [`BuyGate`]).
-///
-/// Вся «математика» входа (late-entry, порог сырой модели, калибрация,
-/// Kelly, `KELLY_MULTIPLIER`, `MAX_BET_FRACTION`, `MAX_POSITION_USD`,
-/// `MIN_POSITION_USD`) живёт только здесь. `try_open_position` оборачивает это в счётчики и реальный
-/// `open_position`; `real_sim` использует `matches!(.., BuyGate::Proceed)`
-/// как дешёвый gate до HTTP-запроса стакана.
-///
-/// `pnl_inference` — **заранее посчитанный** booster + калибровка PnL-модели
-/// (см. [`compute_pnl_inference`]). Гейт сам по себе не делает ни predict, ни
-/// `Calibration::apply` — это позволяет `real_sim::tick_once` считать всю
-/// «дорогую» часть decision-tree ОДИН раз за кадр **вне** write-локов и
-/// переиспользовать в обоих местах (`may_open` и `try_open_position`), вместо
-/// двух predict'ов под лок-критсекцией.
+/// Дерево решений входа без побочных эффектов ([`BuyGate`]). Инференс снаружи — [`compute_pnl_inference`].
 pub(crate) fn buy_gate(
     frame: &XFrame<SIZE>,
     pnl_inference: Option<PnlInference>,
@@ -1569,24 +940,9 @@ pub(crate) fn buy_gate(
     if !frame.stable {
         return BuyGate::Unstable;
     }
-    // Без `currency_implied_prob` ни Kelly, ни размер посчитать не из
-    // чего. Оба вызывающих (`run_history_sim`, `real_sim::tick_once`)
-    // отбрасывают такие кадры до вызова `buy_gate`, но защитно отдаём
-    // `BelowThreshold` — эта ветка не обновляет `diag_sum_*`, поэтому
-    // статистика остаётся consistent с прежним поведением.
-    //
-    // При наличии HTTP-стакана prob берём по нему (mid лучшего bid/ask,
-    // см. `effective_implied_prob`): WS отстаёт от HTTP, и Kelly-расчёт
-    // на свежем mid точнее. На history_sim-пути strict_book всегда `None`,
-    // поведение совпадает с прежним.
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return BuyGate::BelowThreshold;
     };
-    // `pnl_inference == None` означает либо «inference не звали из-за late_entry/
-    // !stable/нет implied_prob» (мы уже выше вернулись бы), либо «predict
-    // вернул None — лаг превысил `PNL_MAX_LAG`». В обоих случаях это эквивалент
-    // прежнего `predict_frame(...) == None` → `BelowThreshold`, статистика
-    // совпадает с прошлым поведением (диагностические суммы не трогаются).
     let Some(PnlInference { raw, pred }) = pnl_inference else {
         return BuyGate::BelowThreshold;
     };
@@ -1595,13 +951,6 @@ pub(crate) fn buy_gate(
         return BuyGate::BelowThreshold;
     }
 
-    // `kelly_f` считается **всегда** — нужен и для kelly-сайзинга, и для
-    // диагностических сумм во всех skip-ветках ниже (раз модель сигналит,
-    // мы хотим видеть среднее edge'а, а не только успешных входов).
-    // `best_bid_at_entry` идёт в `kelly_gain_ratio` для определения
-    // maker-/taker-статуса будущей TP-лимитки: real_sim путь — лучший bid
-    // из HTTP-snapshot CLOB (`strict_book.bids[0]`), history_sim путь —
-    // L1 из WS-кадра.
     let best_bid_at_entry = match strict_book {
         Some(book) => book.bids.first().map(|lvl| lvl.price),
         None => frame.book_bid_l1_price,
@@ -1622,13 +971,6 @@ pub(crate) fn buy_gate(
         return BuyGate::EntryProbOutOfRange { raw, pred, kelly_f };
     }
 
-    // ── Диагностический раздел: `is_kelly = false` ────────────────────────────
-    // Kelly-сайзинг и его проверки (`kelly_f_adj ≤ 0`, `MAX_BET_FRACTION`)
-    // полностью отключены — каждый прошедший порог сигнал открывает
-    // позицию **фиксированного** номинала [`NO_KELLY_POSITION_SIZE_USD`],
-    // ограниченного остатком bankroll'а. `kelly_f` всё равно считается
-    // (его значение пишется в per-trade CSV для post-hoc анализа), но в
-    // решение «брать или нет» не попадает.
     if !is_kelly {
         let size = NO_KELLY_POSITION_SIZE_USD.min(bankroll).max(0.0);
         if size < MIN_POSITION_USD {
@@ -1661,15 +1003,7 @@ pub(crate) fn buy_gate(
     BuyGate::Proceed { raw, pred, kelly_f, size }
 }
 
-/// Возвращает `true`, если на этом тике реально открыли позицию
-/// (`positions.push(pos)` сработал). На любом skip-пути — `false`,
-/// чтобы вызывающая сторона (см. `real_sim::tick_once`) могла
-/// триггерить вывод/`update_drawdown` без локального трекинга
-/// `positions.len()`/`stats.trades`.
-///
-/// `currency` — лейбл валюты лейна (`btc` и т.п.). Используется только
-/// для записи в `OpenPosition.currency` (нужна для per-trade CSV); на
-/// торговую логику не влияет.
+/// При успешном [`open_position`] — `true` и push в `positions`; иначе счётчики skip и `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_open_position(
     frame: &XFrame<SIZE>,
@@ -1683,29 +1017,8 @@ pub(crate) fn try_open_position(
     polymarket_url: &str,
     price_to_beat: Option<f64>,
     final_price: Option<f64>,
+    event_end_ms: Option<i64>,
 ) -> bool {
-    // Единая точка принятия решения о входе: ниже — только бухгалтерия
-    // (счётчики пропусков + `open_position` при успехе). Вся логика
-    // «брать/не брать» — в `buy_gate`, её же использует `real_sim` как
-    // дешёвый gate до HTTP-запроса стакана (`matches!(.., Proceed)`).
-    //
-    // Нет `currency_implied_prob` — `buy_gate` всё равно вернул бы
-    // `BelowThreshold` (no-op здесь, `diag_sum_*` не трогаются), так
-    // что коротко замыкаем без обращения к gate и пропускаем тик.
-    //
-    // `effective_implied_prob` берёт prob из HTTP-стакана при его
-    // наличии (mid лучшего bid/ask) — то же самое значение, что увидит
-    // `buy_gate` ниже, чтобы `diag_sum_entry_prob` корректно отражал
-    // именно ту цену, по которой принималось решение о входе.
-    //
-    // `pnl_inference` пробрасывается caller'ом (см. [`compute_pnl_inference`])
-    // — это позволяет real_sim считать booster + калибровку ОДИН раз вне локов
-    // и переиспользовать здесь, вместо повторного `predict_frame` /
-    // `Calibration::apply` под write-локом.
-    //
-    // Второй вход на тот же `asset_id` запрещён: проверка в ветке
-    // `BuyGate::Proceed` (см. `same_asset_open_skips`), не на каждом кадре,
-    // чтобы не раздувать счётчик на всём удержании.
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return false;
     };
@@ -1718,16 +1031,8 @@ pub(crate) fn try_open_position(
             stats.unstable_skips += 1;
             false
         }
-        BuyGate::BelowThreshold => {
-            // До диагностических сумм мы не дошли — ни `raw_above_threshold`,
-            // ни `diag_sum_*` не трогаем (совместимо с прежним поведением).
-            false
-        }
+        BuyGate::BelowThreshold => false,
         BuyGate::EntryProbOutOfRange { raw, pred, kelly_f } => {
-            // Диагностические суммы ОБНОВЛЯЕМ — модель сигналит выше порога,
-            // мы хотим видеть среднее raw/cal/entry/f* по всем кадрам, где
-            // была попытка торговать (включая отбитые по entry_prob), а не
-            // только по успешно открытым.
             stats.raw_above_threshold += 1;
             stats.diag_sum_raw += raw as f64;
             stats.diag_sum_calibrated += pred as f64;
@@ -1761,16 +1066,20 @@ pub(crate) fn try_open_position(
 
             match open_position(
                 frame, size, stats, strict_book, raw, pred, kelly_f, currency,
-                polymarket_url, price_to_beat, final_price,
+                polymarket_url, price_to_beat, final_price, event_end_ms,
             ) {
                 Some(pos) => {
                     // Гистограммы заполняем только для **успешно открытых**
                     // позиций — нас интересует распределение реальных входов,
                     // а не «kelly_skip / thin_book_skip». Бакет берём по
-                    // `pos.entry_prob` (фактическая цена входа после `effective_implied_prob`)
-                    // и `pred` (калиброванный); это две точки, между которыми
-                    // живёт edge модели.
-                    let bucket_entry = prob_bucket_index(pos.entry_prob);
+                    // `pos.buy_price` (фактический VWAP заполнения, реальная
+                    // цена покупки) и `pred` (калиброванный); это две точки,
+                    // между которыми живёт edge модели. Используем buy_price,
+                    // а не `entry_prob`, чтобы гистограмма отражала
+                    // **фактические цены входа**, а не displayed-prob (mid/
+                    // last_trade), который при широком спреде может далеко
+                    // расходиться с реальной ценой fill'а.
+                    let bucket_entry = prob_bucket_index(pos.buy_price);
                     let bucket_pred = prob_bucket_index(pred as f64);
                     stats.histogram_entry_prob[bucket_entry] += 1;
                     stats.histogram_cal_pred[bucket_pred] += 1;
@@ -1778,23 +1087,6 @@ pub(crate) fn try_open_position(
                     true
                 }
                 None => {
-                    // Сюда попадаем в трёх случаях:
-                    //   * strict-режим (real_sim): HTTP-стакана не хватило
-                    //     для покупки на `size` USDC, либо VWAP уехал за
-                    //     [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] cap, либо
-                    //     `total_shares < min_order_size` ([`book_fill_buy_strict`]
-                    //     вернула `None`).
-                    //   * non-strict (history_sim) — нехватка глубины:
-                    //     суммарной ликвидности WS-стакана не хватило на
-                    //     `size` USDC ([`book_fill_buy`] вернул `None` на
-                    //     incomplete fill).
-                    //   * non-strict (history_sim) — превышен cap: VWAP
-                    //     обхода уехал больше чем на
-                    //     [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] от best ask. Симметрично
-                    //     с y_train-разметкой `walk_buy_xfeatures`: на тех же
-                    //     тиках y_train ставит `None` → не учим, не торгуем.
-                    // Считаем все три под `kelly_strict_buy_skips`: это
-                    // «вход пропустили из-за стакана, не из-за Kelly».
                     stats.kelly_strict_buy_skips += 1;
                     false
                 }
@@ -1803,14 +1095,7 @@ pub(crate) fn try_open_position(
     }
 }
 
-/// Результат «сухого» прогона decision-tree закрытия позиции.
-///
-/// Парный к [`BuyGate`] на sell-стороне: одна и та же цепочка условий
-/// (Resolution на `event_remaining_ms ≤ 0` → hard SL → hold-zone EV-exit →
-/// TP / SL / Timeout вне hold zone) живёт в одном месте ([`sell_gate`]), а
-/// её потребители — настоящий цикл `manage_positions` (мутирует позиции/
-/// статистику) и дешёвый WS-предикат [`any_position_would_sell`] для
-/// `real_sim` — не копипастят эти ветви.
+/// Парный к [`BuyGate`]: решение о закрытии без побочных эффектов.
 pub(crate) enum SellGate {
     /// Hold в **PnL-зоне** — обычный режим ведения позиции: TP/SL/Timeout
     /// по ценовой дельте на горизонте pnl-модели. `pos.p_win_ema` в этой
@@ -1831,36 +1116,52 @@ pub(crate) enum SellGate {
     Close { exit_price: f64, reason: CloseReason },
 }
 
-/// Прогоняет весь decision-tree закрытия **одной** позиции без побочных
-/// эффектов (парно с [`buy_gate`]). Включает и resolution-predict
-/// (`booster_resolution` → `calibration_resolution` → EMA `p_win`), и
-/// проверку причин закрытия — всё, что раньше было разбросано между
-/// `manage_positions` и вручную копипастилось в WS-предикате.
-///
-/// Контракт параметров, которые могут отличаться у разных потребителей:
-/// * `frames_held` — как бы **после** инкремента этим тиком. В
-///   `manage_positions` это уже инкрементированное `pos.frames_held`; в
-///   WS-предикате — `pos.frames_held + 1`, т.к. инкремент ещё не случился.
-/// * `p_win_now` — свежая оценка `P(win)` от resolution-модели на этом
-///   кадре (после калибровки), посчитанная **одной** инференцией в
-///   вызывающем `manage_positions` и переиспользуемая для всех его
-///   позиций. WS-предикат [`any_position_would_sell`] передаёт `None`,
-///   чтобы намеренно **не дёргать predict_frame** на «тихих» тиках; в
-///   этом случае EMA не обновляется (`new_p_win_ema = pos.p_win_ema`)
-///   и EV-exit считается по последнему известному EMA.
-/// * `strict_book` — `Some(book)` только в реальном исполнении через
-///   `manage_positions` при наличии HTTP-стакана. В WS-предикате всегда
-///   `None` — EV-exit оценивается через `book_fill_sell` (WS-fallback).
-///
-/// Если в hold-zone по strict-стакану не хватает bid-ликвидности на
-/// `pos.shares_held`, возвращается [`SellGate::Hold`]: решение о выходе
-/// зафиксировать честно нельзя (остаток пришлось бы досчитывать по
-/// implied prob), ждём следующего тика.
-///
-/// Стоимость: `predict_frame` resolution-модели вызывается **один раз
-/// на кадр** в `manage_positions` и переиспользуется для всех его
-/// позиций. `sell_gate` сам инференса не делает; его доля каждой
-/// позиции — только EMA-апдейт, проверки TP/SL/Timeout/EV.
+/// Bid-walk с cap + fee + maker-флаг для TP/SL-дельты и EV-exit (один расчёт).
+#[derive(Clone, Copy)]
+struct CappedSellFill {
+    gross_usdc: f64,
+    /// VWAP gross по bid-walk (pp на шер).
+    sell_vwap: f64,
+    ev_sell_taker: f64,
+    ev_is_maker: bool,
+}
+
+fn capped_sell_fill_for_gate(
+    frame: &XFrame<SIZE>,
+    strict_book: Option<&StrictBook>,
+    shares_held: f64,
+    current_prob: f64,
+) -> Option<CappedSellFill> {
+    let gross_usdc = match strict_book {
+        Some(book) => book_fill_sell_strict(book, shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
+        None => book_fill_sell(frame, shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
+    }?;
+    let sell_vwap = if shares_held > 0.0 {
+        (gross_usdc / shares_held).clamp(0.001, 0.999)
+    } else {
+        current_prob.clamp(0.001, 0.999)
+    };
+    let fee_usdc =
+        shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_vwap * (1.0 - sell_vwap);
+    let current_best_bid = match strict_book {
+        Some(book) => book.bids.first().map(|lvl| lvl.price),
+        None => frame.book_bid_l1_price,
+    };
+    let ev_is_maker = match current_best_bid {
+        Some(b) => current_prob > b,
+        None => true,
+    };
+    let ev_sell_taker = gross_usdc - fee_usdc;
+    Some(CappedSellFill {
+        gross_usdc,
+        sell_vwap,
+        ev_sell_taker,
+        ev_is_maker,
+    })
+}
+
+/// `frames_held` — уже после инкремента тика (`manage_positions`) или `+1` в WS-предикате.
+/// `p_win_now` — из одного predict на кадр; `None` в [`any_position_would_sell`] (EMA не двигается).
 pub(crate) fn sell_gate(
     pos: &OpenPosition,
     frames_held: usize,
@@ -1869,146 +1170,56 @@ pub(crate) fn sell_gate(
     p_win_now: Option<f64>,
     strict_book: Option<&StrictBook>,
 ) -> SellGate {
-    // Событие закончилось ИЛИ это принудительно последний кадр прогона —
-    // рыночные выходы (TP/SL/Timeout/EV) больше не применимы. Позиция
-    // дождётся резолюционного колбека
-    // [`crate::account::Account::resolve_pending_market`] и закроется
-    // по бинарной выплате CTF ($1/шер победителю, $0 проигравшему —
-    // без комиссии). На этом тике для неё — Hold.
-    //
-    // `is_last` — fallback для **битого буфера** в history_sim: дамп
-    // мог оборваться раньше, чем `event_remaining_ms ≤ 0` (например,
-    // из-за раннего kill / краша writer'а). На truncated-дампе TP/SL/
-    // Timeout по последнему кадру дали бы рыночное закрытие по
-    // неполным данным с фейковой комиссией, в то время как сам маркет
-    // в реальности всё равно резолвнулся (`up_won` известен в
-    // `simulate_event` через `MarketXFramesDump::up_won`). Hold +
-    // путь через pending → `resolve_pending_market_sync` даёт
-    // фактическую бинарную выплату.
-    //
-    // В real_sim понятия «последний кадр» не существует (live-поток),
-    // поэтому caller всегда передаёт `is_last = false`.
     if is_last || frame.event_remaining_ms <= 0 {
         return SellGate::HoldPnl;
     }
 
-    // Без `currency_implied_prob` решение принять нельзя — ни TP/SL/Timeout,
-    // ни EV-exit посчитать не из чего. Защитно возвращаем Hold, а не
-    // panic: повторный тик с валидным кадром обработает позицию.
-    //
-    // Если передан HTTP-стакан, берём `current_prob` по нему (mid лучшего
-    // bid/ask) — HTTP всегда свежее WS, и решение о выходе должно
-    // строиться на актуальной цене. Без strict_book — `frame.currency_implied_prob`.
     let Some(current_prob) = effective_implied_prob(frame, strict_book) else {
         return SellGate::HoldPnl;
     };
 
     let in_hold_zone = frame.event_remaining_ms > 0 && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
-    let delta = current_prob - pos.entry_prob;
+
+    let Some(fill) = capped_sell_fill_for_gate(frame, strict_book, pos.shares_held, current_prob)
+    else {
+        return SellGate::HoldPnl;
+    };
+    let delta = fill.sell_vwap - pos.buy_price;
 
     if in_hold_zone {
-        // EMA-апдейт делаем здесь же, чтобы вся логика sell-решения
-        // была в одном месте. Если `p_win_now=None` (WS-предикат или
-        // predict не удался — лаг больше `RESOLUTION_MAX_LAG`) — EMA
-        // этим тиком не обновляется, EV-exit считаем по последнему
-        // известному `pos.p_win_ema`. Сам инференс делает вызывающий
-        // (`manage_positions`) **один раз на кадр**, см. контракт.
         let new_p_win_ema: Option<f64> = match (p_win_now, pos.p_win_ema) {
             (Some(p), Some(prev)) => Some(EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev),
             (Some(p), None) => Some(p),
             (None, existing) => existing,
         };
 
-        // В зоне удержания TP и Timeout отключены (модель резолюции лучше
-        // оценивает P(win) вблизи конца события), но остаются два выхода:
-        //
-        // 1) **Hard SL** — предохранитель от переуверенной
-        //    resolution-модели: при `delta ≤ Y_TRAIN_STOP_LOSS_PP` цена
-        //    ушла настолько, что лучше зафиксировать убыток сейчас, чем
-        //    ждать резолюции проигравшего токена за $0. Mandatory exit
-        //    без cap'а: может выходить по плохому VWAP на тонком
-        //    стакане, но альтернатива (досидеть до $0-выплаты) хуже.
-        //
-        // 2) **EV-exit** — мягкий выход через `book_fill_sell` с cap'ом
-        //    (`SIM_MAX_SLIPPAGE_FROM_L1_PCT`), если рыночная продажа после
-        //    fee строго выгоднее ожидаемого удержания до резолюции.
-        //
-        // Порядок: SL → EV-exit. SL стоит первым как hard safety net:
-        // на `delta ≤ −SL_PP` мы выходим немедленно, не доверяя
-        // resolution-модели (которая может быть переуверена).
         if delta <= Y_TRAIN_STOP_LOSS_PP {
             return SellGate::Close { exit_price: current_prob, reason: CloseReason::StopLoss };
         }
-        let ev_close: Option<(f64, CloseReason)> = if let Some(p_ema) = new_p_win_ema {
-            let gross_usdc_opt = match strict_book {
-                Some(book) => book_fill_sell_strict(book, pos.shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
-                None => book_fill_sell(frame, pos.shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
+        let ev_close: Option<(f64, CloseReason)> = new_p_win_ema.and_then(|p_ema| {
+            let ev_sell_maker = if fill.ev_is_maker {
+                fill.gross_usdc
+            } else {
+                fill.ev_sell_taker
             };
-            gross_usdc_opt.and_then(|gross_usdc| {
-                let sell_vwap = if pos.shares_held > 0.0 {
-                    (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
+            let ev_hold = p_ema * pos.shares_held;
+            if fill.ev_sell_taker * (1.0 - EV_EXIT_MARGIN) > ev_hold {
+                let reason = if ev_sell_maker > pos.entry_cost {
+                    CloseReason::EvExitProfit
                 } else {
-                    current_prob.clamp(0.001, 0.999)
+                    CloseReason::EvExitLoss
                 };
-                let fee = pos.shares_held
-                    * POLYMARKET_CRYPTO_TAKER_FEE_RATE
-                    * sell_vwap
-                    * (1.0 - sell_vwap);
-                // EV-exit — реактивное решение в hold-zone: лимитка
-                // ставится **в этот же момент** на `current_prob`, поэтому
-                // maker-/taker-проверка идёт от **текущего** best_bid (не
-                // от entry'шного, как у TP — там лимитка ставилась один
-                // раз на входе и зафиксировалась как maker). Источник
-                // best_bid: real_sim — HTTP-snapshot CLOB, history_sim —
-                // L1 WS-кадра.
-                let current_best_bid = match strict_book {
-                    Some(book) => book.bids.first().map(|lvl| lvl.price),
-                    None => frame.book_bid_l1_price,
-                };
-                let ev_is_maker = match current_best_bid {
-                    Some(b) => current_prob > b,
-                    None => true,
-                };
-                // `ev_sell_taker` — выручка при urgent-выходе через
-                // bid-walk (cross-spread, taker-fee). Используется как
-                // **порог принятия решения**: «выходим, только если
-                // даже консервативный taker-сценарий обгоняет hold-EV».
-                let ev_sell_taker = gross_usdc - fee;
-                // `ev_sell_maker` — выручка при resting-лимитке над
-                // current_prob (maker-fee = 0 = gross_usdc), но только
-                // если такая лимитка действительно ляжет как maker
-                // (`ev_is_maker == true`). Иначе наша лимитка пересекла
-                // бы спред = taker, и maker-сценарий вырождается в
-                // taker. Используется **только** для классификации
-                // reason → если без fee мы в плюсе, это voluntary
-                // EvExitProfit, и `close_position` тоже не возьмёт fee
-                // (см. `is_voluntary_exit`). Если maker-cценарий уже не
-                // прибылен — cut-losses через taker (EvExitLoss).
-                let ev_sell_maker = if ev_is_maker { gross_usdc } else { ev_sell_taker };
-                let ev_hold = p_ema * pos.shares_held;
-                if ev_sell_taker * (1.0 - EV_EXIT_MARGIN) > ev_hold {
-                    let reason = if ev_sell_maker > pos.entry_cost {
-                        CloseReason::EvExitProfit
-                    } else {
-                        CloseReason::EvExitLoss
-                    };
-                    Some((current_prob, reason))
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+                Some((current_prob, reason))
+            } else {
+                None
+            }
+        });
         if let Some((exit_price, reason)) = ev_close {
             return SellGate::Close { exit_price, reason };
         }
         return SellGate::HoldResolution { new_p_win_ema };
     }
 
-    // PnL-зона: классический TP/SL/Timeout по ценовой дельте и горизонту
-    // pnl-модели. EMA `p_win` здесь не трогается и в возврат не
-    // включается — это исключительно резолюционный концепт hold-zone.
     if delta >= Y_TRAIN_TAKE_PROFIT_PP {
         return SellGate::Close { exit_price: current_prob, reason: CloseReason::TakeProfit };
     }
@@ -2021,29 +1232,7 @@ pub(crate) fn sell_gate(
     SellGate::HoldPnl
 }
 
-/// Дешёвый WS-предикат «нужен ли strict HTTP-стакан для продажи этим тиком».
-///
-/// Парный к `matches!(buy_gate(..), BuyGate::Proceed)` на sell-стороне:
-/// используется в `real_sim` как gate до HTTP-запроса стакана, чтобы не
-/// дёргать CLOB на «тихих» тиках, когда позиции просто стоят на хранении.
-/// Возвращает `true`, если [`sell_gate`] на одной из позиций при
-/// WS-fallback (без strict book, стандартное `pos.p_win_ema`,
-/// `frames_held + 1`) вернул бы [`SellGate::Close`]:
-///
-/// * hard SL — работает и в обычной зоне, и в hold zone;
-/// * TP / Timeout — только **вне** hold zone;
-/// * EV-exit в hold zone — по `book_fill_sell(frame, shares)` и
-///   **последнему известному** `p_win_ema`. На реальном ходу
-///   `manage_positions` сперва обновит EMA, потом проверит по
-///   strict-стакану — результат может чуть отличаться, но WS-оценка
-///   обычно консистентна с HTTP (HTTP не хуже по глубине).
-///
-/// **На `event_remaining_ms ≤ 0` возвращаем `false`**: завершившееся
-/// событие закрывается через резолюционный колбек
-/// [`crate::account::Account::resolve_pending_market`] (бинарная
-/// выплата `0`/`1` без HTTP), а `manage_positions` на таком кадре
-/// для рыночных выходов уже неактивен — `sell_gate` сам возвращает
-/// `Hold` при `event_remaining_ms <= 0`.
+/// Gate до HTTP: был бы [`sell_gate`] в режиме WS (`Close`) на этом тике.
 pub(crate) fn any_position_would_sell(
     positions: &[OpenPosition],
     frame: &XFrame<SIZE>,
@@ -2051,31 +1240,17 @@ pub(crate) fn any_position_would_sell(
     if positions.is_empty() || frame.event_remaining_ms <= 0 {
         return false;
     }
-    // Этот предикат — только для real_sim (history_sim не дёргает HTTP-стакан),
-    // и в real_sim `is_last` не существует. Передаём `false`.
     positions.iter().any(|pos| {
-        // Stale-позиции (asset_id ≠ текущему маркету лейна) на этом
-        // тике скипаются в `manage_positions`, поэтому и HTTP-стакан
-        // ради них тащить не нужно: `sell_gate` для них всё равно
-        // не вызывается, EV/SL/TP по чужому маркету бессмысленны.
         if pos.asset_id != frame.asset_id {
             return false;
         }
         matches!(
             sell_gate(
                 pos,
-                // `frames_held` как бы после инкремента в `manage_positions`.
                 pos.frames_held + 1,
                 frame,
-                // `is_last = false`: real_sim — это live-поток без понятия
-                // последнего кадра, fallback на битый буфер тут не нужен.
                 false,
-                // `p_win_now = None`: EV-exit использует последнее
-                // известное `pos.p_win_ema` без свежего predict_frame —
-                // дешёвый gate, на «тихих» тиках мы намеренно не
-                // запускаем resolution-инференс.
                 None,
-                // Без HTTP: EV считаем через WS-fallback `book_fill_sell`.
                 None,
             ),
             SellGate::Close { .. }
@@ -2083,27 +1258,8 @@ pub(crate) fn any_position_would_sell(
     })
 }
 
-/// Общий lifecycle позиций одной стороны за один кадр: инкремент `frames_held`
-/// и делегация решения о закрытии в [`sell_gate`] (там же живут predict
-/// resolution-модели, EMA `p_win`, hold-zone EV-exit и TP/SL/Timeout). На
-/// `SellGate::Hold` персистим обновлённый EMA в `pos.p_win_ema`; на
-/// `SellGate::Close` — зовём `close_position` (P&L → `bankroll`, счётчики
-/// → `stats`). В strict-режиме при нехватке bid-ликвидности на
-/// `shares_held` `close_position` возвращает `None`, позиция остаётся
-/// открытой и ретраится на следующем тике (`kelly_strict_sell_skips++`).
-///
-/// Возвращает `true`, если хотя бы одна позиция была успешно закрыта на
-/// этом тике (т.е. `bankroll` сдвинулся и `stats.trades` инкрементнулся).
-/// На `Hold*` для всех позиций или на strict skip’ах закрытия — `false`.
-/// `pending_resolution` — sink-корзина того же лейна, см.
-/// [`crate::account::Account::pending_resolution`]. Сюда уезжают
-/// stale-позиции (asset_id не совпал с фреймом), чтобы дождаться
-/// post-resolution колбека и закрыться по реальному `final_price`
-/// маркета, к которому они принадлежали. На активную книгу `positions`
-/// этого лейна они больше не влияют — ни sell_gate, ни Kelly-сайзинг
-/// (см. `try_open_position` → `available_bankroll`) их не учитывают;
-/// учёт `entry_cost` для них переезжает на `pending_resolution`.
-#[allow(clippy::too_many_arguments)]
+/// Закрытия через [`sell_gate`] / `close_position`; чужой `asset_id` → [`pending_resolution`](crate::account::Account::pending_resolution).
+/// `true`, если был хотя бы один успешный close (bankroll обновился).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn manage_positions(
     positions: &mut Vec<OpenPosition>,
@@ -2115,53 +1271,17 @@ pub(crate) fn manage_positions(
     bankroll: &mut f64,
     strict_book: Option<&StrictBook>,
     _log_tag: &str,
-    // is_kelly попадает сюда, чтобы downstream-вызовы (sell_gate /
-    // close_position) могли при необходимости адаптировать поведение,
-    // но прямо сейчас ни одна из этих функций его не использует —
-    // приехал «впрок» и для симметрии с `try_open_position`. На
-    // sell-стороне `is_kelly = false` пока ничем не отличается от
-    // обычного режима (выходы TP/SL/Timeout/EV считаются от тех же цен,
-    // что и в kelly-прогоне).
     _is_kelly: bool,
 ) -> bool {
     for pos in positions.iter_mut() { pos.frames_held += 1; }
 
-    // `p_win_now` приходит уже посчитанным caller'ом (см. [`compute_p_win_now`]).
-    // Это resolution-инференс booster + калибровка — единственный «дорогой»
-    // шаг decision-tree продаж. Вынос наверх по стэку нужен в первую очередь
-    // для real_sim: predict выполняется ВНЕ write-локов, не блокируя 4×N
-    // параллельных воркеров. На history_sim семантика та же (вызов раз на
-    // кадр, переиспользуется для всех позиций стороны), просто сама арифметика
-    // живёт в caller'е, а не здесь.
-
     let mut sold = false;
     let mut remaining: Vec<OpenPosition> = Vec::new();
     for mut pos in positions.drain(..) {
-        // Stale-позиции (asset_id ≠ текущему фрейму) — это позиции
-        // ОТ предыдущего маркета лейна (5m/15m раунд сменился, токены
-        // уже другие). К ним нельзя применять `sell_gate(frame, ...)`:
-        // ни `currency_implied_prob`, ни `event_remaining_ms`, ни
-        // hold-zone окно нового маркета не описывают старую позицию.
-        //
-        // **Перевозим их из активной книги в `pending_resolution`**
-        // (см. doc-комментарий `Account::pending_resolution`). Там
-        // они дождутся post-resolution колбека по реальному маркету
-        // и закроются через [`Account::resolve_pending_market`] по
-        // `final_price`, который придёт по тому же каналу, что
-        // снабжает `xframe_dump::final_price`.
         if pos.asset_id != frame.asset_id {
             pending_resolution.push(pos);
             continue;
         }
-        // Весь decision-tree (EMA-апдейт `p_win_ema`, проверки
-        // TP/SL/Timeout/EV) живёт в `sell_gate`. Здесь подаём
-        // `pos.frames_held` уже после инкремента и **готовый**
-        // `p_win_now` (один инференс на кадр выше). Текущий
-        // `current_prob` гейт достаёт из `frame.currency_implied_prob`.
-        // На `event_remaining_ms ≤ 0` (и на `is_last` для truncated-дампа
-        // в history_sim) `sell_gate` сам возвращает Hold, и резолюция
-        // позиции уйдёт в колбек
-        // [`crate::account::Account::resolve_pending_market`].
         let close = match sell_gate(
             &pos,
             pos.frames_held,
@@ -2172,12 +1292,9 @@ pub(crate) fn manage_positions(
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
             SellGate::HoldResolution { new_p_win_ema } => {
-                // Персистим обновлённый EMA на позицию — только в hold-zone.
-                // На `Close` EMA возвращать не надо: позиция уйдёт из Vec.
                 pos.p_win_ema = new_p_win_ema;
                 None
             }
-            // В PnL-зоне EMA не обновлялся — `pos.p_win_ema` остаётся как есть.
             SellGate::HoldPnl => None,
         };
         if let Some((exit_price, reason)) = close {
@@ -2188,11 +1305,6 @@ pub(crate) fn manage_positions(
                 }
                 None => {
                     stats.kelly_strict_sell_skips += 1;
-                    // let prefix = if log_tag.is_empty() { String::new() } else { format!("[{log_tag}] ") };
-                    // tee_eprintln!(
-                    //     "{prefix}sell skip ({reason:?}): стакана не хватает на shares={:.4}; держим позицию и ретраим в след. тике",
-                    //     pos.shares_held,
-                    // );
                     remaining.push(pos);
                 }
             }
@@ -2205,21 +1317,7 @@ pub(crate) fn manage_positions(
 }
 
 
-// ─── Kelly criterion ──────────────────────────────────────────────────────────
-
-/// Ожидаемая доля выигрыша при срабатывании Take Profit.
-///
-/// Моделирует покупку $1 токена по `entry_prob` (taker — вход через ask-walk)
-/// и продажу по `entry_prob + TP`. Maker-/taker-статус выходного ордера
-/// определяется по фактическому состоянию стакана **на entry-кадре**: сразу
-/// после покупки мы выставляем resting ask на `tp_target = entry_prob +
-/// Y_TRAIN_TAKE_PROFIT_PP`, и его роль решается в этот же момент:
-///   • `tp_target > best_bid_at_entry` — лимитка ложится как maker
-///     (fee = 0 на выходе, согласовано с `close_position` для voluntary).
-///   • `tp_target ≤ best_bid_at_entry` — лимитка пересекает спред при
-///     постановке = taker, fee применяется.
-///   • `best_bid_at_entry = None` (одностронний стакан без bid'ов) —
-///     нашему ask не на что кросснуться, лимитка резинг-ит как maker.
+/// Доля выигрыша при TP: вход taker по `entry_prob`, выход по TP; maker/taker выхода по `best_bid_at_entry` (как в `close_position`).
 fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
     let tp_is_maker = match best_bid_at_entry {
@@ -2230,23 +1328,14 @@ fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     (net - 1.0).max(1e-9)
 }
 
-/// Ожидаемая доля убытка при срабатывании Stop Loss.
-///
-/// Моделирует покупку $1 токена по `entry_prob` (taker) и продажу по
-/// `entry_prob + SL` как **taker** (urgent-выход через bid-walk: SL реагирует
-/// на просадку, ждать резинг-лимитки нельзя — maker-альтернативы у SL нет).
-/// Согласовано с `close_position`, который на StopLoss/Timeout/EvExitLoss
-/// применяет taker-fee безусловно.
+/// Доля убытка при SL: всегда taker на выходе (как `close_position` на SL).
 fn kelly_loss_ratio(entry_prob: f64) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_STOP_LOSS_PP).clamp(0.001, 0.999);
     let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ true);
     (1.0 - net).max(1e-9)
 }
 
-/// Чистый возврат на $1 при покупке по `buy` (всегда taker — вход через
-/// книгу) и продаже по `sell`. `sell_is_taker = true` соответствует
-/// urgent-выходу (SL/Timeout/EvExitLoss): бид-walk + fee. `sell_is_taker =
-/// false` — voluntary-выход (TP/EvExitProfit): resting maker-лимитка, fee = 0.
+/// Чистый множитель на $1 notional: вход taker; `sell_is_taker` — urgent vs maker выход.
 fn net_round_trip(buy: f64, sell: f64, sell_is_taker: bool) -> f64 {
     let nominal_shares = 1.0 / buy;
     let buy_fee = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy * (1.0 - buy);
@@ -2261,13 +1350,7 @@ fn net_round_trip(buy: f64, sell: f64, sell_is_taker: bool) -> f64 {
     gross - sell_fee
 }
 
-/// Оптимальная доля банкролла по формуле Келли: `f* = p/l − q/g`.
-///
-/// - `p_win` — вероятность прибыльной сделки (предсказание модели).
-/// - `gain` — доля выигрыша при TP ([`kelly_gain_ratio`]).
-/// - `loss` — доля убытка при SL ([`kelly_loss_ratio`]).
-///
-/// Возвращает «сырую» долю (может быть > 1 при высоком edge).
+/// Kelly `f* = p/l − q/g`; может быть >1 — caller режет по [`MAX_BET_FRACTION`] / USD-cap.
 fn kelly_fraction(p_win: f64, gain: f64, loss: f64) -> f64 {
     if gain <= 0.0 || loss <= 0.0 {
         return 0.0;
@@ -2276,10 +1359,7 @@ fn kelly_fraction(p_win: f64, gain: f64, loss: f64) -> f64 {
     p_win / loss - q / gain
 }
 
-/// Бакет вероятности `[0..1]` в индекс `0..=4` для гистограмм
-/// [`SideStats::histogram_entry_prob`] / [`SideStats::histogram_cal_pred`].
-/// Сетка: `[0.0..0.2)`, `[0.2..0.4)`, `[0.4..0.6)`, `[0.6..0.8)`, `[0.8..1.0]`.
-/// Значения `< 0` или `NaN` уходят в бакет `0`, `>= 1.0` — в `4`.
+/// Индекс бакета 0..=4 для гистограмм (шаг 0.2); `<0`/NaN→0, `≥1`→4.
 pub(crate) fn prob_bucket_index(p: f64) -> usize {
     if !p.is_finite() || p < 0.0 {
         return 0;
@@ -2288,23 +1368,8 @@ pub(crate) fn prob_bucket_index(p: f64) -> usize {
     idx.clamp(0, 4) as usize
 }
 
-// ─── Торговые операции с учётом комиссий ──────────────────────────────────────
-
-/// Открывает виртуальную позицию за `position_size` USDC.
-///
-/// Цена исполнения определяется обходом ask-стакана (L1→L2→L3): если L1 не хватает
-/// ликвидности — добираем с L2, затем L3. VWAP покупки = `position_size / total_shares`.
-/// Taker-комиссия вычитается из полученных шерсов:
-/// `actual_shares = nominal_shares − nominal_shares × FEE_RATE × p × (1−p)`
-///
-/// Параметры `raw_pred_at_open`/`cal_pred_at_open`/`kelly_f_at_open` —
-/// диагностические значения decision-tree входа (`BuyGate::Proceed`),
-/// сохраняются в [`OpenPosition`] и потом печатаются в per-trade CSV-логе.
-/// На решение о торговле здесь не влияют (gate уже разрешил вход).
-///
-/// `currency` — лейбл валюты текущего лейна (`btc` и т.п.). Сохраняется
-/// в [`OpenPosition::currency`] для per-trade CSV; на торговую логику
-/// не влияет.
+/// Виртуальный вход на `position_size` USDC: ask-walk, fee из шеров, VWAP→[`OpenPosition::buy_price`].
+/// `raw/cal/kelly` и `currency` — только для CSV; gate уже прошёл.
 #[allow(clippy::too_many_arguments)]
 fn open_position(
     frame: &XFrame<SIZE>,
@@ -2318,6 +1383,7 @@ fn open_position(
     polymarket_url: &str,
     price_to_beat: Option<f64>,
     final_price: Option<f64>,
+    event_end_ms: Option<i64>,
 ) -> Option<OpenPosition> {
     let (buy_price, nominal_shares) = match strict_book {
         Some(book) => book_fill_buy_strict(book, position_size)?,
@@ -2334,18 +1400,9 @@ fn open_position(
 
     stats.fees_paid += fee_usdc;
 
-    // `entry_prob` для последующих TP/SL/EV-проверок: с HTTP-стаканом
-    // берём mid лучшего bid/ask (живое значение, симметрично с
-    // sell_gate/buy_gate), без него — `frame.currency_implied_prob`.
-    // `unwrap_or(buy_price)` остаётся защитой — если ни strict, ни WS
-    // не дали prob, но fill прошёл (теоретически только в strict при
-    // частичном `asks`-стаке без bid'ов), `buy_price` лучше дефолтного 0.5.
+    // Отображаемая prob (CSV/MtM); TP/SL считаются от buy_price.
     let entry_prob = effective_implied_prob(frame, strict_book).unwrap_or(buy_price);
 
-    // Best_bid в момент входа — определяет maker-/taker-статус
-    // resting-лимитки на TP-выходе (см. doc у `OpenPosition::best_bid_at_entry`).
-    // Источник: real_sim путь — HTTP-snapshot CLOB (`strict_book.bids`),
-    // history_sim путь — L1 из WS-кадра.
     let best_bid_at_entry = match strict_book {
         Some(book) => book.bids.first().map(|lvl| lvl.price),
         None => frame.book_bid_l1_price,
@@ -2356,6 +1413,7 @@ fn open_position(
         market_id: frame.market_id.clone(),
         shares_held: actual_shares,
         entry_prob,
+        buy_price,
         entry_cost: position_size,
         best_bid_at_entry,
         frames_held: 0,
@@ -2370,21 +1428,11 @@ fn open_position(
         polymarket_url: polymarket_url.to_string(),
         price_to_beat,
         final_price,
+        event_end_ms,
     })
 }
 
-/// Закрывает позицию **рыночным** выходом и возвращает P&L в USDC
-/// (может быть отрицательным).
-///
-/// Покрывает только `TP / SL / Timeout / EvExit*`: рыночная продажа
-/// по bid-стакану (L1→L2→L3), VWAP продажи = `gross_usdc / shares_held`,
-/// taker-fee вычитается из USDC:
-/// `net = gross − shares × FEE_RATE × p_sell × (1−p_sell)`.
-///
-/// Резолюционные закрытия (бинарная выплата $1/$0 без комиссии)
-/// здесь НЕ обрабатываются — для них есть отдельный путь
-/// [`crate::account::Account::resolve_pending_market`], в т.ч. с
-/// собственным обновлением `SideStats.resolution_win/loss`.
+/// Рыночный выход (TP/SL/Timeout/EvExit): bid-walk, fee. Резолюция — в [`crate::account::Account`].
 fn close_position(
     pos: &OpenPosition,
     exit_price: f64,
@@ -2393,12 +1441,6 @@ fn close_position(
     stats: &mut SideStats,
     strict_book: Option<&StrictBook>,
 ) -> Option<f64> {
-    // Slippage cap включаем **только** для добровольных выходов
-    // (TP / EvExitProfit) — там есть смысл «передумать» и подождать
-    // лучшего стакана. Для SL / Timeout / EvExitLoss cap отключён
-    // (`None`): удерживание позиции из-за тонкого стакана хуже, чем
-    // выход с повышенным slippage, потому что эти причины именно
-    // сигнализируют о том, что дальнейшее ожидание ухудшает PnL.
     let slippage_cap = if reason.is_voluntary_exit() {
         Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
     } else {
@@ -2413,27 +1455,10 @@ fn close_position(
     } else {
         exit_price.clamp(0.001, 0.999)
     };
-    // Voluntary-выход — maker-fee = 0 при условии, что наша resting
-    // лимитка действительно легла в книгу как maker (не пересекла спред
-    // при постановке). У двух voluntary-причин maker-проверка считается
-    // в **разный момент времени**, поэтому источник best_bid разный:
-    //
-    //   • **TakeProfit** — TP-лимитка ставилась один раз сразу после
-    //     buy-walk-а на `pos.entry_prob + Y_TRAIN_TAKE_PROFIT_PP`.
-    //     Maker-/taker-статус зафиксирован тогда же; используем
-    //     `pos.best_bid_at_entry` (захвачен в `try_open_position`).
-    //
-    //   • **EvExitProfit** — реактивное решение в hold-zone: лимитка
-    //     ставится прямо сейчас на `exit_price` (= `current_prob`).
-    //     Maker-проверка идёт от **текущего** best_bid (из `strict_book`
-    //     или `frame.book_bid_l1_price`); согласовано с
-    //     `ev_is_maker` в EV-decision выше.
-    //
-    // Без best_bid (одностронний стакан без bid'ов) — нашему ask не на
-    // что было бы кросснуться, лимитка резинг-ит как maker.
+    // TP: maker по bid на входе; EvExitProfit: по текущему bid; иначе taker.
     let voluntary_is_maker = match reason {
         CloseReason::TakeProfit => {
-            let tp_target = (pos.entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
+            let tp_target = (pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
             match pos.best_bid_at_entry {
                 Some(b) => tp_target > b,
                 None => true,
@@ -2450,7 +1475,6 @@ fn close_position(
                 None => true,
             }
         }
-        // SL / Timeout / EvExitLoss — urgent-выход, maker-альтернативы нет.
         _ => false,
     };
     let fee_usdc = if voluntary_is_maker {
@@ -2480,6 +1504,8 @@ fn close_position(
     // (бинарная выплата $1/$0) пишет `Account::resolve_pending_market_sync`.
     let interval_str = position_interval_label(pos);
     let side_str = position_side_label(pos);
+    let open_unix_ms = pos.event_end_ms.map(|e| e - pos.event_remaining_ms_at_open);
+    let close_unix_ms = pos.event_end_ms.map(|e| e - frame.event_remaining_ms);
     crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &pos.polymarket_url,
         price_to_beat: pos.price_to_beat,
@@ -2490,7 +1516,7 @@ fn close_position(
         interval: interval_str,
         currency: &pos.currency,
         exit_reason: trade_csv_close_reason_label(reason),
-        entry_prob: pos.entry_prob,
+        buy_price: pos.buy_price,
         raw_pred: pos.raw_pred_at_open,
         cal_pred: pos.cal_pred_at_open,
         kelly_f: pos.kelly_f_at_open,
@@ -2503,14 +1529,14 @@ fn close_position(
         p_win_ema_at_close: pos.p_win_ema,
         event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
         event_remaining_ms_at_close: frame.event_remaining_ms,
+        open_unix_ms,
+        close_unix_ms,
     });
 
     Some(pnl)
 }
 
-/// Лейбл интервала позиции для CSV: `"5m"` / `"15m"` / `"unknown"`.
-/// Использует [`XFrameIntervalKind::from_i32`] и общий
-/// [`crate::real_sim::interval_label`].
+/// CSV: `"5m"` / `"15m"` / `"unknown"` через [`crate::real_sim::interval_label`].
 pub(crate) fn position_interval_label(pos: &OpenPosition) -> &'static str {
     match XFrameIntervalKind::from_i32(pos.xframe_interval_type_at_open) {
         Some(kind) => crate::real_sim::interval_label(kind),
@@ -2526,9 +1552,7 @@ pub(crate) fn position_side_label(pos: &OpenPosition) -> &'static str {
     }
 }
 
-/// Текстовый лейбл [`CloseReason`] для CSV-колонки `exit_reason`.
-/// Стабильные значения (не меняются по локали / порядку enum'а) —
-/// чтобы внешний анализ CSV не зависел от Debug-печати.
+/// Стабильный `exit_reason` для CSV (не `Debug`).
 pub(crate) fn trade_csv_close_reason_label(reason: &CloseReason) -> &'static str {
     match reason {
         CloseReason::TakeProfit => "TP",
@@ -2539,32 +1563,8 @@ pub(crate) fn trade_csv_close_reason_label(reason: &CloseReason) -> &'static str
     }
 }
 
-// ─── Обход стакана ────────────────────────────────────────────────────────────
-
-/// Покупка `position_size` USDC по ask-стакану кадра ([`XFrame::book_asks`]).
-///
-/// Возвращает `Some((vwap_price, total_nominal_shares))`, если удалось
-/// полностью закрыть `position_size` фактическими уровнями стакана **и**
-/// (при `Some(slippage_cap)`) VWAP уложился в cap относительно best ask.
-/// Иначе — `None`, вход пропускается (`open_position` возвращает `None`,
-/// `try_open_position` инкрементирует `kelly_strict_buy_skips`).
-///
-/// **Симметрия с [`book_fill_buy_strict`] и `walk_buy_xfeatures` (y_train)**:
-/// y_train (`calc_y_train_pnl` / `calc_y_train_resolution`) размечает кадр
-/// как `None`, если `walk_buy_xfeatures` не закрыл $200 нотинала по L1+L2+L3
-/// или VWAP уехал больше [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`] от best ask. Раньше
-/// `book_fill_buy` (non-strict) на тех же тиках спокойно открывал позицию
-/// на «частичном fill'е» с burn'ом остатка USDC по `0.5` VWAP — и
-/// `history_sim` получал торговые сигналы там, где обучение их **не
-/// размечало**. Теперь оба пути отказываются от входа на ту же глубину
-/// и тот же cap.
-///
-/// `slippage_cap = None` — cap отключён (для отладки/полноты API; на
-/// практике сейчас не используется, входы всегда добровольные).
-///
-/// Идём по полному ask-стакану кадра (`book_asks`, от лучшего к худшему).
-/// На легаси-дампах без сохранённой полной лестницы (`book_asks = None`)
-/// фоллбэчимся на L1/L2/L3 фичи (`book_levels_from_legacy_l123`).
+/// Ask-walk до полного `position_size`; опционально cap VWAP к best ask ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]) — как y_train / [`book_fill_buy_strict`].
+/// Легаси: `book_asks` пуст → L1–L3 фичи.
 fn book_fill_buy(
     frame: &XFrame<SIZE>,
     position_size: f64,
@@ -2616,35 +1616,8 @@ fn book_fill_buy(
     Some((vwap, total_shares))
 }
 
-/// Продажа `shares_to_sell` по bid-стакану кадра ([`XFrame::book_bids`]).
-///
-/// Возвращает `Some(gross_usdc)` (до вычета fee), если bid-стакана
-/// хватило, чтобы продать весь `shares_to_sell` **и** (при
-/// `Some(slippage_cap)`) VWAP уложился в cap относительно best bid.
-/// Иначе — `None`: продажу нельзя завершить на этом тике.
-///
-/// **Семантика `slippage_cap`**:
-///
-/// * `Some(pct)` — добровольный выход (TP / EvExitProfit): cap активен,
-///   при превышении вернёт `None` → `manage_positions` оставит позицию
-///   открытой и попробует следующий тик. Симметрично с
-///   [`CloseReason::is_voluntary_exit`] и [`book_fill_sell_strict`].
-/// * `None` — обязательный выход (SL / Timeout / EvExitLoss): cap
-///   отключён, ждём только полного fill'а по объёму. Если bid-стакана
-///   не хватает на весь `shares_to_sell`, всё равно возвращаем `None`
-///   (нельзя продать «частично» — fee/PnL считаются от полного
-///   объёма, а позиция, не закрытая на этом тике, дождётся резолюции
-///   через [`crate::account::Account::resolve_pending_market`]).
-///
-/// **Симметрия с `walk_sell_xfeatures` (y_train)**: y_train на
-/// неполном fill'е bid'ов **не считает ни TP, ни SL** на этом тике —
-/// просто переходит к следующему. Раньше `book_fill_sell` (non-strict)
-/// на тех же тиках сжигал шеры с `gross_usdc = 0`, и `close_position`
-/// фиксировал «выход» с PnL ≈ −entry_cost. Теперь `history_sim`
-/// откладывает выход (`kelly_strict_sell_skips++`), как и y_train.
-///
-/// Идём по полному bid-стакану кадра. На легаси-дампах без сохранённой
-/// лестницы (`book_bids = None`) фоллбэчимся на L1/L2/L3 фичи.
+/// Bid-walk на полный объём; `slippage_cap`: voluntary — cap vs best bid, urgent — только полный fill.
+/// Симметрично y_train (неполный fill → нет выхода на тике). Легаси: L1–L3.
 fn book_fill_sell(
     frame: &XFrame<SIZE>,
     shares_to_sell: f64,
@@ -2695,13 +1668,7 @@ fn book_fill_sell(
     Some(total_usdc)
 }
 
-/// Пересобирает [`BookLevel`]-лестницу из трёх кандидатов `(price, size)` в
-/// порядке «лучший → худший». Невалидные уровни (отсутствие цены/размера,
-/// нулевые/отрицательные/нефинитные значения) пропускаются.
-///
-/// Используется как фоллбэк в [`book_fill_buy`]/[`book_fill_sell`] для
-/// легаси-кадров без сохранённой полной лестницы (`book_bids`/`book_asks =
-/// None` после миграции — см. [`crate::migration`]).
+/// До трёх уровней из L1–L3, если в дампе нет полной лестницы ([`book_fill_buy`]/[`book_fill_sell`]).
 fn book_levels_from_legacy_l123(levels: [(Option<f64>, Option<f64>); 3]) -> Vec<BookLevel> {
     let mut out = Vec::with_capacity(3);
     for (price_opt, size_opt) in levels {
@@ -2713,8 +1680,6 @@ fn book_levels_from_legacy_l123(levels: [(Option<f64>, Option<f64>); 3]) -> Vec<
     }
     out
 }
-
-// ─── Предсказание ─────────────────────────────────────────────────────────────
 
 fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>) -> Option<f32> {
     let features = match max_lag {
@@ -2732,22 +1697,8 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
     booster.predict(&dmat).ok()?.into_iter().next()
 }
 
-// ─── Вывод статистики ─────────────────────────────────────────────────────────
-
 pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bool) {
     let n = s.raw_above_threshold.max(1) as f64;
-    // `kelly_*`-поля имеют смысл только в kelly-режиме. В raw-прогоне:
-    //   * `avg_kelly_f` — посчитан, но не используется в решении →
-    //     не печатаем (анализ ведётся отдельно по CSV);
-    //   * `kelly_skips` — счётчик «прошли порог, Kelly зарезал» в raw
-    //     срабатывает только в edge-кейсе bankroll < MIN_POSITION_USD;
-    //     переименовываем в более точное `bankroll_too_small_skips`;
-    //   * `kelly_strict_buy_skips` / `kelly_strict_sell_skips` —
-    //     отказы исполнения (book_fill_buy/sell вернул `None`):
-    //     либо стакан слишком тонкий для полного fill'а, либо VWAP
-    //     превысил `SIM_MAX_SLIPPAGE_FROM_L1_PCT` cap. Имеют смысл и
-    //     в history_sim (после введения cap'а на non-strict путь),
-    //     и в real_sim (через book_fill_*_strict).
     let diag = if is_kelly {
         format!(
             "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} entry_prob_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
@@ -2783,11 +1734,6 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_ke
     }
     let win_rate = s.wins as f64 / s.trades as f64 * 100.0;
     let avg_pnl = s.pnl_usd / s.trades as f64;
-    // `Res✓={n}(profit={p}/loss={l})`: первый счётчик — token-outcome
-    // («токен резолвнулся как победивший»), скобки — разбивка по знаку
-    // pnl. См. doc у `SideStats::resolution_win_profit/loss` — при дорогих
-    // входах `resolution_win_loss` может быть существенно > 0 даже при
-    // правильно угаданном исходе.
     tee_println!(
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
@@ -2800,18 +1746,11 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_ke
         s.resolution_loss, s.late_entry_skips, s.unstable_skips, s.same_asset_open_skips,
     );
 
-    // Гистограмма `entry_prob` / калиброванного `pred` на момент входа
-    // — ровно на тех 5 бакетах по 0.2, что и [`prob_bucket_index`].
-    // Полезно для проверки: если все входы в `[0.6..0.8)`, edge модели
-    // мал, и любая ошибка калибровки немедленно «съедает» плюс.
     tee_println!(
         "[sim] {tag} [{side_label}] entry_prob hist (0..0.2 / 0.2..0.4 / 0.4..0.6 / 0.6..0.8 / 0.8..1): {} / {} / {} / {} / {}",
         s.histogram_entry_prob[0], s.histogram_entry_prob[1], s.histogram_entry_prob[2],
         s.histogram_entry_prob[3], s.histogram_entry_prob[4],
     );
-    // В raw-прогоне `pred = raw`, гистограмма cal_pred повторяла бы
-    // raw-распределение. Чтобы не плодить лишний шум в логе — печатаем
-    // только в kelly-режиме, где калибровка реально применяется.
     if is_kelly {
         tee_println!(
             "[sim] {tag} [{side_label}] cal_pred  hist (0..0.2 / 0.2..0.4 / 0.4..0.6 / 0.6..0.8 / 0.8..1): {} / {} / {} / {} / {}",
@@ -2820,9 +1759,6 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_ke
         );
     }
 
-    // PnL по причине закрытия. Считаем **средний** PnL на сделку для
-    // быстрой эвристики: «один TP компенсирует 5 SL?». Делим только на
-    // непустые причины, чтобы не печатать nan.
     let avg = |sum: f64, cnt: usize| if cnt == 0 { 0.0 } else { sum / cnt as f64 };
     tee_println!(
         "[sim] {tag} [{side_label}] pnl_by_reason: \
@@ -2876,9 +1812,6 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
 
     let total_losses = sim_stats.total_losses();
     if is_kelly {
-        // Kelly-режим: вся воронка (`kelly_skips`, `entry_prob_skips`,
-        // `kelly_strict_*`) полезна для диагностики, чем именно режутся
-        // сигналы.
         tee_println!(
             "[sim] {tag} \
              | events={} trades={} win={:.1}% \
@@ -2893,9 +1826,6 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
             kss = sim_stats.total_kelly_strict_sell_skips(),
         );
     } else {
-        // Raw-режим: ни Kelly, ни strict_book — печатаем только то, что
-        // имеет смысл (см. doc у `print_side_stats` для расшифровки
-        // `bankroll_too_small_skips`).
         tee_println!(
             "[sim] {tag} \
              | events={} trades={} win={:.1}% \
@@ -2917,8 +1847,6 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
     print_side_stats(tag, "DOWN", &sim_stats.down, is_kelly);
 }
 
-// ─── Утилиты ──────────────────────────────────────────────────────────────────
-
 pub(crate) fn load_booster(path: &Path) -> Option<Booster> {
     if !path.exists() {
         return None;
@@ -2937,55 +1865,14 @@ fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
     Ok(bincode::deserialize(&bytes)?)
 }
 
-/// Восстанавливает Polymarket-URL события из имени дамп-файла.
-///
-/// Дампы пишутся в [`crate::xframe_dump::dump_market_xframes_binary_lane`]
-/// с именем `{stem}__{dump_ts_ms}.bin`, где `dump_ts_ms` — wall-clock
-/// в момент записи. Запись стартует **после** резолюции маркета
-/// (`tokio::time::sleep(max_step)` после `final_price`-callback'а), и
-/// разброс реальных задержек до `tokio::fs::write` — десятки секунд:
-/// при дампе ~10 МБ bincode-серилизация + I/O в час пик (множество
-/// параллельных дампов) уезжает в 60–90 сек.
-///
-/// Polymarket выравнивает окна по UTC-сетке (`window_start_sec` кратен
-/// `300` / `900` сек), поэтому формула
-/// `event_end_ms = floor(dump_ts_ms / interval_ms) × interval_ms`
-/// возвращает корректный конец окна **до тех пор**, пока
-/// `dump_ts_ms < event_end_ms + interval_ms` (т.е. лаг строго меньше
-/// длины интервала); при большем лаге `floor` уже зачерпнёт начало
-/// следующего окна — там URL принадлежит соседнему маркету, выдавать
-/// его нельзя.
-///
-/// Slug собирается как у [`crate::project_manager`]:
-/// `{currency}-updown-{period}-{window_start_sec}` →
-/// `https://polymarket.com/event/{slug}`.
-///
-/// Возвращает `None`, если имя файла не соответствует формату или
-/// `dump_ts_ms` отстал от `event_end_ms` больше, чем на длину интервала
-/// (нештатная задержка / файл руками переименован — URL посчитать
-/// нельзя без риска указать на соседнее окно).
+/// URL события из имени дампа `{stem}__{dump_ts_ms}.bin`: `event_end_ms = floor(ts/interval)×interval`, slug `{currency}-updown-{5m|15m}-{window_start_sec}`.
+/// `None`, если парсинг/лаг ≥ интервала (floor попадает в следующее окно).
 fn polymarket_event_url_from_dump_path(
     dump_file_path: &Path,
     currency: &str,
     interval_kind: XFrameIntervalKind,
 ) -> Option<String> {
-    let stem = dump_file_path.file_stem()?.to_str()?;
-    let ts_part = stem.rsplit("__").next()?;
-    let dump_ts_ms: i64 = ts_part.parse().ok()?;
-    let interval_sec = match interval_kind {
-        XFrameIntervalKind::FiveMin    => FIVE_MIN_SEC,
-        XFrameIntervalKind::FifteenMin => FIFTEEN_MIN_SEC,
-    };
-    let interval_ms = interval_sec * 1_000;
-    let event_end_ms = (dump_ts_ms / interval_ms) * interval_ms;
-    let lag_ms = dump_ts_ms - event_end_ms;
-    // Полуоткрытый диапазон `[0, interval_ms)`: на верхней границе
-    // `floor` уже даёт следующее окно, и URL стал бы ссылаться на
-    // соседний маркет.
-    if !(0..interval_ms).contains(&lag_ms) {
-        return None;
-    }
-    let window_start_sec = (event_end_ms - interval_ms) / 1_000;
+    let bounds = window_bounds_from_dump_path(dump_file_path, interval_kind)?;
     let interval_label_str = match interval_kind {
         XFrameIntervalKind::FiveMin    => "5m",
         XFrameIntervalKind::FifteenMin => "15m",
@@ -2993,7 +1880,38 @@ fn polymarket_event_url_from_dump_path(
     Some(format!(
         "https://polymarket.com/event/{currency}-updown-{interval_label_str}-{window_start_sec}",
         currency = currency.to_lowercase(),
+        window_start_sec = bounds.window_start_sec,
     ))
+}
+
+/// Границы окна из `...__{dump_ts_ms}.bin`: `event_end_ms = floor(ts/interval)×interval`, лаг ∈ `[0, interval)`.
+/// Общая логика для URL, CSV unix_ms и миграций (`price_to_beat`).
+pub(crate) fn window_bounds_from_dump_path(
+    dump_file_path: &Path,
+    interval_kind: XFrameIntervalKind,
+) -> Option<DumpWindowBounds> {
+    let stem = dump_file_path.file_stem()?.to_str()?;
+    let ts_part = stem.rsplit("__").next()?;
+    let dump_ts_ms: i64 = ts_part.parse().ok()?;
+    let interval_ms = interval_kind.interval_ms();
+    let event_end_ms = (dump_ts_ms / interval_ms) * interval_ms;
+    let lag_ms = dump_ts_ms - event_end_ms;
+    if !(0..interval_ms).contains(&lag_ms) {
+        return None;
+    }
+    Some(DumpWindowBounds {
+        window_start_sec: (event_end_ms - interval_ms) / 1_000,
+        event_end_ms,
+    })
+}
+
+/// Из [`window_bounds_from_dump_path`]: левая граница (sec) и резолюция (UTC ms).
+pub(crate) struct DumpWindowBounds {
+    /// Левая граница окна (UTC, секунды). `Polymarket window_start_sec`.
+    pub window_start_sec: i64,
+    /// Правая граница окна (UTC, миллисекунды). Момент резолюции
+    /// маркета — он же начало следующего окна.
+    pub event_end_ms: i64,
 }
 
 fn fs_sorted_dirs(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {

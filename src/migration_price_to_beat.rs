@@ -350,7 +350,6 @@ fn collect_dump_files_with_window(
             "15m" => XFrameIntervalKind::FifteenMin,
             _ => continue,
         };
-        let interval_ms = interval_kind.interval_ms();
         for step_entry in fs::read_dir(&interval_path)?.flatten() {
             let step_path = step_entry.path();
             if !step_path.is_dir() {
@@ -369,12 +368,13 @@ fn collect_dump_files_with_window(
                     if file_path.extension().and_then(|s| s.to_str()) != Some("bin") {
                         continue;
                     }
-                    let Some(window_start_sec) =
-                        window_start_sec_from_dump_path(&file_path, interval_ms)
-                    else {
+                    let Some(bounds) = crate::history_sim::window_bounds_from_dump_path(
+                        &file_path,
+                        interval_kind,
+                    ) else {
                         continue;
                     };
-                    out.push((file_path, interval_kind, window_start_sec));
+                    out.push((file_path, interval_kind, bounds.window_start_sec));
                 }
             }
         }
@@ -383,72 +383,9 @@ fn collect_dump_files_with_window(
     Ok(out)
 }
 
-/// `window_start_sec` из имени дампа: суффикс `__{ms}.bin` — wall-time записи
-/// (~ через `max_step` секунд после `event_end_ms`). Делим на `interval_ms`,
-/// получаем `event_end_ms`, отнимаем интервал, делим на 1000.
-///
-/// Логика идентична [`crate::history_sim::polymarket_event_url_from_dump_path`],
-/// но возвращаем `window_start_sec`, а не URL.
-fn window_start_sec_from_dump_path(file_path: &Path, interval_ms: i64) -> Option<i64> {
-    let stem = file_path.file_stem()?.to_str()?;
-    let ts_part = stem.rsplit("__").next()?;
-    let dump_ts_ms: i64 = ts_part.parse().ok()?;
-    let event_end_ms = (dump_ts_ms / interval_ms) * interval_ms;
-    let lag_ms = dump_ts_ms - event_end_ms;
-    if !(0..interval_ms).contains(&lag_ms) {
-        return None;
-    }
-    Some((event_end_ms - interval_ms) / 1000)
-}
-
 fn interval_label(kind: XFrameIntervalKind) -> &'static str {
     match kind {
         XFrameIntervalKind::FiveMin => "5m",
         XFrameIntervalKind::FifteenMin => "15m",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Восстановление спота из old_pct и подстановка new_pct: round-trip формулы.
-    #[test]
-    fn pct_roundtrip_recovers_new_pct_for_known_spot() {
-        let old_ptb = 78715.586952_f64;
-        let spot = 78700.0_f64;
-        let old_pct = (old_ptb - spot) / old_ptb * 100.0;
-
-        let new_ptb = 78677.662595_f64;
-        // Восстанавливаем спот по формуле миграции:
-        let spot_recovered = old_ptb * (1.0 - old_pct / 100.0);
-        assert!((spot_recovered - spot).abs() < 1e-6, "spot recovery diff");
-
-        let new_pct = (new_ptb - spot_recovered) / new_ptb * 100.0;
-        let expected = (new_ptb - spot) / new_ptb * 100.0;
-        assert!((new_pct - expected).abs() < 1e-9, "new_pct mismatch");
-    }
-
-    #[test]
-    fn window_start_sec_from_dump_path_5m() {
-        // dump_ts_ms попадает в окно 11:25-11:30 ET (1777821900-1777822200).
-        let path = PathBuf::from("Bitcoin Up or Down - May 3, 11_25AM-11_30AM ET__1777822222169.bin");
-        let interval_ms = 5 * 60 * 1000;
-        let ws = window_start_sec_from_dump_path(&path, interval_ms);
-        assert_eq!(ws, Some(1777821900));
-    }
-
-    #[test]
-    fn window_start_sec_from_dump_path_outside_lag_returns_none() {
-        // dump_ts_ms ровно на границе следующего окна — пропускаем (не наш файл).
-        let path = PathBuf::from("foo__1777822200000.bin");
-        let interval_ms = 5 * 60 * 1000;
-        // lag_ms = 0 → допустим (за начало окна). Проверим точное переполнение:
-        let path2 = PathBuf::from(format!("foo__{}.bin", 1777822200000_i64 + interval_ms));
-        let ws2 = window_start_sec_from_dump_path(&path2, interval_ms);
-        // На границе — следующее окно уже началось, lag_ms = 0 относительно нового
-        // event_end_ms; должно вернуть тот же event_end_ms - interval_ms.
-        assert!(ws2.is_some());
-        let _ = path; // глушим warning
     }
 }
