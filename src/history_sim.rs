@@ -277,7 +277,7 @@ pub enum CloseReason {
 impl CloseReason {
     /// TP / EvExitProfit — можно отложить выход при слишком глубоком slippage (`SIM_MAX_SLIPPAGE_FROM_L1_PCT`).
     pub fn is_voluntary_exit(&self) -> bool {
-        matches!(self, CloseReason::TakeProfit | CloseReason::EvExitProfit)
+        matches!(self, CloseReason::TakeProfit)
     }
 }
 
@@ -1109,54 +1109,48 @@ pub(crate) enum SellGate {
     /// на одно состояние назад. Если `booster_resolution=None` (WS-предикат)
     /// или predict не удался — равен `pos.p_win_ema` без изменений.
     HoldResolution { new_p_win_ema: Option<f64> },
-    /// Позицию закрываем с указанной причиной и ценой выхода. `exit_price`
-    /// идёт в `close_position` для учёта реального fill (через `strict_book`
-    /// или WS-fallback), а также в статистику/логи. EMA тут не возвращается:
-    /// позиция всё равно уйдёт из `positions`.
+    /// Позицию закрываем с указанной причиной. `exit_price` — **фактическая**
+    /// цена продажи (VWAP после walk по bid). TP / EvExitProfit — из voluntary fill (cap + maker cash);
+    /// SL / Timeout / EvExitLoss — из urgent fill (без cap + taker fee). PnL в `close_position` по тем же причинам.
     Close { exit_price: f64, reason: CloseReason },
 }
 
-/// Bid-walk с cap + fee + maker-флаг для TP/SL-дельты и EV-exit (один расчёт).
+/// Один bid-walk для гейта. `net_usdc`: при `exit_as_maker == true` — gross без комиссии на выход;
+/// при `false` — после taker fee.
 #[derive(Clone, Copy)]
 struct CappedSellFill {
-    gross_usdc: f64,
-    /// VWAP gross по bid-walk (pp на шер).
+    /// VWAP цены продажи, доли вероятности на один share (0–1), после walk по книге.
     sell_vwap: f64,
-    ev_sell_taker: f64,
-    ev_is_maker: bool,
+    /// Чистая выручка USDC в выбранном режиме (maker vs taker).
+    net_usdc: f64,
 }
 
 fn capped_sell_fill_for_gate(
     frame: &XFrame<SIZE>,
     strict_book: Option<&StrictBook>,
     shares_held: f64,
+    slippage_cap: Option<f64>,
+    exit_as_maker: bool,
     current_prob: f64,
 ) -> Option<CappedSellFill> {
     let gross_usdc = match strict_book {
-        Some(book) => book_fill_sell_strict(book, shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
-        None => book_fill_sell(frame, shares_held, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)),
+        Some(book) => book_fill_sell_strict(book, shares_held, slippage_cap),
+        None => book_fill_sell(frame, shares_held, slippage_cap),
     }?;
     let sell_vwap = if shares_held > 0.0 {
         (gross_usdc / shares_held).clamp(0.001, 0.999)
     } else {
         current_prob.clamp(0.001, 0.999)
     };
-    let fee_usdc =
-        shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_vwap * (1.0 - sell_vwap);
-    let current_best_bid = match strict_book {
-        Some(book) => book.bids.first().map(|lvl| lvl.price),
-        None => frame.book_bid_l1_price,
+    let net_usdc = if exit_as_maker {
+        gross_usdc
+    } else {
+        let fee_usdc = shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_vwap * (1.0 - sell_vwap);
+        gross_usdc - fee_usdc
     };
-    let ev_is_maker = match current_best_bid {
-        Some(b) => current_prob > b,
-        None => true,
-    };
-    let ev_sell_taker = gross_usdc - fee_usdc;
     Some(CappedSellFill {
-        gross_usdc,
         sell_vwap,
-        ev_sell_taker,
-        ev_is_maker,
+        net_usdc,
     })
 }
 
@@ -1178,15 +1172,23 @@ pub(crate) fn sell_gate(
         return SellGate::HoldPnl;
     };
 
+
     let in_hold_zone = frame.event_remaining_ms > 0 && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
 
-    let Some(fill) = capped_sell_fill_for_gate(frame, strict_book, pos.shares_held, current_prob)
-    else {
-        return SellGate::HoldPnl;
-    };
-    let delta = fill.sell_vwap - pos.buy_price;
-
     if in_hold_zone {
+        let Some(fill) = capped_sell_fill_for_gate(
+            frame,
+            strict_book,
+            pos.shares_held,
+            None,
+            true,
+            current_prob,
+        ) else {
+            return SellGate::HoldPnl;
+        };
+
+        let delta = fill.sell_vwap - pos.buy_price;
+
         let new_p_win_ema: Option<f64> = match (p_win_now, pos.p_win_ema) {
             (Some(p), Some(prev)) => Some(EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev),
             (Some(p), None) => Some(p),
@@ -1194,22 +1196,19 @@ pub(crate) fn sell_gate(
         };
 
         if delta <= Y_TRAIN_STOP_LOSS_PP {
-            return SellGate::Close { exit_price: current_prob, reason: CloseReason::StopLoss };
+            return SellGate::Close {
+                exit_price: fill.sell_vwap,
+                reason: CloseReason::StopLoss,
+            };
         }
         let ev_close: Option<(f64, CloseReason)> = new_p_win_ema.and_then(|p_ema| {
-            let ev_sell_maker = if fill.ev_is_maker {
-                fill.gross_usdc
-            } else {
-                fill.ev_sell_taker
-            };
             let ev_hold = p_ema * pos.shares_held;
-            if fill.ev_sell_taker * (1.0 - EV_EXIT_MARGIN) > ev_hold {
-                let reason = if ev_sell_maker > pos.entry_cost {
-                    CloseReason::EvExitProfit
+            if fill.net_usdc * (1.0 - EV_EXIT_MARGIN) > ev_hold {
+                if fill.net_usdc > pos.entry_cost {
+                    Some((fill.sell_vwap, CloseReason::EvExitProfit))
                 } else {
-                    CloseReason::EvExitLoss
-                };
-                Some((current_prob, reason))
+                    Some((fill.sell_vwap, CloseReason::EvExitLoss))
+                }
             } else {
                 None
             }
@@ -1218,17 +1217,54 @@ pub(crate) fn sell_gate(
             return SellGate::Close { exit_price, reason };
         }
         return SellGate::HoldResolution { new_p_win_ema };
+    } else {
+        let fill_v = capped_sell_fill_for_gate(
+            frame,
+            strict_book,
+            pos.shares_held,
+            Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
+            true,
+            current_prob,
+        );
+        let Some(fill_u) = capped_sell_fill_for_gate(
+            frame,
+            strict_book,
+            pos.shares_held,
+            None,
+            false,
+            current_prob,
+        ) else {
+            return SellGate::HoldPnl;
+        };
+    
+
+  
+        let delta_sl = fill_u.sell_vwap - pos.buy_price;
+
+        if let Some(fill_v) = fill_v {
+            let delta_tp = fill_v.sell_vwap - pos.buy_price;
+            if delta_tp >= Y_TRAIN_TAKE_PROFIT_PP {
+                return SellGate::Close {
+                    exit_price: fill_v.sell_vwap,
+                    reason: CloseReason::TakeProfit,
+                };
+            } 
+        }
+        if delta_sl <= Y_TRAIN_STOP_LOSS_PP {
+            return SellGate::Close {
+                exit_price: fill_u.sell_vwap,
+                reason: CloseReason::StopLoss,
+            };
+        }
+        if frames_held >= POSITION_TIMEOUT_FRAMES {
+            return SellGate::Close {
+                exit_price: fill_u.sell_vwap,
+                reason: CloseReason::Timeout,
+            };
+        }
     }
 
-    if delta >= Y_TRAIN_TAKE_PROFIT_PP {
-        return SellGate::Close { exit_price: current_prob, reason: CloseReason::TakeProfit };
-    }
-    if delta <= Y_TRAIN_STOP_LOSS_PP {
-        return SellGate::Close { exit_price: current_prob, reason: CloseReason::StopLoss };
-    }
-    if frames_held >= POSITION_TIMEOUT_FRAMES {
-        return SellGate::Close { exit_price: current_prob, reason: CloseReason::Timeout };
-    }
+
     SellGate::HoldPnl
 }
 
@@ -1455,23 +1491,12 @@ fn close_position(
     } else {
         exit_price.clamp(0.001, 0.999)
     };
-    // TP: maker по bid на входе; EvExitProfit: по текущему bid; иначе taker.
+    // TP: maker по bid на входе. EvExitProfit: maker при exit VWAP > L1 bid; иначе taker (как urgent в `sell_gate`).
     let voluntary_is_maker = match reason {
         CloseReason::TakeProfit => {
             let tp_target = (pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
             match pos.best_bid_at_entry {
                 Some(b) => tp_target > b,
-                None => true,
-            }
-        }
-        CloseReason::EvExitProfit => {
-            let exit_clamped = exit_price.clamp(0.001, 0.999);
-            let current_best_bid = match strict_book {
-                Some(book) => book.bids.first().map(|lvl| lvl.price),
-                None => frame.book_bid_l1_price,
-            };
-            match current_best_bid {
-                Some(b) => exit_clamped > b,
                 None => true,
             }
         }

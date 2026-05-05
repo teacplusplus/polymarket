@@ -1,5 +1,5 @@
-//! Режим обучения: читает дампы [`crate::xframe_dump::MarketXFramesDump`] из папки `xframes/`,
-//! строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
+//! Режим обучения: читает дампы [`crate::xframe_dump::MarketXFramesDump`] из папки `xframes/` **по одному файлу**
+//! (без удержания всех `frames_up`/`frames_down` в RAM), строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
 //! и сохраняет модель рядом с папкой версии.
 
 use crate::history_sim::{HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS};
@@ -578,13 +578,14 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                         paths.len(),
                     );
 
-                    let train_dumps = load_dumps_for_paths(train_paths);
-                    let val_dumps   = load_dumps_for_paths(val_paths);
-                    let test_dumps  = load_dumps_for_paths(test_paths);
-
                     train_all_variants(
-                        &train_dumps, &val_dumps, &test_dumps,
-                        &version_path, &tag_prefix, interval, step_sec,
+                        train_paths,
+                        val_paths,
+                        test_paths,
+                        &version_path,
+                        &tag_prefix,
+                        interval,
+                        step_sec,
                     )?;
                 }
             }
@@ -661,9 +662,9 @@ impl AppendStats {
 /// файл `model_{interval}_{step_sec}s_{model_type}_{side}.ubj` — формат,
 /// который грузит `history_sim`.
 fn train_all_variants(
-    train_dumps: &[MarketXFramesDump],
-    val_dumps:   &[MarketXFramesDump],
-    test_dumps:  &[MarketXFramesDump],
+    train_paths: &[PathBuf],
+    val_paths: &[PathBuf],
+    test_paths: &[PathBuf],
     version_path: &Path,
     tag_prefix: &str,
     interval: &str,
@@ -689,9 +690,9 @@ fn train_all_variants(
                 ModelType::Pnl => PNL_MAX_LAG,
             };
 
-            let (train_markets, train_stats) = build_market_datasets(train_dumps, side, model_type, max_lag);
-            let (val_markets, val_stats)     = build_market_datasets(val_dumps,   side, model_type, max_lag);
-            let (test_markets, test_stats)   = build_market_datasets(test_dumps,  side, model_type, max_lag);
+            let (train_markets, train_stats) = build_market_datasets(train_paths, side, model_type, max_lag);
+            let (val_markets, val_stats) = build_market_datasets(val_paths, side, model_type, max_lag);
+            let (test_markets, test_stats) = build_market_datasets(test_paths, side, model_type, max_lag);
 
             let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
             if total_markets == 0 {
@@ -773,33 +774,32 @@ pub fn split_counts(n: usize) -> (usize, usize, usize) {
     (train_count, val_count, test_count)
 }
 
-/// Загружает дампы для заданного списка путей. Ошибки чтения/десериализации
-/// молча пропускаются (печатаются в stderr) — идентичное поведение
-/// с [`crate::history_sim`]: битый файл одинаково игнорируется обоими.
-fn load_dumps_for_paths(paths: &[PathBuf]) -> Vec<MarketXFramesDump> {
-    let mut dumps = Vec::with_capacity(paths.len());
-    for path in paths {
-        let bytes = match fs::read(path) {
-            Ok(b) => b,
-            Err(err) => {
-                tee_eprintln!("[train] не удалось прочитать {}: {err}", path.display());
-                continue;
-            }
-        };
-        match bincode::deserialize::<MarketXFramesDump>(&bytes) {
-            Ok(dump) => dumps.push(dump),
-            Err(err) => tee_eprintln!("[train] ошибка десериализации {}: {err}", path.display()),
+/// Одна попытка прочитать и десериализовать дамп по пути. При ошибке печатает в лог и возвращает `None`
+/// (как раньше в батч-загрузке). Не держит все маркеты в памяти: вызывать по одному пути в [`build_market_datasets`].
+fn try_load_dump_from_path(path: &Path) -> Option<MarketXFramesDump> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(err) => {
+            tee_eprintln!("[train] не удалось прочитать {}: {err}", path.display());
+            return None;
+        }
+    };
+    match bincode::deserialize::<MarketXFramesDump>(&bytes) {
+        Ok(dump) => Some(dump),
+        Err(err) => {
+            tee_eprintln!("[train] ошибка десериализации {}: {err}", path.display());
+            None
         }
     }
-    dumps
 }
 
-/// Формирует `MarketDataset` для каждого дампа по заданной ноге и типу модели.
+/// Формирует `MarketDataset` для каждого файла по заданной ноге и типу модели.
+/// Дампы читаются **по одному** — после разметки кадры (`frames_up`/`frames_down`) снимаются с памяти.
 /// `max_lag` — если `Some(n)`, лаговые массивы обрезаются до первых `n` элементов.
 ///
 /// Возвращает агрегированный [`AppendStats`] по всем дампам — для печати
 /// диагностики «сколько кадров отвалилось до разметки». См. [`AppendStats`].
-fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_type: ModelType, max_lag: Option<usize>) -> (Vec<MarketDataset>, AppendStats) {
+fn build_market_datasets(paths: &[PathBuf], side: FrameSide, model_type: ModelType, max_lag: Option<usize>) -> (Vec<MarketDataset>, AppendStats) {
     let feature_count = match max_lag {
         Some(n) => XFrame::<SIZE>::count_features_n(n),
         None => XFrame::<SIZE>::count_features(),
@@ -807,10 +807,22 @@ fn build_market_datasets(dumps: &[MarketXFramesDump], side: FrameSide, model_typ
     let mut markets = Vec::new();
     let mut total_stats = AppendStats::default();
 
-    for dump in dumps {
+    for path in paths {
+        let Some(dump) = try_load_dump_from_path(path) else {
+            continue;
+        };
         let mut x = Vec::new();
         let mut y = Vec::new();
-        let stats = append_frames(side.frames(dump), feature_count, model_type, dump.price_to_beat, dump.final_price, max_lag, &mut x, &mut y);
+        let stats = append_frames(
+            side.frames(&dump),
+            feature_count,
+            model_type,
+            dump.price_to_beat,
+            dump.final_price,
+            max_lag,
+            &mut x,
+            &mut y,
+        );
         total_stats.merge(&stats);
         if !y.is_empty() {
             markets.push(MarketDataset { x, y });
