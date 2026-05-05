@@ -46,6 +46,8 @@ use xgb::{Booster, DMatrix};
 pub const SIM_BUY_THRESHOLD: f32 = 0.70;
 
 /// Cap проскальзывания VWAP от L1 при `book_fill_*` (см. y_train в train_mode).
+/// Для **take profit**, если VWAP полного bid-walk даёт прибыль ≥
+/// [`Y_TRAIN_TAKE_PROFIT_PP`], cap не применяется ([`sell_gate`], [`close_position`]).
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый виртуальный банкролл (USDC).
@@ -64,6 +66,9 @@ pub const MAX_POSITION_USD: f64 = 300.0;
 /// Фиксированный размер входа в режиме `run_sim_mode(is_kelly=false)` (без Kelly/калибровки; raw pred).
 pub const NO_KELLY_POSITION_SIZE_USD: f64 = 30.0;
 
+/// Если `true` — не считаем SHAP-топ5 для PnL-модели на входе; колонка `pnl_top5_shap` в CSV пустая (экономия CPU).
+pub const HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS: bool = false;
+
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
 /// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
 /// См. [Polymarket: Fees](https://docs.polymarket.com/trading/fees).
@@ -80,6 +85,8 @@ pub const EV_EXIT_MARGIN: f64 = 0.01;
 
 /// Лимит кадров без TP/SL → [`CloseReason::Timeout`]. Должен совпадать с `Y_TRAIN_HORIZON_FRAMES` в xframe.
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
+
+pub const MINPOSITION_FRAMES: usize = 2;
 
 /// Минимум `event_remaining_ms` для нового входа ([`buy_gate`] LateEntry).
 pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
@@ -256,6 +263,13 @@ pub struct OpenPosition {
     pub(crate) final_price: Option<f64>,
     /// Конец окна UTC (мс) для `open_unix_ms`/`close_unix_ms` в CSV.
     pub(crate) event_end_ms: Option<i64>,
+    /// Путь к `.bin` дампу этого маркета (`xframes/…`) для колонки `graph_html_file_uri` в CSV.
+    /// В [`crate::real_sim`] — синтетический путь по Gamma stem или пусто, если вопроса ещё нет.
+    pub(crate) graph_dump_bin_path: String,
+    /// Gamma `question` на входе ([`crate::real_sim::LaneFrame::gamma_question`]) — синтетический путь `.bin` для CSV, если явный путь пуст.
+    pub(crate) gamma_question_at_open: Option<String>,
+    /// Топ-5 SHAP-вкладов PnL-бустера на открытии (многострочная ячейка CSV); пусто если расчёт отключён или недоступен.
+    pub(crate) pnl_top5_shap_at_open: String,
 }
 
 /// Рыночный выход до резолюции; бинарное закрытие — в [`crate::account::Account::resolve_pending_market`].
@@ -612,6 +626,7 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                                 is_kelly,
                                 &polymarket_url,
                                 event_end_ms,
+                                file_path.as_path(),
                             );
                             sim_stats.events += 1;
                         }
@@ -647,7 +662,9 @@ fn simulate_event(
     is_kelly: bool,
     polymarket_url: &str,
     event_end_ms: Option<i64>,
+    bin_dump_path: &std::path::Path,
 ) {
+    let graph_dump_bin_path = bin_dump_path.to_string_lossy().into_owned();
     let price_to_beat = Some(market_xframes.price_to_beat);
     let final_price = Some(market_xframes.final_price);
     let lane_key_up = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Up);
@@ -678,6 +695,7 @@ fn simulate_event(
             price_to_beat,
             final_price,
             event_end_ms,
+            &graph_dump_bin_path,
         );
     }
     {
@@ -696,6 +714,7 @@ fn simulate_event(
             price_to_beat,
             final_price,
             event_end_ms,
+            &graph_dump_bin_path,
         );
     }
 
@@ -748,6 +767,7 @@ fn run_side_simulation(
     price_to_beat: Option<f64>,
     final_price: Option<f64>,
     event_end_ms: Option<i64>,
+    graph_dump_bin_path: &str,
 ) {
     if frames.is_empty() {
         return;
@@ -792,6 +812,7 @@ fn run_side_simulation(
         try_open_position(
             frame,
             pnl_inference,
+            Some(booster_pnl),
             positions,
             side_stats,
             available,
@@ -802,6 +823,8 @@ fn run_side_simulation(
             price_to_beat,
             final_price,
             event_end_ms,
+            graph_dump_bin_path,
+            None,
         );
 
         // MtM equity (как real_sim): без prob на кадре тик пропускаем.
@@ -1008,6 +1031,7 @@ pub(crate) fn buy_gate(
 pub(crate) fn try_open_position(
     frame: &XFrame<SIZE>,
     pnl_inference: Option<PnlInference>,
+    booster_pnl_for_shap: Option<&Booster>,
     positions: &mut Vec<OpenPosition>,
     stats: &mut SideStats,
     bankroll: f64,
@@ -1018,6 +1042,8 @@ pub(crate) fn try_open_position(
     price_to_beat: Option<f64>,
     final_price: Option<f64>,
     event_end_ms: Option<i64>,
+    graph_dump_bin_path: &str,
+    gamma_question_at_open: Option<&str>,
 ) -> bool {
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return false;
@@ -1064,9 +1090,20 @@ pub(crate) fn try_open_position(
             stats.diag_sum_entry_prob += entry_prob;
             stats.diag_sum_kelly_f += kelly_f;
 
+            let pnl_top5_shap_at_open = if HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS {
+                String::new()
+            } else {
+                booster_pnl_for_shap
+                    .map(|b| top_pnl_shap_features_csv_cell(b, frame, PNL_MAX_LAG, 5))
+                    .unwrap_or_default()
+            };
+
             match open_position(
                 frame, size, stats, strict_book, raw, pred, kelly_f, currency,
                 polymarket_url, price_to_beat, final_price, event_end_ms,
+                graph_dump_bin_path,
+                gamma_question_at_open,
+                &pnl_top5_shap_at_open,
             ) {
                 Some(pos) => {
                     // Гистограммы заполняем только для **успешно открытых**
@@ -1172,6 +1209,9 @@ pub(crate) fn sell_gate(
         return SellGate::HoldPnl;
     };
 
+    if frames_held < MINPOSITION_FRAMES {
+        return SellGate::HoldPnl;
+    }
 
     let in_hold_zone = frame.event_remaining_ms > 0 && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
 
@@ -1236,11 +1276,11 @@ pub(crate) fn sell_gate(
         ) else {
             return SellGate::HoldPnl;
         };
-    
 
-  
         let delta_sl = fill_u.sell_vwap - pos.buy_price;
 
+        // TP: сначала voluntary+cap (maker); если порог TP достигается только глубже по книге —
+        // закрываем по полному walk, игнорируя cap slippage от L1.
         if let Some(fill_v) = fill_v {
             let delta_tp = fill_v.sell_vwap - pos.buy_price;
             if delta_tp >= Y_TRAIN_TAKE_PROFIT_PP {
@@ -1248,7 +1288,13 @@ pub(crate) fn sell_gate(
                     exit_price: fill_v.sell_vwap,
                     reason: CloseReason::TakeProfit,
                 };
-            } 
+            }
+        }
+        if delta_sl >= Y_TRAIN_TAKE_PROFIT_PP {
+            return SellGate::Close {
+                exit_price: fill_u.sell_vwap,
+                reason: CloseReason::TakeProfit,
+            };
         }
         if delta_sl <= Y_TRAIN_STOP_LOSS_PP {
             return SellGate::Close {
@@ -1420,6 +1466,9 @@ fn open_position(
     price_to_beat: Option<f64>,
     final_price: Option<f64>,
     event_end_ms: Option<i64>,
+    graph_dump_bin_path: &str,
+    gamma_question_at_open: Option<&str>,
+    pnl_top5_shap_at_open: &str,
 ) -> Option<OpenPosition> {
     let (buy_price, nominal_shares) = match strict_book {
         Some(book) => book_fill_buy_strict(book, position_size)?,
@@ -1465,7 +1514,55 @@ fn open_position(
         price_to_beat,
         final_price,
         event_end_ms,
+        graph_dump_bin_path: graph_dump_bin_path.to_string(),
+        gamma_question_at_open: gamma_question_at_open.map(|s| s.to_string()),
+        pnl_top5_shap_at_open: pnl_top5_shap_at_open.to_string(),
     })
+}
+
+/// Gross USDC при TP: если полный sell-walk даёт порог TP — можно обойти cap к L1 (см. [`sell_gate`]).
+fn gross_usdc_sell_take_profit(
+    frame: &XFrame<SIZE>,
+    pos: &OpenPosition,
+    strict_book: Option<&StrictBook>,
+) -> Option<f64> {
+    let cap = Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT);
+    let meets_tp = |gross: f64| -> bool {
+        if pos.shares_held <= 1e-18 {
+            return false;
+        }
+        let vwap = gross / pos.shares_held;
+        vwap - pos.buy_price >= Y_TRAIN_TAKE_PROFIT_PP
+    };
+
+    match strict_book {
+        Some(book) => {
+            let uncapped = book_fill_sell_strict(book, pos.shares_held, None)?;
+            let capped = book_fill_sell_strict(book, pos.shares_held, cap);
+            if meets_tp(uncapped) {
+                match capped {
+                    Some(g) if meets_tp(g) => Some(g),
+                    Some(_) => Some(uncapped),
+                    None => Some(uncapped),
+                }
+            } else {
+                capped.or(Some(uncapped))
+            }
+        }
+        None => {
+            let uncapped = book_fill_sell(frame, pos.shares_held, None)?;
+            let capped = book_fill_sell(frame, pos.shares_held, cap);
+            if meets_tp(uncapped) {
+                match capped {
+                    Some(g) if meets_tp(g) => Some(g),
+                    Some(_) => Some(uncapped),
+                    None => Some(uncapped),
+                }
+            } else {
+                capped.or(Some(uncapped))
+            }
+        }
+    }
 }
 
 /// Рыночный выход (TP/SL/Timeout/EvExit): bid-walk, fee. Резолюция — в [`crate::account::Account`].
@@ -1477,14 +1574,14 @@ fn close_position(
     stats: &mut SideStats,
     strict_book: Option<&StrictBook>,
 ) -> Option<f64> {
-    let slippage_cap = if reason.is_voluntary_exit() {
-        Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
+    let gross_usdc = if reason.is_voluntary_exit() {
+        gross_usdc_sell_take_profit(frame, pos, strict_book)?
     } else {
-        None
-    };
-    let gross_usdc = match strict_book {
-        Some(book) => book_fill_sell_strict(book, pos.shares_held, slippage_cap)?,
-        None => book_fill_sell(frame, pos.shares_held, slippage_cap)?,
+        // SL / Timeout / EvExit*: как urgent в `sell_gate` — без cap от L1 (TakeProfit уже разобран выше).
+        match strict_book {
+            Some(book) => book_fill_sell_strict(book, pos.shares_held, None)?,
+            None => book_fill_sell(frame, pos.shares_held, None)?,
+        }
     };
     let sell_price = if pos.shares_held > 0.0 {
         (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
@@ -1531,6 +1628,9 @@ fn close_position(
     let side_str = position_side_label(pos);
     let open_unix_ms = pos.event_end_ms.map(|e| e - pos.event_remaining_ms_at_open);
     let close_unix_ms = pos.event_end_ms.map(|e| e - frame.event_remaining_ms);
+    let graph_html_file_uri = crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(pos)
+        .map(|p| crate::xframe_graph_dump::graph_html_trade_file_uri(&p, open_unix_ms, close_unix_ms, Some(side_str)))
+        .unwrap_or_default();
     crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &pos.polymarket_url,
         price_to_beat: pos.price_to_beat,
@@ -1556,6 +1656,8 @@ fn close_position(
         event_remaining_ms_at_close: frame.event_remaining_ms,
         open_unix_ms,
         close_unix_ms,
+        graph_html_file_uri: graph_html_file_uri.as_str(),
+        pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
     });
 
     Some(pnl)
@@ -1707,6 +1809,11 @@ fn book_levels_from_legacy_l123(levels: [(Option<f64>, Option<f64>); 3]) -> Vec<
 }
 
 fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>) -> Option<f32> {
+    let dmat = frame_to_prediction_dmatrix(frame, max_lag)?;
+    booster.predict(&dmat).ok()?.into_iter().next()
+}
+
+fn frame_to_prediction_dmatrix(frame: &XFrame<SIZE>, max_lag: Option<usize>) -> Option<DMatrix> {
     let features = match max_lag {
         Some(n) => frame.to_x_train_n_with(n, apply_side_symmetry),
         None => frame.to_x_train_with(apply_side_symmetry),
@@ -1718,8 +1825,56 @@ fn predict_frame(booster: &Booster, frame: &XFrame<SIZE>, max_lag: Option<usize>
     if features.len() != expected {
         return None;
     }
-    let dmat = DMatrix::from_dense(&features, 1).ok()?;
-    booster.predict(&dmat).ok()?.into_iter().next()
+    DMatrix::from_dense(&features, 1).ok()
+}
+
+/// Топ `top_n` признаков по |SHAP| для одной строки (как [`crate::train_mode::print_contributions`]),
+/// без bias; строки — формат `   shap   pct%  name` для одной ячейки CSV (через `\n`).
+fn top_pnl_shap_features_csv_cell(
+    booster: &Booster,
+    frame: &XFrame<SIZE>,
+    max_lag: Option<usize>,
+    top_n: usize,
+) -> String {
+    let Some(dmat) = frame_to_prediction_dmatrix(frame, max_lag) else {
+        return String::new();
+    };
+    let Ok((shap_values, (num_rows, num_cols))) = booster.predict_contributions(&dmat) else {
+        return String::new();
+    };
+    if num_rows != 1 || num_cols < 2 {
+        return String::new();
+    }
+    let n_features = num_cols - 1;
+    let total_abs: f32 = (0..n_features)
+        .map(|i| shap_values[i].abs())
+        .sum();
+
+    let mut contributions: Vec<(String, f32, f32)> = (0..n_features)
+        .filter_map(|feat_idx| {
+            let shap = shap_values[feat_idx];
+            let name = match max_lag {
+                Some(n) => XFrame::<SIZE>::feature_name_n(feat_idx, n),
+                None => XFrame::<SIZE>::feature_name(feat_idx),
+            }?;
+            let percent = if total_abs > 0.0 {
+                shap.abs() / total_abs * 100.0
+            } else {
+                0.0
+            };
+            Some((name.to_string(), shap, percent))
+        })
+        .collect();
+    contributions.sort_by(|(_, _, pct_a), (_, _, pct_b)| {
+        pct_b.partial_cmp(pct_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    contributions
+        .into_iter()
+        .take(top_n)
+        .map(|(name, shap, percent)| format!("   {shap:>8.4}   {percent:>6.2}%  {name}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bool) {

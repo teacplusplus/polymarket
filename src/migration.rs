@@ -7,14 +7,14 @@
 //! # Стратегия
 //!
 //! Дампы хранятся в виде `xframes/{currency}/{schema_size}/{interval}/{step}/{date}/{name}.bin`,
-//! где `schema_size = bincode::serialized_size(&XFrame::<SIZE>::default())` — стабильный
+//! где `schema_size = crate::xframe::xframe_bincode_schema_size_bytes()` — стабильный
 //! «fingerprint» раскладки структуры (см. [`crate::xframe_dump`]). Добавление двух
 //! `Option<Vec<BookLevel>>` (по умолчанию `None` — 1 байт-тег на каждый,
 //! без полезной нагрузки) увеличивает `schema_size` на 2 байта, поэтому новые
 //! дампы лягут в **другой** под-каталог.
 //!
 //! Миграция:
-//! 1. Считает `schema_size` текущего [`crate::xframe::XFrame`] через bincode.
+//! 1. Берёт `schema_size` через [`crate::xframe::xframe_bincode_schema_size_bytes`] (lazy, один расчёт на процесс).
 //! 2. Обходит все `xframes/{currency}/<old_size>/...` каталоги, где
 //!    `<old_size> != current_size`.
 //! 3. Каждый `.bin` в `<interval>/<step>/<date>/` десериализует как
@@ -42,8 +42,6 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const CURRENCIES: &[&str] = &["btc"];
 
 /// Старая раскладка [`crate::xframe::XFrame`] **до** добавления полей
 /// `book_bids`/`book_asks`. Используется только для десериализации
@@ -475,8 +473,7 @@ fn legacy_to_current(legacy: LegacyXFrame<SIZE>) -> XFrame<SIZE> {
 }
 
 pub fn current_schema_size() -> usize {
-    bincode::serialized_size(&XFrame::<SIZE>::default())
-        .expect("XFrame::<SIZE>::default() must be bincode-serializable") as usize
+    crate::xframe::xframe_bincode_schema_size_bytes()
 }
 
 fn legacy_schema_size() -> usize {
@@ -577,7 +574,7 @@ fn migrate_file_in_place(src: &Path) -> Result<bool> {
 
 /// Точка входа миграции (`STATUS=migrate`).
 ///
-/// Идём по [`CURRENCIES`], для каждой валюты вычисляем текущий `schema_size`,
+/// Идём по [`crate::CURRENCIES`], для каждой валюты вычисляем текущий `schema_size`,
 /// пересериализуем все `.bin`-дампы устаревшего каталога `<old_size>/` под
 /// актуальную раскладку и переименовываем сам каталог в `<current_size>/`.
 /// Печатает прогресс в stdout — никаких файлов кроме `xframes/...` не пишем.
@@ -595,7 +592,7 @@ pub fn run_migration() -> Result<()> {
         "[migration] schema_size: current={current_size} legacy(expected_old)={legacy_size}"
     );
 
-    for currency in CURRENCIES {
+    for currency in crate::CURRENCIES {
         let currency_root = Path::new("xframes").join(currency);
         if !currency_root.exists() {
             println!(

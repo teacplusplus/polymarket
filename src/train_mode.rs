@@ -55,12 +55,21 @@ pub const VAL_FRACTION: f64 = 0.2;
 /// Доля тестовой выборки (финальная, честная оценка AUC).
 pub const TEST_FRACTION: f64 = 0.2;
 /// Понижающий коэффициент `feature_weights` для конкретных фич из [`DOWNWEIGHTED_FEATURES`].
-const DOWNWEIGHT_FACTOR: f32 = 0.1;
+/// `None` — не понижать эти фичи.
+const DOWNWEIGHT_FACTOR: Option<f32> = Some(0.1);
 /// Понижающий коэффициент для лаговых фич (массивы `delta_n_*[i]`).
-const LAG_DOWNWEIGHT_FACTOR: f32 = 0.3;
+/// `None` — не понижать лаговые фичи.
+///
+/// Чем больше индекс `i` в суффиксе `[i]`, тем ниже фактический вес: множится
+/// на [`LAG_DOWNWEIGHT_PER_STEP`] для каждого шага после `[0]` (см.
+/// [`lag_downweight_with_index`]).
+const LAG_DOWNWEIGHT_FACTOR: Option<f32> = Some(0.3);
+/// На каждый следующий индекс лага (`[0]` → `[1]` → …) вес дополнительно
+/// умножается на это значение. `1.0` — только базовый [`LAG_DOWNWEIGHT_FACTOR`] без затухания по индексу.
+const LAG_DOWNWEIGHT_PER_STEP: f32 = 0.88;
 /// Имена фич, которым автоматически понижается `feature_weight` при обучении.
 // const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "currency_price_vs_beat_pct", "sibling_currency_price_vs_beat_pct"];
-const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "sibling_currency_price_vs_beat_pct"];
+const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "sibling_currency_price_vs_beat_pct", "currency_implied_prob"];
 /// Ниже этого порога сохраняется identity-калибровка.
 const CALIBRATION_MIN_AUC: f32 = 0.60;
 /// Эпсилон для клиппинга выходов isotonic regression: исключает 0/1 значения,
@@ -161,9 +170,9 @@ pub const Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.2;
 /// элементов через [`XFrame::to_x_train_n_with`]. Общий источник истины
 /// для тренера и [`crate::history_sim`]: один и тот же feature layout
 /// на обучении и инференсе.
-pub const PNL_MAX_LAG: Option<usize> = Some(3);
+pub const PNL_MAX_LAG: Option<usize> = None;
 /// Максимальный лаг `delta_n_*` для Resolution-модели (см. [`PNL_MAX_LAG`]).
-pub const RESOLUTION_MAX_LAG: Option<usize> = Some(3);
+pub const RESOLUTION_MAX_LAG: Option<usize> = None;
 
 // ─── Калибровка (Isotonic Regression) ────────────────────────────────────────
 
@@ -1420,10 +1429,23 @@ fn get_u32(map: &HashMap<String, ParamValue>, key: &str) -> u32 {
 
 // ─── Feature weights ─────────────────────────────────────────────────────────
 
+/// Индекс лага из суффикса вида `field[4]` в имени фичи (см. `XFeatures`).
+fn lag_bracket_index(name: &str) -> Option<usize> {
+    let inner = name.split_once('[')?.1;
+    inner.split_once(']')?.0.parse().ok()
+}
+
+/// Эффективный понижающий вес лаговой фичи с учётом индекса в скобках.
+#[inline]
+fn lag_downweight_with_index(base: f32, name: &str) -> f32 {
+    let i = lag_bracket_index(name).unwrap_or(0);
+    base * LAG_DOWNWEIGHT_PER_STEP.powi(i as i32)
+}
+
 /// Строит вектор `feature_weights` длины `n_features`.
-/// - Фичи из [`DOWNWEIGHTED_FEATURES`] получают вес [`DOWNWEIGHT_FACTOR`].
-/// - Лаговые фичи (имя содержит `[`) получают вес [`LAG_DOWNWEIGHT_FACTOR`].
-/// - Если фича попадает в оба условия, берётся минимальный вес.
+/// - Фичи из [`DOWNWEIGHTED_FEATURES`] получают вес из [`DOWNWEIGHT_FACTOR`], если он `Some`.
+/// - Лаговые фичи (имя содержит `[`) получают вес из [`LAG_DOWNWEIGHT_FACTOR`], если он `Some`, с затуханием по индексу лага ([`LAG_DOWNWEIGHT_PER_STEP`]).
+/// - Если фича попадает в оба условия, берётся минимальный из применимых весов; при обоих `None` вес остаётся 1.0.
 fn build_feature_weights(n_features: usize, max_lag: Option<usize>) -> Vec<f32> {
     let mut weights = vec![1.0_f32; n_features];
     let mut n_explicit = 0usize;
@@ -1439,22 +1461,34 @@ fn build_feature_weights(n_features: usize, max_lag: Option<usize>) -> Vec<f32> 
             let is_explicit = DOWNWEIGHTED_FEATURES.contains(&base_name);
 
             if is_explicit && is_lag {
-                weights[idx] = DOWNWEIGHT_FACTOR.min(LAG_DOWNWEIGHT_FACTOR);
-                n_explicit += 1;
-                n_lag += 1;
+                let w = match (DOWNWEIGHT_FACTOR, LAG_DOWNWEIGHT_FACTOR) {
+                    (Some(d), Some(l)) => Some(d.min(lag_downweight_with_index(l, name))),
+                    (Some(d), None) => Some(d),
+                    (None, Some(l)) => Some(lag_downweight_with_index(l, name)),
+                    (None, None) => None,
+                };
+                if let Some(w) = w {
+                    weights[idx] = w;
+                    n_explicit += 1;
+                    n_lag += 1;
+                }
             } else if is_explicit {
-                weights[idx] = DOWNWEIGHT_FACTOR;
-                n_explicit += 1;
+                if let Some(d) = DOWNWEIGHT_FACTOR {
+                    weights[idx] = d;
+                    n_explicit += 1;
+                }
             } else if is_lag {
-                weights[idx] = LAG_DOWNWEIGHT_FACTOR;
-                n_lag += 1;
+                if let Some(l) = LAG_DOWNWEIGHT_FACTOR {
+                    weights[idx] = lag_downweight_with_index(l, name);
+                    n_lag += 1;
+                }
             }
         }
     }
     if n_explicit > 0 || n_lag > 0 {
         tee_println!(
-            "[train] feature_weights: explicit={n_explicit} (factor={DOWNWEIGHT_FACTOR}), \
-             lag={n_lag} (factor={LAG_DOWNWEIGHT_FACTOR})"
+            "[train] feature_weights: explicit={n_explicit} (factor={DOWNWEIGHT_FACTOR:?}), \
+             lag={n_lag} (base={LAG_DOWNWEIGHT_FACTOR:?}, per_lag_step={LAG_DOWNWEIGHT_PER_STEP})"
         );
     }
     weights

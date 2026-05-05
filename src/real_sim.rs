@@ -10,7 +10,7 @@ use crate::history_sim::{
     load_booster, manage_positions, print_sim_stats, try_open_position, OpenPosition,
     SimStats, StrictBook,
 };
-/// Тот же cap, что в [`crate::history_sim::manage_positions`] / `book_fill_*`.
+/// Тот же cap, что в [`crate::history_sim::manage_positions`] / `book_fill_*` (на TP при выполненном пороге VWAP — cap может игнорироваться).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::xframe::BookLevel;
 use crate::project_manager::{LaneFrame, ProjectManager};
@@ -292,6 +292,7 @@ async fn tick_once(
         asset_id,
         event_start_ms,
         price_to_beat,
+        gamma_question,
         frame,
     } = lane_frame;
 
@@ -535,9 +536,24 @@ async fn tick_once(
                     interval_kind,
                     event_start_ms,
                 );
+                let graph_dump_bin_path_str = gamma_question
+                    .as_deref()
+                    .map(|gq| {
+                        let stem =
+                            crate::util::sanitized_filename_from_gamma_question(Some(gq));
+                        crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(
+                            currency,
+                            interval_kind,
+                            &stem,
+                        )
+                    })
+                    .flatten()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 bought = try_open_position(
                     &frame,
                     pnl_inference,
+                    Some(&models.booster_pnl),
                     this_positions,
                     side_stats,
                     available_bankroll_post,
@@ -548,6 +564,8 @@ async fn tick_once(
                     price_to_beat,
                     None,
                     None, // real_sim: без HTTP сверки времени для CSV
+                    graph_dump_bin_path_str.as_str(),
+                    gamma_question.as_deref(),
                 );
             }
         }

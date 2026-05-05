@@ -50,6 +50,8 @@ pub struct LaneFrame {
     pub event_start_ms: Option<i64>,
     /// Кэш PTB на момент фанаута → CSV; `None`, если страница ещё не дала значение.
     pub price_to_beat: Option<f64>,
+    /// Текст вопроса Gamma для имени дампа и синтетического пути `.bin` в CSV ([`crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link`]).
+    pub gamma_question: Option<String>,
     pub frame: XFrame<SIZE>,
 }
 
@@ -723,6 +725,18 @@ impl ProjectManager {
             }
             map
         };
+        let gamma_question_by_market: HashMap<String, Option<String>> = {
+            let guard = self.event_data_by_market.read().await;
+            let mut map: HashMap<String, Option<String>> = HashMap::new();
+            for entry in &built_xframes {
+                map.entry(entry.market_id.clone()).or_insert_with(|| {
+                    guard
+                        .get(&entry.market_id)
+                        .and_then(|d| d.gamma_question.clone())
+                });
+            }
+            map
+        };
 
         for entry in built_xframes {
             if entry.frame.stable {
@@ -750,11 +764,16 @@ impl ProjectManager {
                             .get(&entry.market_id)
                             .copied()
                             .flatten();
+                        let gamma_question = gamma_question_by_market
+                            .get(&entry.market_id)
+                            .cloned()
+                            .flatten();
                         let lane_frame = LaneFrame {
                             market_id: entry.market_id.clone(),
                             asset_id: entry.asset_id.clone(),
                             event_start_ms,
                             price_to_beat,
+                            gamma_question,
                             frame: entry.frame.clone(),
                         };
                         let _ = tx.send(lane_frame).await;

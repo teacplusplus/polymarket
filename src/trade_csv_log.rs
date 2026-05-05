@@ -96,11 +96,16 @@ pub fn set_current_regime(regime: &'static str) {
 /// (UTC, ms). В history_sim рассчитываются из имени `.bin`-дампа
 /// (см. [`crate::history_sim::window_bounds_from_dump_path`]) и
 /// `event_remaining_ms_at_*`; в real_sim выходят пустыми.
+///
+/// `graph_html_file_uri` — `file:///.../graph/...html?ts1=...&ts2=...` для
+/// локального просмотра с вертикалями открытия/закрытия (пусто без пути дампа).
+///
+/// `pnl_top5_shap` — топ-5 SHAP PnL-модели на входе (многострочная ячейка в кавычках).
 const TRADE_CSV_HEADER: &str = "regime,polymarket_url,price_to_beat,final_price,\
 currency,interval,side,market_id,asset_id,exit_reason,\
 buy_price,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
 frames_held,p_win_ema_at_close,event_remaining_ms_at_open,event_remaining_ms_at_close,\
-open_unix_ms,close_unix_ms,final_outcome";
+open_unix_ms,close_unix_ms,graph_html_file_uri,pnl_top5_shap,final_outcome";
 
 /// Открывает / перезаписывает файл `path` и записывает CSV-заголовок.
 /// Идемпотентен в смысле «последний победил»: повторный вызов закроет
@@ -215,6 +220,11 @@ pub struct TradeCsvRow<'a> {
     /// Wall-clock UTC ms закрытия позиции. Семантика `None` —
     /// та же, что у [`Self::open_unix_ms`].
     pub close_unix_ms: Option<i64>,
+    /// Локальный `file://` URL HTML-графика с `ts1`/`ts2` и опционально `side=up|down` (см. [`crate::xframe_graph_dump::graph_html_trade_file_uri`]).
+    /// Пустая строка, если нет привязки к дампу (`real_sim`) или URI не собрать.
+    pub graph_html_file_uri: &'a str,
+    /// Топ-5 SHAP вкладов PnL-модели в момент открытия (переводы строк `\n`); пусто если расчёт отключён.
+    pub pnl_top5_shap: &'a str,
 }
 
 /// Owned-копия [`TradeCsvRow`] для буферизации до момента, когда
@@ -248,6 +258,8 @@ struct PendingTradeRow {
     event_remaining_ms_at_close: i64,
     open_unix_ms: Option<i64>,
     close_unix_ms: Option<i64>,
+    graph_html_file_uri: String,
+    pnl_top5_shap: String,
 }
 
 /// Кладёт одну строку в in-memory буфер [`TRADE_CSV_PENDING`]. Не пишет
@@ -289,6 +301,8 @@ pub fn write_trade_csv_row(row: TradeCsvRow<'_>) {
         event_remaining_ms_at_close: row.event_remaining_ms_at_close,
         open_unix_ms: row.open_unix_ms,
         close_unix_ms: row.close_unix_ms,
+        graph_html_file_uri: row.graph_html_file_uri.to_string(),
+        pnl_top5_shap: row.pnl_top5_shap.to_string(),
     };
     if let Ok(mut pending) = TRADE_CSV_PENDING.lock() {
         pending.push(owned);
@@ -362,7 +376,7 @@ fn write_pending_row_to_file(
 ) {
     let _ = writeln!(
         w,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         row.regime,
         csv_escape(&row.polymarket_url),
         row.price_to_beat.map(fmt_f64).unwrap_or_default(),
@@ -388,6 +402,8 @@ fn write_pending_row_to_file(
         row.event_remaining_ms_at_close,
         row.open_unix_ms.map(|v| v.to_string()).unwrap_or_default(),
         row.close_unix_ms.map(|v| v.to_string()).unwrap_or_default(),
+        csv_escape(&row.graph_html_file_uri),
+        csv_escape(&row.pnl_top5_shap),
         csv_escape(final_outcome),
     );
 }

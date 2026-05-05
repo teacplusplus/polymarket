@@ -1021,7 +1021,7 @@ pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.7;
 /// тонком маркете $200 могут не пройти L1+L2+L3 ask и съесть VWAP за пределами
 /// порога из [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`] (передаётся
 /// в [`calc_y_train_pnl`] / [`calc_y_train_resolution`]) — такие кадры отфильтровываются.
-pub const Y_TRAIN_NOMINAL_USDC: f64 = 200.0;
+pub const Y_TRAIN_NOMINAL_USDC: f64 = 10.0;
 
 /// Результат walk'а через L1/L2/L3 ask из xframe для покупки `target_usdc`.
 ///
@@ -1065,16 +1065,39 @@ struct WalkSellResult {
     best_bid: f64,
 }
 
-/// Walk через L1/L2/L3 ask из `frame`, тратя `target_usdc` gross.
+fn collect_walk_ask_levels<const N: usize>(frame: &XFrame<N>) -> Vec<(f64, f64)> {
+    if let Some(book) = &frame.book_asks {
+        book.iter()
+            .filter_map(|l| {
+                (l.price > 0.0 && l.size > 0.0).then_some((l.price, l.size))
+            })
+            .collect()
+    } else {
+        [
+            (frame.book_ask_l1_price, frame.book_ask_l1_size),
+            (frame.book_ask_l2_price, frame.book_ask_l2_size),
+            (frame.book_ask_l3_price, frame.book_ask_l3_size),
+        ]
+        .into_iter()
+        .filter_map(|(p, s)| match (p, s) {
+            (Some(price), Some(size)) if price > 0.0 && size > 0.0 => Some((price, size)),
+            _ => None,
+        })
+        .collect()
+    }
+}
+
+/// Walk по ask из `frame`, тратя `target_usdc` gross.
 ///
-/// **Используются только `#[xfeature]` поля** (`book_ask_l{1,2,3}_(price|size)`):
-/// полные `book_asks` (без `#[xfeature]`) намеренно не трогаем — Y-разметка
-/// должна работать на тех же данных, что доступны модели на инференсе.
+/// Источник уровней — [`XFrame::book_asks`], если оно `Some` (как
+/// [`crate::history_sim::book_fill_buy`]: полный стакан от лучшего к
+/// худшему). Если `book_asks == None` (старый дамп / плейсхолдер без
+/// книги), фолбэк на `book_ask_l{1,2,3}_{price,size}`.
 ///
 /// Возвращает `None`, если:
-/// 1. ни один валидный (`price > 0 && size > 0`) ask не найден в L1;
-/// 2. суммарной глубины L1+L2+L3 не хватило, чтобы потратить весь
-///    `target_usdc` (в `book_asks_remaining > 1e-9` после прохода).
+/// 1. нет ни одного валидного (`price > 0 && size > 0`) уровня;
+/// 2. суммарной глубины не хватило, чтобы потратить весь `target_usdc`
+///    (`remaining_usdc > 1e-9` после прохода).
 ///
 /// Slippage cap здесь **не** применяется — caller (Y-функция) проверяет
 /// его сам относительно нужного для конкретного reason cap'а.
@@ -1090,26 +1113,13 @@ fn walk_buy_xfeatures<const N: usize>(
     if !target_usdc.is_finite() || target_usdc <= 0.0 {
         return None;
     }
-    let levels: [(Option<f64>, Option<f64>); 3] = [
-        (frame.book_ask_l1_price, frame.book_ask_l1_size),
-        (frame.book_ask_l2_price, frame.book_ask_l2_size),
-        (frame.book_ask_l3_price, frame.book_ask_l3_size),
-    ];
-    let best_ask = levels
-        .iter()
-        .find_map(|(p, s)| match (p, s) {
-            (Some(price), Some(size)) if *price > 0.0 && *size > 0.0 => Some(*price),
-            _ => None,
-        })?;
+    let levels = collect_walk_ask_levels(frame);
+    let best_ask = levels.first().map(|(p, _)| *p)?;
 
     let mut remaining_usdc = target_usdc;
     let mut gross_shares = 0.0_f64;
     let mut fee_usdc_total = 0.0_f64;
-    for (price_opt, size_opt) in levels.iter() {
-        let (price, size) = match (price_opt, size_opt) {
-            (Some(p), Some(s)) if *p > 0.0 && *s > 0.0 => (*p, *s),
-            _ => continue,
-        };
+    for &(price, size) in &levels {
         let usdc_at_level = (size * price).min(remaining_usdc);
         let shares_at_level = usdc_at_level / price;
         gross_shares += shares_at_level;
@@ -1142,13 +1152,34 @@ fn walk_buy_xfeatures<const N: usize>(
     })
 }
 
-/// Walk через L1/L2/L3 bid из `frame`, продавая `shares` штук.
+fn collect_walk_bid_levels<const N: usize>(frame: &XFrame<N>) -> Vec<(f64, f64)> {
+    if let Some(book) = &frame.book_bids {
+        book.iter()
+            .filter_map(|l| {
+                (l.price > 0.0 && l.size > 0.0).then_some((l.price, l.size))
+            })
+            .collect()
+    } else {
+        [
+            (frame.book_bid_l1_price, frame.book_bid_l1_size),
+            (frame.book_bid_l2_price, frame.book_bid_l2_size),
+            (frame.book_bid_l3_price, frame.book_bid_l3_size),
+        ]
+        .into_iter()
+        .filter_map(|(p, s)| match (p, s) {
+            (Some(price), Some(size)) if price > 0.0 && size > 0.0 => Some((price, size)),
+            _ => None,
+        })
+        .collect()
+    }
+}
+
+/// Walk по bid из `frame`, продавая `shares` штук.
 ///
-/// Симметричен [`walk_buy_xfeatures`]: только `#[xfeature]` поля
-/// (`book_bid_l{1,2,3}_(price|size)`); fee per-level через ту же
-/// формулу `level_shares × rate × p × (1 − p)`; возвращает `None`,
-/// если глубины L1+L2+L3 не хватило, чтобы продать весь `shares`,
-/// либо в L1 нет валидного bid.
+/// Симметричен [`walk_buy_xfeatures`]: если [`XFrame::book_bids`] — `Some`,
+/// полный bid-стакан; иначе фолбэк на `book_bid_l{1,2,3}_{price,size}`.
+/// Fee per-level через `level_shares × rate × p × (1 − p)`;
+/// возвращает `None`, если глубины не хватило на весь `shares`.
 fn walk_sell_xfeatures<const N: usize>(
     frame: &XFrame<N>,
     shares: f64,
@@ -1156,26 +1187,13 @@ fn walk_sell_xfeatures<const N: usize>(
     if !shares.is_finite() || shares <= 0.0 {
         return None;
     }
-    let levels: [(Option<f64>, Option<f64>); 3] = [
-        (frame.book_bid_l1_price, frame.book_bid_l1_size),
-        (frame.book_bid_l2_price, frame.book_bid_l2_size),
-        (frame.book_bid_l3_price, frame.book_bid_l3_size),
-    ];
-    let best_bid = levels
-        .iter()
-        .find_map(|(p, s)| match (p, s) {
-            (Some(price), Some(size)) if *price > 0.0 && *size > 0.0 => Some(*price),
-            _ => None,
-        })?;
+    let levels = collect_walk_bid_levels(frame);
+    let best_bid = levels.first().map(|(p, _)| *p)?;
 
     let mut remaining = shares;
     let mut gross_usdc = 0.0_f64;
     let mut fee_usdc_total = 0.0_f64;
-    for (price_opt, size_opt) in levels.iter() {
-        let (price, size) = match (price_opt, size_opt) {
-            (Some(p), Some(s)) if *p > 0.0 && *s > 0.0 => (*p, *s),
-            _ => continue,
-        };
+    for &(price, size) in &levels {
         let take = remaining.min(size);
         gross_usdc += take * price;
         fee_usdc_total += take * POLYMARKET_CRYPTO_TAKER_FEE_RATE * price * (1.0 - price);
@@ -1199,31 +1217,31 @@ fn walk_sell_xfeatures<const N: usize>(
         best_bid,
     })
 }
+
 /// Метка y для PnL-модели — `«успеет ли позиция $200 нотиналом отбить TP до
 /// конца горизонта или попадёт в SL»`.
 ///
 /// # Модель торговли (как в `real_sim` / `history_sim`)
 ///
 /// 1. **Вход**: купить ровно [`Y_TRAIN_NOMINAL_USDC`] gross-USDC walk'ом
-///    через `book_ask_l{1,2,3}` текущего кадра ([`walk_buy_xfeatures`]).
-///    Используются **только `#[xfeature]` поля** — те же данные, что
-///    видит модель на инференсе. Полные `book_asks` (без `#[xfeature]`)
-///    намеренно не трогаем, чтобы Y и фичи жили в одном пространстве.
+///    ([`walk_buy_xfeatures`]): при `Some` — [`XFrame::book_asks`], иначе
+///    фолбэк на `book_ask_l{1,2,3}` (старые дампы без полного стакана).
 ///    Fee per-level по точной формуле Polymarket
 ///    `level_shares × rate × p × (1 − p)`. Полученные шеры:
 ///    `actual_shares = gross_shares − fee_usdc / vwap`.
 ///
 ///    Кадр размечается как `None`, если:
-///    - в L1+L2+L3 ask нет валидного уровня, либо суммарной глубины не
+///    - в выбранных уровнях ask нет валидного уровня, либо суммарной глубины не
 ///      хватило, чтобы потратить $200 (тонкий маркет);
 ///    - VWAP покупки уехал от best ask больше, чем на переданный
 ///      `max_slippage_from_l1_pct` (реальный исполнитель такой ордер
 ///      бы зарубил → семантически это «вход не открылся»).
 ///
 /// 2. **Шаги горизонта** (1..=n): на каждом будущем кадре —
-///    walk_sell_xfeatures(actual_shares) по `book_bid_l{1,2,3}`. Если
-///    глубины bid не хватает на `actual_shares` — выйти нельзя ни в
-///    каком виде, ни TP, ни SL не считаются на этом тике, идём дальше.
+///    `walk_sell_xfeatures(actual_shares)`: при [`XFrame::book_bids`] `Some` —
+///    полный bid, иначе L1–L3. Если глубины bid не хватает на
+///    `actual_shares` — выйти нельзя ни в каком виде, ни TP, ни SL не
+///    считаются на этом тике, идём дальше.
 ///
 ///    `net_ret = (net_usdc − Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC`
 ///    нормирован относительно gross-нотионала, поэтому пороги
@@ -1378,12 +1396,12 @@ pub fn calc_y_train_pnl(
         // Slippage cap включён в обеих ветках: симметрично с
         // [`crate::history_sim::SellGate`], где voluntary-exit по
         // слишком тонкому стакану ждёт следующего тика.
-        let cap_ok = (sell.best_bid - sell.vwap) / sell.best_bid <= max_slippage_from_l1_pct;
+      
         if tp_is_maker {
-            if cap_ok && net_ret_maker >= Y_TRAIN_TAKE_PROFIT_PP {
+            if net_ret_maker >= Y_TRAIN_TAKE_PROFIT_PP {
                 return Some(1.0);
             }
-        } else if cap_ok && net_ret_taker >= Y_TRAIN_TAKE_PROFIT_PP {
+        } else if net_ret_taker >= Y_TRAIN_TAKE_PROFIT_PP {
             return Some(1.0);
         }
     }
@@ -1715,6 +1733,20 @@ pub(crate) fn currency_implied_prob_polymarket_style(
     } else {
         mid
     }
+}
+
+/// Размер bincode-сериализации [`XFrame::<SIZE>::default()`]: сегмент каталога `xframes/{currency}/{байты}/…`, зеркально `graph/…`, `streams/…`.
+/// Считается один раз при первом вызове [`xframe_bincode_schema_size_bytes`].
+static XFRAME_BINCODE_SCHEMA_SIZE_BYTES: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| {
+        bincode::serialized_size(&XFrame::<SIZE>::default())
+            .expect("XFrame::<SIZE>::default() must be bincode-serializable") as usize
+    });
+
+/// Размер сериализованного по bincode дефолтного [`XFrame::<SIZE>`] — «fingerprint» раскладки полей для подкаталога дампов.
+#[inline]
+pub fn xframe_bincode_schema_size_bytes() -> usize {
+    *XFRAME_BINCODE_SCHEMA_SIZE_BYTES
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ pub mod run_log;
 pub mod currency_ws;
 pub mod data_ws;
 pub mod xframe_dump;
+pub mod xframe_graph_dump;
 pub mod train_mode;
 pub mod tee_log;
 pub mod history_sim;
@@ -16,6 +17,7 @@ pub mod real_sim;
 pub mod account;
 pub mod migration;
 pub mod migration_price_to_beat;
+pub mod migration_graph_html;
 pub mod trade_csv_log;
 pub mod poly_chain;
 
@@ -23,11 +25,10 @@ use anyhow::Result;
 use account::Account;
 use project_manager::ProjectManager;
 
-/// Список валют, для которых поднимаются независимые `ProjectManager`-ы
-/// (свой WS + свой кэш xframes + свои воркеры `real_sim`). Новую валюту
-/// достаточно добавить сюда — точки входа режимов `Default` и `RealSim` сами
-/// пройдут по массиву.
-const CURRENCIES: &[&str] = &["btc"];
+/// Список валют: независимые `ProjectManager`-ы в `Default`/`RealSim`, обход дампов
+/// в миграциях (`migrate`, `migrate_price_to_beat`, `migrate_graph_html`).
+/// Новую валюту достаточно добавить сюда.
+pub const CURRENCIES: &[&str] = &["btc"];
 
 /// Режим запуска, считанный из переменной окружения `STATUS` (`.env`).
 #[derive(Debug)]
@@ -64,6 +65,10 @@ enum AppMode {
     /// Запускается через `STATUS=migrate_price_to_beat`; идемпотентна —
     /// повторный запуск на уже исправленных дампах их не меняет.
     MigratePriceToBeat,
+    /// Для каждого `xframes/{currency}/<schema>/.../*.bin` создаёт зеркальный
+    /// `graph/.../*.html` (см. [`crate::xframe_graph_dump::try_write_graph_html_from_bin_dump`]).
+    /// Запуск: `STATUS=migrate_graph_html`.
+    MigrateGraphHtml,
 }
 
 impl AppMode {
@@ -75,6 +80,7 @@ impl AppMode {
             Ok("real_sim")              => AppMode::RealSim,
             Ok("migrate")               => AppMode::Migrate,
             Ok("migrate_price_to_beat") => AppMode::MigratePriceToBeat,
+            Ok("migrate_graph_html")    => AppMode::MigrateGraphHtml,
             _                           => AppMode::Default,
         }
     }
@@ -123,6 +129,9 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for HTTPS)");
             migration_price_to_beat::run_price_to_beat_migration().await?;
+        }
+        AppMode::MigrateGraphHtml => {
+            migration_graph_html::run_graph_html_migration()?;
         }
         AppMode::Default => {
             rustls::crypto::ring::default_provider()

@@ -1,6 +1,7 @@
 /target
 /errors
 /xframes
+/graph
 /streams
 .env
 deploy/libxgboost.so

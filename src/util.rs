@@ -15,6 +15,42 @@ pub fn current_timestamp_ms() -> i64 {
     now.as_millis() as i64
 }
 
+/// Имя файла из текста Gamma `question`: безопасные символы и ограничение длины.
+pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
+    let raw = q.unwrap_or("no_question");
+    let s: String = raw
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    const MAX: usize = 180;
+    if s.len() > MAX {
+        format!("{}...", &s[..MAX])
+    } else {
+        s
+    }
+}
+
+/// Локальный абсолютный путь в `file://` URI: оставляем `A-Za-z0-9/._-()`, остальное — `%XX`.
+pub fn encode_path_as_file_uri(abs_path: &str) -> String {
+    let mut out = String::from("file://");
+    for ch in abs_path.chars() {
+        match ch {
+            '/' | 'A'..='Z' | 'a'..='z' | '0'..='9' | '.' | '_' | '-' | '(' | ')' => out.push(ch),
+            _ => {
+                for b in ch.encode_utf8(&mut [0u8; 4]).bytes() {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut out, "%{b:02X}");
+                }
+            }
+        }
+    }
+    out
+}
+
 pub struct CurrencyEventSlugData {
     pub currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
     pub market_event_start_ms: HashMap<String, Option<i64>>,

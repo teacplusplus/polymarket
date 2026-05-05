@@ -53,8 +53,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CURRENCIES: &[&str] = &["btc"];
-
 /// Сколько раз дёргать `polymarket.com/event/{slug}` за exact `priceToBeat`,
 /// прежде чем сдаться и пропустить окно. Между попытками — фиксированная пауза
 /// [`HTTP_RETRY_DELAY`]. На исторические окна фолбэка нет: либо страница ещё
@@ -76,7 +74,7 @@ pub async fn run_price_to_beat_migration() -> Result<()> {
     let current_size = crate::migration::current_schema_size();
     println!("[migration_ptb] current schema_size={current_size}");
 
-    for currency in CURRENCIES {
+    for currency in crate::CURRENCIES {
         let dump_root = Path::new("xframes")
             .join(currency)
             .join(format!("{current_size}"));

@@ -204,6 +204,9 @@ impl Account {
                         };
                         let open_unix_ms = pos.event_end_ms.map(|e| e - pos.event_remaining_ms_at_open);
                         let close_unix_ms = pos.event_end_ms;
+                        let graph_html_file_uri = crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
+                            .map(|p| crate::xframe_graph_dump::graph_html_trade_file_uri(&p, open_unix_ms, close_unix_ms, Some(side_str)))
+                            .unwrap_or_default();
                         crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
                             polymarket_url: &pos.polymarket_url,
                             price_to_beat: pos.price_to_beat,
@@ -229,6 +232,8 @@ impl Account {
                             event_remaining_ms_at_close: 0,
                             open_unix_ms,
                             close_unix_ms,
+                            graph_html_file_uri: graph_html_file_uri.as_str(),
+                            pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
                         });
                     }
                 } else {

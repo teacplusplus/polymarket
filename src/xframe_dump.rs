@@ -3,7 +3,7 @@
 use crate::constants::XFrameIntervalKind;
 use crate::project_manager::{ProjectManager, FRAME_BUILD_INTERVALS_SEC};
 use crate::run_log;
-use crate::util::current_timestamp_ms;
+use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
 use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -31,25 +31,6 @@ pub struct MarketXFramesDump {
 impl MarketXFramesDump {
     pub fn up_won(&self) -> bool {
         self.final_price >= self.price_to_beat
-    }
-}
-
-/// Имя файла из текста Gamma `question`: безопасные символы и ограничение длины.
-pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
-    let raw = q.unwrap_or("no_question");
-    let s: String = raw
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            c if c.is_control() => '_',
-            c => c,
-        })
-        .collect();
-    const MAX: usize = 180;
-    if s.len() > MAX {
-        format!("{}...", &s[..MAX])
-    } else {
-        s
     }
 }
 
@@ -115,6 +96,19 @@ pub fn spawn_dump_market_xframes_binary(
                 ).await
             {
                 eprintln!("xframe_dump lane={lane}: {err:#}");
+            }
+            if let Err(err) =
+                crate::xframe_graph_dump::dump_market_graph_html_lane(
+                    project_manager.clone(),
+                    market_id.clone(),
+                    gamma_question.clone(),
+                    interval_kind,
+                    lane,
+                    price_to_beat,
+                    final_price,
+                ).await
+            {
+                eprintln!("graph_dump lane={lane}: {err:#}");
             }
         }
         if DUMP_MARKET_WS_STREAM_TXT {
@@ -185,11 +179,8 @@ pub async fn dump_market_xframes_binary_lane(
     let frame_count = frames_up.len() + frames_down.len();
     let dump = MarketXFramesDump { frames_up, frames_down, price_to_beat, final_price };
 
-    // Версия схемы дампа — размер сериализованного `XFrame<SIZE>` по умолчанию (bincode).
-    // Меняется при любом изменении раскладки полей/констант структуры, поэтому
-    // подходит в качестве стабильного «fingerprint» для разбиения по версиям.
-    let schema_size = bincode::serialized_size(&XFrame::<SIZE>::default())
-        .expect("XFrame::<SIZE>::default() must be bincode-serializable") as usize;
+    // Версия схемы дампа — см. [`crate::xframe::xframe_bincode_schema_size_bytes`].
+    let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
 
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let base: PathBuf = Path::new("xframes")
@@ -208,6 +199,36 @@ pub async fn dump_market_xframes_binary_lane(
     tokio::fs::write(&path, bytes).await?;
     run_log::xframe_dump_written(&path, &market_id, frame_count, byte_len);
     Ok(())
+}
+
+/// Собирает ожидаемый относительный путь `.bin` под `xframes/…` в том же виде, что [`dump_market_xframes_binary_lane`],
+/// **без обращения к диску** — файл может появиться позже или иметь другой суффикс `__{ts}` у дампера.
+/// Нужен только для колонки графика в CSV ([`crate::real_sim`], fallback в [`crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri`]).
+pub(crate) fn synthetic_xframes_dump_bin_path_for_csv_link(
+    currency: &str,
+    interval_kind: XFrameIntervalKind,
+    stem: &str,
+) -> Option<PathBuf> {
+    if stem.is_empty() {
+        return None;
+    }
+    let interval_label = match interval_kind {
+        XFrameIntervalKind::FiveMin => "5m",
+        XFrameIntervalKind::FifteenMin => "15m",
+    };
+    let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
+    let step_secs = *FRAME_BUILD_INTERVALS_SEC.first().unwrap_or(&1);
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let fname = format!("{stem}__{}.bin", current_timestamp_ms());
+    Some(
+        Path::new("xframes")
+            .join(currency)
+            .join(format!("{schema_size}"))
+            .join(interval_label)
+            .join(format!("{step_secs}s"))
+            .join(date)
+            .join(fname),
+    )
 }
 
 pub async fn dump_market_ws_stream_txt(
@@ -250,9 +271,7 @@ pub async fn dump_market_ws_stream_txt(
         XFrameIntervalKind::FifteenMin => "15m",
     };
 
-    let schema_size = bincode::serialized_size(&XFrame::<SIZE>::default())
-        .expect("XFrame::<SIZE>::default() must be bincode-serializable")
-        as usize;
+    let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let base: PathBuf = Path::new("streams")
         .join(project_manager.currency.as_str())
