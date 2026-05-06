@@ -33,6 +33,7 @@ use crate::train_mode::{
 };
 use crate::xframe::{
     apply_side_symmetry, BookLevel, XFrame, SIZE,
+    Y_TRAIN_SL_MIN_REF_SELL_REL_DROP,
     Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
     Y_TRAIN_NO_TRADE_PROB_LOW, Y_TRAIN_NO_TRADE_PROB_HIGH,
 };
@@ -242,6 +243,10 @@ pub struct OpenPosition {
     pub(crate) entry_prob: f64,
     /// VWAP покупки — база для TP/SL, pending MtM, CSV `buy_price`, гистограмма входов.
     pub(crate) buy_price: f64,
+    /// Sell VWAP на кадре входа для [`Self::shares_held`] с cap к L1 ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]);
+    /// gross walk / шеры, как у voluntary-ветки. Для SL: urgent VWAP должен просесть относительно
+    /// этого уровня не меньше [`crate::xframe::Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`].
+    pub(crate) sell_vwap_entry: f64,
     /// USDC потраченные на покупку (= POSITION_SIZE_USD).
     pub(crate) entry_cost: f64,
     /// L1 bid на входе: maker vs taker для модельной TP-лимитки в [`close_position`].
@@ -1077,13 +1082,13 @@ pub(crate) fn try_open_position(
             false
         }
         BuyGate::Proceed { raw, pred, kelly_f, size } => {
-            if positions
-                .iter()
-                .any(|p| p.asset_id == frame.asset_id)
-            {
-                stats.same_asset_open_skips += 1;
-                return false;
-            }
+            // if positions
+            //     .iter()
+            //     .any(|p| p.asset_id == frame.asset_id)
+            // {
+            //     stats.same_asset_open_skips += 1;
+            //     return false;
+            // }
             stats.raw_above_threshold += 1;
             stats.diag_sum_raw += raw as f64;
             stats.diag_sum_calibrated += pred as f64;
@@ -1191,6 +1196,16 @@ fn capped_sell_fill_for_gate(
     })
 }
 
+/// Urgent sell VWAP просел относительно входного ref (со slippage cap) не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`].
+fn stop_loss_sell_deteriorated_vs_entry_ref(pos: &OpenPosition, urgent_sell_vwap: f64) -> bool {
+    let sell_vwap_entry = pos.sell_vwap_entry;
+    if !(sell_vwap_entry > 0.0) || !sell_vwap_entry.is_finite() {
+        return true;
+    }
+    let threshold = sell_vwap_entry * (1.0 - Y_TRAIN_SL_MIN_REF_SELL_REL_DROP);
+    urgent_sell_vwap <= threshold
+}
+
 /// `frames_held` — уже после инкремента тика (`manage_positions`) или `+1` в WS-предикате.
 /// `p_win_now` — из одного predict на кадр; `None` в [`any_position_would_sell`] (EMA не двигается).
 pub(crate) fn sell_gate(
@@ -1235,7 +1250,7 @@ pub(crate) fn sell_gate(
             (None, existing) => existing,
         };
 
-        if delta <= Y_TRAIN_STOP_LOSS_PP {
+        if delta <= Y_TRAIN_STOP_LOSS_PP && stop_loss_sell_deteriorated_vs_entry_ref(pos, fill.sell_vwap) {
             return SellGate::Close {
                 exit_price: fill.sell_vwap,
                 reason: CloseReason::StopLoss,
@@ -1296,7 +1311,9 @@ pub(crate) fn sell_gate(
                 reason: CloseReason::TakeProfit,
             };
         }
-        if delta_sl <= Y_TRAIN_STOP_LOSS_PP {
+        if delta_sl <= Y_TRAIN_STOP_LOSS_PP
+            && stop_loss_sell_deteriorated_vs_entry_ref(pos, fill_u.sell_vwap)
+        {
             return SellGate::Close {
                 exit_price: fill_u.sell_vwap,
                 reason: CloseReason::StopLoss,
@@ -1493,12 +1510,19 @@ fn open_position(
         None => frame.book_bid_l1_price,
     };
 
+    let gross_sell = match strict_book {
+        Some(book) => book_fill_sell_strict(book, actual_shares, None)?,
+        None => book_fill_sell(frame, actual_shares, None)?,
+    };
+    let sell_vwap_entry = (gross_sell / actual_shares).clamp(0.001, 0.999);
+
     Some(OpenPosition {
         asset_id: frame.asset_id.clone(),
         market_id: frame.market_id.clone(),
         shares_held: actual_shares,
         entry_prob,
         buy_price,
+        sell_vwap_entry,
         entry_cost: position_size,
         best_bid_at_entry,
         frames_held: 0,

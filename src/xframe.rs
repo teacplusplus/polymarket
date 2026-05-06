@@ -974,6 +974,10 @@ pub fn currency_price_z_score_from_sec_history(
 pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
 /// Максимальная чистая доходность для метки y=0 (Stop Loss).
 pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
+/// Минимальная **относительная** просадка urgent sell VWAP относительно **фактического**
+/// sell VWAP на входе (полный bid-walk в [`walk_sell_xfeatures`]). Та же доля, что
+/// в runtime SL от ref с cap ([`crate::history_sim::sell_gate`]); в y-разметке ref без cap.
+pub const Y_TRAIN_SL_MIN_REF_SELL_REL_DROP: f64 = 0.03;
 /// Горизонт [`calc_y_train_pnl`] / [`calc_y_train_resolution`]: сколько
 /// следующих кадров смотреть на этапе y-разметки.
 ///
@@ -987,7 +991,7 @@ pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
 /// Если эта связка нарушится (значения разойдутся), runtime будет
 /// торговать на тиках, которые модель не видела при обучении, — это
 /// прямой источник bias'а между симуляцией и live-режимом.
-pub const Y_TRAIN_HORIZON_FRAMES: usize = 5;
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
 
 /// Нижняя граница **исключённого** центра распределения `currency_implied_prob`
 /// для [`calc_y_train_pnl`]: модель учится **только на хвостах** —
@@ -1021,7 +1025,7 @@ pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.7;
 /// тонком маркете $200 могут не пройти L1+L2+L3 ask и съесть VWAP за пределами
 /// порога из [`crate::train_mode::Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT`] (передаётся
 /// в [`calc_y_train_pnl`] / [`calc_y_train_resolution`]) — такие кадры отфильтровываются.
-pub const Y_TRAIN_NOMINAL_USDC: f64 = 10.0;
+pub const Y_TRAIN_NOMINAL_USDC: f64 = 30.0;
 
 /// Результат walk'а через L1/L2/L3 ask из xframe для покупки `target_usdc`.
 ///
@@ -1061,7 +1065,8 @@ struct WalkSellResult {
     net_usdc: f64,
     /// VWAP на проданных шерсах: `gross_usdc / shares`. Для slippage-чека.
     vwap: f64,
-    /// Лучший bid из L1 (best_bid), для slippage-чека.
+    /// Лучший bid из L1 (best_bid); сохраняется для отладки / будущих cap-чеков.
+    #[allow(dead_code)]
     best_bid: f64,
 }
 
@@ -1218,6 +1223,19 @@ fn walk_sell_xfeatures<const N: usize>(
     })
 }
 
+/// Urgent sell VWAP просел относительно входного фактического ref не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`].
+fn y_train_stop_loss_sell_deteriorated_vs_entry_ref(
+    sell_vwap_at_entry: f64,
+    urgent_sell_vwap: f64,
+) -> bool {
+    let r = sell_vwap_at_entry;
+    if !(r > 0.0) || !r.is_finite() {
+        return true;
+    }
+    let threshold = r * (1.0 - Y_TRAIN_SL_MIN_REF_SELL_REL_DROP);
+    urgent_sell_vwap <= threshold
+}
+
 /// Метка y для PnL-модели — `«успеет ли позиция $200 нотиналом отбить TP до
 /// конца горизонта или попадёт в SL»`.
 ///
@@ -1248,9 +1266,12 @@ fn walk_sell_xfeatures<const N: usize>(
 ///    `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` (как % от
 ///    нотионала) переиспользуются 1:1.
 ///
-///    * **SL** (mandatory exit, без cap'а): если `net_ret ≤ SL_PP` →
-///      `Some(0.0)`. На SL-выходе реальный исполнитель не применяет
-///      cap, иначе позиция могла бы доехать до $0 при тонком стакане.
+///    * **SL** (mandatory exit, без cap'а): если `net_ret ≤ SL_PP` **и**
+///      urgent sell VWAP просел относительно **фактического** sell VWAP на входе
+///      (полный bid-walk) не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`] →
+///      `Some(0.0)` (симметрично runtime [`crate::history_sim::sell_gate`]). Иначе SL на этом
+///      тике не считается. На SL-выходе реальный исполнитель не применяет
+///      cap к bid-walk, иначе позиция могла бы доехать до $0 при тонком стакане.
 ///    * **TP** (voluntary exit, **с** cap'ом): если slippage от best bid
 ///      ≤ `max_slippage_from_l1_pct` **и** `net_ret ≥ TP_PP` →
 ///      `Some(1.0)`. Если cap не соблюдён — TP «не сработал на этом
@@ -1327,6 +1348,11 @@ pub fn calc_y_train_pnl(
         return Some(0.0)
     }
     let actual_shares = buy.actual_shares;
+    // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.
+    // let sell_vwap_at_entry = match walk_sell_xfeatures(current, actual_shares) {
+    //     None => return Some(0.0),
+    //     Some(s) => s.vwap,
+    // };
     // Maker-проверка решается **в момент входа**: сразу после buy-walk-а
     // мы выставляем resting-лимитку на TP-таргет, и в этот же момент
     // фиксируется её maker-/taker-статус. Если `tp_target > best_bid_at_entry`
@@ -1383,8 +1409,12 @@ pub fn calc_y_train_pnl(
         let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
         let net_ret_maker = (sell.gross_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
 
-        // SL — mandatory exit, slippage cap отключён, taker-fee.
-        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP {
+        // SL — mandatory exit, slippage cap отключён, taker-fee; дополнительно —
+        // urgent [`WalkSellResult::vwap`] должен просесть относительно входного ref
+        // не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`] (симметрично runtime SL).
+        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP
+            // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
+        {
             return Some(0.0);
         }
         // TP — voluntary exit. Maker-/taker-статус ордера зафиксирован
@@ -1595,10 +1625,11 @@ pub fn calc_y_train_resolution(
         return Some(0.0)
     }
     let actual_shares = buy.actual_shares;
-    // Был ли хоть один тик с `net_ret < 0`. Любая просадка в минус
-    // (даже мелкая, не дотянувшая до SL) убивает «положительный»
-    // лейбл — синхронно с [`calc_y_train_pnl`]. Семантика:
-    // «выделяем только спокойные восходящие исходы».
+    // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.
+    // let sell_vwap_at_entry = match walk_sell_xfeatures(current, actual_shares) {
+    //     None => return Some(0.0),
+    //     Some(s) => s.vwap,
+    // };
 
     for i in 1..=n {
         // Отсутствие следующего кадра трактуется как конец маркета
@@ -1635,7 +1666,9 @@ pub fn calc_y_train_resolution(
         // `sell.net_usdc` (= gross − taker-fee) без maker-ветки.
         // Симметрично с обработкой SL в [`calc_y_train_pnl`].
         let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
-        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP {
+        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP
+            // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
+        {
             return Some(0.0);
         }
     }
