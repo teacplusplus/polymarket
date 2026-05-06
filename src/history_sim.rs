@@ -1692,7 +1692,7 @@ pub(crate) fn trade_csv_close_reason_label(reason: &CloseReason) -> &'static str
 
 /// Ask-walk до полного `position_size`; опционально cap VWAP к best ask ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]) — как y_train / [`book_fill_buy_strict`].
 /// Легаси: `book_asks` пуст → L1–L3 фичи.
-fn book_fill_buy(
+pub(crate) fn book_fill_buy(
     frame: &XFrame<SIZE>,
     position_size: f64,
     slippage_cap: Option<f64>,
@@ -1745,7 +1745,7 @@ fn book_fill_buy(
 
 /// Bid-walk на полный объём; `slippage_cap`: voluntary — cap vs best bid, urgent — только полный fill.
 /// Симметрично y_train (неполный fill → нет выхода на тике). Легаси: L1–L3.
-fn book_fill_sell(
+pub(crate) fn book_fill_sell(
     frame: &XFrame<SIZE>,
     shares_to_sell: f64,
     slippage_cap: Option<f64>,

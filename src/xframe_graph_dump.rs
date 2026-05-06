@@ -1,7 +1,10 @@
 //! Статический HTML с графиком UP/DOWN по [`crate::xframe::XFrame`] в `graph/...` (рядом с деревом `xframes/`).
 
 use crate::constants::XFrameIntervalKind;
-use crate::history_sim::OpenPosition;
+use crate::history_sim::{
+    book_fill_buy, book_fill_sell, OpenPosition, NO_KELLY_POSITION_SIZE_USD,
+    SIM_MAX_SLIPPAGE_FROM_L1_PCT,
+};
 use crate::project_manager::{ProjectManager, FRAME_BUILD_INTERVALS_SEC};
 use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
 use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
@@ -34,7 +37,7 @@ pub enum GraphHtmlFromBinOutcome {
 }
 
 /// Одна точка графика: сжатые ключи JSON для встраивания в HTML (см. [`XFrame`]).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct GraphHtmlRow {
     /// Время кадра: `aligned_ts` из буфера кадров (мс, Unix).
     t: i64,
@@ -42,14 +45,12 @@ struct GraphHtmlRow {
     er: i64,
     /// Рыночная оценка вероятности исхода токена: [`XFrame::currency_implied_prob`]; в JSON `0`, если в кадре `None`.
     ip: f64,
-    /// Лучший ask L1 (цена в шкале вероятности 0..1): [`XFrame::book_ask_l1_price`]; `0`, если `None`.
-    ap: f64,
-    /// Объём на лучшем ask L1: [`XFrame::book_ask_l1_size`]; `0`, если `None`.
-    az: f64,
-    /// Лучший bid L1 (цена в шкале вероятности 0..1): [`XFrame::book_bid_l1_price`]; `0`, если `None`.
-    bp: f64,
-    /// Объём на лучшем bid L1: [`XFrame::book_bid_l1_size`]; `0`, если `None`.
-    bz: f64,
+    /// VWAP покупки по стакану (ask-walk): номинал [`crate::history_sim::NO_KELLY_POSITION_SIZE_USD`] USDC, cap к L1 [`crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT`]; `0`, если fill невозможен.
+    bb: f64,
+    /// VWAP продажи того же числа шеров (bid-walk) с тем же cap к best bid; `0`, если fill невозможен.
+    bs: f64,
+    /// VWAP продажи того же числа шеров без cap (полный bid-walk); `0`, если fill невозможен.
+    bu: f64,
     /// `(price_to_beat - spot) / price_to_beat * 100` (%): [`XFrame::currency_price_vs_beat_pct`]; `0`, если `None`.
     vb: f64,
     /// Z-score спота в окне: [`XFrame::currency_price_z_score`]; `0`, если `None`.
@@ -62,7 +63,8 @@ struct GraphHtmlPayload {
     price_to_beat: f64,
     /// Цена закрытия / следующего открытия — как в [`crate::xframe_dump::MarketXFramesDump::final_price`].
     final_price: f64,
-    /// Левый край окна рынка (Unix мс): `window_start_sec * 1000` из имени дампа ([`crate::history_sim::window_bounds_from_dump_path`]).
+    /// Левый край окна рынка (Unix мс): из имени `.bin` ([`crate::history_sim::window_bounds_from_dump_path`])
+    /// или из `median(t+er) − interval` для lane-графика ([`lane_window_start_ms_from_rows`]).
     window_start_ms: i64,
     /// Длительность окна в секундах (300 для 5m, 900 для 15m).
     window_duration_sec: i64,
@@ -88,7 +90,7 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <!-- market_id=__MARKET_ID__ -->
   <div id="resolutionMeta" class="hint"></div>
   <div class="hint">
-    В JSON время <code>t</code> — Unix-мс. Ось X — **секунды от начала окна** рынка: <code>(t - window_start_ms) / 1000</code>, диапазон ожидаемо 0…window_duration_sec (5m → 300 с). Подписи без сокращений «B» (отключён SI).
+    В JSON время <code>t</code> — Unix-мс, <code>er</code> — мс до конца окна. Начало окна на оси X: <code>median(t + er) − window_duration</code> по точкам с <code>er ≥ 0</code> (как у восстановления времени из <code>.bin</code>); затем секунды <code>(t − origin) / 1000</code> ограничиваются 0…window_duration_sec (5m → 300 с). Поле <code>window_start_ms</code> в JSON — то же начало окна.
     Ось Y — выбранное поле кадра, в т.ч. <code>currency_price_vs_beat_pct</code>, <code>currency_price_z_score</code> (нет значения → <code>0</code>).
     Параметры URL: <code>y</code> — метрика по вертикали; устаревший <code>x</code> (≠ <code>time</code>) = как <code>y</code>.
     <code>side</code> — <code>up</code> или <code>down</code>.
@@ -118,10 +120,9 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     { id: 'currency_implied_prob', label: 'currency_implied_prob', key: 'ip' },
     { id: 'currency_price_vs_beat_pct', label: 'currency_price_vs_beat_pct (%)', key: 'vb' },
     { id: 'currency_price_z_score', label: 'currency_price_z_score', key: 'zs' },
-    { id: 'book_ask_l1_price', label: 'book_ask_l1_price', key: 'ap' },
-    { id: 'book_ask_l1_size', label: 'book_ask_l1_size', key: 'az' },
-    { id: 'book_bid_l1_price', label: 'book_bid_l1_price', key: 'bp' },
-    { id: 'book_bid_l1_size', label: 'book_bid_l1_size', key: 'bz' },
+    { id: 'sim_book_buy_vwap', label: 'sim book buy VWAP ($30, slip cap)', key: 'bb' },
+    { id: 'sim_book_sell_vwap_slip', label: 'sim book sell VWAP (same shares, slip cap)', key: 'bs' },
+    { id: 'sim_book_sell_vwap', label: 'sim book sell VWAP (same shares, no slip cap)', key: 'bu' },
   ];
   const params = new URLSearchParams(window.location.search);
   function readSide() {
@@ -164,16 +165,43 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     history.replaceState(null, '', '?' + params.toString());
     render();
   });
-  function windowStartMs() {
-    const w = DATA.window_start_ms;
-    if (w != null && Number.isFinite(w)) return w;
+  function windowDurationSec() {
+    return Number.isFinite(DATA.window_duration_sec) ? DATA.window_duration_sec : 300;
+  }
+  /** Медиана конца окна по кадрам (er≥0): совпадает с логикой lane/.bin в Rust. */
+  function inferredWindowStartMsFromEr() {
+    const durMs = windowDurationSec() * 1000;
+    const ends = [];
+    for (const r of DATA.up) {
+      if (typeof r.er === 'number' && r.er >= 0 && Number.isFinite(r.t)) ends.push(r.t + r.er);
+    }
+    for (const r of DATA.down) {
+      if (typeof r.er === 'number' && r.er >= 0 && Number.isFinite(r.t)) ends.push(r.t + r.er);
+    }
+    if (!ends.length) return null;
+    ends.sort((a, b) => a - b);
+    const mid = ends[Math.floor(ends.length / 2)];
+    return mid - durMs;
+  }
+  function dataMinTsMs() {
     let m = Infinity;
     for (const r of DATA.up) m = Math.min(m, r.t);
     for (const r of DATA.down) m = Math.min(m, r.t);
     return m === Infinity ? 0 : m;
   }
+  function windowStartMs() {
+    const fromEr = inferredWindowStartMsFromEr();
+    if (fromEr !== null && Number.isFinite(fromEr)) return fromEr;
+    const w = DATA.window_start_ms;
+    if (w != null && Number.isFinite(w)) return w;
+    return dataMinTsMs();
+  }
+  /** Секунды внутри окна рынка [0 … window_duration_sec]. */
   function msFromWindowStart(msWall) {
-    return (msWall - windowStartMs()) / 1000;
+    const dur = windowDurationSec();
+    const s = (msWall - windowStartMs()) / 1000;
+    if (!Number.isFinite(s)) return 0;
+    return Math.min(Math.max(s, 0), dur);
   }
   function rowY(row, key) {
     const v = row[key];
@@ -227,29 +255,12 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         line: { color: 'rgba(25,25,112,0.75)', width: 2, dash: 'dot' },
       });
     }
-    let minX = 0;
-    let maxX = DATA.window_duration_sec != null ? DATA.window_duration_sec : 300;
-    for (const tr of traces) {
-      for (let i = 0; i < tr.x.length; i++) {
-        const xv = tr.x[i];
-        if (xv > maxX) maxX = xv;
-        if (xv < minX) minX = xv;
-      }
-    }
-    function bumpTsVertical(tsWall) {
-      if (tsWall === null) return;
-      const xv = msFromWindowStart(tsWall);
-      if (!Number.isFinite(xv)) return;
-      minX = Math.min(minX, xv);
-      maxX = Math.max(maxX, xv);
-    }
-    bumpTsVertical(ts1);
-    bumpTsVertical(ts2);
+    const durSec = windowDurationSec();
     const layout = {
       title: 'UP / DOWN vs time — Y: ' + yModeDef.label,
       xaxis: {
         title: 'time in window (s)',
-        range: [minX, Math.max(maxX, (DATA.window_duration_sec != null ? DATA.window_duration_sec : 0) || 1)],
+        range: [0, Math.max(durSec, 1)],
         tickformat: '.0f',
         exponentformat: 'none',
         showexponent: 'none',
@@ -274,18 +285,56 @@ fn graph_html_f64_or_zero(o: Option<f64>) -> f64 {
     o.filter(|x| x.is_finite()).unwrap_or(0.0)
 }
 
+/// Три VWAP для графика HTML: покупка на [`crate::history_sim::NO_KELLY_POSITION_SIZE_USD`] с cap к L1 ([`crate::history_sim::book_fill_buy`]);
+/// продажа того же числа шеров по bid с cap и без ([`crate::history_sim::book_fill_sell`]). Нули при нехватке ликвидности.
+fn graph_sim_book_roundtrip_vwaps(frame: &XFrame<SIZE>) -> (f64, f64, f64) {
+    let Some((buy_vwap, shares)) = book_fill_buy(
+        frame,
+        NO_KELLY_POSITION_SIZE_USD,
+        Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
+    ) else {
+        return (0.0, 0.0, 0.0);
+    };
+    let sell_slip = book_fill_sell(frame, shares, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT))
+        .map(|gross_usdc| gross_usdc / shares);
+    let sell_uncapped = book_fill_sell(frame, shares, None).map(|gross_usdc| gross_usdc / shares);
+    (
+        buy_vwap,
+        sell_slip.unwrap_or(0.0),
+        sell_uncapped.unwrap_or(0.0),
+    )
+}
+
 fn graph_html_row(frame: &XFrame<SIZE>, aligned_ts: i64) -> GraphHtmlRow {
+    let (bb, bs, bu) = graph_sim_book_roundtrip_vwaps(frame);
     GraphHtmlRow {
         t: aligned_ts,
         er: frame.event_remaining_ms,
         ip: graph_html_f64_or_zero(frame.currency_implied_prob),
-        ap: graph_html_f64_or_zero(frame.book_ask_l1_price),
-        az: graph_html_f64_or_zero(frame.book_ask_l1_size),
-        bp: graph_html_f64_or_zero(frame.book_bid_l1_price),
-        bz: graph_html_f64_or_zero(frame.book_bid_l1_size),
+        bb: graph_html_f64_or_zero(Some(bb)),
+        bs: graph_html_f64_or_zero(Some(bs)),
+        bu: graph_html_f64_or_zero(Some(bu)),
         vb: graph_html_f64_or_zero(frame.currency_price_vs_beat_pct),
         zs: graph_html_f64_or_zero(frame.currency_price_z_score),
     }
+}
+
+/// Левый край окна Polymarket по точкам графика: `median(t + er) − interval_ms` среди строк с `er ≥ 0`
+/// (та же идея, что `event_end_ms` в [`graph_html_rows_from_dump_frames`]).
+fn lane_window_start_ms_from_rows<'a>(
+    rows: impl Iterator<Item = &'a GraphHtmlRow>,
+    interval_ms: i64,
+) -> Option<i64> {
+    let mut ends: Vec<i64> = rows
+        .filter(|r| r.er >= 0)
+        .map(|r| r.t.saturating_add(r.er))
+        .collect();
+    if ends.is_empty() {
+        return None;
+    }
+    ends.sort_unstable();
+    let median_end = ends[ends.len() / 2];
+    Some(median_end.saturating_sub(interval_ms))
 }
 
 /// Время на оси X для кадра из `.bin`: `event_end_ms - event_remaining_ms`
@@ -479,16 +528,26 @@ pub async fn dump_market_graph_html_lane(
     let fname = format!("{stem}__{}.html", current_timestamp_ms());
     let path = base.join(&fname);
 
-    let window_bounds = crate::history_sim::window_bounds_from_dump_path(&path, interval_kind);
-    let window_start_ms = window_bounds
-        .map(|b| b.window_start_sec.saturating_mul(1000))
-        .unwrap_or_else(|| {
-            up.iter()
-                .chain(down.iter())
-                .map(|r| r.t)
-                .min()
-                .unwrap_or(0)
-        });
+    let interval_ms = interval_kind.interval_ms();
+    let window_start_ms = lane_window_start_ms_from_rows(up.iter().chain(down.iter()), interval_ms)
+        .unwrap_or_else(|| up.iter().chain(down.iter()).map(|r| r.t).min().unwrap_or(0));
+
+    let we = window_start_ms.saturating_add(interval_ms);
+    let up_f: Vec<GraphHtmlRow> = up
+        .iter()
+        .filter(|r| r.t >= window_start_ms && r.t <= we)
+        .cloned()
+        .collect();
+    let down_f: Vec<GraphHtmlRow> = down
+        .iter()
+        .filter(|r| r.t >= window_start_ms && r.t <= we)
+        .cloned()
+        .collect();
+    let (up, down) = if up_f.is_empty() && down_f.is_empty() {
+        (up, down)
+    } else {
+        (up_f, down_f)
+    };
     let window_duration_sec = interval_kind.interval_ms() / 1000;
 
     let payload = GraphHtmlPayload {

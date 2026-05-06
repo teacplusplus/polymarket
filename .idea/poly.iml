@@ -5,6 +5,8 @@
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/xframes" />
+      <excludeFolder url="file://$MODULE_DIR$/errors" />
+      <excludeFolder url="file://$MODULE_DIR$/graph" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
