@@ -73,7 +73,7 @@ pub const HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS: bool = false;
 /// Коэффициент taker-комиссии Polymarket для категории **Crypto** (CLOB):
 /// `fee_usdc = C × POLYMARKET_CRYPTO_TAKER_FEE_RATE × p × (1 − p)`, где C — число шерсов, p — цена.
 /// См. [Polymarket: Fees](https://docs.polymarket.com/trading/fees).
-pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.072;
+pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.07;
 
 /// Hold-zone: конец окна по времени; TP/timeout off; остаются hard SL и EV-exit по resolution-модели.
 pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 0;

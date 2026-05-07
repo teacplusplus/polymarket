@@ -991,7 +991,7 @@ pub const Y_TRAIN_SL_MIN_REF_SELL_REL_DROP: f64 = 0.03;
 /// Если эта связка нарушится (значения разойдутся), runtime будет
 /// торговать на тиках, которые модель не видела при обучении, — это
 /// прямой источник bias'а между симуляцией и live-режимом.
-pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 5;
 
 /// Нижняя граница **исключённого** центра распределения `currency_implied_prob`
 /// для [`calc_y_train_pnl`]: модель учится **только на хвостах** —
@@ -1426,7 +1426,7 @@ pub fn calc_y_train_pnl(
         // Slippage cap включён в обеих ветках: симметрично с
         // [`crate::history_sim::SellGate`], где voluntary-exit по
         // слишком тонкому стакану ждёт следующего тика.
-      
+
         if tp_is_maker {
             if net_ret_maker >= Y_TRAIN_TAKE_PROFIT_PP {
                 return Some(1.0);
