@@ -48,6 +48,12 @@ pub struct LaneFrame {
     pub asset_id: String,
     /// Gamma `startDate` для URL в [`tick_once`](crate::real_sim::tick_once); `None`, если Gamma ещё не подтянулся.
     pub event_start_ms: Option<i64>,
+    /// Gamma `endDate` (момент резолюции маркета, UTC ms) — для CSV-колонок
+    /// `open_unix_ms`/`close_unix_ms` в `OpenPosition` и `close_position`
+    /// (см. [`crate::history_sim::OpenPosition::event_end_ms`]). Без него
+    /// в real_sim CSV-колонки времени остаются пустыми. `None`, если Gamma
+    /// ещё не подтянулся для этого `market_id`.
+    pub event_end_ms: Option<i64>,
     /// Кэш PTB на момент фанаута → CSV; `None`, если страница ещё не дала значение.
     pub price_to_beat: Option<f64>,
     /// Текст вопроса Gamma для имени дампа и синтетического пути `.bin` в CSV ([`crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link`]).
@@ -707,14 +713,22 @@ impl ProjectManager {
             }
         }
 
-        let event_start_ms_by_market: HashMap<String, Option<i64>> = {
+        let (event_start_ms_by_market, event_end_ms_by_market): (
+            HashMap<String, Option<i64>>,
+            HashMap<String, Option<i64>>,
+        ) = {
             let guard = self.event_data_by_market.read().await;
-            let mut map: HashMap<String, Option<i64>> = HashMap::new();
+            let mut start_map: HashMap<String, Option<i64>> = HashMap::new();
+            let mut end_map: HashMap<String, Option<i64>> = HashMap::new();
             for entry in &built_xframes {
-                map.entry(entry.market_id.clone())
+                start_map
+                    .entry(entry.market_id.clone())
                     .or_insert_with(|| guard.get(&entry.market_id).and_then(|d| d.start_ms));
+                end_map
+                    .entry(entry.market_id.clone())
+                    .or_insert_with(|| guard.get(&entry.market_id).and_then(|d| d.end_ms));
             }
-            map
+            (start_map, end_map)
         };
         let price_to_beat_by_market_snapshot: HashMap<String, Option<f64>> = {
             let guard = self.price_to_beat_by_market.read().await;
@@ -760,6 +774,10 @@ impl ProjectManager {
                             .get(&entry.market_id)
                             .copied()
                             .flatten();
+                        let event_end_ms = event_end_ms_by_market
+                            .get(&entry.market_id)
+                            .copied()
+                            .flatten();
                         let price_to_beat = price_to_beat_by_market_snapshot
                             .get(&entry.market_id)
                             .copied()
@@ -772,6 +790,7 @@ impl ProjectManager {
                             market_id: entry.market_id.clone(),
                             asset_id: entry.asset_id.clone(),
                             event_start_ms,
+                            event_end_ms,
                             price_to_beat,
                             gamma_question,
                             frame: entry.frame.clone(),

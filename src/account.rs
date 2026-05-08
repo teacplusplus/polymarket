@@ -72,7 +72,10 @@ impl Account {
     /// Победа токена: `pnl = shares_held - entry_cost`, иначе `pnl = -entry_cost`; комиссии на redeem нет.
     ///
     /// **Параметры:** `account`, `state` — счёт и `RealSimState` этой валюты; `currency` / `interval` —
-    /// фильтр лейнов; `market_id` — `condition_id`; `up_won` — см. [`crate::xframe_dump::MarketXFramesDump::up_won`].
+    /// фильтр лейнов; `market_id` — `condition_id`; `up_won` — см. [`crate::xframe_dump::MarketXFramesDump::up_won`];
+    /// `final_price` — фактическая цена закрытия окна, прокидывается в CSV-колонку `final_price`
+    /// resolution-строки (на момент входа в позицию неизвестна, появляется только в callback'е
+    /// [`crate::xframe_dump::spawn_dump_market_xframes_binary`]).
     ///
     /// **Lock order:** `state.write()` → `account.write()`, как в `tick_once`.
     ///
@@ -84,6 +87,7 @@ impl Account {
         interval: XFrameIntervalKind,
         market_id: &str,
         up_won: bool,
+        final_price: f64,
     ) {
         let mut state_guard = state.write().await;
         let mut account_guard = account.write().await;
@@ -122,11 +126,18 @@ impl Account {
             interval,
             market_id,
             up_won,
+            Some(final_price),
         );
     }
 
     /// Ядро резолюции без локов: из `history_sim` с `&mut Account` или после локов из [`Account::resolve_pending_market`].
     /// Пишет строки в [`crate::trade_csv_log`] и вызывает [`crate::trade_csv_log::record_market_outcome`].
+    ///
+    /// `final_price_override` — фактическая цена закрытия окна, попадает в CSV-колонку
+    /// `final_price` resolution-строк. `None` — берём `pos.final_price` (исторический режим:
+    /// dump уже содержит финальную цену, она проставлена в `OpenPosition.final_price` на входе);
+    /// `Some(_)` — переопределяем (real-time режим: на входе финал ещё неизвестен,
+    /// прилетает позже из callback'а).
     pub fn resolve_pending_market_sync(
         &mut self,
         sim_stats: &mut SimStats,
@@ -134,6 +145,7 @@ impl Account {
         interval: XFrameIntervalKind,
         market_id: &str,
         up_won: bool,
+        final_price: Option<f64>,
     ) {
         // До PnL: помечаем маркет резолвнутым (гонка HTTP vs колбек; FIFO cap — см. константу).
         if self
@@ -181,6 +193,11 @@ impl Account {
                     } else {
                         side_stats.losses += 1;
                     }
+                    // См. doc у `SideStats::closed_trade_entries` в history_sim.rs:
+                    // resolution-закрытия идут не через `close_position`, поэтому
+                    // дублируем сюда — иначе sim-replay калибровка теряет хвост
+                    // позиций, доехавших до резолюции (Res✓/Res✗).
+                    side_stats.closed_trade_entries.push((pos.raw_pred_at_open, pnl > 0.0));
                     if token_won {
                         side_stats.resolution_win += 1;
                         side_stats.pnl_resolution_win += pnl;
@@ -210,7 +227,7 @@ impl Account {
                         crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
                             polymarket_url: &pos.polymarket_url,
                             price_to_beat: pos.price_to_beat,
-                            final_price: pos.final_price,
+                            final_price: final_price.or(pos.final_price),
                             currency: cur,
                             interval: interval_str,
                             side: side_str,

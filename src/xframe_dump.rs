@@ -80,6 +80,7 @@ pub fn spawn_dump_market_xframes_binary(
             interval_kind,
             &market_id,
             up_won,
+            final_price,
         )
         .await;
 

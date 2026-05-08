@@ -8,7 +8,7 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
     BuyGate, any_position_would_sell, buy_gate, compute_p_win_now, compute_pnl_inference,
     load_booster, manage_positions, print_sim_stats, try_open_position, OpenPosition,
-    SimStats, StrictBook,
+    SimStats, StrictBook, HOLD_TO_END_THRESHOLD_SEC,
 };
 /// Тот же cap, что в [`crate::history_sim::manage_positions`] / `book_fill_*` (на TP при выполненном пороге VWAP — cap может игнорироваться).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
@@ -54,6 +54,14 @@ const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
 /// FIFO-кольцо [`RealSimState::seen_market_ids`] на интервал (`shift_remove_index(0)` сверх лимита).
 const SEEN_MARKET_IDS_CAP: usize = 8;
 
+/// Период heartbeat-снапшота состояния `Account` + per-interval [`SimStats`]
+/// (см. [`spawn_heartbeat`]). `print_sim_stats` сам по себе дёргается только
+/// при сделке (см. [`tick_once`]), а live-режим может час и больше идти без
+/// сделок: без heartbeat'а в логе тишина, нет ни bankroll, ни max_dd, ни
+/// числа обработанных кадров. 5 минут — компромисс между шумом в `tee` и
+/// видимостью «жив ли пайплайн».
+const HEARTBEAT_INTERVAL_SEC: u64 = 5 * 60;
+
 /// Полный набор 4 ключей фанаута 1s-кадров: `(interval, side)`.
 const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
     (XFrameIntervalKind::FifteenMin, CurrencyUpDownOutcome::Down),
@@ -64,13 +72,7 @@ const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
 
 /// Таблица `Sender` для фанаута lane 0; реальный `rx` у воркера, в карте — dummy пара для типа.
 pub struct LaneFrameChannels {
-    pub channels: Arc<
-        RwLock<
-            HashMap<
-                (XFrameIntervalKind, CurrencyUpDownOutcome), mpsc::Sender<LaneFrame>
-            >,
-        >,
-    >,
+    pub channels: Arc<RwLock<HashMap<(XFrameIntervalKind, CurrencyUpDownOutcome), mpsc::Sender<LaneFrame>>>>,
 }
 
 impl LaneFrameChannels {
@@ -180,6 +182,8 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
         });
     }
 
+    spawn_heartbeat(state.clone(), account.clone(), tag_prefix.clone());
+
     for (interval_kind, side) in LANE_FRAME_ROUTES {
         let label = interval_label(interval_kind);
         let side_lbl = side_label(side);
@@ -263,6 +267,42 @@ fn spawn_side_worker(
     });
 }
 
+/// Раз в [`HEARTBEAT_INTERVAL_SEC`] печатает [`print_sim_stats`] по обоим
+/// интервалам ([`XFrameIntervalKind::FiveMin`] / [`XFrameIntervalKind::FifteenMin`])
+/// + банкролл/просадку текущего [`Account`]. Без этого таска live-режим
+/// без сделок выглядит как «висящий процесс» — нет ни bankroll, ни max_dd,
+/// ни сколько кадров обработано.
+///
+/// Локи берутся read-only, чтобы не конкурировать с торговыми воркерами;
+/// печать идёт через `tee_log` (свой mutex). Если сделка случается ровно
+/// в момент heartbeat'а, оба `print_sim_stats` отработают подряд — это OK,
+/// один из них покажет состояние «до», другой «после», без блокировки.
+fn spawn_heartbeat(
+    state: Arc<RwLock<RealSimState>>,
+    account: SharedAccount,
+    tag_prefix: String,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SEC));
+        // Первый tick срабатывает мгновенно — пропускаем, чтобы heartbeat
+        // не печатался до первой реальной активности (на старте все
+        // счётчики нулевые, такой снапшот бесполезен и шумит в логе).
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let state_guard = state.read().await;
+            let account_guard = account.read().await;
+            for kind in [XFrameIntervalKind::FiveMin, XFrameIntervalKind::FifteenMin] {
+                let Some(stats) = state_guard.stats.get(&kind) else {
+                    continue;
+                };
+                let tag = format!("{tag_prefix}/{} [heartbeat]", interval_label(kind));
+                print_sim_stats(&tag, stats, &account_guard, true);
+            }
+        }
+    });
+}
+
 /// Сообщение из `catch_unwind` для лога.
 fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -291,6 +331,7 @@ async fn tick_once(
         market_id,
         asset_id,
         event_start_ms,
+        event_end_ms,
         price_to_beat,
         gamma_question,
         frame,
@@ -374,7 +415,7 @@ async fn tick_once(
             .contains(market_id.as_str());
         (
             !this_positions.is_empty(),
-            any_position_would_sell(this_positions, &frame),
+            any_position_would_sell(this_positions, &frame, None),
             available,
             dd_halt,
             account_guard.max_drawdown_pct,
@@ -394,6 +435,7 @@ async fn tick_once(
         models.booster_resolution.as_deref(),
         models.calibration_resolution.as_ref(),
         true,
+        HOLD_TO_END_THRESHOLD_SEC,
     );
 
     let buy_gate_proceed = matches!(
@@ -435,6 +477,25 @@ async fn tick_once(
         None => false,
     };
 
+    // SHAP-топ для CSV считаем **до** взятия trade write-лока: `predict_contributions`
+    // — это XGBoost-инференс (~ms), под `state.write + account.write` он сериализовал бы
+    // все 4 воркера. Гейтим тем же `may_open && !ws_lagging`, что и сам `try_open_position`;
+    // если внутри лока `may_open` обнулится (dd_halt/resolve между snapshot и write) —
+    // строка просто будет отброшена, корректность не страдает, теряется только этот CPU-расчёт.
+    let pnl_top5_shap_at_open_precomputed: Option<String> = if may_open
+        && !ws_lagging
+        && !crate::history_sim::HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS
+    {
+        Some(crate::history_sim::top_pnl_shap_features_csv_cell(
+            &models.booster_pnl,
+            &frame,
+            crate::train_mode::PNL_MAX_LAG,
+            5,
+        ))
+    } else {
+        Some(String::new())
+    };
+
     // Торговля + MtM: порядок state.write → account.write (без инверсии).
     // state дропаем после фазы торговли — MtM только по Account; печать — под read ниже.
     let mut sold = false;
@@ -463,7 +524,20 @@ async fn tick_once(
                 account_guard.max_drawdown_pct
             );
         }
-        let may_open = may_open && !dd_halt_now;
+        // Та же логика для резолюции: колбек `Account::resolve_pending_market`
+        // мог вписать `market_id` в `recently_resolved_markets` за время HTTP-fetch.
+        // Без этой повторной сверки `try_open_position` может открыть позицию
+        // в только что резолвнутом маркете (до следующего тика, когда
+        // `manage_positions` вытолкнет её в pending как чужой `asset_id`).
+        let market_resolved_now = account_guard
+            .recently_resolved_markets
+            .contains(market_id.as_str());
+        if !market_already_resolved && market_resolved_now && may_open {
+            crate::tee_eprintln!(
+                "[real_sim] {tag}: market={market_id} резолвнулся между snapshot'ом и HTTP — отмена входа"
+            );
+        }
+        let may_open = may_open && !dd_halt_now && !market_resolved_now;
 
         // Фаза 1: торговля (sold/bought из возвратов manage_positions / try_open_position).
         if has_positions || may_open {
@@ -518,8 +592,7 @@ async fn tick_once(
                     side_stats,
                     bankroll,
                     strict_book.as_ref(),
-                    tag,
-                    true,
+                    None, // MINPOSITION_FRAMES — выдержка нужна только в history_sim
                 );
             }
 
@@ -563,9 +636,11 @@ async fn tick_once(
                     &polymarket_url,
                     price_to_beat,
                     None,
-                    None, // real_sim: без HTTP сверки времени для CSV
+                    event_end_ms,
                     graph_dump_bin_path_str.as_str(),
                     gamma_question.as_deref(),
+                    // SHAP уже посчитан вне локов; передаём строку как override.
+                    pnl_top5_shap_at_open_precomputed,
                 );
             }
         }

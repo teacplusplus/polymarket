@@ -44,7 +44,7 @@ use std::path::Path;
 use xgb::{Booster, DMatrix};
 
 /// Префильтр raw-предикта перед Kelly (`f* > 0`).
-pub const SIM_BUY_THRESHOLD: f32 = 0.70;
+pub const SIM_BUY_THRESHOLD: f32 = 0.60;
 
 /// Cap проскальзывания VWAP от L1 при `book_fill_*` (см. y_train в train_mode).
 /// Для **take profit**, если VWAP полного bid-walk даёт прибыль ≥
@@ -87,7 +87,37 @@ pub const EV_EXIT_MARGIN: f64 = 0.01;
 /// Лимит кадров без TP/SL → [`CloseReason::Timeout`]. Должен совпадать с `Y_TRAIN_HORIZON_FRAMES` в xframe.
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
 
+/// Минимальная выдержка позиции (в кадрах) до того, как [`sell_gate`] вообще
+/// начинает проверять SL/TP/EV-exit. В history_sim'e защищает от моментальных
+/// «вход на тике t — выход на тике t» из-за всплеска WS-цены в hold-zone.
+///
+/// В режиме [`crate::real_sim`] этот гейт отключается передачей `None` в
+/// параметре `min_position_frames` ([`sell_gate`] / [`manage_positions`] /
+/// [`any_position_would_sell`]) — там кадры приходят раз в секунду и каждая
+/// «выдержка» эквивалентна реальной задержке торговли.
 pub const MINPOSITION_FRAMES: usize = 2;
+
+/// Запрет одновременного открытия второй позиции на тот же `asset_id`,
+/// пока первая ещё не закрылась.
+///
+/// * `true` (single-position-per-asset, режим «как в real_sim») — на каждый
+///   asset одна активная позиция; повторные `raw≥thr` сигналы между
+///   входом и закрытием идут в `same_asset_open_skips`. Калибровка в
+///   [`crate::train_mode::first_entry_calibration_samples`] синхронно
+///   фильтрует по cooldown'у [`POSITION_TIMEOUT_FRAMES`] — на каждый
+///   маркет остаётся 1+ «entry-кадр», и `cal_pred` отражает win-rate
+///   реального входа, а не per-frame сигнала.
+///
+/// * `false` (multi-position-per-asset) — позволяем каскад позиций на
+///   одном asset (например, для усреднения / pyramid-входа). Калибровка
+///   тогда вырождается в per-frame и сильно занижается, потому что
+///   повторные кадры с `raw≥thr` после уже сработавшего TP помечаются
+///   `y=0` (TP не повторится в горизонте). Kelly с такой калибровкой
+///   почти не открывается.
+///
+/// Эта константа — единственный switch, синхронизирующий gate в
+/// [`try_open_position`] и cooldown-фильтр в калибровке. Не разносить.
+pub const BLOCK_SAME_ASSET_OPEN: bool = false;
 
 /// Минимум `event_remaining_ms` для нового входа ([`buy_gate`] LateEntry).
 pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
@@ -436,6 +466,38 @@ pub struct SideStats {
     /// **проигравшие** (`token_won = false`). Всегда `<= 0`
     /// (теряется весь `entry_cost`).
     pub(crate) pnl_resolution_loss: f64,
+    /// `(raw_pred_at_open, won)` для каждого закрытого трейда (TP/SL/Timeout/EvExit
+    /// из [`close_position`] плюс ResolutionWin/ResolutionLoss из
+    /// [`crate::account::Account::resolve_pending_market_sync`]). `won = pnl > 0.0`.
+    ///
+    /// Заполняется только ради
+    /// [`crate::train_mode::fit_calibration_via_sim_replay`]: per-frame калибровка
+    /// на val'е страдает distribution shift'ом (raw сигнал держится десятки
+    /// кадров вокруг entry-момента, y-разметка маркирует только узкое окно
+    /// TP-горизонта), поэтому калибруемся не на «кадрах с y», а на реальных
+    /// трейдах симулятора (raw на открытии, факт закрытия в плюс/минус). Раз
+    /// данные уже здесь — добавляем поле, не плодя параллельный сборщик.
+    ///
+    /// В обычных прогонах `run_sim_mode_inner` поле остаётся пустым (никто не
+    /// читает) — стоимость памяти на закрытый трейд: `4 + 1 = 5` байт + Vec
+    /// overhead.
+    pub(crate) closed_trade_entries: Vec<(f32, bool)>,
+    /// Сырое предсказание resolution-модели **на каждом кадре в hold-zone**
+    /// (`event_remaining_ms <= hold_to_end_threshold_sec*1000` и `> 0`),
+    /// для которого `compute_p_win_now` вернул `Some(_)`. Заполняется только
+    /// когда `booster_resolution` передан и `calibration_resolution = None` —
+    /// единственная конфигурация, в которой [`compute_p_win_now`] возвращает
+    /// **сырой** скор, а не калиброванный.
+    ///
+    /// Используется в [`crate::train_mode::fit_calibration_via_sim_replay`]
+    /// для калибровки `ModelType::Resolution`: каждое значение пары'ится с
+    /// `token_won` маркета (`up_won` для UP-стороны, `!up_won` для DOWN);
+    /// получаем `(raw_resolution, token_won)` точки для PAV.
+    ///
+    /// В обычных прогонах поле остаётся пустым: production sim передаёт
+    /// `calibration_resolution = Some(...)`, гейт блокирует push (см.
+    /// [`run_side_simulation`]).
+    pub(crate) hold_zone_resolution_predictions: Vec<f32>,
 }
 
 /// Статистика симуляции по версии; деньги/dd — в [`crate::account::Account`].
@@ -684,44 +746,38 @@ fn simulate_event(
         .map(|f| f.market_id.clone())
         .or_else(|| frames_down.first().map(|f| f.market_id.clone()));
 
-    {
-        let mut positions_up: Vec<OpenPosition> = Vec::new();
-        run_side_simulation(
-            &frames_up,
-            booster_up, calibration_up,
-            booster_resolution_up, calibration_resolution_up,
-            &mut positions_up,
-            account,
-            &lane_key_up,
-            &mut sim_stats.up,
-            currency,
-            is_kelly,
-            polymarket_url,
-            price_to_beat,
-            final_price,
-            event_end_ms,
-            &graph_dump_bin_path,
-        );
-    }
-    {
-        let mut positions_down: Vec<OpenPosition> = Vec::new();
-        run_side_simulation(
-            &frames_down,
-            booster_down, calibration_down,
-            booster_resolution_down, calibration_resolution_down,
-            &mut positions_down,
-            account,
-            &lane_key_down,
-            &mut sim_stats.down,
-            currency,
-            is_kelly,
-            polymarket_url,
-            price_to_beat,
-            final_price,
-            event_end_ms,
-            &graph_dump_bin_path,
-        );
-    }
+    run_side_simulation(
+        &frames_up,
+        booster_up, calibration_up,
+        booster_resolution_up, calibration_resolution_up,
+        account,
+        &lane_key_up,
+        &mut sim_stats.up,
+        currency,
+        is_kelly,
+        polymarket_url,
+        price_to_beat,
+        final_price,
+        event_end_ms,
+        &graph_dump_bin_path,
+        HOLD_TO_END_THRESHOLD_SEC,
+    );
+    run_side_simulation(
+        &frames_down,
+        booster_down, calibration_down,
+        booster_resolution_down, calibration_resolution_down,
+        account,
+        &lane_key_down,
+        &mut sim_stats.down,
+        currency,
+        is_kelly,
+        polymarket_url,
+        price_to_beat,
+        final_price,
+        event_end_ms,
+        &graph_dump_bin_path,
+        HOLD_TO_END_THRESHOLD_SEC,
+    );
 
     if let Some(market_id) = market_id_opt {
         account.resolve_pending_market_sync(
@@ -730,6 +786,7 @@ fn simulate_event(
             interval_kind,
             &market_id,
             up_won,
+            None,
         );
     }
 
@@ -752,17 +809,23 @@ fn simulate_event(
 }
 
 /// Один проход стороны (UP/DOWN) по ряду кадров: manage/open → MtM equity.
-/// Живые позиции в локальной `Vec`; после цикла — в `pending_resolution`, финальный payout в `simulate_event`.
+/// Живые позиции — `account.positions[lane_key]` (source-of-truth, как в [`crate::real_sim`]);
+/// после цикла дренируются в `account.pending_resolution[lane_key]`, финальный payout —
+/// в [`simulate_event`].
 ///
-/// Equity: `bankroll + Σ(local×prob) + Σ(pending×buy_price)` (как `real_sim::tick_once`). Сайзинг от `bankroll − Σ(entry_cost)` на этой стороне.
+/// Equity: `bankroll + Σ(local×prob) + Σ(pending×buy_price)` (как `real_sim::tick_once`).
+/// Сайзинг от `bankroll − Σ(entry_cost)` на этой стороне.
+///
+/// `hold_to_end_threshold_sec` — окно, в котором применяется resolution-модель
+/// и собираются точки для её калибровки (см. [`compute_p_win_now`] и
+/// [`SideStats::hold_zone_resolution_predictions`]).
 #[allow(clippy::too_many_arguments)]
-fn run_side_simulation(
+pub(crate) fn run_side_simulation(
     frames: &[&XFrame<SIZE>],
     booster_pnl: &Booster,
     calibration_pnl: Option<&Calibration>,
     booster_resolution: Option<&Booster>,
     calibration_resolution: Option<&Calibration>,
-    positions: &mut Vec<OpenPosition>,
     account: &mut Account,
     lane_key: &(String, XFrameIntervalKind, CurrencyUpDownOutcome),
     side_stats: &mut SideStats,
@@ -773,6 +836,7 @@ fn run_side_simulation(
     final_price: Option<f64>,
     event_end_ms: Option<i64>,
     graph_dump_bin_path: &str,
+    hold_to_end_threshold_sec: i64,
 ) {
     if frames.is_empty() {
         return;
@@ -786,20 +850,38 @@ fn run_side_simulation(
             booster_resolution,
             calibration_resolution,
             is_kelly,
+            hold_to_end_threshold_sec,
         );
+        // Sim-replay калибровки `ModelType::Resolution`: для каждого hold-zone
+        // кадра, на котором есть raw-предсказание, копим его в side_stats.
+        // Гейт `calibration_resolution.is_none()` гарантирует, что:
+        //  (а) production sim сюда не зайдёт (там cal Some после успешной загрузки);
+        //  (б) `p_win_now` уже **сырой** скор, а не калиброванный (см.
+        //      `compute_p_win_now`: при cal=None возвращает `raw as f64`).
+        if calibration_resolution.is_none() {
+            if let Some(p) = p_win_now {
+                side_stats.hold_zone_resolution_predictions.push(p as f32);
+            }
+        }
         let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl, is_kelly);
 
+        // Фаза 1: manage_positions. Деструктурируем account на disjoint поля:
+        // `bankroll`, `positions[lane_key]` (live), `pending_resolution[lane_key]` (carry).
         {
             let Account {
                 bankroll,
+                positions: account_positions,
                 pending_resolution,
                 ..
             } = &mut *account;
+            let positions_v = account_positions
+                .entry(lane_key.clone())
+                .or_default();
             let pending = pending_resolution
                 .entry(lane_key.clone())
                 .or_default();
             manage_positions(
-                positions,
+                positions_v,
                 pending,
                 frame,
                 is_last_idx,
@@ -807,35 +889,51 @@ fn run_side_simulation(
                 side_stats,
                 bankroll,
                 None,
-                "",
-                is_kelly,
+                Some(MINPOSITION_FRAMES),
             );
         }
 
-        let same_side_locked: f64 = positions.iter().map(|p| p.entry_cost).sum();
-        let available = (account.bankroll - same_side_locked).max(0.0);
-        try_open_position(
-            frame,
-            pnl_inference,
-            Some(booster_pnl),
-            positions,
-            side_stats,
-            available,
-            None,
-            currency,
-            is_kelly,
-            polymarket_url,
-            price_to_beat,
-            final_price,
-            event_end_ms,
-            graph_dump_bin_path,
-            None,
-        );
+        // Фаза 2: try_open_position. Тот же destructure, available считается
+        // на тех же live-позициях (в данном лейне same_side_locked).
+        {
+            let Account {
+                bankroll,
+                positions: account_positions,
+                ..
+            } = &mut *account;
+            let positions_v = account_positions
+                .entry(lane_key.clone())
+                .or_default();
+            let same_side_locked: f64 = positions_v.iter().map(|p| p.entry_cost).sum();
+            let available = (*bankroll - same_side_locked).max(0.0);
+            try_open_position(
+                frame,
+                pnl_inference,
+                Some(booster_pnl),
+                positions_v,
+                side_stats,
+                available,
+                None,
+                currency,
+                is_kelly,
+                polymarket_url,
+                price_to_beat,
+                final_price,
+                event_end_ms,
+                graph_dump_bin_path,
+                None,
+                None,
+            );
+        }
 
         // MtM equity (как real_sim): без prob на кадре тик пропускаем.
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
-            let positions_value: f64 = positions.iter().map(|p| p.shares_held * prob).sum();
+            let positions_value: f64 = account
+                .positions
+                .get(lane_key)
+                .map(|v| v.iter().map(|p| p.shares_held * prob).sum())
+                .unwrap_or(0.0);
             let pending_value: f64 = account
                 .pending_resolution
                 .values()
@@ -847,12 +945,23 @@ fn run_side_simulation(
         }
     }
 
-    if !positions.is_empty() {
-        let pending = account
-            .pending_resolution
+    // Хвост открытых позиций уезжает в pending_resolution — финальный payout
+    // делает caller через `Account::resolve_pending_market_sync`.
+    {
+        let Account {
+            positions: account_positions,
+            pending_resolution,
+            ..
+        } = &mut *account;
+        let positions_v = account_positions
             .entry(lane_key.clone())
             .or_default();
-        pending.append(positions);
+        if !positions_v.is_empty() {
+            let pending = pending_resolution
+                .entry(lane_key.clone())
+                .or_default();
+            pending.append(positions_v);
+        }
     }
 }
 
@@ -891,14 +1000,22 @@ pub(crate) fn compute_pnl_inference(
 
 /// P(win) resolution-модели в hold-zone; `None` вне зоны / нет booster / лаг > [`RESOLUTION_MAX_LAG`].
 /// Без гейта «есть позиции»: predict каждый тик в зоне — EMA не отстаёт на тик открытия.
+///
+/// `hold_to_end_threshold_sec` — параметр, а не константа: production-вызовы
+/// (real_sim, simulate_event) передают [`HOLD_TO_END_THRESHOLD_SEC`]; sim-replay
+/// калибровка ([`crate::train_mode::fit_calibration_via_sim_replay`]) подменяет
+/// его на `RESOLUTION_CALIBRATION_HOLD_SEC` (см. train_mode), чтобы собирать
+/// `(raw_resolution, token_won)` точки в реалистичном окне даже когда production
+/// EvExit временно отключён константой `= 0`.
 pub(crate) fn compute_p_win_now(
     frame: &XFrame<SIZE>,
     booster_resolution: Option<&Booster>,
     calibration_resolution: Option<&Calibration>,
     is_kelly: bool,
+    hold_to_end_threshold_sec: i64,
 ) -> Option<f64> {
     let in_hold_zone = frame.event_remaining_ms > 0
-        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+        && frame.event_remaining_ms <= hold_to_end_threshold_sec * 1000;
     if !in_hold_zone {
         return None;
     }
@@ -1049,6 +1166,11 @@ pub(crate) fn try_open_position(
     event_end_ms: Option<i64>,
     graph_dump_bin_path: &str,
     gamma_question_at_open: Option<&str>,
+    // Готовая строка SHAP-топа: если `Some`, используется как есть (caller
+    // уже посчитал её вне локов — см. `real_sim::tick_once`). При `None`
+    // считаем здесь по `booster_pnl_for_shap` как раньше.
+    // `Some(String::new())` = caller сознательно пропустил SHAP (не пересчитываем).
+    pnl_top5_shap_at_open_override: Option<String>,
 ) -> bool {
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return false;
@@ -1082,25 +1204,31 @@ pub(crate) fn try_open_position(
             false
         }
         BuyGate::Proceed { raw, pred, kelly_f, size } => {
-            // if positions
-            //     .iter()
-            //     .any(|p| p.asset_id == frame.asset_id)
-            // {
-            //     stats.same_asset_open_skips += 1;
-            //     return false;
-            // }
+            if BLOCK_SAME_ASSET_OPEN
+                && positions
+                    .iter()
+                    .any(|p| p.asset_id == frame.asset_id)
+            {
+                stats.same_asset_open_skips += 1;
+                return false;
+            }
             stats.raw_above_threshold += 1;
             stats.diag_sum_raw += raw as f64;
             stats.diag_sum_calibrated += pred as f64;
             stats.diag_sum_entry_prob += entry_prob;
             stats.diag_sum_kelly_f += kelly_f;
 
-            let pnl_top5_shap_at_open = if HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS {
-                String::new()
-            } else {
-                booster_pnl_for_shap
-                    .map(|b| top_pnl_shap_features_csv_cell(b, frame, PNL_MAX_LAG, 5))
-                    .unwrap_or_default()
+            let pnl_top5_shap_at_open = match pnl_top5_shap_at_open_override {
+                Some(s) => s,
+                None => {
+                    if HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS {
+                        String::new()
+                    } else {
+                        booster_pnl_for_shap
+                            .map(|b| top_pnl_shap_features_csv_cell(b, frame, PNL_MAX_LAG, 5))
+                            .unwrap_or_default()
+                    }
+                }
             };
 
             match open_position(
@@ -1208,6 +1336,9 @@ fn stop_loss_sell_deteriorated_vs_entry_ref(pos: &OpenPosition, urgent_sell_vwap
 
 /// `frames_held` — уже после инкремента тика (`manage_positions`) или `+1` в WS-предикате.
 /// `p_win_now` — из одного predict на кадр; `None` в [`any_position_would_sell`] (EMA не двигается).
+/// `min_position_frames` — минимальная выдержка позиции до первой проверки
+/// SL/TP/EV-exit; `Some(MINPOSITION_FRAMES)` в history_sim, `None` в
+/// [`crate::real_sim`] (см. [`MINPOSITION_FRAMES`]).
 pub(crate) fn sell_gate(
     pos: &OpenPosition,
     frames_held: usize,
@@ -1215,6 +1346,7 @@ pub(crate) fn sell_gate(
     is_last: bool,
     p_win_now: Option<f64>,
     strict_book: Option<&StrictBook>,
+    min_position_frames: Option<usize>,
 ) -> SellGate {
     if is_last || frame.event_remaining_ms <= 0 {
         return SellGate::HoldPnl;
@@ -1224,8 +1356,10 @@ pub(crate) fn sell_gate(
         return SellGate::HoldPnl;
     };
 
-    if frames_held < MINPOSITION_FRAMES {
-        return SellGate::HoldPnl;
+    if let Some(min_frames) = min_position_frames {
+        if frames_held < min_frames {
+            return SellGate::HoldPnl;
+        }
     }
 
     let in_hold_zone = frame.event_remaining_ms > 0 && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
@@ -1332,9 +1466,12 @@ pub(crate) fn sell_gate(
 }
 
 /// Gate до HTTP: был бы [`sell_gate`] в режиме WS (`Close`) на этом тике.
+/// `min_position_frames` — синхронно с одноимённым параметром
+/// [`sell_gate`] / [`manage_positions`]; в [`crate::real_sim`] всегда `None`.
 pub(crate) fn any_position_would_sell(
     positions: &[OpenPosition],
     frame: &XFrame<SIZE>,
+    min_position_frames: Option<usize>,
 ) -> bool {
     if positions.is_empty() || frame.event_remaining_ms <= 0 {
         return false;
@@ -1351,6 +1488,7 @@ pub(crate) fn any_position_would_sell(
                 false,
                 None,
                 None,
+                min_position_frames,
             ),
             SellGate::Close { .. }
         )
@@ -1359,6 +1497,7 @@ pub(crate) fn any_position_would_sell(
 
 /// Закрытия через [`sell_gate`] / `close_position`; чужой `asset_id` → [`pending_resolution`](crate::account::Account::pending_resolution).
 /// `true`, если был хотя бы один успешный close (bankroll обновился).
+/// `min_position_frames` пробрасывается в [`sell_gate`] (см. там).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn manage_positions(
     positions: &mut Vec<OpenPosition>,
@@ -1369,8 +1508,7 @@ pub(crate) fn manage_positions(
     stats: &mut SideStats,
     bankroll: &mut f64,
     strict_book: Option<&StrictBook>,
-    _log_tag: &str,
-    _is_kelly: bool,
+    min_position_frames: Option<usize>,
 ) -> bool {
     for pos in positions.iter_mut() { pos.frames_held += 1; }
 
@@ -1388,6 +1526,7 @@ pub(crate) fn manage_positions(
             is_last,
             p_win_now,
             strict_book,
+            min_position_frames,
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
             SellGate::HoldResolution { new_p_win_ema } => {
@@ -1637,6 +1776,11 @@ fn close_position(
     stats.trades += 1;
     if pnl >= 0.0 { stats.wins += 1; } else { stats.losses += 1; }
 
+    // См. doc у `SideStats::closed_trade_entries`. В обычных прогонах никто
+    // не читает — но если sim запущен из `train_mode` ради калибровки,
+    // именно эти пары (raw, won) идут в isotonic вместо per-frame y-меток.
+    stats.closed_trade_entries.push((pos.raw_pred_at_open, pnl > 0.0));
+
     match reason {
         CloseReason::TakeProfit   => { stats.tp_count += 1;              stats.pnl_tp += pnl; }
         CloseReason::StopLoss     => { stats.sl_count += 1;              stats.pnl_sl += pnl; }
@@ -1854,7 +1998,13 @@ fn frame_to_prediction_dmatrix(frame: &XFrame<SIZE>, max_lag: Option<usize>) -> 
 
 /// Топ `top_n` признаков по |SHAP| для одной строки (как [`crate::train_mode::print_contributions`]),
 /// без bias; строки — формат `   shap   pct%  name` для одной ячейки CSV (через `\n`).
-fn top_pnl_shap_features_csv_cell(
+///
+/// `pub(crate)`, чтобы [`crate::real_sim::tick_once`] мог посчитать SHAP **до** взятия
+/// trade write-лока и передать готовую строку в [`try_open_position`] через
+/// `pnl_top5_shap_at_open_override` — иначе `predict_contributions` блокирует
+/// `state.write + account.write` на длительность XGBoost-инференса (~ms),
+/// что сериализует все 4 воркера real_sim между собой.
+pub(crate) fn top_pnl_shap_features_csv_cell(
     booster: &Booster,
     frame: &XFrame<SIZE>,
     max_lag: Option<usize>,
@@ -2064,7 +2214,7 @@ pub(crate) fn load_booster(path: &Path) -> Option<Booster> {
     }
 }
 
-fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
+pub(crate) fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
     let bytes = fs::read(path)?;
     Ok(bincode::deserialize(&bytes)?)
 }

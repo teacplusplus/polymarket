@@ -130,6 +130,25 @@ pub fn init_trade_csv_log_file(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Очищает [`TRADE_CSV_PENDING`] **без** записи в файл.
+///
+/// Нужно для побочных запусков sim'а, которые делают `write_trade_csv_row`
+/// (через `close_position` / `Account::resolve_pending_market_sync`), но
+/// не должны попасть в финальный CSV — например, sim-replay калибровка
+/// в [`crate::train_mode::fit_calibration_via_sim_replay`]. После каждого
+/// маркета `record_market_outcome` дренирует свои строки из буфера, но
+/// если writer не открыт (а в train phase он закрыт), они уходят в drop.
+/// Этот метод — defensive sweep на случай маркетов, для которых
+/// `record_market_outcome` не дёрнулся (пустой dump / отсутствующий
+/// `market_id` / panic'нувший воркер): чистим буфер до того, как
+/// `init_trade_csv_log_file` следующей фазы откроет writer и любая
+/// нечаянная запись попадёт в финальный CSV.
+pub fn clear_pending_buffer() {
+    if let Ok(mut pending) = TRADE_CSV_PENDING.lock() {
+        pending.clear();
+    }
+}
+
 /// Флашит и закрывает писатель в [`TRADE_CSV_LOG`], если он был открыт.
 /// Симметрично `tee_log::finish_tee_log` — для контролируемого закрытия
 /// в финале однократного режима.

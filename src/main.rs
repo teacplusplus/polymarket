@@ -179,6 +179,17 @@ async fn main() -> Result<()> {
                 "real_sim",
             )?;
 
+            // Per-trade CSV-лог: одна строка на каждое закрытие позиции
+            // (см. `trade_csv_log` модульный комментарий и
+            // `Account::resolve_pending_market_sync`). Без этой инициализации
+            // `write_trade_csv_row` молча копит строки в `TRADE_CSV_PENDING`
+            // и `record_market_outcome` дренирует их в drop — никаких
+            // per-trade данных на диск не попадает.
+            trade_csv_log::init_trade_csv_log_file(
+                std::path::Path::new("xframes/last_real_sim_trades.csv"),
+            )?;
+            trade_csv_log::set_current_regime("real_sim");
+
             // См. комментарий в `AppMode::Default` — общий счёт на процесс.
             let account = Account::new_shared();
 

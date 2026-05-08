@@ -1064,6 +1064,7 @@ struct WalkSellResult {
     /// закрытиях `close_position` (SL / Timeout / EvExitLoss).
     net_usdc: f64,
     /// VWAP на проданных шерсах: `gross_usdc / shares`. Для slippage-чека.
+    #[allow(dead_code)]
     vwap: f64,
     /// Лучший bid из L1 (best_bid); сохраняется для отладки / будущих cap-чеков.
     #[allow(dead_code)]
@@ -1223,18 +1224,6 @@ fn walk_sell_xfeatures<const N: usize>(
     })
 }
 
-/// Urgent sell VWAP просел относительно входного фактического ref не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`].
-fn y_train_stop_loss_sell_deteriorated_vs_entry_ref(
-    sell_vwap_at_entry: f64,
-    urgent_sell_vwap: f64,
-) -> bool {
-    let r = sell_vwap_at_entry;
-    if !(r > 0.0) || !r.is_finite() {
-        return true;
-    }
-    let threshold = r * (1.0 - Y_TRAIN_SL_MIN_REF_SELL_REL_DROP);
-    urgent_sell_vwap <= threshold
-}
 
 /// Метка y для PnL-модели — `«успеет ли позиция $200 нотиналом отбить TP до
 /// конца горизонта или попадёт в SL»`.
@@ -1405,7 +1394,7 @@ pub fn calc_y_train_pnl(
         // TP / max-progress — это «resting-лимитка над текущим mid»,
         // т.е. **maker-сценарий**: fee = 0, в карман падает gross_usdc.
         // См. `CloseReason::is_voluntary_exit` в `history_sim.rs` для
-        // той же дихотомии в runtime-симуляторе.
+        // той же дихотомии в runtime-симуляторе.нщ
         let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
         let net_ret_maker = (sell.gross_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
 
@@ -1624,6 +1613,7 @@ pub fn calc_y_train_resolution(
     if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
         return Some(0.0)
     }
+    
     let actual_shares = buy.actual_shares;
     // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.
     // let sell_vwap_at_entry = match walk_sell_xfeatures(current, actual_shares) {

@@ -2,7 +2,13 @@
 //! (без удержания всех `frames_up`/`frames_down` в RAM), строит матрицы признаков и меток, обучает XGBoost с байесовской оптимизацией гиперпараметров
 //! и сохраняет модель рядом с папкой версии.
 
-use crate::history_sim::{HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS};
+use crate::account::Account;
+use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
+use crate::history_sim::{
+    HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS,
+    SideStats, SimStats, load_market_xframes, run_side_simulation,
+    window_bounds_from_dump_path,
+};
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::tee_log::TEE_LOG;
 use crate::xframe::{
@@ -75,12 +81,45 @@ const CALIBRATION_MIN_AUC: f32 = 0.60;
 /// Эпсилон для клиппинга выходов isotonic regression: исключает 0/1 значения,
 /// которые сломают logloss и Kelly при логарифмировании.
 const CALIBRATION_EPS: f32 = 1e-3;
-/// Минимальный суммарный вес одного блока (число сэмплов) в isotonic-калибровке.
+/// Верхний кап на минимальный суммарный вес одного блока (число сэмплов) в
+/// isotonic-калибровке. Эффективный порог адаптивный:
+/// `min_weight = min(CALIBRATION_MIN_BLOCK_WEIGHT_CAP, n_entries / 5)`.
 /// После PAV последовательно объединяем соседние блоки до достижения этого порога —
 /// это регуляризация против переобучения на малых калибровочных сетах.
 /// Монотонность при этом сохраняется (weighted-avg двух non-decreasing соседей
 /// остаётся в интервале [prev, next]).
-const CALIBRATION_MIN_BLOCK_WEIGHT: f64 = 50.0;
+///
+/// Адаптивность нужна потому, что фиксированные `50` на маленьком sim-replay
+/// сете (например, 95 трейдов после `SIM_BUY_THRESHOLD`) гарантируют схлопывание
+/// в один bucket → константная калибровка. С `n/5` мы получаем ≈5 ступенек на
+/// любом размере сета, при этом для крупных сетов сохраняем полноценные 50.
+const CALIBRATION_MIN_BLOCK_WEIGHT_CAP: f64 = 50.0;
+
+/// Минимальное количество трейдов в калибровочном сете sim-replay
+/// (см. [`fit_calibration_via_sim_replay`]). Если симулятор на val'е набрал
+/// меньше — калибровка fallback'ит на полный per-frame `(preds, y)` сет
+/// с предупреждением. Меньше ~50 точек слишком мало для устойчивого PAV:
+/// верхний бакет может содержать всего 1–2 трейда, и `cal(raw≥0.7)` будет случайным.
+const CALIBRATION_MIN_FILTERED_SAMPLES: usize = 25;
+
+/// Стартовый банкролл для sim-replay калибровки
+/// (см. [`fit_calibration_via_sim_replay`]).
+///
+/// **Намеренно ≫ [`crate::history_sim::INITIAL_BANKROLL`]**: реальный $50
+/// банкролл с `BLOCK_SAME_ASSET_OPEN=false` после 1-2 одновременных $30-входов
+/// упирается в `available = bankroll - same_side_locked` ≤ 0 и **скипает**
+/// последующие signal-frames (или открывает их меньшим размером). Это
+/// добавляет bankroll-driven sampling bias в калибровочный сет: «поздние»
+/// сигналы маркета и сигналы после серии лоссов недопредставлены не потому,
+/// что хуже, а потому что денег нет.
+///
+/// Калибровка отвечает на вопрос «при `raw=X` какова **истинная** P(win)?» —
+/// это свойство сигнала модели, а не истории трейдов. Чтобы убрать bias,
+/// банкролл выбран настолько большим, чтобы `min(NO_KELLY_POSITION_SIZE_USD,
+/// bankroll) = NO_KELLY_POSITION_SIZE_USD` всегда, а `available ≫ entry_cost`
+/// никогда не отбраковывал сигнал (см. [`crate::history_sim::try_open_position`]
+/// и [`crate::history_sim::run_side_simulation`]).
+const CALIBRATION_REPLAY_BANKROLL_USD: f64 = 1.0e12;
 
 /// Базовый уровень logloss для штрафа в [`TuneObjective::MaximizeAucWithPenalty`].
 /// При типичном дисбалансе классов (~25% y=1) константная модель даёт logloss
@@ -249,48 +288,379 @@ impl Calibration {
     }
 }
 
+/// Прогон `run_side_simulation` по val-маркетам с `is_kelly=false` и identity-калибровкой:
+/// возвращает пары `(raw_pred_at_open, won)` со всех **закрытых** трейдов
+/// ([`crate::history_sim::close_position`] + [`crate::account::Account::resolve_pending_market_sync`]).
+///
+/// # Зачем
+///
+/// Per-frame калибровка отвечает на вопрос «какова доля `y=1` среди **всех**
+/// кадров с `raw ≥ thr`». В реальной торговле это не тот вопрос: после того
+/// как сигнал ушёл выше порога, он держится десятками кадров (модель «думает»
+/// о том же рынке), а y-разметка ([`crate::xframe::calc_y_train_pnl`]) пишет
+/// `1` только на узком окне TP-горизонта. В сумме per-frame доля позитивных
+/// в 2–4 раза ниже, чем фактический win-rate sim'а на тех же данных, и
+/// isotonic сжимает `cal(raw≥0.7) → 0.30`, ломая Kelly.
+///
+/// Здесь мы прогоняем **тот же** [`run_side_simulation`] на val'е (с
+/// `is_kelly=false`, фиксированный $30 entry, identity-калибровка) и
+/// собираем фактический исход каждой открытой позиции — TP/SL/Timeout/EvExit
+/// или Resolution. На этих парах `(raw, won)` PAV даёт честный
+/// «raw-скор → реальный win-rate sim'а», а не «raw-скор → доля кадров с y=1».
+///
+/// # Изоляция от глобального состояния
+///
+/// На каждый маркет создаётся свежий [`Account`] с очень большим bankroll
+/// (чтобы фиксированный $30-entry не урезался по `min(size, bankroll)` после
+/// серии трейдов). [`SimStats`] / `positions` / `pending_resolution` тоже
+/// per-маркет. CSV-лог трейдов обычно не открыт в момент train_mode
+/// ([`crate::trade_csv_log::init_trade_csv_log_file`] дёргается только в
+/// [`crate::history_sim::run_sim_mode`]); если открыт — туда попадут лишние
+/// строки, в `train_and_history_sim` это не происходит.
+/// Hold-zone threshold (sec) для sim-replay калибровки `ModelType::Resolution`.
+///
+/// Управляет [`compute_p_win_now`] **только в калибровочном прогоне**: production
+/// (`run_sim_mode_inner`, `real_sim::tick_once`) продолжает использовать
+/// [`HOLD_TO_END_THRESHOLD_SEC`]. Эти константы намеренно разные:
+///   * production сейчас фиксирован в `0` — EvExit отключён, resolution-модель
+///     в живом sim'е не запрашивается;
+///   * для калибровки же resolution на пустом множестве смысла нет, нужно
+///     набрать `(raw_resolution, token_won)` точки в реалистичном окне последних
+///     30 секунд эвента (где модель в принципе будет применяться, как только
+///     production включит EvExit).
+const RESOLUTION_CALIBRATION_HOLD_SEC: i64 = 30;
+
+/// Hold-zone threshold (sec) для sim-replay калибровки `ModelType::Pnl`.
+/// Жёстко `= 0`: при PnL-калибровке нам нужен «чистый» trade outcome (TP/SL/
+/// Timeout/Resolution) без EvExit-выходов, поэтому resolution-ветку
+/// глушим, выставляя пустой hold-zone.
+const PNL_CALIBRATION_HOLD_SEC: i64 = 0;
+
+/// Sim-replay сбор данных для калибровки одной из двух моделей.
+///
+/// **Контракт по моделям:**
+///
+/// * `ModelType::Pnl`: `booster_for_calibration` — сама обучаемая PnL-модель.
+///   `pnl_for_entries` игнорируется. `run_side_simulation` запускается в
+///   raw-режиме (`is_kelly=false`, identity-калибровка PnL, без resolution).
+///   Hold-zone = `PNL_CALIBRATION_HOLD_SEC = 0` (resolution-ветка отключена,
+///   EvExit'ы не «съедают» трейды). Возврат — `(raw_pnl_at_open, pnl > 0)` из
+///   [`SideStats::closed_trade_entries`].
+///
+/// * `ModelType::Resolution`: `booster_for_calibration` — обучаемая
+///   Resolution-модель. `pnl_for_entries = Some((pnl_booster, pnl_cal))`
+///   обязателен — вход в позиции должен идти **через уже откалиброванный
+///   PnL-канал в Kelly-режиме**, иначе калибровочные точки берутся из
+///   нерепрезентативной популяции кадров (production-сайзинг по Kelly влияет
+///   на то, какие маркеты вообще получают позицию). `run_side_simulation`
+///   получает `(pnl_booster, Some(pnl_cal), Some(resolution_booster),
+///   None /* calibration_resolution */, is_kelly=true)`. Hold-zone =
+///   `RESOLUTION_CALIBRATION_HOLD_SEC = 30`. На каждом кадре в hold-zone
+///   `compute_p_win_now` (т.к. `calibration_resolution=None`) вернёт **сырой**
+///   скор — `run_side_simulation` копит его в
+///   [`SideStats::hold_zone_resolution_predictions`]. После прохода каждое
+///   значение пар'ится с `token_won` маркета (`up_won` для UP, `!up_won` для
+///   DOWN) — единый исход монотонно делит все hold-zone-кадры на «выигрышные»
+///   и «проигрышные». PAV сошьёт их в монотонную калибровку.
+fn fit_calibration_via_sim_replay(
+    val_paths: &[PathBuf],
+    booster_for_calibration: &Booster,
+    pnl_for_entries: Option<(&Booster, &Calibration)>,
+    side: FrameSide,
+    currency: &str,
+    interval_kind: XFrameIntervalKind,
+    model_type: ModelType,
+    tag: &str,
+) -> Vec<(f32, bool)> {
+    let outcome = side.to_outcome();
+    let lane_key = (currency.to_string(), interval_kind, outcome);
+    let identity = Calibration::identity();
+
+    // Раскладка ролей моделей и режима sim-replay по `model_type`.
+    // `booster_pnl` / `calibration_pnl` идут в PnL-канал `run_side_simulation`,
+    // `booster_resolution` — в resolution-канал. Hold-zone определяет окно,
+    // в котором собираются точки для калибровки Resolution (см. doc).
+    let (booster_pnl, calibration_pnl, booster_resolution, is_kelly, hold_sec) =
+        match model_type {
+            ModelType::Pnl => (
+                booster_for_calibration,
+                &identity,
+                None,
+                false,
+                PNL_CALIBRATION_HOLD_SEC,
+            ),
+            ModelType::Resolution => {
+                let Some((pnl_b, pnl_c)) = pnl_for_entries else {
+                    tee_eprintln!(
+                        "[calibration-sim] {tag}: ModelType::Resolution требует \
+                         pnl_for_entries (PnL booster + калибровку для драйва entry); \
+                         sim-replay пропущен — будет fallback на per-frame."
+                    );
+                    return Vec::new();
+                };
+                (
+                    pnl_b,
+                    pnl_c,
+                    Some(booster_for_calibration),
+                    true,
+                    RESOLUTION_CALIBRATION_HOLD_SEC,
+                )
+            }
+        };
+
+    let mut entries: Vec<(f32, bool)> = Vec::new();
+
+    let mut markets_processed: usize = 0;
+    let mut markets_skipped: usize = 0;
+    let mut total_frames: usize = 0;
+
+    for path in val_paths {
+        let dump = match load_market_xframes(path) {
+            Ok(d) => d,
+            Err(err) => {
+                tee_eprintln!(
+                    "[calibration-sim] {tag}: загрузка дампа {} провалена: {err}",
+                    path.display()
+                );
+                markets_skipped += 1;
+                continue;
+            }
+        };
+        let frames_vec: Vec<&XFrame<SIZE>> = side.frames(&dump).iter().collect();
+        if frames_vec.is_empty() {
+            markets_skipped += 1;
+            continue;
+        }
+        total_frames += frames_vec.len();
+
+        // См. [`CALIBRATION_REPLAY_BANKROLL_USD`]: намеренно ≫ INITIAL_BANKROLL,
+        // чтобы убрать capacity-фильтр real-bankroll'а из калибровочного сета.
+        let mut account = Account::new();
+        account.bankroll = CALIBRATION_REPLAY_BANKROLL_USD;
+        account.peak_bankroll = CALIBRATION_REPLAY_BANKROLL_USD;
+        let mut sim_stats = SimStats::new();
+
+        let event_end_ms = window_bounds_from_dump_path(path, interval_kind)
+            .map(|b| b.event_end_ms);
+        let bin_dump_path = path.to_string_lossy().into_owned();
+        let market_id_opt = frames_vec.first().map(|f| f.market_id.clone());
+        let up_won = dump.up_won();
+        let token_won = match side {
+            FrameSide::Up => up_won,
+            FrameSide::Down => !up_won,
+        };
+
+        {
+            let side_stats: &mut SideStats = match side {
+                FrameSide::Up   => &mut sim_stats.up,
+                FrameSide::Down => &mut sim_stats.down,
+            };
+            run_side_simulation(
+                &frames_vec,
+                booster_pnl,
+                Some(calibration_pnl),
+                booster_resolution,
+                None, // см. doc: calibration_resolution не передаётся
+                &mut account,
+                &lane_key,
+                side_stats,
+                currency,
+                is_kelly,
+                "",
+                Some(dump.price_to_beat),
+                Some(dump.final_price),
+                event_end_ms,
+                &bin_dump_path,
+                hold_sec,
+            );
+        }
+
+        // Хвост позиций, доехавших до конца окна, лежит в `account.pending_resolution`
+        // под нашим `lane_key`. resolve_pending_market_sync закрывает их бинарной
+        // выплатой и (благодаря патчу в account.rs) push'ит в closed_trade_entries.
+        if let Some(market_id) = market_id_opt {
+            account.resolve_pending_market_sync(
+                &mut sim_stats,
+                currency,
+                interval_kind,
+                &market_id,
+                up_won,
+                None,
+            );
+        }
+
+        let side_stats_ref: &SideStats = match side {
+            FrameSide::Up   => &sim_stats.up,
+            FrameSide::Down => &sim_stats.down,
+        };
+        match model_type {
+            ModelType::Pnl => {
+                entries.extend_from_slice(&side_stats_ref.closed_trade_entries);
+            }
+            ModelType::Resolution => {
+                // Все hold-zone кадры одного маркета получают один и тот же
+                // `token_won` — резолюция эвента бинарна и общая для всех
+                // кадров его hold-окна. Это и есть «правильная» метка для
+                // калибровки P(токен_выиграл | признаки кадра).
+                entries.extend(
+                    side_stats_ref
+                        .hold_zone_resolution_predictions
+                        .iter()
+                        .map(|&p| (p, token_won)),
+                );
+            }
+        }
+        markets_processed += 1;
+    }
+
+    // Defensive sweep: `close_position` / `Account::resolve_pending_market_sync`
+    // выше клали строки в `TRADE_CSV_PENDING` (in-memory буфер). Для каждого
+    // маркета `resolve_pending_market_sync` вызывает `record_market_outcome`,
+    // который дренирует свой `market_id` (с writer == None строки уходят в
+    // drop, см. `trade_csv_log::record_market_outcome`). Но если в каком-то
+    // маркете `market_id_opt = None` (пустой dump), `record_market_outcome`
+    // не дёрнется и его строки останутся висеть. Чистим буфер до того, как
+    // `run_sim_mode` откроет writer и эти orphan-строки попадут в финальный
+    // CSV под чужим `regime`.
+    crate::trade_csv_log::clear_pending_buffer();
+
+    let n_won = entries.iter().filter(|(_, w)| *w).count();
+    let n_lost = entries.len() - n_won;
+    let mean_raw_won: f64 = if n_won > 0 {
+        entries.iter().filter(|(_, w)| *w).map(|(r, _)| *r as f64).sum::<f64>() / n_won as f64
+    } else { 0.0 };
+    let mean_raw_lost: f64 = if n_lost > 0 {
+        entries.iter().filter(|(_, w)| !*w).map(|(r, _)| *r as f64).sum::<f64>() / n_lost as f64
+    } else { 0.0 };
+    let win_rate = if !entries.is_empty() {
+        n_won as f64 / entries.len() as f64
+    } else { 0.0 };
+    let label = match model_type {
+        ModelType::Pnl => "trades",
+        ModelType::Resolution => "hold_frames",
+    };
+    tee_println!(
+        "[calibration-sim] {tag} ({model_type:?} hold={hold_sec}s is_kelly={is_kelly}): \
+         обработано {markets_processed}/{} маркетов ({} пропущено, {} кадров) | \
+         {label}={} won={n_won} lost={n_lost} win_rate={win_rate:.3} \
+         mean_raw_won={mean_raw_won:.4} mean_raw_lost={mean_raw_lost:.4}",
+        val_paths.len(),
+        markets_skipped,
+        total_frames,
+        entries.len(),
+    );
+
+    entries
+}
+
 /// Isotonic regression калибровка: подгоняет монотонную неубывающую функцию
 /// методом PAV (Pool Adjacent Violators) к парам `(raw_prediction, label)`.
 ///
-/// Печатает диагностику для обнаружения инверсии/distribution shift.
-fn fit_calibration(booster: &Booster, dmat: &DMatrix, y: &[f32], tag: &str) -> anyhow::Result<Calibration> {
+/// # Источник данных
+///
+/// **Основной путь** — sim-replay (см. [`fit_calibration_via_sim_replay`]):
+/// прогоняем `run_side_simulation` на val-сплите. Для PnL-модели — в
+/// raw-режиме с identity-калибровкой и собираем `(raw_pred_at_open, pnl > 0)`
+/// из закрытых трейдов. Для Resolution-модели — в Kelly-режиме с **уже
+/// откалиброванным PnL** (передаётся через `pnl_for_entries`), без
+/// `calibration_resolution`, и собираем `(raw_resolution, token_won)` на
+/// каждом hold-zone-кадре. Подробности — в doc к
+/// [`fit_calibration_via_sim_replay`].
+///
+/// **Fallback** — full per-frame `(preds, y)` (как было до перехода на
+/// sim-replay). Срабатывает, если sim-replay набрал меньше
+/// [`CALIBRATION_MIN_FILTERED_SAMPLES`] точек или один из классов пуст
+/// (например, в test-сплите модель не открывает позиций при
+/// `SIM_BUY_THRESHOLD` — диагностический сигнал, что AUC высокий за счёт
+/// «низких» кадров, а не сигналов на покупку). Per-frame fallback
+/// корректен и для Resolution: `MarketDataset::y` для Resolution-модели —
+/// это `calc_y_train_resolution` (тот же `token_won`, только размечается
+/// плотно по всем кадрам, а не только по hold-zone).
+///
+/// Печатает диагностику обоих сетов (per-frame vs sim-replay) — позволяет
+/// сравнить distribution shift «глазами» и зафиксировать, какой набор
+/// фактически попал в PAV.
+#[allow(clippy::too_many_arguments)]
+fn fit_calibration(
+    booster: &Booster,
+    dmat: &DMatrix,
+    val_markets: &[MarketDataset],
+    val_paths: &[PathBuf],
+    currency: &str,
+    interval_kind: XFrameIntervalKind,
+    side: FrameSide,
+    model_type: ModelType,
+    pnl_for_entries: Option<(&Booster, &Calibration)>,
+    tag: &str,
+) -> anyhow::Result<Calibration> {
     let preds = booster.predict(dmat)?;
+    let y: Vec<f32> = val_markets.iter().flat_map(|m| m.y.iter().copied()).collect();
+    debug_assert_eq!(preds.len(), y.len());
 
-    let n_pos = y.iter().filter(|&&v| v >= 1.0).count();
-    let n_neg = y.len() - n_pos;
-    let mean_pred_pos: f64 = preds.iter().zip(y.iter())
+    // ── Диагностика на полном per-frame сете (для сравнения) ─────────────
+    let n_pos_full = y.iter().filter(|&&v| v >= 1.0).count();
+    let n_neg_full = y.len() - n_pos_full;
+    let mean_pred_pos_full: f64 = preds.iter().zip(y.iter())
         .filter(|(_, yv)| **yv >= 1.0)
         .map(|(&p, _)| p as f64)
-        .sum::<f64>() / n_pos.max(1) as f64;
-    let mean_pred_neg: f64 = preds.iter().zip(y.iter())
+        .sum::<f64>() / n_pos_full.max(1) as f64;
+    let mean_pred_neg_full: f64 = preds.iter().zip(y.iter())
         .filter(|(_, yv)| **yv < 1.0)
         .map(|(&p, _)| p as f64)
-        .sum::<f64>() / n_neg.max(1) as f64;
-    let cal_auc = calc_auc(&preds, y);
+        .sum::<f64>() / n_neg_full.max(1) as f64;
+    let cal_auc_full = calc_auc(&preds, &y);
     tee_println!(
-        "[calibration] {tag}: n_pos={n_pos} n_neg={n_neg} mean_pred_pos={mean_pred_pos:.4} \
-         mean_pred_neg={mean_pred_neg:.4} AUC={cal_auc:.4}"
+        "[calibration] {tag}: full per-frame: n_pos={n_pos_full} n_neg={n_neg_full} \
+         mean_pred_pos={mean_pred_pos_full:.4} mean_pred_neg={mean_pred_neg_full:.4} AUC={cal_auc_full:.4}"
     );
 
-    if cal_auc < CALIBRATION_MIN_AUC {
+    if cal_auc_full < CALIBRATION_MIN_AUC {
         tee_eprintln!(
-            "[calibration] {tag}: AUC={cal_auc:.4} < {CALIBRATION_MIN_AUC} — модель слишком \
+            "[calibration] {tag}: AUC={cal_auc_full:.4} < {CALIBRATION_MIN_AUC} — модель слишком \
              слабая для калибровки. Используется identity."
         );
         return Ok(Calibration::identity());
     }
 
-    if n_pos == 0 || n_neg == 0 {
-        tee_eprintln!(
-            "[calibration] {tag}: в калибровочном сете есть только один класс \
-             (n_pos={n_pos}, n_neg={n_neg}). Используется identity."
-        );
-        return Ok(Calibration::identity());
-    }
+    // ── Sim-replay (основной путь) ───────────────────────────────────────
+    let entries = fit_calibration_via_sim_replay(
+        val_paths,
+        booster,
+        pnl_for_entries,
+        side,
+        currency,
+        interval_kind,
+        model_type,
+        tag,
+    );
+    let preds_sim: Vec<f32> = entries.iter().map(|(r, _)| *r).collect();
+    let y_sim: Vec<f32> = entries.iter().map(|(_, w)| if *w { 1.0 } else { 0.0 }).collect();
+    let n_pos_sim = entries.iter().filter(|(_, w)| *w).count();
+    let n_neg_sim = entries.len() - n_pos_sim;
 
-    let cal = isotonic_fit(&preds, y);
+    // Решаем какой набор кормить в PAV.
+    let (cal_preds, cal_y, source_label): (&[f32], &[f32], &'static str) =
+        if entries.len() >= CALIBRATION_MIN_FILTERED_SAMPLES && n_pos_sim > 0 && n_neg_sim > 0 {
+            (preds_sim.as_slice(), y_sim.as_slice(), "sim-replay")
+        } else {
+            tee_eprintln!(
+                "[calibration] {tag}: sim-replay набор слишком мал ({} < {CALIBRATION_MIN_FILTERED_SAMPLES}) \
+                 или один класс пуст (won={n_pos_sim} lost={n_neg_sim}) — fallback на per-frame.",
+                entries.len(),
+            );
+            if n_pos_full == 0 || n_neg_full == 0 {
+                tee_eprintln!(
+                    "[calibration] {tag}: per-frame набор тоже без двух классов \
+                     (n_pos={n_pos_full}, n_neg={n_neg_full}). Используется identity."
+                );
+                return Ok(Calibration::identity());
+            }
+            (preds.as_slice(), y.as_slice(), "per-frame")
+        };
+
+    let cal = isotonic_fit(cal_preds, cal_y);
     tee_println!(
-        "[calibration] {tag}: fit OK | breakpoints={} | \
+        "[calibration] {tag}: fit OK ({source_label}) | breakpoints={} | \
          range=[{:.3}…{:.3}] → [{:.3}…{:.3}]",
         cal.xs.len(),
         cal.xs.first().copied().unwrap_or(0.0),
@@ -371,10 +741,13 @@ fn isotonic_fit(preds: &[f32], y: &[f32]) -> Calibration {
     }
 
     // Шаг 3: регуляризация — последовательно аккумулируем блоки в «bucket»,
-    // пока суммарный вес не достигнет CALIBRATION_MIN_BLOCK_WEIGHT.
+    // пока суммарный вес не достигнет min_weight. Порог адаптивный:
+    // `min(CAP, n/5)` — на маленьком sim-replay сете (≪ 5·CAP) фиксированный
+    // CAP=50 склеивал всё в один bucket и калибровка вырождалась в константу.
+    // n/5 даёт ≈5 ступенек при любом N; на больших сетах кап ограничивает сверху.
     // Монотонность сохраняется: если v_1 ≤ … ≤ v_k и v_{k+1} ≤ … ≤ v_m,
     // то weighted_avg(v_1..v_k) ≤ v_k ≤ v_{k+1} ≤ weighted_avg(v_{k+1}..v_m).
-    let min_weight = CALIBRATION_MIN_BLOCK_WEIGHT;
+    let min_weight = (preds.len() as f64 / 5.0).min(CALIBRATION_MIN_BLOCK_WEIGHT_CAP);
     if !stack.is_empty() && min_weight > 1.0 {
         let mut regularized: Vec<Block> = Vec::with_capacity(stack.len());
         let mut acc: Option<Block> = None;
@@ -493,6 +866,15 @@ impl FrameSide {
             Self::Down => &dump.frames_down,
         }
     }
+
+    /// Маппинг на лейн-ключ симулятора: одна и та же сторона
+    /// в обоих модулях (UP-токен / DOWN-токен).
+    fn to_outcome(self) -> CurrencyUpDownOutcome {
+        match self {
+            Self::Up   => CurrencyUpDownOutcome::Up,
+            Self::Down => CurrencyUpDownOutcome::Down,
+        }
+    }
 }
 
 /// Тип модели: определяет какую y-метку использовать при обучении.
@@ -562,6 +944,18 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                     continue;
                 }
 
+                // Лейбл "5m"/"15m" → enum XFrameIntervalKind: один источник истины
+                // с лейном sim'а в [`fit_calibration_via_sim_replay`] (через
+                // `lane_key = (currency, interval_kind, outcome)`).
+                let interval_kind = match interval {
+                    "5m"  => XFrameIntervalKind::FiveMin,
+                    "15m" => XFrameIntervalKind::FifteenMin,
+                    other => {
+                        tee_eprintln!("[train] {currency}/{version_str}/{other}: неизвестный interval, пропуск");
+                        continue;
+                    }
+                };
+
                 for &step_sec in &FRAME_BUILD_INTERVALS_SEC {
                     let step_path = interval_path.join(format!("{step_sec}s"));
                     if !step_path.is_dir() {
@@ -593,7 +987,9 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                         test_paths,
                         &version_path,
                         &tag_prefix,
+                        &currency,
                         interval,
+                        interval_kind,
                         step_sec,
                     )?;
                 }
@@ -676,7 +1072,9 @@ fn train_all_variants(
     test_paths: &[PathBuf],
     version_path: &Path,
     tag_prefix: &str,
+    currency: &str,
     interval: &str,
+    interval_kind: XFrameIntervalKind,
     step_sec: u64,
 ) -> anyhow::Result<()> {
     for model_type in [ModelType::Pnl, ModelType::Resolution] {
@@ -736,9 +1134,26 @@ fn train_all_variants(
                 side.label(),
             ));
 
+            // Для Resolution той же стороны рядом уже должен лежать сохранённый
+            // PnL: внешний цикл идёт `[Pnl, Resolution]`, внутренний — `[Up, Down]`.
+            // К моменту, когда обучаем `(Resolution, Up)`, файл
+            // `model_{interval}_1s_pnl_up.ubj` (+ `.calibration.bin`) уже на
+            // диске; аналогично для `Down`. Если по какой-то причине его нет
+            // (ошибка/skip предыдущей итерации) — `train_and_save` опустится
+            // в fallback на per-frame калибровку.
+            let pnl_model_path: Option<PathBuf> = match model_type {
+                ModelType::Pnl => None,
+                ModelType::Resolution => Some(version_path.join(format!(
+                    "model_{interval}_{step_sec}s_{}_{}.ubj",
+                    ModelType::Pnl.label(),
+                    side.label(),
+                ))),
+            };
+
             match train_and_save(
                 &train_markets, &val_markets, &test_markets,
-                &model_path, &tag, model_type, max_lag,
+                val_paths, currency, interval_kind, side,
+                &model_path, pnl_model_path.as_deref(), &tag, model_type, max_lag,
             ) {
                 Ok(()) => tee_println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => tee_eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
@@ -945,11 +1360,17 @@ fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
 /// попадает в один и тот же сплит.
 /// - **val** — используется optimizer'ом для подбора гиперпараметров и early stopping.
 /// - **test** — held-out, только для финальной честной оценки AUC.
+#[allow(clippy::too_many_arguments)]
 fn train_and_save(
     train_markets: &[MarketDataset],
     val_markets: &[MarketDataset],
     test_markets: &[MarketDataset],
+    val_paths: &[PathBuf],
+    currency: &str,
+    interval_kind: XFrameIntervalKind,
+    side: FrameSide,
     model_path: &Path,
+    pnl_model_path: Option<&Path>,
     tag: &str,
     model_type: ModelType,
     max_lag: Option<usize>,
@@ -1022,7 +1443,58 @@ fn train_and_save(
     // test обязан оставаться полностью held-out для честной финальной оценки AUC.
     // Кроме того, isotonic имеет O(N) параметров и катастрофически переобучается
     // если калибровочный сет совпадает с тем, по которому меряется AUC.
-    match fit_calibration(&booster, &dval, &y_val, tag) {
+
+    // Для Resolution-модели подгружаем PnL `Booster` + `Calibration` той же
+    // стороны (записаны на диск более ранней итерацией внешнего цикла
+    // `train_all_variants`). Они нужны, чтобы entry в sim-replay шёл через
+    // production-эквивалентный канал (PnL Kelly), а не через сырые скоры
+    // самой Resolution-модели. Держим `Option`-обёртки локально, чтобы
+    // ссылки внутри `pnl_for_entries` жили до конца вызова `fit_calibration`.
+    let (loaded_pnl_booster, loaded_pnl_cal): (Option<Booster>, Option<Calibration>) =
+        if matches!(model_type, ModelType::Resolution) {
+            match pnl_model_path {
+                Some(p) => {
+                    let b = crate::history_sim::load_booster(p);
+                    let c = load_calibration(p).ok();
+                    if b.is_none() {
+                        tee_eprintln!(
+                            "[train] {tag}: PnL booster для sim-replay калибровки Resolution \
+                             не загрузился (путь {}); fit_calibration_via_sim_replay упадёт в \
+                             fallback на per-frame.",
+                            p.display(),
+                        );
+                    }
+                    if c.is_none() {
+                        tee_eprintln!(
+                            "[train] {tag}: PnL calibration для sim-replay калибровки Resolution \
+                             не загрузилась (путь {}.calibration.bin); \
+                             fit_calibration_via_sim_replay упадёт в fallback на per-frame.",
+                            p.display(),
+                        );
+                    }
+                    (b, c)
+                }
+                None => {
+                    tee_eprintln!(
+                        "[train] {tag}: ModelType::Resolution без `pnl_model_path` — \
+                         sim-replay калибровка пропущена, ждём fallback на per-frame."
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+    let pnl_for_entries: Option<(&Booster, &Calibration)> =
+        match (loaded_pnl_booster.as_ref(), loaded_pnl_cal.as_ref()) {
+            (Some(b), Some(c)) => Some((b, c)),
+            _ => None,
+        };
+
+    match fit_calibration(
+        &booster, &dval, val_markets, val_paths, currency,
+        interval_kind, side, model_type, pnl_for_entries, tag,
+    ) {
         Ok(cal) => {
             tee_println!(
                 "[train] {tag}: calibration: breakpoints={} \
