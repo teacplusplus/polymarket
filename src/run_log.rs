@@ -64,7 +64,7 @@ pub fn price_to_beat_from_rtds(
     );
 }
 
-/// `fetch_price_to_beat_from_polymarket_event_page`: сразу или отложенное обновление после rtds.
+/// `fetch_price_to_beat_from_vatic_api`: сразу или отложенное обновление после rtds.
 pub fn price_to_beat_from_event_page(
     period: &str,
     slug: &str,
@@ -74,7 +74,7 @@ pub fn price_to_beat_from_event_page(
         return;
     }
     crate::tee_eprintln!(
-        "[{period}] price_to_beat со страницы polymarket event: slug={slug} price={price}"
+        "[{period}] price_to_beat из Vatic API targets/timestamp: slug={slug} price={price}"
     )
 }
 

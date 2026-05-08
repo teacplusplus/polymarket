@@ -18,9 +18,10 @@
 //! 2. По имени файла восстанавливает `(currency, interval_kind, window_start_sec)`
 //!    (как это делает [`crate::history_sim::polymarket_event_url_from_dump_path`])
 //!    и формирует slug `{currency}-updown-{label}-{window_start_sec}`.
-//! 3. Через [`crate::util::fetch_price_to_beat_from_polymarket_event_page`] с
-//!    `fallback_to_latest=false` (только exact-матч) забирает истинный
-//!    `priceToBeat` со страницы маркета (HTTP, не Gamma API).
+//! 3. Через [`crate::util::fetch_price_to_beat_from_vatic_api`] забирает
+//!    истинный `priceToBeat` (target/opening price окна) из Vatic API
+//!    `targets/timestamp` — единственный источник правды теперь, когда
+//!    скрейп `__NEXT_DATA__` со страницы маркета удалён.
 //! 4. Перезаписывает `dump.price_to_beat` и пересчитывает у каждого кадра
 //!    `currency_price_vs_beat_pct` (использует тот же спот, восстановленный из
 //!    старых полей: `spot = old_ptb * (1 - old_pct/100)`) и
@@ -45,7 +46,7 @@
 //! не меняет.
 
 use crate::constants::XFrameIntervalKind;
-use crate::util::fetch_price_to_beat_from_polymarket_event_page;
+use crate::util::fetch_price_to_beat_from_vatic_api;
 use crate::xframe::{XFrame, SIZE};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::{Context, Result};
@@ -53,17 +54,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Сколько раз дёргать `polymarket.com/event/{slug}` за exact `priceToBeat`,
-/// прежде чем сдаться и пропустить окно. Между попытками — фиксированная пауза
-/// [`HTTP_RETRY_DELAY`]. На исторические окна фолбэка нет: либо страница ещё
-/// есть и отдала точный матч, либо мы не трогаем дамп.
+/// Сколько раз дёргать Vatic API за `priceToBeat`, прежде чем сдаться и
+/// пропустить окно. Между попытками — фиксированная пауза [`HTTP_RETRY_DELAY`].
+/// На слишком старые окна (Chainlink retention ~14 дней) Vatic возвращает 410 —
+/// дамп такого окна тоже не трогаем.
 const HTTP_MAX_ATTEMPTS: u32 = 5;
 const HTTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Точка входа миграции (`STATUS=migrate_price_to_beat`).
 ///
 /// Async — потому что HTTP-запросы за `priceToBeat` идут через тот же
-/// [`fetch_price_to_beat_from_polymarket_event_page`], что и в основном цикле,
+/// [`fetch_price_to_beat_from_vatic_api`], что и в основном цикле,
 /// и оперируют `reqwest::Client` (`tokio`-async).
 pub async fn run_price_to_beat_migration() -> Result<()> {
     let http = reqwest::Client::builder()
@@ -311,10 +312,8 @@ async fn fetch_exact_with_retries(
     currency: &str,
 ) -> Option<f64> {
     for attempt in 1..=HTTP_MAX_ATTEMPTS {
-        // `fallback_to_latest=false` — гарантирует, что Ok возвращается ТОЛЬКО
-        // при exact-матче в `crypto-prices` или `past-results`.
-        match fetch_price_to_beat_from_polymarket_event_page(http, slug, currency, false).await {
-            Ok((p, _exact)) => return Some(p),
+        match fetch_price_to_beat_from_vatic_api(http, slug, currency).await {
+            Ok(p) => return Some(p),
             Err(e) => {
                 if attempt < HTTP_MAX_ATTEMPTS {
                     tokio::time::sleep(HTTP_RETRY_DELAY).await;

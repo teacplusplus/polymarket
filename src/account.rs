@@ -5,7 +5,7 @@
 //! в отличие от старой схемы с отдельным «счётом» на каждый интервал.
 
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
-use crate::history_sim::{INITIAL_BANKROLL, OpenPosition, SimStats};
+use crate::history_sim::{ClosingPosition, INITIAL_BANKROLL, OpenPosition, SimStats};
 use crate::real_sim::{interval_label, side_label, RealSimState};
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
@@ -44,6 +44,18 @@ pub struct Account {
     /// Позиции старого маркета после смены раунда в лейне; закрываются в [`Account::resolve_pending_market`],
     /// не через `manage_positions`.
     pub pending_resolution: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), Vec<OpenPosition>>,
+    /// Записи о закрытиях позиций (TP/SL/Timeout/EV) для матчинга
+    /// real-time подтверждений через user-WS канал
+    /// (`wss://ws-subscriptions-clob.polymarket.com/ws/user`,
+    /// см. [`spawn_user_ws_listener`]). Создаётся / управляется в
+    /// [`crate::history_sim::manage_positions`]; cleanup терминальных
+    /// `Closed`/`CloseFailed` записей делается там же на следующем тике.
+    ///
+    /// Семантика статусов и lifecycle — см. [`ClosingPositionStatus`].
+    /// В history_sim/real_sim сюда сразу идёт `Closed` (PnL уже учтён в
+    /// `bankroll`), real-торговля будет создавать `PendingClose` и ждать
+    /// колбека `apply_user_ws_event`.
+    pub closing: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), Vec<ClosingPosition>>,
     /// Уже резолвнутые `condition_id` (см. [`RECENTLY_RESOLVED_MARKETS_CAP`]): не открывать сделку
     /// на маркет после резолюции при гонке HTTP/tick и колбека.
     pub recently_resolved_markets: IndexSet<String>,
@@ -65,15 +77,23 @@ pub struct Account {
     /// Аутентифицированный CLOB-клиент Polymarket — single source of truth
     /// на процесс. Используется для `POST /v1/heartbeats` (см.
     /// [`spawn_heartbeat`]) и в перспективе для `post_order` /
-    /// `cancel_order`. `None` пока не выполнилась авторизация: lazy при
-    /// старте `run_real_sim` (см. [`try_authenticate_clob_for_heartbeats`]);
-    /// в `STATUS=default`/`history_sim`/`train` остаётся `None`.
+    /// `cancel_order`. `None` если авторизацию не выполняли (иначе в
+    /// RealSim см. вызов [`try_authenticate_clob_for_heartbeats`] в `main` до
+    /// [`spawn_heartbeat`]) или она упала; в `history_sim`/`train` и т.п.
+    /// остаётся `None`.
     ///
     /// `clob::Client` — небольшой обёрткой над `Arc<ClientInner<...>>`,
     /// `Clone` дешёвый, поэтому хранится по значению (внешний `Arc` не
     /// нужен). Доступ из любого места — через
     /// [`crate::project_manager::ProjectManager::clob_authed`].
     pub clob_authed: Option<clob::Client<Authenticated<Normal>>>,
+    /// EOA-подписант (`POLY_PRIVATE_KEY` + `POLYGON` chain_id), кэшируется
+    /// рядом с [`Self::clob_authed`] чтобы [`crate::account_order::post_order_on_clob`] не лез
+    /// в `std::env` на каждый ордер. Заполняется в
+    /// [`try_authenticate_clob_for_heartbeats`] одновременно с
+    /// `clob_authed`; `None` ↔ auth не поднимался / упал.
+    /// `PrivateKeySigner: Clone`, поэтому держим по значению.
+    pub clob_signer: Option<PrivateKeySigner>,
 }
 
 impl Account {
@@ -89,14 +109,16 @@ impl Account {
             last_prob: HashMap::new(),
             positions: HashMap::new(),
             pending_resolution: HashMap::new(),
+            closing: HashMap::new(),
             recently_resolved_markets: IndexSet::new(),
             clob,
             clob_authed: None,
+            clob_signer: None,
         }
     }
 
-    /// Пустые `positions` / `pending_resolution` для всех лейнов валюты ([`crate::real_sim::run_real_sim`]).
-    /// `or_default()` идемпотентен при повторном вызове.
+    /// Пустые `positions` / `pending_resolution` / `closing` для всех лейнов валюты
+    /// ([`crate::real_sim::run_real_sim`]). `or_default()` идемпотентен при повторном вызове.
     pub fn register_currency_lanes(
         &mut self,
         currency: &str,
@@ -105,7 +127,8 @@ impl Account {
         for (interval, side) in lanes {
             let key = (currency.to_string(), *interval, *side);
             self.positions.entry(key.clone()).or_default();
-            self.pending_resolution.entry(key).or_default();
+            self.pending_resolution.entry(key.clone()).or_default();
+            self.closing.entry(key).or_default();
         }
     }
 
@@ -344,7 +367,7 @@ const CLOB_HEARTBEAT_INTERVAL_SEC: u64 = 5;
 /// [`try_authenticate_clob_for_heartbeats`] выходит молча, оставляя
 /// `Account.clob_authed = None`; [`spawn_heartbeat`] всё равно
 /// поднимается, но clob-тик становится no-op'ом.
-const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
+pub(crate) const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
 
 /// Глобальный CLOB heartbeat-таск на процесс (один на все валюты): раз в
 /// [`CLOB_HEARTBEAT_INTERVAL_SEC`] секунд шлёт `POST /v1/heartbeats`,
@@ -352,9 +375,10 @@ const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
 /// сервер их автоматически отменит; окно 10s + ~5s буфер, см.
 /// [docs](https://docs.polymarket.com/developers/CLOB/orders/orders#heartbeat)).
 ///
-/// Старт — один раз в `main` сразу после [`Account::new_shared`] (общий
-/// ресурс на процесс, не привязан к валюте/`ProjectManager`/`real_sim`-
-/// state'у). Если в окружении нет [`POLY_PRIVATE_KEY_ENV`] или
+/// Старт — один раз в `main`: после [`Account::new_shared`] вызывается
+/// [`try_authenticate_clob_for_heartbeats`], затем [`spawn_heartbeat`]
+/// (общий ресурс на процесс, не привязан к валюте/`ProjectManager`/
+/// `real_sim`-state'у). Если в окружении нет [`POLY_PRIVATE_KEY_ENV`] или
 /// [`try_authenticate_clob_for_heartbeats`] упал — таск всё равно крутится,
 /// но ничего не шлёт (clob-тик no-op). Это безопасно, поскольку без
 /// аутентификации **открытых ордеров не может быть** в принципе.
@@ -368,13 +392,10 @@ const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
 /// тик отсчитывается от момента возврата управления.
 pub fn spawn_heartbeat(account: SharedAccount) {
     tokio::spawn(async move {
-        // Аутентификация делается один раз на старте. Если упала — heartbeat
-        // отключаем на эту сессию (логика «retry до победного» спрятана за
-        // рестарт процесса; фоновые retry-ы плодят лог-шум и могут совпасть
-        // с реальным API rate-limit). Результат пишется в
-        // [`Account::clob_authed`] (single source of truth на процесс),
-        // здесь забираем локальный клон на жизнь таска.
-        try_authenticate_clob_for_heartbeats(&account).await;
+        // Аутентификация выполняется в `main` до [`spawn_heartbeat`]:
+        // [`try_authenticate_clob_for_heartbeats`]. Здесь только снимаем
+        // снимок `clob_authed` на время жизни таска (`None` если auth не было
+        // или упал до спавна).
         let auth_client: Option<clob::Client<Authenticated<Normal>>> =
             account.read().await.clob_authed.clone();
 
@@ -403,8 +424,8 @@ pub fn spawn_heartbeat(account: SharedAccount) {
             let Some(client) = auth_client.as_ref() else {
                 // Auth выключен (нет POLY_PRIVATE_KEY или authenticate()
                 // упал) — таск крутится no-op'ом, ждать тут нечего, но
-                // и rolling-проверки на появление auth не делаем: auth
-                // в текущей архитектуре поднимается один раз на старте.
+                // rolling-проверки на появление auth не делаем:
+                // [`try_authenticate_clob_for_heartbeats`] уже отработала в main.
                 continue;
             };
             match client.post_heartbeat(heartbeat_id).await {
@@ -442,8 +463,8 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 
 /// Поднимает аутентифицированный CLOB-клиент по `POLY_PRIVATE_KEY` (та же
 /// EOA, что в [`crate::poly_chain`]) и сохраняет его в
-/// [`Account::clob_authed`] — single source of truth на процесс. Все
-/// читатели ([`spawn_heartbeat`] и
+/// [`Account::clob_authed`] — single source of truth на процесс. В RealSim
+/// вызывается из `main` до [`spawn_heartbeat`]. Все читатели ([`spawn_heartbeat`] и
 /// [`crate::project_manager::ProjectManager::clob_authed`]) берут клиент
 /// именно оттуда.
 ///
@@ -487,7 +508,12 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount
     let unauth: clob::Client = (*account.read().await.clob).clone();
     match unauth.authentication_builder(&signer).authenticate().await {
         Ok(authed) => {
-            account.write().await.clob_authed = Some(authed);
+            // signer кэшируем рядом с authed-клиентом — нужен для
+            // [`post_order_on_clob`] (`auth_client.sign(&signer, …)`),
+            // чтобы не парсить `POLY_PRIVATE_KEY` на каждый ордер.
+            let mut guard = account.write().await;
+            guard.clob_authed = Some(authed);
+            guard.clob_signer = Some(signer);
             crate::tee_println!(
                 "[heartbeat] CLOB authenticate OK (eoa={address:#x}); heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
             );
@@ -500,12 +526,20 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount
     }
 }
 
+// Постановка ордеров на CLOB (`POST /order`) вынесена в модуль
+// [`crate::account_order`]: публичный API — `post_order_on_clob` плюс
+// типы `PostOrderRequest`/`PostOrderResult`/`OrderRole`/`OrderAmount`.
+// Сюда модуль резолвит зависимости через `Account.clob_authed` и
+// `Account.clob_signer` (заполняются [`try_authenticate_clob_for_heartbeats`]),
+// `account.rs` сам не импортирует CLOB-ордерные типы, чтобы не тащить их
+// в heartbeat-петлю.
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Live integration-тест полного цикла CLOB-аутентификации.
-    /// Выполняет тот же путь, что и hot-path [`spawn_heartbeat`] на старте:
+    /// Выполняет полный цикл как в RealSim перед [`spawn_heartbeat`]:
     /// 1. Читает `POLY_PRIVATE_KEY` через [`dotenvy`].
     /// 2. Вызывает [`try_authenticate_clob_for_heartbeats`] на свежем
     ///    [`Account`] (где `clob_authed = None`).

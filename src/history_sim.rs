@@ -260,6 +260,33 @@ pub(crate) fn book_fill_sell_strict(
     Some(total_usdc)
 }
 
+/// Жизненный цикл live-ордера на открытие позиции (BUY) на Polymarket CLOB.
+///
+/// В history_sim/real_sim позиции открываются «виртуально» и сразу
+/// существуют, поэтому дефолт — [`OpenPositionStatus::Open`]. Когда поверх
+/// будет поднят реальный pipeline постановки ордеров (CLOB `post_order`),
+/// позиция будет создаваться со статусом [`OpenPositionStatus::PendingOpen`]
+/// и [`OpenPosition::open_order_id`] — `Some(...)`; колбек user-WS канала
+/// (см. [`crate::account::spawn_user_ws_listener`]) переведёт её в
+/// [`OpenPositionStatus::Open`] (по `MATCHED`) или в
+/// [`OpenPositionStatus::OpenFailed`] (по `CANCELED`/`FAILED`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenPositionStatus {
+    /// BUY-ордер поставлен на CLOB, ждём подтверждения через user-WS.
+    /// В этом состоянии MtM позиции ведётся по `entry_cost` (как pending),
+    /// поскольку шеры ещё не зачислены.
+    PendingOpen,
+    /// BUY подтверждён (WS прислал `MATCHED`/`CONFIRMED` либо это
+    /// виртуальная позиция history_sim/real_sim). Доступна для
+    /// `manage_positions` / закрытия.
+    Open,
+    /// BUY был отменён / упал на пути placement→matched (`CANCELED`,
+    /// `FAILED`, `RETRYING` исчерпан). Позицию надо удалить и вернуть
+    /// `entry_cost` в bankroll. Сейчас этот переход — TODO для real
+    /// торговли.
+    OpenFailed,
+}
+
 /// Открытая позиция; в `real_sim` фильтр `asset_id == frame.asset_id` от чужого маркета.
 #[derive(Debug, Clone)]
 pub struct OpenPosition {
@@ -305,6 +332,74 @@ pub struct OpenPosition {
     pub(crate) gamma_question_at_open: Option<String>,
     /// Топ-5 SHAP-вкладов PnL-бустера на открытии (многострочная ячейка CSV); пусто если расчёт отключён или недоступен.
     pub(crate) pnl_top5_shap_at_open: String,
+    /// Состояние live-ордера на открытие; см. [`OpenPositionStatus`]. Для
+    /// виртуальных трейдов history_sim/real_sim сразу создаётся со
+    /// значением `Open` ([`open_position`]).
+    pub(crate) open_status: OpenPositionStatus,
+    /// Идентификатор BUY-ордера на CLOB (`id` из user-WS события `order`).
+    /// `None` — это виртуальная позиция (history_sim/real_sim) или ордер
+    /// ещё не успел проставиться. Используется в
+    /// [`crate::account::apply_user_ws_event`] для матчинга колбека.
+    pub(crate) open_order_id: Option<String>,
+}
+
+/// Жизненный цикл live-ордера на закрытие позиции (SELL) на Polymarket CLOB.
+///
+/// В history_sim/real_sim закрытия выполняются «виртуально» и сразу
+/// финализируют PnL (см. [`close_position`]); такие записи создаются со
+/// статусом [`ClosingPositionStatus::Closed`] и удаляются из
+/// [`crate::account::Account::closing`] на следующем тике
+/// [`manage_positions`] (cleanup pass в начале функции).
+///
+/// Для real-торговли flow такой:
+/// 1. `manage_positions` принимает решение закрыться (TP/SL/Timeout/EV)
+/// 2. SELL-ордер ставится на CLOB, в `closing` появляется запись
+///    `ClosingPosition { close_status: PendingClose, pnl: None, .. }`
+/// 3. user-WS event `MATCHED` → `apply_user_ws_event` переводит в
+///    `Closed`, проставляет `pnl`, обновляет `bankroll`/`stats`
+/// 4. Cleanup на следующем тике вытесняет запись.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosingPositionStatus {
+    /// SELL-ордер поставлен, ждём `MATCHED`/`CONFIRMED` через user-WS.
+    /// `entry_cost` всё ещё заблокирован, MtM ведётся по правилам
+    /// активной позиции (через `last_prob`).
+    PendingClose,
+    /// SELL исполнен — PnL финализирован, `bankroll`/`stats` обновлены.
+    /// В history_sim/real_sim это immediate-state после
+    /// [`close_position`]; в real-торговле — после WS-колбека.
+    Closed,
+    /// SELL не прошёл (`CANCELED`/`FAILED`/timeout): позицию надо
+    /// вернуть в `Account.positions` для следующей попытки. Сейчас
+    /// этот переход — TODO для real торговли.
+    CloseFailed,
+}
+
+/// Запись о закрытии позиции для матчинга real-time подтверждения через
+/// user-WS (см. [`ClosingPositionStatus`]). Создаётся в [`manage_positions`];
+/// читается / апдейтится в [`crate::account::apply_user_ws_event`].
+#[derive(Debug, Clone)]
+pub struct ClosingPosition {
+    /// Сама позиция, которую закрываем (полный снимок на момент решения).
+    /// Понадобится в реальной торговле, чтобы при `CloseFailed` вернуть её
+    /// обратно в `Account.positions`.
+    pub position: OpenPosition,
+    /// VWAP цена выхода, посчитанная в [`sell_gate`] на момент решения
+    /// закрыться (для real-торговли это limit/market price ордера).
+    pub exit_price: f64,
+    /// Причина закрытия — синхронно с тем, что попадает в CSV-лог.
+    pub reason: CloseReason,
+    /// Реализованный PnL после fill'а; `None` пока не подтверждён
+    /// колбеком (для виртуальных закрытий — заполняется сразу).
+    pub pnl: Option<f64>,
+    /// Текущий статус, см. [`ClosingPositionStatus`].
+    pub close_status: ClosingPositionStatus,
+    /// Идентификатор SELL-ордера на CLOB (`id` из user-WS события
+    /// `order`). `None` — это виртуальное закрытие (sim) или ордер ещё
+    /// не успел проставиться.
+    pub close_order_id: Option<String>,
+    /// Wall-time момента создания записи (UTC ms) — для будущих TTL-чисток
+    /// «застрявших» pending-ов и для CSV-лога диагностики.
+    pub created_unix_ms: i64,
 }
 
 /// Рыночный выход до резолюции; бинарное закрытие — в [`crate::account::Account::resolve_pending_market`].
@@ -870,12 +965,14 @@ pub(crate) fn run_side_simulation(
         let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl, is_kelly);
 
         // Фаза 1: manage_positions. Деструктурируем account на disjoint поля:
-        // `bankroll`, `positions[lane_key]` (live), `pending_resolution[lane_key]` (carry).
+        // `bankroll`, `positions[lane_key]` (live), `pending_resolution[lane_key]` (carry),
+        // `closing[lane_key]` (теневые записи о закрытиях, см. doc у [`manage_positions`]).
         {
             let Account {
                 bankroll,
                 positions: account_positions,
                 pending_resolution,
+                closing: account_closing,
                 ..
             } = &mut *account;
             let positions_v = account_positions
@@ -884,9 +981,13 @@ pub(crate) fn run_side_simulation(
             let pending = pending_resolution
                 .entry(lane_key.clone())
                 .or_default();
+            let closing_v = account_closing
+                .entry(lane_key.clone())
+                .or_default();
             manage_positions(
                 positions_v,
                 pending,
+                closing_v,
                 frame,
                 is_last_idx,
                 p_win_now,
@@ -1502,10 +1603,27 @@ pub(crate) fn any_position_would_sell(
 /// Закрытия через [`sell_gate`] / `close_position`; чужой `asset_id` → [`pending_resolution`](crate::account::Account::pending_resolution).
 /// `true`, если был хотя бы один успешный close (bankroll обновился).
 /// `min_position_frames` пробрасывается в [`sell_gate`] (см. там).
+///
+/// Параметр `closing` — буфер записей о закрытиях для матчинга с user-WS
+/// событиями ([`crate::account::Account::closing`]). На каждом тике мы
+/// **сначала вытесняем** из него все терминальные записи
+/// ([`ClosingPositionStatus::Closed`] / [`ClosingPositionStatus::CloseFailed`]) —
+/// это и cleanup для history_sim/real_sim (где `Closed` ставится сразу),
+/// и эвикция уже подтверждённых WS-колбеком закрытий в real-торговле.
+/// Записи `PendingClose` остаются жить до прихода WS-подтверждения /
+/// явного `apply_user_ws_event`.
+///
+/// **Hot-path для виртуальной торговли (history_sim/real_sim):** после
+/// успешного [`close_position`] (PnL уже учтён в `bankroll`/`stats`) сюда
+/// пушится `ClosingPosition` со статусом [`ClosingPositionStatus::Closed`]
+/// и заполненным `pnl`; `close_order_id` пуст. Это шаблон, который
+/// real-торговля заменит на «push с `PendingClose` + `Some(order_id)`,
+/// без правок `bankroll` — pnl и инкременты сделает WS-колбек».
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn manage_positions(
     positions: &mut Vec<OpenPosition>,
     pending_resolution: &mut Vec<OpenPosition>,
+    closing: &mut Vec<ClosingPosition>,
     frame: &XFrame<SIZE>,
     is_last: bool,
     p_win_now: Option<f64>,
@@ -1514,6 +1632,14 @@ pub(crate) fn manage_positions(
     strict_book: Option<&StrictBook>,
     min_position_frames: Option<usize>,
 ) -> bool {
+    // Cleanup: терминальные `Closed`/`CloseFailed` уже отработаны
+    // (виртуально или WS-колбеком), их можно отпускать. `PendingClose`
+    // оставляем — ждём подтверждения. Делаем in-place, чтобы не аллоцировать
+    // новый Vec.
+    closing.retain(|c| {
+        matches!(c.close_status, ClosingPositionStatus::PendingClose)
+    });
+
     for pos in positions.iter_mut() { pos.frames_held += 1; }
 
     let mut sold = false;
@@ -1544,6 +1670,21 @@ pub(crate) fn manage_positions(
                 Some(pnl) => {
                     *bankroll += pnl;
                     sold = true;
+                    // Виртуальное закрытие: PnL уже в `bankroll`/`stats`,
+                    // теневая запись `Closed` нужна только для:
+                    //   (а) симметрии с real-flow (в обоих случаях
+                    //       завершённое закрытие проходит через `closing`),
+                    //   (б) того, чтобы cleanup-шаг следующего тика её
+                    //       отпустил — без cleanup'а Vec бы рос неограниченно.
+                    closing.push(ClosingPosition {
+                        position: pos,
+                        exit_price,
+                        reason,
+                        pnl: Some(pnl),
+                        close_status: ClosingPositionStatus::Closed,
+                        close_order_id: None,
+                        created_unix_ms: crate::util::current_timestamp_ms(),
+                    });
                 }
                 None => {
                     stats.kelly_strict_sell_skips += 1;
@@ -1684,6 +1825,11 @@ fn open_position(
         graph_dump_bin_path: graph_dump_bin_path.to_string(),
         gamma_question_at_open: gamma_question_at_open.map(|s| s.to_string()),
         pnl_top5_shap_at_open: pnl_top5_shap_at_open.to_string(),
+        // Виртуальный fill: книжный sweep уже выполнен, шеры зачислены — позиция сразу `Open`,
+        // CLOB-ордера здесь нет, потому `open_order_id = None`. Реальная торговля заменит обе
+        // строки: `PendingOpen` + `Some(order_id)`, переход в `Open` — через user-WS колбек.
+        open_status: OpenPositionStatus::Open,
+        open_order_id: None,
     })
 }
 

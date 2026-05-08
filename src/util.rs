@@ -1,9 +1,7 @@
 use anyhow::Context;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::DateTime;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
-
 
 use crate::constants::CurrencyUpDownOutcome;
 
@@ -58,210 +56,75 @@ pub struct CurrencyEventSlugData {
     pub gamma_question: Option<String>,
 }
 
-/// `priceToBeat` из JSON скрипта `#__NEXT_DATA__` на [`https://polymarket.com/event/{slug}`](https://polymarket.com/event/).
+/// `priceToBeat` (target/opening price) окна Polymarket из публичного Vatic API.
 ///
-/// `currency` — тикер как в [`crate::project_manager::ProjectManager::currency`] (например `eth`); в кэшах React Query сравнивается в **верхнем** регистре.
+/// Заменяет старую логику чтения `__NEXT_DATA__` со страницы
+/// `polymarket.com/event/{slug}` на единый GET к
+/// `https://api.vatic.trading/api/v1/targets/timestamp?asset={currency}&type={5min|15min}&timestamp={window_start_sec}`
+/// (см. <https://docs.vatic.trading/api-reference/targets/timestamp.md>).
 ///
-/// В `props.pageProps.dehydratedState.queries` (только данные **этого** окна из `slug`, иначе [`None`]):
-/// 1. `["crypto-prices", …, <ISO начала>, <variant>, <ISO конца свечи>]` — `openPrice`;
-///    `ISO конца` = начало окна + 300 с (5m) или + 900 с (15m); при дублях — запись с max `dataUpdatedAt`.
-/// 2. `["past-results", …, <ISO начала окна>]` — в `results` строка с `endTime` = начало окна (RFC3339),
-///    берём `closePrice` (не «последнюю» строку массива — там другие свечи).
-/// Возвращает `Ok((price, exact))`: `exact = true` — точное совпадение свечи, `false` — использован fallback (ближайший `closePrice`).
-pub async fn fetch_price_to_beat_from_polymarket_event_page(
+/// `currency` — тикер как в [`crate::project_manager::ProjectManager::currency`]
+/// (`btc`/`eth`/...), в URL уходит **в нижнем** регистре.
+///
+/// `slug` ожидается формата `{currency}-updown-{5m|15m}-{window_start_sec}`
+/// (тот же, что лежит в `polymarket.com/event/{slug}`); из него извлекается
+/// тип интервала и Unix-секунды окна.
+///
+/// Vatic возвращает точную опеновую цену окна (Chainlink Data Streams для
+/// 5min/15min с retention ~14 дней), внутри уже делает 4 повтора с задержкой
+/// 1с против publish-лага на границе окна — fallback-логика с предыдущим
+/// `closePrice` больше не нужна.
+pub async fn fetch_price_to_beat_from_vatic_api(
     http: &reqwest::Client,
     slug: &str,
     currency: &str,
-    fallback_to_latest: bool,
-) -> anyhow::Result<(f64, bool)> {
-    let url = format!("https://polymarket.com/event/{slug}");
+) -> anyhow::Result<f64> {
+    let (window_sec, market_type) = vatic_slug_window_sec_and_market_type(currency, slug)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "нет priceToBeat: slug {slug:?} не имеет формата {{currency}}-updown-{{5m|15m}}-{{ts}} (currency={currency})"
+            )
+        })?;
+    let asset = currency.to_lowercase();
+    let url = format!(
+        "https://api.vatic.trading/api/v1/targets/timestamp?asset={asset}&type={market_type}&timestamp={window_sec}"
+    );
     let response = http
         .get(&url)
         .send()
         .await
-        .with_context(|| format!("polymarket GET event page {url}"))?;
-    if response.status() != reqwest::StatusCode::OK {
+        .with_context(|| format!("vatic GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
         anyhow::bail!(
-            "нет priceToBeat: polymarket.com/event вернул HTTP {} для slug={slug:?}",
-            response.status()
+            "нет priceToBeat: vatic вернул HTTP {status} для slug={slug:?} url={url} body={body}"
         );
     }
-    let html = response
-        .text()
+    let body: Value = response
+        .json()
         .await
-        .with_context(|| format!("polymarket event page body {url}"))?;
-
-    let price_result: anyhow::Result<(f64, bool)> = (|| -> anyhow::Result<(f64, bool)> {
-        let json_str = extract_next_data_json(&html).ok_or_else(|| {
+        .with_context(|| format!("vatic JSON {url}"))?;
+    let price = body
+        .get("price")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .ok_or_else(|| {
             anyhow::anyhow!(
-                "нет priceToBeat: не найден скрипт __NEXT_DATA__ на polymarket.com/event для slug={slug:?}"
+                "нет priceToBeat: в ответе vatic нет числового поля `price` для slug={slug:?} body={body}"
             )
         })?;
-        let v: Value = serde_json::from_str(json_str).with_context(|| {
-            format!("нет priceToBeat: JSON __NEXT_DATA__ не разобрать для slug={slug:?}")
-        })?;
-        let (price, exact) = price_to_beat_from_next_data(&v, slug, currency, fallback_to_latest).ok_or_else(|| {
-            anyhow::anyhow!(
-                "нет priceToBeat: в __NEXT_DATA__ для slug={slug:?} нет подходящего crypto-prices (openPrice + конец свечи) ни строки past-results с endTime=start окна"
-            )
-        })?;
-        if !price.is_finite() || price <= 0.0 {
-            anyhow::bail!(
-                "нет priceToBeat: некорректное значение {price} в __NEXT_DATA__ для slug={slug:?}"
-            );
-        }
-        Ok((price, exact))
-    })();
-
-    if price_result.is_err() {
-        dump_event_page_html_missing_price_to_beat(slug, &html);
+    if !price.is_finite() || price <= 0.0 {
+        anyhow::bail!(
+            "нет priceToBeat: некорректное значение {price} в ответе vatic для slug={slug:?}"
+        );
     }
-
-    price_result
+    Ok(price)
 }
 
-fn dump_event_page_html_missing_price_to_beat(slug: &str, html: &str) {
-    let path = Path::new("errors/html").join(format!("{slug}.html"));
-    if let Err(e) = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
-        .and_then(|_| std::fs::write(&path, html))
-    {
-        eprintln!("errors/html dump {path:?}: {e}");
-    }
-}
-
-fn extract_next_data_json(html: &str) -> Option<&str> {
-    const ID_MARK: &str = r#"id="__NEXT_DATA__""#;
-    let i = html.find(ID_MARK)?;
-    let tail = html.get(i..)?;
-    let after_open = tail.find('>').map(|j| i + j + 1)?;
-    let rest = html.get(after_open..)?;
-    let end_rel = rest.find("</script>")?;
-    Some(rest.get(..end_rel)?.trim())
-}
-
-fn json_f64(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-}
-
-/// Возвращает `(price, exact)`: `exact = true` — точное совпадение, `false` — fallback.
-fn price_to_beat_from_next_data(next_data: &Value, slug: &str, currency: &str, fallback_to_latest: bool) -> Option<(f64, bool)> {
-    if let Some(p) = price_to_beat_from_currency_open_price_crypto_prices(next_data, slug, currency) {
-        return Some((p, true));
-    }
-    price_to_beat_from_currency_past_results_close(next_data, slug, currency, fallback_to_latest)
-}
-
-fn price_to_beat_from_currency_past_results_close(
-    next_data: &Value,
-    slug: &str,
-    currency: &str,
-    fallback_to_latest: bool,
-) -> Option<(f64, bool)> {
-    let (window_sec, variant) = currency_updown_slug_window_sec_and_variant(currency, slug)?;
-    let iso = window_start_iso_utc_z(window_sec)?;
-    let queries = next_data
-        .get("props")?
-        .get("pageProps")?
-        .get("dehydratedState")?
-        .get("queries")?
-        .as_array()?;
-    let currency_upper = currency.to_uppercase();
-    for q in queries {
-        let key = match q.get("queryKey").and_then(|k| k.as_array()) {
-            Some(k) if k.len() == 4 => k,
-            _ => continue,
-        };
-        if key[0].as_str() != Some("past-results") {
-            continue;
-        }
-        if key[1].as_str() != Some(currency_upper.as_str()) {
-            continue;
-        }
-        if key[2].as_str() != Some(variant) {
-            continue;
-        }
-        if key[3].as_str() != Some(iso.as_str()) {
-            continue;
-        }
-        let Some(state_data) = q.get("state").and_then(|s| s.get("data")) else {
-            continue;
-        };
-        let Some(results) = state_data
-            .get("data")
-            .and_then(|d| d.get("results"))
-            .and_then(|r| r.as_array())
-            .or_else(|| state_data.get("results").and_then(|r| r.as_array()))
-        else {
-            continue;
-        };
-        if let Some(result) = price_from_past_results_for_window_start(results, window_sec, fallback_to_latest) {
-            return Some(result);
-        }
-    }
-    None
-}
-
-/// Свеча с `endTime` = началу окна: `closePrice` = цена на открытии окна (price to beat). Иначе строка с `startTime` = началу → `openPrice`.
-/// При `fallback_to_latest = true`: если точного совпадения нет, берём `closePrice` свечи с максимальным `endTime ≤ window_sec`.
-/// Возвращает `(price, exact)`: `exact = true` — точное совпадение, `false` — fallback.
-fn price_from_past_results_for_window_start(results: &[Value], window_sec: i64, fallback_to_latest: bool) -> Option<(f64, bool)> {
-    for row in results {
-        let Some(end) = row.get("endTime").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(end_sec) = parse_iso_time_to_unix_sec(end) else {
-            continue;
-        };
-        if end_sec == window_sec {
-            if let Some(p) = row.get("closePrice").and_then(json_f64) {
-                return Some((p, true));
-            }
-        }
-    }
-    for row in results {
-        let Some(start) = row.get("startTime").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let Some(start_sec) = parse_iso_time_to_unix_sec(start) else {
-            continue;
-        };
-        if start_sec == window_sec {
-            if let Some(p) = row.get("openPrice").and_then(json_f64) {
-                return Some((p, true));
-            }
-        }
-    }
-    if fallback_to_latest {
-        let mut best: Option<(i64, f64)> = None;
-        for row in results {
-            let Some(end) = row.get("endTime").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(end_sec) = parse_iso_time_to_unix_sec(end) else {
-                continue;
-            };
-            if end_sec > window_sec {
-                continue;
-            }
-            let Some(p) = row.get("closePrice").and_then(json_f64) else {
-                continue;
-            };
-            if best.map_or(true, |(prev_end, _)| end_sec > prev_end) {
-                best = Some((end_sec, p));
-            }
-        }
-        return best.map(|(_, p)| (p, false));
-    }
-    None
-}
-
-fn parse_iso_time_to_unix_sec(s: &str) -> Option<i64> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.timestamp())
-}
-
-fn currency_updown_slug_window_sec_and_variant(
+/// Парсит `{currency}-updown-{5m|15m}-{ts}` → `(window_sec, market_type)`,
+/// где `market_type` — значение параметра `type` в Vatic API
+/// (`5min`/`15min`, см. <https://docs.vatic.trading/concepts/market-types.md>).
+fn vatic_slug_window_sec_and_market_type(
     currency: &str,
     slug: &str,
 ) -> Option<(i64, &'static str)> {
@@ -269,97 +132,12 @@ fn currency_updown_slug_window_sec_and_variant(
     let rest = slug.strip_prefix(prefix.as_str())?;
     let (mid, sec_str) = rest.rsplit_once('-')?;
     let window_sec: i64 = sec_str.parse().ok()?;
-    let variant = match mid {
-        "5m" => "fiveminute",
-        "15m" => "fifteen",
+    let market_type = match mid {
+        "5m" => "5min",
+        "15m" => "15min",
         _ => return None,
     };
-    Some((window_sec, variant))
-}
-
-fn window_start_iso_utc_z(window_sec: i64) -> Option<String> {
-    let dt = Utc.timestamp_opt(window_sec, 0).single()?;
-    Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-}
-
-fn updown_interval_sec_for_variant(variant: &str) -> Option<i64> {
-    match variant {
-        "fiveminute" => Some(300),
-        "fifteen" => Some(900),
-        _ => None,
-    }
-}
-
-/// Кэш React Query `crypto-prices` — `openPrice` только для свечи `[window, window+interval)`; `queryKey[5]` = конец интервала.
-fn price_to_beat_from_currency_open_price_crypto_prices(
-    next_data: &Value,
-    slug: &str,
-    currency: &str,
-) -> Option<f64> {
-    let (window_sec, variant_expected) = currency_updown_slug_window_sec_and_variant(currency, slug)?;
-    let interval = updown_interval_sec_for_variant(variant_expected)?;
-    let candle_end_sec = window_sec.saturating_add(interval);
-    let iso_start = window_start_iso_utc_z(window_sec)?;
-    let queries = next_data
-        .get("props")?
-        .get("pageProps")?
-        .get("dehydratedState")?
-        .get("queries")?
-        .as_array()?;
-    let currency_upper = currency.to_uppercase();
-    let mut best: Option<(i64, f64)> = None;
-    for q in queries {
-        let key = match q.get("queryKey").and_then(|k| k.as_array()) {
-            Some(k) if k.len() >= 5 => k,
-            _ => continue,
-        };
-        if key[0].as_str() != Some("crypto-prices") {
-            continue;
-        }
-        if key[1].as_str() != Some("price") {
-            continue;
-        }
-        if key[2].as_str() != Some(currency_upper.as_str()) {
-            continue;
-        }
-        if key[3].as_str() != Some(iso_start.as_str()) {
-            continue;
-        }
-        if key[4].as_str() != Some(variant_expected) {
-            continue;
-        }
-        if let Some(key_end_sec) = key
-            .get(5)
-            .and_then(|v| v.as_str())
-            .and_then(parse_iso_time_to_unix_sec)
-        {
-            if key_end_sec != candle_end_sec {
-                continue;
-            }
-        }
-        let Some(state) = q.get("state") else {
-            continue;
-        };
-        let Some(data) = state.get("data") else {
-            continue;
-        };
-        let Some(open) = data.get("openPrice") else {
-            continue;
-        };
-        let Some(price) = json_f64(open) else {
-            continue;
-        };
-        let updated = state
-            .get("dataUpdatedAt")
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
-            .unwrap_or(0);
-        best = match best {
-            None => Some((updated, price)),
-            Some((u, _)) if updated > u => Some((updated, price)),
-            Some(bp) => Some(bp),
-        };
-    }
-    best.map(|(_, p)| p)
+    Some((window_sec, market_type))
 }
 
 pub async fn fetch_gamma_event_data_for_slug(
@@ -529,4 +307,52 @@ pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
         country: pick("country"),
         ip:      pick("ip"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Лайв-тест [`fetch_price_to_beat_from_vatic_api`]: реальный GET к
+    /// `api.vatic.trading` за target/opening price конкретного 5-минутного
+    /// окна Polymarket'а
+    /// [`btc-updown-5m-1778267400`](https://polymarket.com/event/btc-updown-5m-1778267400)
+    /// (May 8 2026, 3:10–3:15PM ET, 19:10:00 UTC) и сверка с `$80,061.62` —
+    /// точное значение Chainlink BTC/USD на открытии этого окна.
+    ///
+    /// Запуск:
+    ///
+    /// ```bash
+    /// cargo test --bin poly util::tests::live_fetch_price_to_beat_from_vatic_btc_updown_5m_1778267400 -- --ignored --nocapture
+    /// ```
+    ///
+    /// `#[ignore]` — не хотим бить по живому API в обычном `cargo test`.
+    /// Помимо самого окна тест зависит от Chainlink retention (~14 дней
+    /// для 5min), поэтому при запуске позже середины мая 2026 Vatic может
+    /// вернуть 410 — это уже не баг функции.
+    #[tokio::test]
+    #[ignore = "live network: GET https://api.vatic.trading/api/v1/targets/timestamp"]
+    async fn live_fetch_price_to_beat_from_vatic_btc_updown_5m_1778267400() -> anyhow::Result<()> {
+        // rustls 0.23 требует CryptoProvider до первого TLS-запроса; в
+        // обычном бинарнике это делает `main`, а в `tokio::test` — мы
+        // сами. `install_default()` идемпотентен — повтор молча даст Err.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()?;
+
+        let slug = "btc-updown-5m-1778267400";
+        let price = fetch_price_to_beat_from_vatic_api(&http, slug, "btc").await?;
+
+        // Округлённое до 2 знаков должно дать ровно 80061.62 (на странице
+        // Polymarket "Price to Beat" показан как `$80,061.62`). Реальное
+        // значение Chainlink: ~80061.61963627425.
+        let price_2dp = (price * 100.0).round() / 100.0;
+        anyhow::ensure!(
+            (price_2dp - 80061.62).abs() < 1e-9,
+            "ожидался priceToBeat $80,061.62 для slug={slug}, получено {price} (rounded 2dp = {price_2dp})"
+        );
+        Ok(())
+    }
 }

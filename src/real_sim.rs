@@ -580,21 +580,26 @@ async fn tick_once(
                 bankroll,
                 positions: account_positions,
                 pending_resolution: account_pending,
+                closing: account_closing,
                 ..
             } = &mut *account_guard;
-            // Две разные HashMap — два get_mut на один lane_key без конфликта.
+            // Три разные HashMap — три get_mut на один lane_key без конфликта.
             let this_positions: &mut Vec<OpenPosition> = account_positions
                 .get_mut(&lane_key)
                 .expect("Account.positions pre-populated by run_real_sim");
             let this_pending: &mut Vec<OpenPosition> = account_pending
                 .get_mut(&lane_key)
                 .expect("Account.pending_resolution pre-populated by run_real_sim");
+            let this_closing: &mut Vec<crate::history_sim::ClosingPosition> = account_closing
+                .get_mut(&lane_key)
+                .expect("Account.closing pre-populated by run_real_sim");
 
             // Закрытия / carry / pending при смене маркета; payout — в Account::resolve_pending_market.
             if has_positions {
                 sold = manage_positions(
                     this_positions,
                     this_pending,
+                    this_closing,
                     &frame,
                     false, // history_sim only: last-frame fallback
                     p_win_now,

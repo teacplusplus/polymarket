@@ -4,7 +4,7 @@ use crate::constants::XFrameIntervalKind;
 use crate::run_log;
 use crate::util::{
     current_timestamp_ms, fetch_gamma_event_data_for_slug,
-    fetch_price_to_beat_from_polymarket_event_page, CurrencyEventSlugData,
+    fetch_price_to_beat_from_vatic_api, CurrencyEventSlugData,
 };
 use crate::xframe_dump;
 pub use crate::currency_updown_sibling::{
@@ -941,7 +941,7 @@ impl ProjectManager {
             let project_manager_cloned = self.clone();
             let currency = self.currency.clone();
 
-            // Быстрый PTB в кэш (RTDS по start_ms или страница с fallback); exact подтянет фон.
+            // Быстрый PTB в кэш (RTDS по start_ms или Vatic API target/timestamp); exact подтянет фон.
             let inline_ptb_opt: Option<f64> = match market_start_ms {
                 Some(start_ms) => {
                     let rtds_currency_prices_by_ms_lock = project_manager_cloned.rtds_currency_prices_by_ms.read().await;
@@ -963,15 +963,14 @@ impl ProjectManager {
             let inline_ptb_opt = if let Some(price) = inline_ptb_opt {
                 Some(price)
             } else {
-                match fetch_price_to_beat_from_polymarket_event_page(
+                match fetch_price_to_beat_from_vatic_api(
                     self.http.as_ref(),
                     &slug,
                     currency.as_str(),
-                    true,
                 )
                 .await
                 {
-                    Ok((price, _)) => {
+                    Ok(price) => {
                         run_log::price_to_beat_from_event_page(period, &slug, price);
                         Some(price)
                     }
@@ -1057,7 +1056,7 @@ impl ProjectManager {
     }
 }
 
-/// Exact PTB со страницы (retry, без fallback): обновляет кэш, шлёт в oneshot, дампит prev при непрерывности окон.
+/// Exact PTB через Vatic API (retry): обновляет кэш, шлёт в oneshot, дампит prev при непрерывности окон.
 fn spawn_bg_price_to_beat_refine(
     project_manager: Arc<ProjectManager>,
     slug: String,
@@ -1160,7 +1159,7 @@ fn spawn_bg_price_to_beat_refine(
     });
 }
 
-/// Страница маркета, `fallback=false`; `None` после исчерпания попыток.
+/// Vatic API `targets/timestamp` с повторами; `None` после исчерпания попыток.
 async fn retry_fetch_exact_price_to_beat(
     http: &reqwest::Client,
     slug: &str,
@@ -1169,8 +1168,8 @@ async fn retry_fetch_exact_price_to_beat(
     retry_delay: Duration,
 ) -> Option<f64> {
     for attempt in 1..=max_attempts {
-        match fetch_price_to_beat_from_polymarket_event_page(http, slug, currency, false).await {
-            Ok((price, _)) => return Some(price),
+        match fetch_price_to_beat_from_vatic_api(http, slug, currency).await {
+            Ok(price) => return Some(price),
             Err(_) => {
                 if attempt < max_attempts {
                     tokio::time::sleep(retry_delay).await;

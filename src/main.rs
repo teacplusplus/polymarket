@@ -15,6 +15,8 @@ pub mod tee_log;
 pub mod history_sim;
 pub mod real_sim;
 pub mod account;
+pub mod account_order;
+pub mod account_ws;
 pub mod migration;
 pub mod migration_price_to_beat;
 pub mod migration_graph_html;
@@ -59,8 +61,8 @@ enum AppMode {
     /// Одноразовая миграция `price_to_beat` уже сохранённых дампов
     /// `xframes/{currency}/<size>/...` (см.
     /// `migration_price_to_beat::run_price_to_beat_migration`). Перетягивает
-    /// точный `priceToBeat` со страницы `polymarket.com/event/{slug}` (HTTP,
-    /// не Gamma API) и пересчитывает зависимые поля кадра
+    /// точный `priceToBeat` через Vatic API `targets/timestamp`
+    /// (`https://api.vatic.trading`) и пересчитывает зависимые поля кадра
     /// (`currency_price_vs_beat_pct`, `sibling_currency_price_vs_beat_pct`).
     /// Запускается через `STATUS=migrate_price_to_beat`; идемпотентна —
     /// повторный запуск на уже исправленных дампах их не меняет.
@@ -123,7 +125,7 @@ async fn main() -> Result<()> {
             migration::run_migration()?;
         }
         AppMode::MigratePriceToBeat => {
-            // rustls нужен для HTTPS-запросов на polymarket.com через
+            // rustls нужен для HTTPS-запросов на api.vatic.trading через
             // `reqwest`; ставим default-провайдер один раз на процесс.
             rustls::crypto::ring::default_provider()
                 .install_default()
@@ -193,6 +195,11 @@ async fn main() -> Result<()> {
             // См. комментарий в `AppMode::Default` — общий счёт на процесс.
             let account = Account::new_shared();
 
+            // CLOB L2-auth + кэш `clob_signer` до фоновых тасков: heartbeat и
+            // user-WS читают готовый [`Account::clob_authed`] без гонки «ждём
+            // auth внутри heartbeat».
+            account::try_authenticate_clob_for_heartbeats(&account).await;
+
             // Глобальный CLOB heartbeat-таск (раз в 5s `POST /v1/heartbeats`,
             // удерживает открытые ордера от автоматической отмены сервером).
             // Один на процесс, не привязан к валюте: auth-сессия и
@@ -200,6 +207,16 @@ async fn main() -> Result<()> {
             // snapshot статистики (`print_sim_stats`) поднимается отдельно
             // в [`real_sim::run_real_sim`] через `spawn_stats_snapshot`.
             account::spawn_heartbeat(account.clone());
+
+            // Глобальный user-WS листенер на процесс
+            // (`wss://ws-subscriptions-clob.polymarket.com/ws/user`):
+            // получает real-time `order`/`trade` события для
+            // подтверждения постановок/исполнений CLOB-ордеров и
+            // переводит статусы [`OpenPosition::open_status`] /
+            // [`ClosingPosition::close_status`]. [`Account::clob_authed`]
+            // поднимается выше через [`account::try_authenticate_clob_for_heartbeats`];
+            // листенер всё равно poll'ит на случай задержки, но обычно уже `Some`.
+            account_ws::spawn_user_ws_listener(account.clone());
 
             for currency in CURRENCIES {
                 let project_manager =
