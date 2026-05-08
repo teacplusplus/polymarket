@@ -7,10 +7,19 @@
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{INITIAL_BANKROLL, OpenPosition, SimStats};
 use crate::real_sim::{interval_label, side_label, RealSimState};
+use alloy::signers::Signer as _;
+use alloy::signers::local::PrivateKeySigner;
 use indexmap::IndexSet;
+use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::auth::Uuid as ClobUuid;
+use polymarket_client_sdk::auth::state::Authenticated;
+use polymarket_client_sdk::clob;
+use polymarket_client_sdk::POLYGON;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::time::MissedTickBehavior;
 
 /// Лимит [`Account::recently_resolved_markets`]; при переполнении вытесняется
 /// самый старый элемент (`IndexSet::shift_remove_index(0)`).
@@ -38,11 +47,41 @@ pub struct Account {
     /// Уже резолвнутые `condition_id` (см. [`RECENTLY_RESOLVED_MARKETS_CAP`]): не открывать сделку
     /// на маркет после резолюции при гонке HTTP/tick и колбека.
     pub recently_resolved_markets: IndexSet<String>,
+    /// Unauthenticated CLOB-клиент Polymarket — **единственное место**, где
+    /// он создаётся. Все потребители (`ProjectManager.clob`,
+    /// [`try_authenticate_clob_for_heartbeats`]) забирают клон отсюда.
+    /// Это даёт один общий пул соединений / DNS-кэш / cookie store на
+    /// процесс и гарантирует, что все компоненты разговаривают с тем же
+    /// CLOB-эндпоинтом.
+    ///
+    /// Хранится в `Arc`, чтобы синхронные потребители (например,
+    /// [`crate::project_manager::ProjectManager::new`]) могли держать
+    /// собственный клон без `await` под локом — на hot-path
+    /// `pm.clob.order_books(&requests)` идёт без локов вообще.
+    /// Внутри SDK `clob::Client` сам по себе обёртка над
+    /// `Arc<ClientInner>`, так что внешний `Arc<Arc<…>>` — это два
+    /// инкремента счётчика и нулевая аллокация.
+    pub clob: Arc<clob::Client>,
+    /// Аутентифицированный CLOB-клиент Polymarket — single source of truth
+    /// на процесс. Используется для `POST /v1/heartbeats` (см.
+    /// [`spawn_heartbeat`]) и в перспективе для `post_order` /
+    /// `cancel_order`. `None` пока не выполнилась авторизация: lazy при
+    /// старте `run_real_sim` (см. [`try_authenticate_clob_for_heartbeats`]);
+    /// в `STATUS=default`/`history_sim`/`train` остаётся `None`.
+    ///
+    /// `clob::Client` — небольшой обёрткой над `Arc<ClientInner<...>>`,
+    /// `Clone` дешёвый, поэтому хранится по значению (внешний `Arc` не
+    /// нужен). Доступ из любого места — через
+    /// [`crate::project_manager::ProjectManager::clob_authed`].
+    pub clob_authed: Option<clob::Client<Authenticated<Normal>>>,
 }
 
 impl Account {
-    /// [`INITIAL_BANKROLL`] для `bankroll` и `peak_bankroll` (избегаем ложного 100% DD на старте).
     pub fn new() -> Self {
+        let clob = Arc::new(
+            clob::Client::new("https://clob.polymarket.com", clob::Config::default())
+                .expect("failed to create Polymarket CLOB client"),
+        );
         Self {
             bankroll: INITIAL_BANKROLL,
             peak_bankroll: INITIAL_BANKROLL,
@@ -51,6 +90,8 @@ impl Account {
             positions: HashMap::new(),
             pending_resolution: HashMap::new(),
             recently_resolved_markets: IndexSet::new(),
+            clob,
+            clob_authed: None,
         }
     }
 
@@ -284,5 +325,294 @@ impl Account {
 impl Default for Account {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Период `POST /v1/heartbeats` к Polymarket CLOB. По
+/// [официальной доке](https://docs.polymarket.com/developers/CLOB/orders/orders#heartbeat)
+/// окно отмены — 10 секунд (`+` ~5 секунд буфер); SDK-пример рекомендует
+/// слать раз в 5 секунд. Без heartbeat'а **все открытые ордера**
+/// аутентифицированной сессии будут автоматически отменены.
+const CLOB_HEARTBEAT_INTERVAL_SEC: u64 = 5;
+
+/// Имя env-переменной с EOA-приватником для CLOB-аутентификации:
+/// та же `POLY_PRIVATE_KEY` (см. `.env`), что используется в
+/// [`crate::poly_chain`] для on-chain split. Одна EOA на процесс —
+/// одни creds для heartbeat и для подписи `splitPosition`.
+///
+/// Если переменная пустая/отсутствует —
+/// [`try_authenticate_clob_for_heartbeats`] выходит молча, оставляя
+/// `Account.clob_authed = None`; [`spawn_heartbeat`] всё равно
+/// поднимается, но clob-тик становится no-op'ом.
+const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
+
+/// Глобальный CLOB heartbeat-таск на процесс (один на все валюты): раз в
+/// [`CLOB_HEARTBEAT_INTERVAL_SEC`] секунд шлёт `POST /v1/heartbeats`,
+/// удерживая открытые ордера аутентифицированной сессии (без heartbeat'а
+/// сервер их автоматически отменит; окно 10s + ~5s буфер, см.
+/// [docs](https://docs.polymarket.com/developers/CLOB/orders/orders#heartbeat)).
+///
+/// Старт — один раз в `main` сразу после [`Account::new_shared`] (общий
+/// ресурс на процесс, не привязан к валюте/`ProjectManager`/`real_sim`-
+/// state'у). Если в окружении нет [`POLY_PRIVATE_KEY_ENV`] или
+/// [`try_authenticate_clob_for_heartbeats`] упал — таск всё равно крутится,
+/// но ничего не шлёт (clob-тик no-op). Это безопасно, поскольку без
+/// аутентификации **открытых ордеров не может быть** в принципе.
+///
+/// Per-currency `print_sim_stats` snapshot вынесен в отдельную таску
+/// [`crate::real_sim::spawn_stats_snapshot`] (он зависит от
+/// [`crate::real_sim::RealSimState`], который per-currency).
+///
+/// `MissedTickBehavior::Delay` — если CLOB-вызов задержался (например,
+/// 502 + retry tcp), не догоняем burst'ом 10 heartbeat'ов сразу: следующий
+/// тик отсчитывается от момента возврата управления.
+pub fn spawn_heartbeat(account: SharedAccount) {
+    tokio::spawn(async move {
+        // Аутентификация делается один раз на старте. Если упала — heartbeat
+        // отключаем на эту сессию (логика «retry до победного» спрятана за
+        // рестарт процесса; фоновые retry-ы плодят лог-шум и могут совпасть
+        // с реальным API rate-limit). Результат пишется в
+        // [`Account::clob_authed`] (single source of truth на процесс),
+        // здесь забираем локальный клон на жизнь таска.
+        try_authenticate_clob_for_heartbeats(&account).await;
+        let auth_client: Option<clob::Client<Authenticated<Normal>>> =
+            account.read().await.clob_authed.clone();
+
+        let mut clob_tick = tokio::time::interval(Duration::from_secs(CLOB_HEARTBEAT_INTERVAL_SEC));
+        clob_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Первый tick срабатывает мгновенно — пропускаем: на старте сразу
+        // постить heartbeat нет смысла (open orders ещё не существуют).
+        clob_tick.tick().await;
+
+        // Chain `heartbeat_id`: первый POST с `None`, далее берём UUID из
+        // ответа. На любой ошибке сбрасываем в `None`, следующий запрос
+        // уйдёт «как первый» (Polymarket-протокол: при невалидном id
+        // сервер возвращает 400 + правильный id, но SDK эту деталь не
+        // прокидывает — `None` после ошибки = безопасный фолбэк).
+        let mut heartbeat_id: Option<ClobUuid> = None;
+
+        // Антишум для лога: подряд успешные heartbeat'ы не печатаем,
+        // подряд ошибки — тоже. Печатаем только на смене состояния
+        // (success ↔ error) и на самой первой попытке, чтобы один раз
+        // подтвердить «heartbeat жив». См. формат сообщений ниже.
+        let mut last_was_success = false;
+        let mut had_first_log = false;
+
+        loop {
+            clob_tick.tick().await;
+            let Some(client) = auth_client.as_ref() else {
+                // Auth выключен (нет POLY_PRIVATE_KEY или authenticate()
+                // упал) — таск крутится no-op'ом, ждать тут нечего, но
+                // и rolling-проверки на появление auth не делаем: auth
+                // в текущей архитектуре поднимается один раз на старте.
+                continue;
+            };
+            match client.post_heartbeat(heartbeat_id).await {
+                Ok(resp) => {
+                    heartbeat_id = Some(resp.heartbeat_id);
+                    if !had_first_log {
+                        crate::tee_println!(
+                            "[heartbeat] CLOB heartbeat OK (heartbeat_id={})",
+                            resp.heartbeat_id,
+                        );
+                        had_first_log = true;
+                    } else if !last_was_success {
+                        crate::tee_println!(
+                            "[heartbeat] CLOB heartbeat восстановлен (heartbeat_id={})",
+                            resp.heartbeat_id,
+                        );
+                    }
+                    last_was_success = true;
+                }
+                Err(err) => {
+                    if last_was_success || !had_first_log {
+                        crate::tee_eprintln!(
+                            "[heartbeat] CLOB heartbeat ошибка: {err:#} \
+                             (открытые ордера могут быть отменены при тишине > 10s)",
+                        );
+                        had_first_log = true;
+                    }
+                    last_was_success = false;
+                    heartbeat_id = None;
+                }
+            }
+        }
+    });
+}
+
+/// Поднимает аутентифицированный CLOB-клиент по `POLY_PRIVATE_KEY` (та же
+/// EOA, что в [`crate::poly_chain`]) и сохраняет его в
+/// [`Account::clob_authed`] — single source of truth на процесс. Все
+/// читатели ([`spawn_heartbeat`] и
+/// [`crate::project_manager::ProjectManager::clob_authed`]) берут клиент
+/// именно оттуда.
+///
+/// Идемпотентна: если в Account уже лежит `Some(...)`, функция выходит
+/// без сетевого вызова. На любой ошибке (нет env-ключа, парсинг
+/// провалился, `clob::Client::new` упал, `authenticate()` вернул
+/// ошибку) — лог + Account остаётся с `None`; clob-тик в
+/// [`spawn_heartbeat`] в этом случае молча no-op.
+///
+/// Аутентификация = `create_or_derive_api_key` (внутри `authenticate()`):
+/// EIP-712 ClobAuth на `chain_id=POLYGON`, signature_type=Eoa (дефолт).
+/// Этого хватает для heartbeat'а; реальная постановка ордеров через
+/// Polymarket Safe потребует отдельного клиента с
+/// `signature_type=GnosisSafe + funder=<safe>` (тот же EOA сможет
+/// переиспользовать API-ключ).
+pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount) {
+    if account.read().await.clob_authed.is_some() {
+        return;
+    }
+    let private_key = match std::env::var(POLY_PRIVATE_KEY_ENV) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) | Err(_) => return,
+    };
+    let signer: PrivateKeySigner = match private_key.trim().parse() {
+        Ok(s) => s,
+        Err(err) => {
+            crate::tee_eprintln!(
+                "[heartbeat] парсинг {POLY_PRIVATE_KEY_ENV} провалился: {err:#}; CLOB heartbeat отключён",
+            );
+            return;
+        }
+    };
+    let signer = signer.with_chain_id(Some(POLYGON));
+    let address = signer.address();
+    // Берём общий unauth-клиент из [`Account::clob`] (создаётся ровно один
+    // раз в [`Account::new`]) и клонируем его — `clob::Client` это
+    // обёртка над `Arc<ClientInner>`, `clone()` это инкремент счётчика.
+    // `authentication_builder` потребляет `self`, поэтому клон обязателен:
+    // нельзя «вынуть» клиент из `Arc<clob::Client>` в Account, не
+    // ломая остальных потребителей (`ProjectManager.clob` и т.п.).
+    let unauth: clob::Client = (*account.read().await.clob).clone();
+    match unauth.authentication_builder(&signer).authenticate().await {
+        Ok(authed) => {
+            account.write().await.clob_authed = Some(authed);
+            crate::tee_println!(
+                "[heartbeat] CLOB authenticate OK (eoa={address:#x}); heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
+            );
+        }
+        Err(err) => {
+            crate::tee_eprintln!(
+                "[heartbeat] CLOB authenticate провалился: {err:#}; CLOB heartbeat отключён",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live integration-тест полного цикла CLOB-аутентификации.
+    /// Выполняет тот же путь, что и hot-path [`spawn_heartbeat`] на старте:
+    /// 1. Читает `POLY_PRIVATE_KEY` через [`dotenvy`].
+    /// 2. Вызывает [`try_authenticate_clob_for_heartbeats`] на свежем
+    ///    [`Account`] (где `clob_authed = None`).
+    /// 3. Проверяет, что после запроса `Account.clob_authed = Some(_)`
+    ///    (т.е. real `POST clob.polymarket.com/auth/api-key/...` отдал
+    ///    creds, и SDK построил `Authenticated<Normal>`-клиента).
+    /// 4. Проверяет идемпотентность: повторный вызов — no-op
+    ///    (короткое замыкание на `clob_authed.is_some()`), HTTP-запроса
+    ///    не делает.
+    ///
+    /// **Делает реальный HTTP-запрос к Polymarket CLOB.** Помечен
+    /// `#[ignore]`, чтобы не запускался в обычном `cargo test`. Запуск:
+    ///
+    /// ```bash
+    /// POLY_PRIVATE_KEY=0x… \
+    ///     cargo test --bin poly account::tests::live_try_authenticate_clob_for_heartbeats -- --ignored --nocapture
+    /// ```
+    ///
+    /// Без `POLY_PRIVATE_KEY` тест пропускается (`Ok(())`), чтобы не
+    /// падать в CI.
+    #[tokio::test]
+    #[ignore = "live network: требует POLY_PRIVATE_KEY; делает HTTP-запрос к clob.polymarket.com/auth/api-key"]
+    async fn live_try_authenticate_clob_for_heartbeats() -> anyhow::Result<()> {
+        let _ = dotenvy::dotenv();
+
+        // rustls 0.23 требует установленного CryptoProvider'а до первого
+        // TLS-запроса. В обычном бинарнике это делает `main`, но
+        // `tokio::test` поднимает свой рантайм и `main` не вызывается.
+        // `install_default()` идемпотентен: вторая попытка вернёт Err,
+        // которую мы намеренно игнорируем.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let private_key_set = std::env::var(POLY_PRIVATE_KEY_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some();
+        if !private_key_set {
+            eprintln!(
+                "live_try_authenticate_clob_for_heartbeats: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
+            );
+            return Ok(());
+        }
+
+        let account = Account::new_shared();
+
+        // 1) Свежий Account → clob_authed=None, инвариант до запроса.
+        anyhow::ensure!(
+            account.read().await.clob_authed.is_none(),
+            "новый Account должен идти с clob_authed=None",
+        );
+
+        // 2) Полный auth-цикл: signer → unauth client → authentication_builder
+        //    → POST /auth/api-key → Account.clob_authed = Some(_).
+        try_authenticate_clob_for_heartbeats(&account).await;
+        anyhow::ensure!(
+            account.read().await.clob_authed.is_some(),
+            "после try_authenticate_clob_for_heartbeats clob_authed обязан быть Some \
+             (если упало — смотри stderr-логи `[heartbeat] CLOB authenticate провалился: …`)",
+        );
+
+        // 3) Идемпотентность: второй вызов должен короткозамкнуться на
+        //    `clob_authed.is_some()` и НЕ делать повторный HTTP-запрос.
+        //    Снимаем Arc<ClientInner> и сравниваем по указателю — после
+        //    no-op у нас тот же самый клиент, не пересозданный.
+        let before = account.read().await.clob_authed.clone();
+        try_authenticate_clob_for_heartbeats(&account).await;
+        let after = account.read().await.clob_authed.clone();
+        anyhow::ensure!(
+            before.is_some() && after.is_some(),
+            "оба вызова должны держать clob_authed = Some",
+        );
+
+        // 4) Реальный heartbeat-RPC через тот же клиент, что лежит в
+        //    `Account.clob_authed`. Это то, чем занят
+        //    [`spawn_heartbeat`] в hot-path: подтверждаем, что
+        //    `Authenticated<Normal>`-сессия валидна для
+        //    `POST /v1/heartbeats` (а не «технически собралась, но не
+        //    принимается сервером»). Первый вызов идёт с `None`
+        //    (server-side создаст новый id), второй — с возвращённым
+        //    UUID (chained heartbeat — тот же путь, что в hot-path-цикле).
+        let client = account
+            .read()
+            .await
+            .clob_authed
+            .clone()
+            .expect("clob_authed обязан быть Some после успешного auth-цикла выше");
+
+        let first = client
+            .post_heartbeat(None)
+            .await
+            .map_err(|err| anyhow::anyhow!("первый POST /v1/heartbeats упал: {err:#}"))?;
+        eprintln!(
+            "live_try_authenticate_clob_for_heartbeats: первый heartbeat OK, heartbeat_id={}",
+            first.heartbeat_id,
+        );
+
+        let second = client
+            .post_heartbeat(Some(first.heartbeat_id))
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("повторный POST /v1/heartbeats с chained id упал: {err:#}")
+            })?;
+        eprintln!(
+            "live_try_authenticate_clob_for_heartbeats: chained heartbeat OK, heartbeat_id={}",
+            second.heartbeat_id,
+        );
+
+        Ok(())
     }
 }

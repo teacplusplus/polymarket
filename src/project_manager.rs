@@ -22,6 +22,8 @@ use crate::xframe::{
     currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
     find_same_outcome_sibling_asset_id, XFrame, SIZE,
 };
+use polymarket_client_sdk::auth::Normal;
+use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -117,8 +119,17 @@ pub struct ProjectManager {
 }
 
 impl ProjectManager {
+    pub async fn clob_authed(&self) -> Option<clob::Client<Authenticated<Normal>>> {
+        self.account.read().await.clob_authed.clone()
+    }
+
     /// WS, сборщик XFrame, циклы 5m/15m. Карта каналов [`LaneFrameChannels`](crate::real_sim::LaneFrameChannels) пуста до регистрации воркерами `real_sim`.
-    pub fn new(currency: String, account: SharedAccount) -> Arc<Self> {
+    ///
+    /// `async` — только из-за чтения [`crate::account::Account::clob`] под
+    /// `RwLock`. CLOB-клиент создаётся ровно в [`crate::account::Account::new`]
+    /// и переиспользуется: один пул соединений / DNS-кэш на все валюты и
+    /// плюс [`crate::account::spawn_heartbeat`].
+    pub async fn new(currency: String, account: SharedAccount) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
         let http = Arc::new(
@@ -128,7 +139,11 @@ impl ProjectManager {
                 .unwrap_or_else(|_| reqwest::Client::new()),
         );
         let gamma = Arc::new(gamma::Client::default());
-        let clob = Arc::new(clob::Client::new("https://clob.polymarket.com", clob::Config::default()).expect("failed to create Polymarket CLOB client"));
+        // CLOB-клиент берём из `Account` (single source of truth, см.
+        // `Account::clob` doc). `Arc::clone` ⇒ один инкремент счётчика,
+        // обёртка над тем же `ClientInner` внутри SDK — никаких
+        // дублирующих `reqwest::Client` / DNS-резолверов.
+        let clob = account.read().await.clob.clone();
 
         let (market_ws_tx, market_ws_rx) =
             mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);

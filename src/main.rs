@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
                 // отпустить, пайплайн продолжит жить. Карта каналов
                 // `lane_frame_channels` у `real_sim_state` остаётся пустой,
                 // фанаут просто молча отбрасывает кадры.
-                let _ = ProjectManager::new((*currency).to_string(), account.clone());
+                let _ = ProjectManager::new((*currency).to_string(), account.clone()).await;
             }
 
             std::future::pending::<()>().await;
@@ -193,9 +193,17 @@ async fn main() -> Result<()> {
             // См. комментарий в `AppMode::Default` — общий счёт на процесс.
             let account = Account::new_shared();
 
+            // Глобальный CLOB heartbeat-таск (раз в 5s `POST /v1/heartbeats`,
+            // удерживает открытые ордера от автоматической отмены сервером).
+            // Один на процесс, не привязан к валюте: auth-сессия и
+            // [`Account.clob_authed`] — общий ресурс. Per-currency
+            // snapshot статистики (`print_sim_stats`) поднимается отдельно
+            // в [`real_sim::run_real_sim`] через `spawn_stats_snapshot`.
+            account::spawn_heartbeat(account.clone());
+
             for currency in CURRENCIES {
                 let project_manager =
-                    ProjectManager::new((*currency).to_string(), account.clone());
+                    ProjectManager::new((*currency).to_string(), account.clone()).await;
                 real_sim::run_real_sim(project_manager).await?;
             }
 

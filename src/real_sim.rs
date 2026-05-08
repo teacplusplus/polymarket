@@ -31,6 +31,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::time::MissedTickBehavior;
 use xgb::Booster;
 
 /// Очередь `LaneFrame` на `(interval, side)` (фанаут lane 0).
@@ -54,13 +55,13 @@ const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
 /// FIFO-кольцо [`RealSimState::seen_market_ids`] на интервал (`shift_remove_index(0)` сверх лимита).
 const SEEN_MARKET_IDS_CAP: usize = 8;
 
-/// Период heartbeat-снапшота состояния `Account` + per-interval [`SimStats`]
-/// (см. [`spawn_heartbeat`]). `print_sim_stats` сам по себе дёргается только
-/// при сделке (см. [`tick_once`]), а live-режим может час и больше идти без
-/// сделок: без heartbeat'а в логе тишина, нет ни bankroll, ни max_dd, ни
-/// числа обработанных кадров. 5 минут — компромисс между шумом в `tee` и
-/// видимостью «жив ли пайплайн».
-const HEARTBEAT_INTERVAL_SEC: u64 = 5 * 60;
+/// Период локального snapshot'а (`Account` + per-interval [`SimStats`])
+/// в [`spawn_stats_snapshot`]. `print_sim_stats` сам по себе дёргается
+/// только при сделке (см. [`tick_once`]), а live-режим может час и
+/// больше идти без сделок: без этого таска в логе тишина — нет ни
+/// bankroll, ни max_dd, ни числа обработанных кадров. 5 минут —
+/// компромисс между шумом в `tee` и видимостью «жив ли пайплайн».
+const STATS_HEARTBEAT_INTERVAL_SEC: u64 = 5 * 60;
 
 /// Полный набор 4 ключей фанаута 1s-кадров: `(interval, side)`.
 const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
@@ -182,7 +183,7 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
         });
     }
 
-    spawn_heartbeat(state.clone(), account.clone(), tag_prefix.clone());
+    spawn_stats_snapshot(state.clone(), account.clone(), tag_prefix.clone());
 
     for (interval_kind, side) in LANE_FRAME_ROUTES {
         let label = interval_label(interval_kind);
@@ -267,24 +268,32 @@ fn spawn_side_worker(
     });
 }
 
-/// Раз в [`HEARTBEAT_INTERVAL_SEC`] печатает [`print_sim_stats`] по обоим
-/// интервалам ([`XFrameIntervalKind::FiveMin`] / [`XFrameIntervalKind::FifteenMin`])
+/// Per-currency snapshot пайплайна: раз в [`STATS_HEARTBEAT_INTERVAL_SEC`]
+/// печатает [`print_sim_stats`] по обоим интервалам
+/// ([`XFrameIntervalKind::FiveMin`] / [`XFrameIntervalKind::FifteenMin`])
 /// + банкролл/просадку текущего [`Account`]. Без этого таска live-режим
-/// без сделок выглядит как «висящий процесс» — нет ни bankroll, ни max_dd,
-/// ни сколько кадров обработано.
+/// без сделок выглядит как «висящий процесс» — нет ни bankroll, ни
+/// max_dd, ни сколько кадров обработано.
 ///
-/// Локи берутся read-only, чтобы не конкурировать с торговыми воркерами;
-/// печать идёт через `tee_log` (свой mutex). Если сделка случается ровно
-/// в момент heartbeat'а, оба `print_sim_stats` отработают подряд — это OK,
-/// один из них покажет состояние «до», другой «после», без блокировки.
-fn spawn_heartbeat(
+/// Привязан к `state` (`RealSimState` per-currency) и `tag_prefix`
+/// (`"{currency}/{version}"`), поэтому живёт здесь, а не в [`crate::account`]
+/// (где сидит глобальный CLOB heartbeat без привязки к валюте).
+/// Спавнится один раз на валюту в [`run_real_sim`].
+///
+/// Локи `state`/`account` берутся read-only, чтобы не конкурировать с
+/// торговыми воркерами; печать идёт через `tee_log` (свой mutex). Если
+/// сделка случается ровно в момент snapshot'а, оба `print_sim_stats`
+/// отработают подряд — это OK, один из них покажет состояние «до»,
+/// другой «после», без блокировки.
+fn spawn_stats_snapshot(
     state: Arc<RwLock<RealSimState>>,
     account: SharedAccount,
     tag_prefix: String,
 ) {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SEC));
-        // Первый tick срабатывает мгновенно — пропускаем, чтобы heartbeat
+        let mut tick = tokio::time::interval(Duration::from_secs(STATS_HEARTBEAT_INTERVAL_SEC));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Первый tick срабатывает мгновенно — пропускаем, чтобы snapshot
         // не печатался до первой реальной активности (на старте все
         // счётчики нулевые, такой снапшот бесполезен и шумит в логе).
         tick.tick().await;
