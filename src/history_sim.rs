@@ -633,6 +633,13 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     }
                 };
 
+                let step_path = interval_path.join("1s");
+                let all_paths = collect_bin_paths(&step_path)?;
+                let (train_count, val_count, test_count) = split_counts(all_paths.len());
+                let test_paths = &all_paths[train_count + val_count..];
+
+                let test_period_str = test_period_label(test_paths, interval_kind);
+
                 if is_kelly {
                     tee_println!(
                         "[sim] {tag}: модели pnl загружены | {} | {} \
@@ -640,7 +647,8 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                          | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s ev_margin={EV_EXIT_MARGIN} ema_α={EV_EXIT_P_WIN_EMA_ALPHA} \
                          | threshold={SIM_BUY_THRESHOLD} | kelly={KELLY_MULTIPLIER} | max_bet={MAX_BET_FRACTION} | max_pos=${MAX_POSITION_USD} \
                          | no_trade_zone=({Y_TRAIN_NO_TRADE_PROB_LOW}..{Y_TRAIN_NO_TRADE_PROB_HIGH}) \
-                         | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}",
+                         | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE} \
+                         | {test_period_str}",
                         cal_info(&calibration_up, "cal_up"),
                         cal_info(&calibration_down, "cal_down"),
                         if booster_resolution_up.is_some()   { "✓" } else { "✗" },
@@ -652,18 +660,14 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                          | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s ev_margin={EV_EXIT_MARGIN} ema_α={EV_EXIT_P_WIN_EMA_ALPHA} \
                          | threshold={SIM_BUY_THRESHOLD} | entry=${NO_KELLY_POSITION_SIZE_USD} (fixed, no Kelly, no calibration) \
                          | no_trade_zone=({Y_TRAIN_NO_TRADE_PROB_LOW}..{Y_TRAIN_NO_TRADE_PROB_HIGH}) \
-                         | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE}",
+                         | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE} \
+                         | {test_period_str}",
                         if booster_resolution_up.is_some()   { "✓" } else { "✗" },
                         if booster_resolution_down.is_some() { "✓" } else { "✗" },
                     );
                 }
 
                 let mut sim_stats = SimStats::new();
-
-                let step_path = interval_path.join("1s");
-                let all_paths = collect_bin_paths(&step_path)?;
-                let (train_count, val_count, test_count) = split_counts(all_paths.len());
-                let test_paths = &all_paths[train_count + val_count..];
 
                 tee_println!(
                     "[sim] {tag}: маркетов всего={} → сплит {train_count}/{val_count}/{test_count} (train/val/test), TEST_FRACTION={TEST_FRACTION}, VAL_FRACTION={VAL_FRACTION}",
@@ -2266,6 +2270,23 @@ pub(crate) struct DumpWindowBounds {
     /// Правая граница окна (UTC, миллисекунды). Момент резолюции
     /// маркета — он же начало следующего окна.
     pub event_end_ms: i64,
+}
+
+/// Суммарная длительность маркетов тест-сплита: `период=Hh Mm`,
+/// где `total_min = n_paths × interval_minutes`. Не зависит от порядка
+/// `paths` (в отличие от span first..last) — на тест-сплите с разреженной
+/// историей маркеты могут идти не подряд, span между крайними не совпадает
+/// с реальным «временем работы стратегии». Возвращает `период=—` при пустом
+/// списке.
+fn test_period_label(paths: &[std::path::PathBuf], interval_kind: XFrameIntervalKind) -> String {
+    if paths.is_empty() {
+        return "период=—".to_string();
+    }
+    let interval_min = interval_kind.interval_ms() / 60_000;
+    let total_min = paths.len() as i64 * interval_min;
+    let hours = total_min / 60;
+    let minutes = total_min % 60;
+    format!("период={hours}h {minutes}m")
 }
 
 fn fs_sorted_dirs(dir: &Path) -> anyhow::Result<Vec<std::path::PathBuf>> {
