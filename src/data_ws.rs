@@ -422,6 +422,7 @@ async fn ingest_single(
         project_manager.append_ws_stream_entries(entries).await;
     }
     for snapshot in snapshots {
+        project_manager.update_last_snapshot(&snapshot).await;
         project_manager
             .ws
             .market_snapshot_sender

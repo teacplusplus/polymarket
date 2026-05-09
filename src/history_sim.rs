@@ -638,7 +638,11 @@ impl SimStats {
 }
 
 /// Два прогона подряд: `kelly` и `raw` ([`NO_KELLY_POSITION_SIZE_USD`]). Колонка CSV `regime`; свой [`Account`] на прогон.
-pub fn run_sim_mode() -> anyhow::Result<()> {
+///
+/// `async fn`, потому что внутри идут `Account::*`-вызовы под `.write().await` /
+/// `.read().await` per-field RwLock'ов; вызывается из `main` (`#[tokio::main]`)
+/// через `.await`.
+pub async fn run_sim_mode() -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     if !xframes_root.exists() {
         anyhow::bail!("Папка xframes/ не найдена — сначала соберите данные (STATUS=default)");
@@ -651,11 +655,11 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 
     crate::trade_csv_log::set_current_regime("kelly");
     tee_println!("[sim] === regime=kelly (Kelly + calibration, min(MAX_BET_FRACTION × bankroll, MAX_POSITION_USD)) ===");
-    run_sim_mode_inner(true)?;
+    run_sim_mode_inner(true).await?;
 
     crate::trade_csv_log::set_current_regime("raw");
     tee_println!("[sim] === regime=raw (no Kelly, no calibration, ${NO_KELLY_POSITION_SIZE_USD} entry) ===");
-    run_sim_mode_inner(false)?;
+    run_sim_mode_inner(false).await?;
 
     crate::trade_csv_log::set_current_regime("");
     crate::trade_csv_log::finish_trade_csv_log();
@@ -665,7 +669,7 @@ pub fn run_sim_mode() -> anyhow::Result<()> {
 }
 
 /// Один режим `is_kelly`; свой свежий [`Account::new()`].
-fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
+async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     let regime_label = if is_kelly { "kelly" } else { "raw" };
 
@@ -678,7 +682,7 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 continue;
             }
 
-            let mut account = Account::new();
+            let account = Account::new();
 
             for interval_kind in [XFrameIntervalKind::FiveMin, XFrameIntervalKind::FifteenMin] {
                 let interval = interval_label(interval_kind);
@@ -788,19 +792,22 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                                 booster_resolution_up.as_ref(), booster_resolution_down.as_ref(),
                                 calibration_resolution_up.as_ref(), calibration_resolution_down.as_ref(),
                                 &mut sim_stats,
-                                &mut account,
+                                &account,
                                 is_kelly,
                                 &polymarket_url,
                                 event_end_ms,
                                 file_path.as_path(),
-                            );
+                            )
+                            .await;
                             sim_stats.events += 1;
                         }
                         Err(err) => tee_eprintln!("[sim] {}: {err}", file_path.display()),
                     }
                 }
 
-                print_sim_stats(&tag, &sim_stats, &account, is_kelly);
+                let bankroll_now = *account.bankroll.read().await;
+                let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
+                print_sim_stats(&tag, &sim_stats, bankroll_now, max_drawdown_pct_now, is_kelly);
             }
         }
     }
@@ -810,8 +817,11 @@ fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
 
 /// Один маркет: последовательные проходы UP и DOWN по двум независимым рядам кадров.
 /// Общий банкролл (как в [`crate::real_sim`]).
+///
+/// `async fn`, потому что [`run_side_simulation`] и [`Account::resolve_pending_market_sync`]
+/// берут поля `Account` под `.write().await` per-field RwLock'ов.
 #[allow(clippy::too_many_arguments)]
-fn simulate_event(
+async fn simulate_event(
     market_xframes: &MarketXFramesDump,
     currency: &str,
     interval_kind: XFrameIntervalKind,
@@ -824,7 +834,7 @@ fn simulate_event(
     calibration_resolution_up: Option<&Calibration>,
     calibration_resolution_down: Option<&Calibration>,
     sim_stats: &mut SimStats,
-    account: &mut Account,
+    account: &Account,
     is_kelly: bool,
     polymarket_url: &str,
     event_end_ms: Option<i64>,
@@ -860,7 +870,8 @@ fn simulate_event(
         event_end_ms,
         &graph_dump_bin_path,
         HOLD_TO_END_THRESHOLD_SEC,
-    );
+    )
+    .await;
     run_side_simulation(
         &frames_down,
         booster_down, calibration_down,
@@ -876,35 +887,33 @@ fn simulate_event(
         event_end_ms,
         &graph_dump_bin_path,
         HOLD_TO_END_THRESHOLD_SEC,
-    );
+    )
+    .await;
 
     if let Some(market_id) = market_id_opt {
-        account.resolve_pending_market_sync(
-            sim_stats,
-            currency,
-            interval_kind,
-            &market_id,
-            up_won,
-            None,
-        );
+        account
+            .resolve_pending_market_sync(
+                sim_stats,
+                currency,
+                interval_kind,
+                &market_id,
+                up_won,
+                None,
+            )
+            .await;
     }
 
     // После resolve pending по этому маркету должен быть пуст (иначе утечка между маркетами).
-    assert!(
-        account
-            .pending_resolution
-            .get(&lane_key_up)
-            .map(|v| v.is_empty())
-            .unwrap_or(true)
-            && account
-                .pending_resolution
-                .get(&lane_key_down)
-                .map(|v| v.is_empty())
-                .unwrap_or(true),
-        "history_sim: pending_resolution не опустошён после resolve_pending_market_sync \
-         (lane_key_up={lane_key_up:?}, lane_key_down={lane_key_down:?}); \
-         dump invariant violated",
-    );
+    {
+        let pending = account.pending_resolution.read().await;
+        assert!(
+            pending.get(&lane_key_up).map(|v| v.is_empty()).unwrap_or(true)
+                && pending.get(&lane_key_down).map(|v| v.is_empty()).unwrap_or(true),
+            "history_sim: pending_resolution не опустошён после resolve_pending_market_sync \
+             (lane_key_up={lane_key_up:?}, lane_key_down={lane_key_down:?}); \
+             dump invariant violated",
+        );
+    }
 }
 
 /// Один проход стороны (UP/DOWN) по ряду кадров: manage/open → MtM equity.
@@ -919,13 +928,13 @@ fn simulate_event(
 /// и собираются точки для её калибровки (см. [`compute_p_win_now`] и
 /// [`SideStats::hold_zone_resolution_predictions`]).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_side_simulation(
+pub(crate) async fn run_side_simulation(
     frames: &[&XFrame<SIZE>],
     booster_pnl: &Booster,
     calibration_pnl: Option<&Calibration>,
     booster_resolution: Option<&Booster>,
     calibration_resolution: Option<&Calibration>,
-    account: &mut Account,
+    account: &Account,
     lane_key: &(String, XFrameIntervalKind, CurrencyUpDownOutcome),
     side_stats: &mut SideStats,
     currency: &str,
@@ -964,26 +973,17 @@ pub(crate) fn run_side_simulation(
         }
         let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl, is_kelly);
 
-        // Фаза 1: manage_positions. Деструктурируем account на disjoint поля:
-        // `bankroll`, `positions[lane_key]` (live), `pending_resolution[lane_key]` (carry),
-        // `closing[lane_key]` (теневые записи о закрытиях, см. doc у [`manage_positions`]).
+        // Фаза 1: manage_positions. Берём поля Account под отдельными write-локами
+        // в каноническом порядке (`bankroll → positions → pending_resolution → closing`),
+        // как в real_sim::tick_once — иначе deadlock с другими потребителями.
         {
-            let Account {
-                bankroll,
-                positions: account_positions,
-                pending_resolution,
-                closing: account_closing,
-                ..
-            } = &mut *account;
-            let positions_v = account_positions
-                .entry(lane_key.clone())
-                .or_default();
-            let pending = pending_resolution
-                .entry(lane_key.clone())
-                .or_default();
-            let closing_v = account_closing
-                .entry(lane_key.clone())
-                .or_default();
+            let mut bankroll = account.bankroll.write().await;
+            let mut positions = account.positions.write().await;
+            let mut pending_resolution = account.pending_resolution.write().await;
+            let mut closing = account.closing.write().await;
+            let positions_v = positions.entry(lane_key.clone()).or_default();
+            let pending = pending_resolution.entry(lane_key.clone()).or_default();
+            let closing_v = closing.entry(lane_key.clone()).or_default();
             manage_positions(
                 positions_v,
                 pending,
@@ -992,23 +992,18 @@ pub(crate) fn run_side_simulation(
                 is_last_idx,
                 p_win_now,
                 side_stats,
-                bankroll,
+                &mut bankroll,
                 None,
                 Some(MINPOSITION_FRAMES),
             );
         }
 
-        // Фаза 2: try_open_position. Тот же destructure, available считается
-        // на тех же live-позициях (в данном лейне same_side_locked).
+        // Фаза 2: try_open_position. available считается на тех же live-позициях
+        // (в данном лейне same_side_locked). Порядок: bankroll → positions.
         {
-            let Account {
-                bankroll,
-                positions: account_positions,
-                ..
-            } = &mut *account;
-            let positions_v = account_positions
-                .entry(lane_key.clone())
-                .or_default();
+            let bankroll = account.bankroll.read().await;
+            let mut positions = account.positions.write().await;
+            let positions_v = positions.entry(lane_key.clone()).or_default();
             let same_side_locked: f64 = positions_v.iter().map(|p| p.entry_cost).sum();
             let available = (*bankroll - same_side_locked).max(0.0);
             try_open_position(
@@ -1034,37 +1029,33 @@ pub(crate) fn run_side_simulation(
         // MtM equity (как real_sim): без prob на кадре тик пропускаем.
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
-            let positions_value: f64 = account
-                .positions
-                .get(lane_key)
-                .map(|v| v.iter().map(|p| p.shares_held * prob).sum())
-                .unwrap_or(0.0);
-            let pending_value: f64 = account
-                .pending_resolution
-                .values()
-                .flat_map(|v| v.iter())
-                .map(|p| p.shares_held * p.buy_price)
-                .sum();
-            let equity = account.bankroll + positions_value + pending_value;
-            account.update_drawdown(equity);
+            let equity = {
+                let bankroll = account.bankroll.read().await;
+                let positions = account.positions.read().await;
+                let pending = account.pending_resolution.read().await;
+                let positions_value: f64 = positions
+                    .get(lane_key)
+                    .map(|v| v.iter().map(|p| p.shares_held * prob).sum())
+                    .unwrap_or(0.0);
+                let pending_value: f64 = pending
+                    .values()
+                    .flat_map(|v| v.iter())
+                    .map(|p| p.shares_held * p.buy_price)
+                    .sum();
+                *bankroll + positions_value + pending_value
+            };
+            account.update_drawdown(equity).await;
         }
     }
 
     // Хвост открытых позиций уезжает в pending_resolution — финальный payout
     // делает caller через `Account::resolve_pending_market_sync`.
     {
-        let Account {
-            positions: account_positions,
-            pending_resolution,
-            ..
-        } = &mut *account;
-        let positions_v = account_positions
-            .entry(lane_key.clone())
-            .or_default();
+        let mut positions = account.positions.write().await;
+        let mut pending_resolution = account.pending_resolution.write().await;
+        let positions_v = positions.entry(lane_key.clone()).or_default();
         if !positions_v.is_empty() {
-            let pending = pending_resolution
-                .entry(lane_key.clone())
-                .or_default();
+            let pending = pending_resolution.entry(lane_key.clone()).or_default();
             pending.append(positions_v);
         }
     }
@@ -2280,7 +2271,17 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_ke
     );
 }
 
-pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account, is_kelly: bool) {
+/// Печать статистики прогона. `bankroll_now` / `max_drawdown_pct_now` передаются явно,
+/// чтобы саму печать оставить sync (без `await`-точек посреди форматирования) —
+/// вызыватели снимают значения короткими `account.bankroll.read().await` /
+/// `account.max_drawdown_pct.read().await` непосредственно перед вызовом.
+pub(crate) fn print_sim_stats(
+    tag: &str,
+    sim_stats: &SimStats,
+    bankroll_now: f64,
+    max_drawdown_pct_now: f64,
+    is_kelly: bool,
+) {
     let total_trades = sim_stats.total_trades();
     if total_trades == 0 {
         if is_kelly {
@@ -2312,7 +2313,7 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
     let total_fees = sim_stats.total_fees();
     let win_rate = total_wins as f64 / total_trades as f64 * 100.0;
     let avg_pnl = total_pnl / total_trades as f64;
-    let roi_pct = (account.bankroll - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
+    let roi_pct = (bankroll_now - INITIAL_BANKROLL) / INITIAL_BANKROLL * 100.0;
 
     let total_losses = sim_stats.total_losses();
     if is_kelly {
@@ -2344,7 +2345,7 @@ pub(crate) fn print_sim_stats(tag: &str, sim_stats: &SimStats, account: &Account
     }
     tee_println!(
         "[sim]   bankroll: {:.2}$ (start={INITIAL_BANKROLL}$) ROI={:+.2}% max_drawdown={:.2}%",
-        account.bankroll, roi_pct, account.max_drawdown_pct,
+        bankroll_now, roi_pct, max_drawdown_pct_now,
     );
 
     print_side_stats(tag, "UP",   &sim_stats.up,   is_kelly);

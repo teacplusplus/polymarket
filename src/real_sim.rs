@@ -3,7 +3,7 @@
 //! Воркеры без таймера (`recv().await`). Общие [`RealSimState`] и портфельный [`Account`]. Стаканы — батч [`run_book_coordinator`].
 //! WS расходится с HTTP (> ~`2×tick_size` по L1–L3) → без новых входов, закрытия как обычно. После buy/sell — [`print_sim_stats`].
 
-use crate::account::{Account, SharedAccount};
+use crate::account::SharedAccount;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
     BuyGate, any_position_would_sell, buy_gate, compute_p_win_now, compute_pnl_inference,
@@ -12,6 +12,7 @@ use crate::history_sim::{
 };
 /// Тот же cap, что в [`crate::history_sim::manage_positions`] / `book_fill_*` (на TP при выполненном пороге VWAP — cap может игнорироваться).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
+use crate::market_snapshot::MarketSnapshot;
 use crate::xframe::BookLevel;
 use crate::project_manager::{LaneFrame, ProjectManager};
 use crate::train_mode::{load_calibration, Calibration};
@@ -48,6 +49,16 @@ const BOOK_BATCH_MAX_MS: u64 = 50;
 
 /// HTTP `order_books`; при таймауте — `None` всем ожидающим (WS-fallback).
 const BOOK_HTTP_TIMEOUT_MS: u64 = 2000;
+
+/// Максимальный возраст последнего WS-снимка по `asset_id`
+/// ([`ProjectManager::last_snapshot_by_asset_id`]), при котором
+/// [`tick_once`] собирает [`StrictBook`] прямо из него и пропускает HTTP
+/// `order_books`. WS-канал шлёт `book` на subscribe и далее непрерывный
+/// поток `price_change`/`last_trade_price` — за 1с обычно есть свежий
+/// мердж, и HTTP-roundtrip в `BOOK_BATCH_*` (~5–50ms idle + 2s timeout)
+/// можно избежать. Если за этот порог снимок не приходит — считаем поток
+/// «остановившимся» и идём в HTTP как обычно.
+pub(crate) const WS_STRICT_BOOK_MAX_AGE_MS: i64 = 1_000;
 
 /// Ожидание ответа координатора в [`fetch_http_strict_book`] (`≈ 3×` HTTP).
 const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
@@ -168,12 +179,12 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
 
     let state = project_manager.real_sim_state.clone();
     let account = project_manager.account.clone();
+    let last_snapshot_by_asset_id = project_manager.last_snapshot_by_asset_id.clone();
     let channels = state.read().await.lane_frame_channels.channels.clone();
 
     account
-        .write()
-        .await
-        .register_currency_lanes(&currency, &LANE_FRAME_ROUTES);
+        .register_currency_lanes(&currency, &LANE_FRAME_ROUTES)
+        .await;
 
     let (book_tx, book_rx) = mpsc::channel::<BookRequest>(BOOK_REQUEST_CHANNEL_CAP);
     {
@@ -207,6 +218,7 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
             state.clone(),
             account.clone(),
             currency_arc.clone(),
+            last_snapshot_by_asset_id.clone(),
             interval_kind,
             side,
             models,
@@ -223,6 +235,7 @@ fn spawn_side_worker(
     state: Arc<RwLock<RealSimState>>,
     account: SharedAccount,
     currency: Arc<String>,
+    last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
     interval_kind: XFrameIntervalKind,
     side: CurrencyUpDownOutcome,
     models: SideModels,
@@ -242,6 +255,7 @@ fn spawn_side_worker(
                 &state,
                 &account,
                 currency.as_str(),
+                &last_snapshot_by_asset_id,
                 interval_kind,
                 side,
                 &models,
@@ -300,13 +314,18 @@ fn spawn_stats_snapshot(
         loop {
             tick.tick().await;
             let state_guard = state.read().await;
-            let account_guard = account.read().await;
+            // Снапшот `bankroll` / `max_drawdown_pct` под per-field read-локами:
+            // оба short-lived, держатся только пока копируем `f64`. Не висят
+            // через печать `print_sim_stats`, чтобы trade-воркеры могли
+            // спокойно идти в `update_drawdown` / payout.
+            let bankroll_now = *account.bankroll.read().await;
+            let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
             for kind in [XFrameIntervalKind::FiveMin, XFrameIntervalKind::FifteenMin] {
                 let Some(stats) = state_guard.stats.get(&kind) else {
                     continue;
                 };
                 let tag = format!("{tag_prefix}/{} [heartbeat]", interval_label(kind));
-                print_sim_stats(&tag, stats, &account_guard, true);
+                print_sim_stats(&tag, stats, bankroll_now, max_drawdown_pct_now, true);
             }
         }
     });
@@ -329,6 +348,7 @@ async fn tick_once(
     state: &Arc<RwLock<RealSimState>>,
     account: &SharedAccount,
     currency: &str,
+    last_snapshot_by_asset_id: &Arc<RwLock<HashMap<String, MarketSnapshot>>>,
     interval_kind: XFrameIntervalKind,
     side: CurrencyUpDownOutcome,
     models: &SideModels,
@@ -389,10 +409,8 @@ async fn tick_once(
 
     // WS-prob в last_prob до HTTP; после fetch перепишем на effective_prob.
     {
-        let mut account_guard = account.write().await;
-        account_guard
-            .last_prob
-            .insert(lane_key.clone(), currency_implied_prob);
+        let mut last_prob = account.last_prob.write().await;
+        last_prob.insert(lane_key.clone(), currency_implied_prob);
     }
 
     let (
@@ -403,31 +421,34 @@ async fn tick_once(
         account_max_dd_pct,
         market_already_resolved,
     ) = {
-        let account_guard = account.read().await;
-        let this_positions = account_guard
-            .positions
+        // Snapshot фаза: берём read-локи только тех полей, которые читаем; в порядке
+        // объявления полей `Account` (`bankroll → max_drawdown_pct → positions →
+        // recently_resolved_markets`).
+        let bankroll_guard = account.bankroll.read().await;
+        let max_dd_guard = account.max_drawdown_pct.read().await;
+        let positions_guard = account.positions.read().await;
+        let recently_resolved_guard = account.recently_resolved_markets.read().await;
+
+        let this_positions = positions_guard
             .get(&lane_key)
             .expect("Account.positions pre-populated by run_real_sim");
-        let total_locked: f64 = account_guard
-            .positions
+        let total_locked: f64 = positions_guard
             .values()
             .flat_map(|v| v.iter())
             .map(|p| p.entry_cost)
             .sum();
-        let available = (account_guard.bankroll - total_locked).max(0.0);
+        let available = (*bankroll_guard - total_locked).max(0.0);
         let dd_halt = match crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT {
-            Some(threshold) => account_guard.max_drawdown_pct >= threshold,
+            Some(threshold) => *max_dd_guard >= threshold,
             None => false,
         };
-        let market_resolved = account_guard
-            .recently_resolved_markets
-            .contains(market_id.as_str());
+        let market_resolved = recently_resolved_guard.contains(market_id.as_str());
         (
             !this_positions.is_empty(),
             any_position_would_sell(this_positions, &frame, None),
             available,
             dd_halt,
-            account_guard.max_drawdown_pct,
+            *max_dd_guard,
             market_resolved,
         )
     };
@@ -466,8 +487,19 @@ async fn tick_once(
     }
     let needs_http = needs_sell || may_open;
 
+    // Сначала пробуем «живой» WS-снимок: если в кэше
+    // (`ProjectManager::last_snapshot_by_asset_id`) есть свежий мердж
+    // (≤ `WS_STRICT_BOOK_MAX_AGE_MS`) с заполненными лестницами `book_bids/asks` —
+    // собираем StrictBook напрямую и пропускаем HTTP `order_books` (экономим
+    // батч-окно `BOOK_BATCH_*` + сетевой roundtrip). При отсутствии/протухании
+    // кэша поведение прежнее: один request через `run_book_coordinator`.
     let strict_book: Option<StrictBook> = if needs_http {
-        fetch_http_strict_book(book_tx, &asset_id, tag).await
+        match try_fresh_ws_strict_book(last_snapshot_by_asset_id, &asset_id, current_timestamp_ms())
+            .await
+        {
+            Some(book) => Some(book),
+            None => fetch_http_strict_book(book_tx, &asset_id, tag).await,
+        }
     } else {
         None
     };
@@ -505,7 +537,8 @@ async fn tick_once(
         Some(String::new())
     };
 
-    // Торговля + MtM: порядок state.write → account.write (без инверсии).
+    // Торговля + MtM: порядок state.write → bankroll → max_drawdown_pct →
+    // last_prob → positions → pending_resolution → closing → recently_resolved_markets.
     // state дропаем после фазы торговли — MtM только по Account; печать — под read ниже.
     let mut sold = false;
     let mut bought = false;
@@ -514,23 +547,33 @@ async fn tick_once(
         .unwrap_or(currency_implied_prob);
     {
         let mut state_guard = state.write().await;
-        let mut account_guard = account.write().await;
+        // Поля `Account` берём индивидуально в порядке объявления, чтобы избежать
+        // deadlock'а с другими потребителями (см. doc у `Account`).
+        // `peak_bankroll` нужен только в MtM-фазе, но захватываем его в правильном
+        // порядке заранее, иначе получили бы инверсию с `update_drawdown`/`_blocking`,
+        // которые берут peak → max_dd.
+        let mut bankroll_guard = account.bankroll.write().await;
+        let mut peak_guard = account.peak_bankroll.write().await;
+        let mut max_dd_guard = account.max_drawdown_pct.write().await;
+        let mut last_prob_guard = account.last_prob.write().await;
+        let mut positions_guard = account.positions.write().await;
+        let mut pending_guard = account.pending_resolution.write().await;
+        let mut closing_guard = account.closing.write().await;
+        let recently_resolved_guard = account.recently_resolved_markets.read().await;
 
         // Обновить last_prob после HTTP (первая запись была WS до fetch).
-        account_guard
-            .last_prob
-            .insert(lane_key.clone(), effective_prob);
+        last_prob_guard.insert(lane_key.clone(), effective_prob);
 
         // Повторная проверка halt после HTTP (snapshot мог устареть за время запроса).
         let dd_halt_now = match crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT {
-            Some(threshold) => account_guard.max_drawdown_pct >= threshold,
+            Some(threshold) => *max_dd_guard >= threshold,
             None => false,
         };
         if !dd_halt_active && dd_halt_now && may_open {
             crate::tee_eprintln!(
                 "[real_sim] {tag}: halt by drawdown сработал между snapshot'ом и HTTP — \
                  новый вход отменяем (max_dd_pct={:.2}%)",
-                account_guard.max_drawdown_pct
+                *max_dd_guard
             );
         }
         // Та же логика для резолюции: колбек `Account::resolve_pending_market`
@@ -538,28 +581,27 @@ async fn tick_once(
         // Без этой повторной сверки `try_open_position` может открыть позицию
         // в только что резолвнутом маркете (до следующего тика, когда
         // `manage_positions` вытолкнет её в pending как чужой `asset_id`).
-        let market_resolved_now = account_guard
-            .recently_resolved_markets
-            .contains(market_id.as_str());
+        let market_resolved_now = recently_resolved_guard.contains(market_id.as_str());
         if !market_already_resolved && market_resolved_now && may_open {
             crate::tee_eprintln!(
                 "[real_sim] {tag}: market={market_id} резолвнулся между snapshot'ом и HTTP — отмена входа"
             );
         }
+        // recently_resolved-лок больше не нужен — отпускаем, чтобы не держать его
+        // через торговую фазу.
+        drop(recently_resolved_guard);
         let may_open = may_open && !dd_halt_now && !market_resolved_now;
 
         // Фаза 1: торговля (sold/bought из возвратов manage_positions / try_open_position).
         if has_positions || may_open {
             // Чужие лейны + их pending: entry_cost всё ещё занят до резолюции.
-            let cross_lanes_locked: f64 = account_guard
-                .positions
+            let cross_lanes_locked: f64 = positions_guard
                 .iter()
                 .filter(|(k, _)| *k != &lane_key)
                 .flat_map(|(_, v)| v.iter())
                 .map(|p| p.entry_cost)
                 .chain(
-                    account_guard
-                        .pending_resolution
+                    pending_guard
                         .iter()
                         .filter(|(k, _)| *k != &lane_key)
                         .flat_map(|(_, v)| v.iter())
@@ -576,21 +618,14 @@ async fn tick_once(
                 CurrencyUpDownOutcome::Down => &mut stats.down,
             };
 
-            let Account {
-                bankroll,
-                positions: account_positions,
-                pending_resolution: account_pending,
-                closing: account_closing,
-                ..
-            } = &mut *account_guard;
             // Три разные HashMap — три get_mut на один lane_key без конфликта.
-            let this_positions: &mut Vec<OpenPosition> = account_positions
+            let this_positions: &mut Vec<OpenPosition> = positions_guard
                 .get_mut(&lane_key)
                 .expect("Account.positions pre-populated by run_real_sim");
-            let this_pending: &mut Vec<OpenPosition> = account_pending
+            let this_pending: &mut Vec<OpenPosition> = pending_guard
                 .get_mut(&lane_key)
                 .expect("Account.pending_resolution pre-populated by run_real_sim");
-            let this_closing: &mut Vec<crate::history_sim::ClosingPosition> = account_closing
+            let this_closing: &mut Vec<crate::history_sim::ClosingPosition> = closing_guard
                 .get_mut(&lane_key)
                 .expect("Account.closing pre-populated by run_real_sim");
 
@@ -604,7 +639,7 @@ async fn tick_once(
                     false, // history_sim only: last-frame fallback
                     p_win_now,
                     side_stats,
-                    bankroll,
+                    &mut bankroll_guard,
                     strict_book.as_ref(),
                     None, // MINPOSITION_FRAMES — выдержка нужна только в history_sim
                 );
@@ -617,7 +652,8 @@ async fn tick_once(
                     .chain(this_pending.iter())
                     .map(|p| p.entry_cost)
                     .sum();
-                let available_bankroll_post = (*bankroll - cross_lanes_locked - same_locked_post).max(0.0);
+                let available_bankroll_post =
+                    (*bankroll_guard - cross_lanes_locked - same_locked_post).max(0.0);
                 let polymarket_url = polymarket_event_url_from_frame(
                     currency,
                     interval_kind,
@@ -660,23 +696,20 @@ async fn tick_once(
         }
 
         drop(state_guard);
+        // closing нужен был только для торговой фазы выше; отпускаем заранее
+        // — MtM ниже его не трогает.
+        drop(closing_guard);
 
         // Фаза 2: портфельный MtM каждый тик → update_drawdown. Активные: shares × prob (этот лейн — effective_prob,
         // остальные — last_prob, clamp). Pending: shares × buy_price (капитал заблокирован до резолюции).
         let total_value: f64 = {
-            let Account {
-                positions: account_positions,
-                pending_resolution: account_pending,
-                last_prob,
-                ..
-            } = &*account_guard;
-            let active: f64 = account_positions
+            let active: f64 = positions_guard
                 .iter()
                 .map(|((c, i, s), pos_vec)| {
                     let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
                         effective_prob
                     } else {
-                        last_prob
+                        last_prob_guard
                             .get(&(c.clone(), *i, *s))
                             .copied()
                             .unwrap_or(0.5)
@@ -689,21 +722,35 @@ async fn tick_once(
                     pos_vec.iter().map(|p| p.shares_held * prob).sum::<f64>()
                 })
                 .sum();
-            let pending: f64 = account_pending
+            let pending: f64 = pending_guard
                 .values()
                 .flat_map(|v| v.iter())
                 .map(|p| p.shares_held * p.buy_price)
                 .sum();
             active + pending
         };
-        let equity = account_guard.bankroll + total_value;
-        account_guard.update_drawdown(equity);
+        let equity = *bankroll_guard + total_value;
+        // Пишем `peak_bankroll` / `max_drawdown_pct` инлайном, не дёргая
+        // `update_drawdown(_blocking)`: те хотят свои собственные локи на эти
+        // поля, но мы уже держим `peak_guard` / `max_dd_guard` write-локами
+        // (захвачены выше в каноническом порядке).
+        if equity > *peak_guard {
+            *peak_guard = equity;
+        }
+        if *peak_guard > 0.0 {
+            let drawdown_pct = (*peak_guard - equity) / *peak_guard * 100.0;
+            if drawdown_pct > *max_dd_guard {
+                *max_dd_guard = drawdown_pct;
+            }
+        }
     }
 
-    // Печать только при сделке; под read (consistency best-effort после дропа write).
+    // Печать только при сделке; снимок bankroll/max_dd под short-lived read-локами
+    // (consistency best-effort после дропа write выше).
     if bought || sold {
         let state_guard = state.read().await;
-        let account_guard = account.read().await;
+        let bankroll_now = *account.bankroll.read().await;
+        let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
         let stats = state_guard
             .stats
             .get(&interval_kind)
@@ -719,7 +766,7 @@ async fn tick_once(
             "[real_sim] {tag}: {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
             current_timestamp_ms(),
         );
-        print_sim_stats(tag, stats, &account_guard, true); // kelly
+        print_sim_stats(tag, stats, bankroll_now, max_drawdown_pct_now, true); // kelly
     }
 
     *last_market_id = Some(market_id);
@@ -765,6 +812,46 @@ async fn fetch_http_strict_book(
             None
         }
     }
+}
+
+/// Собрать [`StrictBook`] из последнего «живого» WS-снимка
+/// ([`ProjectManager::last_snapshot_by_asset_id`]) — или `None`, если в нём
+/// нет полных лестниц `book_bids/asks` (например, шёл только поток
+/// `price_change` со чисто L1 `best_bid`/`best_ask`, а агрегата `book` ещё не
+/// случилось). `min_order_size` в WS-сообщениях не приходит, оставляем `None`
+/// — это соответствует «без min-фильтра» в `book_fill_*_strict` (см.
+/// `if let Some(min) = book.min_order_size` в [`crate::history_sim`]).
+fn strict_book_from_snapshot(snapshot: &MarketSnapshot) -> Option<StrictBook> {
+    let bids = snapshot.book_bids.clone()?;
+    let asks = snapshot.book_asks.clone()?;
+    if bids.is_empty() || asks.is_empty() {
+        return None;
+    }
+    Some(StrictBook {
+        bids,
+        asks,
+        last_trade_price: snapshot.last_trade_price,
+        min_order_size: None,
+    })
+}
+
+/// Свежий WS-снимок по `asset_id` → [`StrictBook`]; иначе `None` и идём в HTTP.
+///
+/// Условия freshness: `now_ms - snapshot.timestamp_ms <= WS_STRICT_BOOK_MAX_AGE_MS`
+/// **и** в снимке есть обе лестницы (`book_bids`+`book_asks` непусты). Read-лок
+/// short-lived: только на `get` + клон — мерджит снимки писатель в
+/// [`ProjectManager::update_last_snapshot`], тут только читаем.
+async fn try_fresh_ws_strict_book(
+    last_snapshot_by_asset_id: &Arc<RwLock<HashMap<String, MarketSnapshot>>>,
+    asset_id: &str,
+    now_ms: i64,
+) -> Option<StrictBook> {
+    let guard = last_snapshot_by_asset_id.read().await;
+    let snapshot = guard.get(asset_id)?;
+    if now_ms.saturating_sub(snapshot.timestamp_ms) > WS_STRICT_BOOK_MAX_AGE_MS {
+        return None;
+    }
+    strict_book_from_snapshot(snapshot)
 }
 
 /// Один таск: собирает [`BookRequest`] в батч (idle + max wait + cap по числу лейнов), дедуп по `asset_id`, один `order_books`.

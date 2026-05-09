@@ -106,10 +106,10 @@ async fn main() -> Result<()> {
 
     match mode {
         AppMode::Train => {
-            train_mode::run_train_mode()?;
+            train_mode::run_train_mode().await?;
         }
         AppMode::HistorySim => {
-            history_sim::run_sim_mode()?;
+            history_sim::run_sim_mode().await?;
         }
         AppMode::TrainAndHistorySim => {
             // Train пишет в `xframes/last_train_mode.txt`, sim — в
@@ -117,9 +117,9 @@ async fn main() -> Result<()> {
             // явно дёргаем `tee_log::finish_tee_log`, чтобы первый файл
             // полностью смылся на диск (на случай если `run_sim_mode`
             // упадёт — обучение всё равно сохранится).
-            train_mode::run_train_mode()?;
+            train_mode::run_train_mode().await?;
             tee_log::finish_tee_log();
-            history_sim::run_sim_mode()?;
+            history_sim::run_sim_mode().await?;
         }
         AppMode::Migrate => {
             migration::run_migration()?;
@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
                 // отпустить, пайплайн продолжит жить. Карта каналов
                 // `lane_frame_channels` у `real_sim_state` остаётся пустой,
                 // фанаут просто молча отбрасывает кадры.
-                let _ = ProjectManager::new((*currency).to_string(), account.clone()).await;
+                let _ = ProjectManager::new((*currency).to_string(), account.clone());
             }
 
             std::future::pending::<()>().await;
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
 
             for currency in CURRENCIES {
                 let project_manager =
-                    ProjectManager::new((*currency).to_string(), account.clone()).await;
+                    ProjectManager::new((*currency).to_string(), account.clone());
                 real_sim::run_real_sim(project_manager).await?;
             }
 

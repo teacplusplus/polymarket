@@ -16,7 +16,7 @@
 //! PING каждые [`USER_WS_PING_INTERVAL_SECS`], watchdog по тишине,
 //! авто-реконнект с задержкой [`USER_WS_RECONNECT_DELAY_SECS`].
 
-use crate::account::{Account, SharedAccount};
+use crate::account::SharedAccount;
 use crate::history_sim::{ClosingPositionStatus, OpenPositionStatus};
 use crate::util::current_timestamp_ms;
 use futures_util::{SinkExt, StreamExt};
@@ -123,13 +123,13 @@ pub fn spawn_user_ws_listener(account: SharedAccount) {
     });
 }
 
-/// Поллим `Account.clob_authed` до появления `Some(_)` либо до таймаута.
+/// Поллим `Account.clob_authed` (ArcSwap) до появления `Some(_)` либо до таймаута.
 /// `Credentials` клонируем (это `Clone`-структура с `SecretString` внутри),
-/// чтобы не держать read-лок на `Account` всю жизнь WS-сессии.
+/// чтобы не держать `Guard<Arc<…>>` через всю жизнь WS-сессии.
 async fn wait_for_clob_credentials(account: &SharedAccount) -> Option<Credentials> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(USER_WS_WAIT_AUTH_MAX_SECS);
     loop {
-        if let Some(authed) = account.read().await.clob_authed.as_ref() {
+        if let Some(authed) = (**account.clob_authed.load()).as_ref() {
             return Some(authed.credentials().clone());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -432,15 +432,11 @@ async fn update_position_statuses(
     if new_open.is_none() && new_close.is_none() {
         return;
     }
-    let mut guard = account.write().await;
-    let Account {
-        positions,
-        pending_resolution,
-        closing,
-        ..
-    } = &mut *guard;
 
     if let Some(status) = new_open {
+        // Lock order: positions → pending_resolution (как в `Account` doc).
+        let mut positions = account.positions.write().await;
+        let mut pending_resolution = account.pending_resolution.write().await;
         let mut hit = false;
         for vec in positions.values_mut().chain(pending_resolution.values_mut()) {
             for pos in vec.iter_mut() {
@@ -458,6 +454,7 @@ async fn update_position_statuses(
     }
 
     if let Some(status) = new_close {
+        let mut closing = account.closing.write().await;
         let mut hit = false;
         for vec in closing.values_mut() {
             for c in vec.iter_mut() {

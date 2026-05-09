@@ -362,7 +362,7 @@ const PNL_CALIBRATION_HOLD_SEC: i64 = 0;
 ///   значение пар'ится с `token_won` маркета (`up_won` для UP, `!up_won` для
 ///   DOWN) — единый исход монотонно делит все hold-zone-кадры на «выигрышные»
 ///   и «проигрышные». PAV сошьёт их в монотонную калибровку.
-fn fit_calibration_via_sim_replay(
+async fn fit_calibration_via_sim_replay(
     val_paths: &[PathBuf],
     booster_for_calibration: &Booster,
     pnl_for_entries: Option<(&Booster, &Calibration)>,
@@ -435,9 +435,13 @@ fn fit_calibration_via_sim_replay(
 
         // См. [`CALIBRATION_REPLAY_BANKROLL_USD`]: намеренно ≫ INITIAL_BANKROLL,
         // чтобы убрать capacity-фильтр real-bankroll'а из калибровочного сета.
-        let mut account = Account::new();
-        account.bankroll = CALIBRATION_REPLAY_BANKROLL_USD;
-        account.peak_bankroll = CALIBRATION_REPLAY_BANKROLL_USD;
+        // Account использует interior mutability (per-field RwLock); пишем
+        // через `.write().await` в каноническом порядке (`bankroll → peak_bankroll`).
+        // `Arc<Account>` (через `new_shared`) для единообразия с real_sim/PM —
+        // `&account` дерефается в `&Account` для всех вызовов ниже.
+        let account = Account::new_shared();
+        *account.bankroll.write().await = CALIBRATION_REPLAY_BANKROLL_USD;
+        *account.peak_bankroll.write().await = CALIBRATION_REPLAY_BANKROLL_USD;
         let mut sim_stats = SimStats::new();
 
         let event_end_ms = window_bounds_from_dump_path(path, interval_kind)
@@ -461,7 +465,7 @@ fn fit_calibration_via_sim_replay(
                 Some(calibration_pnl),
                 booster_resolution,
                 None, // см. doc: calibration_resolution не передаётся
-                &mut account,
+                &account,
                 &lane_key,
                 side_stats,
                 currency,
@@ -472,21 +476,24 @@ fn fit_calibration_via_sim_replay(
                 event_end_ms,
                 &bin_dump_path,
                 hold_sec,
-            );
+            )
+            .await;
         }
 
         // Хвост позиций, доехавших до конца окна, лежит в `account.pending_resolution`
         // под нашим `lane_key`. resolve_pending_market_sync закрывает их бинарной
         // выплатой и (благодаря патчу в account.rs) push'ит в closed_trade_entries.
         if let Some(market_id) = market_id_opt {
-            account.resolve_pending_market_sync(
-                &mut sim_stats,
-                currency,
-                interval_kind,
-                &market_id,
-                up_won,
-                None,
-            );
+            account
+                .resolve_pending_market_sync(
+                    &mut sim_stats,
+                    currency,
+                    interval_kind,
+                    &market_id,
+                    up_won,
+                    None,
+                )
+                .await;
         }
 
         let side_stats_ref: &SideStats = match side {
@@ -581,7 +588,7 @@ fn fit_calibration_via_sim_replay(
 /// сравнить distribution shift «глазами» и зафиксировать, какой набор
 /// фактически попал в PAV.
 #[allow(clippy::too_many_arguments)]
-fn fit_calibration(
+async fn fit_calibration(
     booster: &Booster,
     dmat: &DMatrix,
     val_markets: &[MarketDataset],
@@ -632,7 +639,8 @@ fn fit_calibration(
         interval_kind,
         model_type,
         tag,
-    );
+    )
+    .await;
     let preds_sim: Vec<f32> = entries.iter().map(|(r, _)| *r).collect();
     let y_sim: Vec<f32> = entries.iter().map(|(_, w)| if *w { 1.0 } else { 0.0 }).collect();
     let n_pos_sim = entries.iter().filter(|(_, w)| *w).count();
@@ -899,7 +907,11 @@ impl ModelType {
 
 /// Точка входа в режим обучения. Ищет валюты в `xframes/`, для каждой версии
 /// обучает модели по всем комбинациям interval × step × model_type × side.
-pub fn run_train_mode() -> anyhow::Result<()> {
+///
+/// `async fn`, потому что калибровочный sim-replay внутри `train_all_variants` →
+/// `train_and_save` → `fit_calibration` → `fit_calibration_via_sim_replay`
+/// дёргает `Account::*`-API под `.write().await` per-field RwLock'ов.
+pub async fn run_train_mode() -> anyhow::Result<()> {
     let xframes_root = Path::new("xframes");
     if !xframes_root.exists() {
         anyhow::bail!("Папка xframes/ не найдена — сначала запустите сбор данных (STATUS=default)");
@@ -991,7 +1003,8 @@ pub fn run_train_mode() -> anyhow::Result<()> {
                         interval,
                         interval_kind,
                         step_sec,
-                    )?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -1066,7 +1079,7 @@ impl AppendStats {
 /// `(currency, version, interval, step_sec)`. Каждая комбинация даёт отдельный
 /// файл `model_{interval}_{step_sec}s_{model_type}_{side}.ubj` — формат,
 /// который грузит `history_sim`.
-fn train_all_variants(
+async fn train_all_variants(
     train_paths: &[PathBuf],
     val_paths: &[PathBuf],
     test_paths: &[PathBuf],
@@ -1154,7 +1167,9 @@ fn train_all_variants(
                 &train_markets, &val_markets, &test_markets,
                 val_paths, currency, interval_kind, side,
                 &model_path, pnl_model_path.as_deref(), &tag, model_type, max_lag,
-            ) {
+            )
+            .await
+            {
                 Ok(()) => tee_println!("[train] {tag}: модель сохранена → {}", model_path.display()),
                 Err(err) => tee_eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
@@ -1361,7 +1376,7 @@ fn flatten_markets(markets: &[MarketDataset]) -> (Vec<f32>, Vec<f32>) {
 /// - **val** — используется optimizer'ом для подбора гиперпараметров и early stopping.
 /// - **test** — held-out, только для финальной честной оценки AUC.
 #[allow(clippy::too_many_arguments)]
-fn train_and_save(
+async fn train_and_save(
     train_markets: &[MarketDataset],
     val_markets: &[MarketDataset],
     test_markets: &[MarketDataset],
@@ -1494,7 +1509,9 @@ fn train_and_save(
     match fit_calibration(
         &booster, &dval, val_markets, val_paths, currency,
         interval_kind, side, model_type, pnl_for_entries, tag,
-    ) {
+    )
+    .await
+    {
         Ok(cal) => {
             tee_println!(
                 "[train] {tag}: calibration: breakpoints={} \

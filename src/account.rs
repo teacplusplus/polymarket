@@ -1,20 +1,25 @@
 //! Единый счёт-капитал на процесс: банкролл, пик equity, max drawdown.
 //! Счётчики сделок и per-side статистика — в [`crate::history_sim::SimStats`].
 //!
-//! Один [`SharedAccount`] (`Arc<RwLock<Account>>`) на все лейны и валюты,
-//! в отличие от старой схемы с отдельным «счётом» на каждый интервал.
+//! Один [`SharedAccount`] (`Arc<Account>`) на все лейны и валюты.
+//! [`Account`] держит каждое мутабельное поле под собственным
+//! `Arc<RwLock<…>>`, поэтому потребители конкурируют только за тот лок,
+//! который реально нужен (например, `bankroll` отдельно от `last_prob`).
+//! Read-mostly auth (`clob_authed`, `clob_signer`) живёт в `ArcSwapAny<Arc<…>>`
+//! — load без локов, swap атомарный.
 
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{ClosingPosition, INITIAL_BANKROLL, OpenPosition, SimStats};
-use crate::real_sim::{interval_label, side_label, RealSimState};
+use crate::real_sim::{RealSimState, interval_label, side_label};
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
+use arc_swap::ArcSwapAny;
 use indexmap::IndexSet;
+use polymarket_client_sdk::POLYGON;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::Uuid as ClobUuid;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
-use polymarket_client_sdk::POLYGON;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,24 +31,42 @@ use tokio::time::MissedTickBehavior;
 pub const RECENTLY_RESOLVED_MARKETS_CAP: usize = 8;
 
 /// Разделяемый счёт (`real_sim`, `ProjectManager`): один `Arc` на все воркеры.
-pub type SharedAccount = Arc<RwLock<Account>>;
+/// Никакого внешнего `RwLock`: вся синхронизация — на уровне отдельных полей
+/// [`Account`] (per-field `Arc<RwLock<…>>` / `ArcSwapAny<Arc<…>>`).
+pub type SharedAccount = Arc<Account>;
+
+/// Алиас под общий ключ `(currency, interval, side)`, по которому маршрутизируются
+/// `positions` / `pending_resolution` / `closing` / `last_prob`.
+pub type LaneKey = (String, XFrameIntervalKind, CurrencyUpDownOutcome);
 
 /// Реализованный капитал (`bankroll`), пик equity (`peak_bankroll`) и
 /// `max_drawdown_pct`. Пик и просадка считаются по MtM equity, не только по cash.
+///
+/// Каждое мутабельное поле живёт под собственным `Arc<RwLock<…>>`, чтобы
+/// потребители брали лок ровно того, что им нужно. Порядок локов при
+/// одновременном захвате нескольких — как объявлены ниже:
+/// `bankroll → peak_bankroll → max_drawdown_pct → last_prob → positions →
+/// pending_resolution → closing → recently_resolved_markets`. Соблюдаем во
+/// всех потребителях, иначе deadlock.
+///
+/// Sync-режимы ([`crate::history_sim`] / [`crate::train_mode`]) пользуются
+/// `try_read()` / `try_write()` с `.expect("uncontended")` — там Account живёт
+/// в одном потоке без конкурентных тасков. Async-потребители (`real_sim`,
+/// `account_ws`, `account_order`) — `read().await` / `write().await` как обычно.
 #[derive(Debug)]
 pub struct Account {
-    pub bankroll: f64,
-    pub peak_bankroll: f64,
-    pub max_drawdown_pct: f64,
+    pub bankroll: Arc<RwLock<f64>>,
+    pub peak_bankroll: Arc<RwLock<f64>>,
+    pub max_drawdown_pct: Arc<RwLock<f64>>,
     /// Последний известный implied prob по лейну; для MtM на лейнах без кадра на этом тике.
     /// Ключ с `currency`, чтобы PM разных валют не затирали друг друга.
-    pub last_prob: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), f64>,
+    pub last_prob: Arc<RwLock<HashMap<LaneKey, f64>>>,
     /// Открытые позиции по лейну. Здесь же, а не `RealSimState`, чтобы Kelly видел entry_cost
     /// по всем валютам/лейнам. Пред-инициализация в `register_currency_lanes` для `get_mut().unwrap()`.
-    pub positions: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), Vec<OpenPosition>>,
+    pub positions: Arc<RwLock<HashMap<LaneKey, Vec<OpenPosition>>>>,
     /// Позиции старого маркета после смены раунда в лейне; закрываются в [`Account::resolve_pending_market`],
     /// не через `manage_positions`.
-    pub pending_resolution: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), Vec<OpenPosition>>,
+    pub pending_resolution: Arc<RwLock<HashMap<LaneKey, Vec<OpenPosition>>>>,
     /// Записи о закрытиях позиций (TP/SL/Timeout/EV) для матчинга
     /// real-time подтверждений через user-WS канал
     /// (`wss://ws-subscriptions-clob.polymarket.com/ws/user`,
@@ -55,10 +78,10 @@ pub struct Account {
     /// В history_sim/real_sim сюда сразу идёт `Closed` (PnL уже учтён в
     /// `bankroll`), real-торговля будет создавать `PendingClose` и ждать
     /// колбека `apply_user_ws_event`.
-    pub closing: HashMap<(String, XFrameIntervalKind, CurrencyUpDownOutcome), Vec<ClosingPosition>>,
+    pub closing: Arc<RwLock<HashMap<LaneKey, Vec<ClosingPosition>>>>,
     /// Уже резолвнутые `condition_id` (см. [`RECENTLY_RESOLVED_MARKETS_CAP`]): не открывать сделку
     /// на маркет после резолюции при гонке HTTP/tick и колбека.
-    pub recently_resolved_markets: IndexSet<String>,
+    pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
     /// Unauthenticated CLOB-клиент Polymarket — **единственное место**, где
     /// он создаётся. Все потребители (`ProjectManager.clob`,
     /// [`try_authenticate_clob_for_heartbeats`]) забирают клон отсюда.
@@ -76,24 +99,22 @@ pub struct Account {
     pub clob: Arc<clob::Client>,
     /// Аутентифицированный CLOB-клиент Polymarket — single source of truth
     /// на процесс. Используется для `POST /v1/heartbeats` (см.
-    /// [`spawn_heartbeat`]) и в перспективе для `post_order` /
-    /// `cancel_order`. `None` если авторизацию не выполняли (иначе в
-    /// RealSim см. вызов [`try_authenticate_clob_for_heartbeats`] в `main` до
-    /// [`spawn_heartbeat`]) или она упала; в `history_sim`/`train` и т.п.
-    /// остаётся `None`.
+    /// [`spawn_heartbeat`]) и для постановки/отмены ордеров через
+    /// [`crate::account_order`]. `Arc<None>` если авторизацию не выполняли
+    /// (иначе в RealSim см. вызов [`try_authenticate_clob_for_heartbeats`]
+    /// в `main` до [`spawn_heartbeat`]) или она упала.
     ///
-    /// `clob::Client` — небольшой обёрткой над `Arc<ClientInner<...>>`,
-    /// `Clone` дешёвый, поэтому хранится по значению (внешний `Arc` не
-    /// нужен). Доступ из любого места — через
-    /// [`crate::project_manager::ProjectManager::clob_authed`].
-    pub clob_authed: Option<clob::Client<Authenticated<Normal>>>,
+    /// Read-mostly: hot-path читателей (`spawn_heartbeat`, `account_ws`,
+    /// `account_order`, `ProjectManager::clob_authed`) делают `load()` без
+    /// локов; запись только из [`try_authenticate_clob_for_heartbeats`].
+    pub clob_authed: ArcSwapAny<Arc<Option<clob::Client<Authenticated<Normal>>>>>,
     /// EOA-подписант (`POLY_PRIVATE_KEY` + `POLYGON` chain_id), кэшируется
     /// рядом с [`Self::clob_authed`] чтобы [`crate::account_order::post_order_on_clob`] не лез
     /// в `std::env` на каждый ордер. Заполняется в
     /// [`try_authenticate_clob_for_heartbeats`] одновременно с
-    /// `clob_authed`; `None` ↔ auth не поднимался / упал.
-    /// `PrivateKeySigner: Clone`, поэтому держим по значению.
-    pub clob_signer: Option<PrivateKeySigner>,
+    /// `clob_authed`; `Arc<None>` ↔ auth не поднимался / упал.
+    /// `PrivateKeySigner: Clone`, hot-path `load()` без локов.
+    pub clob_signer: ArcSwapAny<Arc<Option<PrivateKeySigner>>>,
 }
 
 impl Account {
@@ -103,32 +124,35 @@ impl Account {
                 .expect("failed to create Polymarket CLOB client"),
         );
         Self {
-            bankroll: INITIAL_BANKROLL,
-            peak_bankroll: INITIAL_BANKROLL,
-            max_drawdown_pct: 0.0,
-            last_prob: HashMap::new(),
-            positions: HashMap::new(),
-            pending_resolution: HashMap::new(),
-            closing: HashMap::new(),
-            recently_resolved_markets: IndexSet::new(),
+            bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
+            peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
+            max_drawdown_pct: Arc::new(RwLock::new(0.0)),
+            last_prob: Arc::new(RwLock::new(HashMap::new())),
+            positions: Arc::new(RwLock::new(HashMap::new())),
+            pending_resolution: Arc::new(RwLock::new(HashMap::new())),
+            closing: Arc::new(RwLock::new(HashMap::new())),
+            recently_resolved_markets: Arc::new(RwLock::new(IndexSet::new())),
             clob,
-            clob_authed: None,
-            clob_signer: None,
+            clob_authed: ArcSwapAny::new(Arc::new(None)),
+            clob_signer: ArcSwapAny::new(Arc::new(None)),
         }
     }
 
     /// Пустые `positions` / `pending_resolution` / `closing` для всех лейнов валюты
     /// ([`crate::real_sim::run_real_sim`]). `or_default()` идемпотентен при повторном вызове.
-    pub fn register_currency_lanes(
-        &mut self,
+    pub async fn register_currency_lanes(
+        &self,
         currency: &str,
         lanes: &[(XFrameIntervalKind, CurrencyUpDownOutcome)],
     ) {
+        let mut positions = self.positions.write().await;
+        let mut pending = self.pending_resolution.write().await;
+        let mut closing = self.closing.write().await;
         for (interval, side) in lanes {
             let key = (currency.to_string(), *interval, *side);
-            self.positions.entry(key.clone()).or_default();
-            self.pending_resolution.entry(key.clone()).or_default();
-            self.closing.entry(key).or_default();
+            positions.entry(key.clone()).or_default();
+            pending.entry(key.clone()).or_default();
+            closing.entry(key).or_default();
         }
     }
 
@@ -141,7 +165,10 @@ impl Account {
     /// resolution-строки (на момент входа в позицию неизвестна, появляется только в callback'е
     /// [`crate::xframe_dump::spawn_dump_market_xframes_binary`]).
     ///
-    /// **Lock order:** `state.write()` → `account.write()`, как в `tick_once`.
+    /// **Lock order:** сначала `state.write()` (RealSimState — внешний `RwLock`),
+    /// затем поля `Account` в порядке объявления (`bankroll → positions →
+    /// pending_resolution → recently_resolved_markets`). Соблюдаем во всех
+    /// потребителях, чтобы избежать deadlock'а.
     ///
     /// Drawdown здесь не обновляют — следующий `tick_once` вызовет `update_drawdown`.
     pub async fn resolve_pending_market(
@@ -154,21 +181,18 @@ impl Account {
         final_price: f64,
     ) {
         let mut state_guard = state.write().await;
-        let mut account_guard = account.write().await;
 
-        // Колбек резолюции может опередить смену `frame`: переносим совпадающие `market_id` из positions в pending.
+        // Колбек резолюции может опередить смену `frame`: переносим совпадающие `market_id`
+        // из positions в pending. Берём оба лока в порядке объявления полей.
         {
-            let Account {
-                positions,
-                pending_resolution,
-                ..
-            } = &mut *account_guard;
+            let mut positions = account.positions.write().await;
+            let mut pending = account.pending_resolution.write().await;
             for ((cur, int_kind, side), pos_vec) in positions.iter_mut() {
                 if cur.as_str() != currency || *int_kind != interval {
                     continue;
                 }
                 let key = (cur.clone(), *int_kind, *side);
-                let pending_vec = pending_resolution.entry(key).or_default();
+                let pending_vec = pending.entry(key).or_default();
                 let mut idx = 0;
                 while idx < pos_vec.len() {
                     if pos_vec[idx].market_id == market_id {
@@ -184,26 +208,30 @@ impl Account {
             .stats
             .get_mut(&interval)
             .expect("RealSimState.stats: оба интервала пред-инициализированы в new()");
-        account_guard.resolve_pending_market_sync(
-            sim_stats,
-            currency,
-            interval,
-            market_id,
-            up_won,
-            Some(final_price),
-        );
+        account
+            .resolve_pending_market_sync(
+                sim_stats,
+                currency,
+                interval,
+                market_id,
+                up_won,
+                Some(final_price),
+            )
+            .await;
     }
 
-    /// Ядро резолюции без локов: из `history_sim` с `&mut Account` или после локов из [`Account::resolve_pending_market`].
-    /// Пишет строки в [`crate::trade_csv_log`] и вызывает [`crate::trade_csv_log::record_market_outcome`].
+    /// Ядро резолюции: берёт `bankroll` / `pending_resolution` /
+    /// `recently_resolved_markets` под write-локами и проводит payout.
+    /// Пишет строки в [`crate::trade_csv_log`] и вызывает
+    /// [`crate::trade_csv_log::record_market_outcome`].
     ///
     /// `final_price_override` — фактическая цена закрытия окна, попадает в CSV-колонку
     /// `final_price` resolution-строк. `None` — берём `pos.final_price` (исторический режим:
     /// dump уже содержит финальную цену, она проставлена в `OpenPosition.final_price` на входе);
     /// `Some(_)` — переопределяем (real-time режим: на входе финал ещё неизвестен,
     /// прилетает позже из callback'а).
-    pub fn resolve_pending_market_sync(
-        &mut self,
+    pub async fn resolve_pending_market_sync(
+        &self,
         sim_stats: &mut SimStats,
         currency: &str,
         interval: XFrameIntervalKind,
@@ -211,21 +239,19 @@ impl Account {
         up_won: bool,
         final_price: Option<f64>,
     ) {
+        // Lock order: bankroll → pending_resolution → recently_resolved_markets.
+        
+        let mut recently_resolved = self.recently_resolved_markets.write().await;
         // До PnL: помечаем маркет резолвнутым (гонка HTTP vs колбек; FIFO cap — см. константу).
-        if self
-            .recently_resolved_markets
-            .insert(market_id.to_string())
-        {
-            while self.recently_resolved_markets.len() > RECENTLY_RESOLVED_MARKETS_CAP {
-                self.recently_resolved_markets.shift_remove_index(0);
+        if recently_resolved.insert(market_id.to_string()) {
+            while recently_resolved.len() > RECENTLY_RESOLVED_MARKETS_CAP {
+                recently_resolved.shift_remove_index(0);
             }
         }
+        drop(recently_resolved);
 
-        let Account {
-            bankroll,
-            pending_resolution,
-            ..
-        } = self;
+        let mut bankroll = self.bankroll.write().await;
+        let mut pending_resolution = self.pending_resolution.write().await;
 
         for ((cur, int_kind, side), vec) in pending_resolution.iter_mut() {
             if cur.as_str() != currency || *int_kind != interval {
@@ -322,24 +348,30 @@ impl Account {
                 }
             }
         }
+        drop(pending_resolution);
+        drop(bankroll);
+       
 
         crate::trade_csv_log::record_market_outcome(market_id, up_won);
     }
 
-    /// `Arc::new(RwLock::new(Account::new()))` — удобство для `main`/PM.
+    /// `Arc::new(Account::new())` — удобство для `main`/PM.
     pub fn new_shared() -> SharedAccount {
-        Arc::new(RwLock::new(Self::new()))
+        Arc::new(Self::new())
     }
 
     /// Пик equity и max DD по переданной MtM equity (вызыватель считает equity на каждом тике).
-    pub fn update_drawdown(&mut self, equity: f64) {
-        if equity > self.peak_bankroll {
-            self.peak_bankroll = equity;
+    /// Async: берёт `peak_bankroll` и `max_drawdown_pct` под write-локами в каноническом порядке.
+    pub async fn update_drawdown(&self, equity: f64) {
+        let mut peak = self.peak_bankroll.write().await;
+        let mut max_dd = self.max_drawdown_pct.write().await;
+        if equity > *peak {
+            *peak = equity;
         }
-        if self.peak_bankroll > 0.0 {
-            let drawdown_pct = (self.peak_bankroll - equity) / self.peak_bankroll * 100.0;
-            if drawdown_pct > self.max_drawdown_pct {
-                self.max_drawdown_pct = drawdown_pct;
+        if *peak > 0.0 {
+            let drawdown_pct = (*peak - equity) / *peak * 100.0;
+            if drawdown_pct > *max_dd {
+                *max_dd = drawdown_pct;
             }
         }
     }
@@ -365,7 +397,7 @@ const CLOB_HEARTBEAT_INTERVAL_SEC: u64 = 5;
 ///
 /// Если переменная пустая/отсутствует —
 /// [`try_authenticate_clob_for_heartbeats`] выходит молча, оставляя
-/// `Account.clob_authed = None`; [`spawn_heartbeat`] всё равно
+/// `Account.clob_authed = Arc::new(None)`; [`spawn_heartbeat`] всё равно
 /// поднимается, но clob-тик становится no-op'ом.
 pub(crate) const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
 
@@ -394,10 +426,10 @@ pub fn spawn_heartbeat(account: SharedAccount) {
     tokio::spawn(async move {
         // Аутентификация выполняется в `main` до [`spawn_heartbeat`]:
         // [`try_authenticate_clob_for_heartbeats`]. Здесь только снимаем
-        // снимок `clob_authed` на время жизни таска (`None` если auth не было
-        // или упал до спавна).
+        // снимок `clob_authed` через ArcSwap.load() — без локов; внутри
+        // `Arc<Option<…>>`, поэтому `.as_ref()` даёт `Option<&Client>`.
         let auth_client: Option<clob::Client<Authenticated<Normal>>> =
-            account.read().await.clob_authed.clone();
+            (**account.clob_authed.load()).clone();
 
         let mut clob_tick = tokio::time::interval(Duration::from_secs(CLOB_HEARTBEAT_INTERVAL_SEC));
         clob_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -468,10 +500,10 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 /// [`crate::project_manager::ProjectManager::clob_authed`]) берут клиент
 /// именно оттуда.
 ///
-/// Идемпотентна: если в Account уже лежит `Some(...)`, функция выходит
+/// Идемпотентна: если в Account уже лежит `Arc::new(Some(_))`, функция выходит
 /// без сетевого вызова. На любой ошибке (нет env-ключа, парсинг
 /// провалился, `clob::Client::new` упал, `authenticate()` вернул
-/// ошибку) — лог + Account остаётся с `None`; clob-тик в
+/// ошибку) — лог + Account остаётся с `Arc::new(None)`; clob-тик в
 /// [`spawn_heartbeat`] в этом случае молча no-op.
 ///
 /// Аутентификация = `create_or_derive_api_key` (внутри `authenticate()`):
@@ -481,7 +513,7 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 /// `signature_type=GnosisSafe + funder=<safe>` (тот же EOA сможет
 /// переиспользовать API-ключ).
 pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount) {
-    if account.read().await.clob_authed.is_some() {
+    if account.clob_authed.load().is_some() {
         return;
     }
     let private_key = match std::env::var(POLY_PRIVATE_KEY_ENV) {
@@ -505,15 +537,15 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount
     // `authentication_builder` потребляет `self`, поэтому клон обязателен:
     // нельзя «вынуть» клиент из `Arc<clob::Client>` в Account, не
     // ломая остальных потребителей (`ProjectManager.clob` и т.п.).
-    let unauth: clob::Client = (*account.read().await.clob).clone();
+    let unauth: clob::Client = (*account.clob).clone();
     match unauth.authentication_builder(&signer).authenticate().await {
         Ok(authed) => {
             // signer кэшируем рядом с authed-клиентом — нужен для
             // [`post_order_on_clob`] (`auth_client.sign(&signer, …)`),
             // чтобы не парсить `POLY_PRIVATE_KEY` на каждый ордер.
-            let mut guard = account.write().await;
-            guard.clob_authed = Some(authed);
-            guard.clob_signer = Some(signer);
+            // ArcSwap.store даёт атомарную замену без локов.
+            account.clob_authed.store(Arc::new(Some(authed)));
+            account.clob_signer.store(Arc::new(Some(signer)));
             crate::tee_println!(
                 "[heartbeat] CLOB authenticate OK (eoa={address:#x}); heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
             );
@@ -542,13 +574,13 @@ mod tests {
     /// Выполняет полный цикл как в RealSim перед [`spawn_heartbeat`]:
     /// 1. Читает `POLY_PRIVATE_KEY` через [`dotenvy`].
     /// 2. Вызывает [`try_authenticate_clob_for_heartbeats`] на свежем
-    ///    [`Account`] (где `clob_authed = None`).
-    /// 3. Проверяет, что после запроса `Account.clob_authed = Some(_)`
-    ///    (т.е. real `POST clob.polymarket.com/auth/api-key/...` отдал
-    ///    creds, и SDK построил `Authenticated<Normal>`-клиента).
+    ///    [`Account`] (где `clob_authed = Arc::new(None)`).
+    /// 3. Проверяет, что после запроса `Account.clob_authed.load()` отдаёт
+    ///    `Some(_)` (т.е. real `POST clob.polymarket.com/auth/api-key/...`
+    ///    отдал creds, и SDK построил `Authenticated<Normal>`-клиента).
     /// 4. Проверяет идемпотентность: повторный вызов — no-op
-    ///    (короткое замыкание на `clob_authed.is_some()`), HTTP-запроса
-    ///    не делает.
+    ///    (короткое замыкание на `clob_authed.load().is_some()`),
+    ///    HTTP-запроса не делает.
     ///
     /// **Делает реальный HTTP-запрос к Polymarket CLOB.** Помечен
     /// `#[ignore]`, чтобы не запускался в обычном `cargo test`. Запуск:
@@ -585,31 +617,31 @@ mod tests {
 
         let account = Account::new_shared();
 
-        // 1) Свежий Account → clob_authed=None, инвариант до запроса.
+        // 1) Свежий Account → clob_authed=Arc::new(None), инвариант до запроса.
         anyhow::ensure!(
-            account.read().await.clob_authed.is_none(),
-            "новый Account должен идти с clob_authed=None",
+            account.clob_authed.load().is_none(),
+            "новый Account должен идти с clob_authed=Arc::new(None)",
         );
 
         // 2) Полный auth-цикл: signer → unauth client → authentication_builder
-        //    → POST /auth/api-key → Account.clob_authed = Some(_).
+        //    → POST /auth/api-key → Account.clob_authed.store(Arc::new(Some(_))).
         try_authenticate_clob_for_heartbeats(&account).await;
         anyhow::ensure!(
-            account.read().await.clob_authed.is_some(),
+            account.clob_authed.load().is_some(),
             "после try_authenticate_clob_for_heartbeats clob_authed обязан быть Some \
              (если упало — смотри stderr-логи `[heartbeat] CLOB authenticate провалился: …`)",
         );
 
         // 3) Идемпотентность: второй вызов должен короткозамкнуться на
-        //    `clob_authed.is_some()` и НЕ делать повторный HTTP-запрос.
-        //    Снимаем Arc<ClientInner> и сравниваем по указателю — после
-        //    no-op у нас тот же самый клиент, не пересозданный.
-        let before = account.read().await.clob_authed.clone();
+        //    `clob_authed.load().is_some()` и НЕ делать повторный HTTP-запрос.
+        //    Сравниваем Arc по указателю — после no-op у нас тот же самый
+        //    Arc, не пересозданный.
+        let before = account.clob_authed.load_full();
         try_authenticate_clob_for_heartbeats(&account).await;
-        let after = account.read().await.clob_authed.clone();
+        let after = account.clob_authed.load_full();
         anyhow::ensure!(
-            before.is_some() && after.is_some(),
-            "оба вызова должны держать clob_authed = Some",
+            Arc::ptr_eq(&before, &after),
+            "идемпотентность нарушена: clob_authed Arc был пересоздан повторным auth-вызовом",
         );
 
         // 4) Реальный heartbeat-RPC через тот же клиент, что лежит в
@@ -620,10 +652,7 @@ mod tests {
         //    принимается сервером»). Первый вызов идёт с `None`
         //    (server-side создаст новый id), второй — с возвращённым
         //    UUID (chained heartbeat — тот же путь, что в hot-path-цикле).
-        let client = account
-            .read()
-            .await
-            .clob_authed
+        let client = (**account.clob_authed.load())
             .clone()
             .expect("clob_authed обязан быть Some после успешного auth-цикла выше");
 

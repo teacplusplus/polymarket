@@ -113,23 +113,23 @@ pub struct ProjectManager {
     pub clob: Arc<clob::Client>,
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
+    pub last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
     pub real_sim_state: Arc<RwLock<RealSimState>>,
     pub account: SharedAccount,
     pub split_done_by_market_id: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl ProjectManager {
-    pub async fn clob_authed(&self) -> Option<clob::Client<Authenticated<Normal>>> {
-        self.account.read().await.clob_authed.clone()
+    pub fn clob_authed(&self) -> Option<clob::Client<Authenticated<Normal>>> {
+        (**self.account.clob_authed.load()).clone()
     }
 
     /// WS, сборщик XFrame, циклы 5m/15m. Карта каналов [`LaneFrameChannels`](crate::real_sim::LaneFrameChannels) пуста до регистрации воркерами `real_sim`.
     ///
-    /// `async` — только из-за чтения [`crate::account::Account::clob`] под
-    /// `RwLock`. CLOB-клиент создаётся ровно в [`crate::account::Account::new`]
-    /// и переиспользуется: один пул соединений / DNS-кэш на все валюты и
-    /// плюс [`crate::account::spawn_heartbeat`].
-    pub async fn new(currency: String, account: SharedAccount) -> Arc<Self> {
+    /// CLOB-клиент создаётся ровно в [`crate::account::Account::new`] и
+    /// переиспользуется: один пул соединений / DNS-кэш на все валюты плюс
+    /// [`crate::account::spawn_heartbeat`].
+    pub fn new(currency: String, account: SharedAccount) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
         let http = Arc::new(
@@ -142,8 +142,9 @@ impl ProjectManager {
         // CLOB-клиент берём из `Account` (single source of truth, см.
         // `Account::clob` doc). `Arc::clone` ⇒ один инкремент счётчика,
         // обёртка над тем же `ClientInner` внутри SDK — никаких
-        // дублирующих `reqwest::Client` / DNS-резолверов.
-        let clob = account.read().await.clob.clone();
+        // дублирующих `reqwest::Client` / DNS-резолверов. Поле уже
+        // `Arc<clob::Client>`, лок не нужен.
+        let clob = account.clob.clone();
 
         let (market_ws_tx, market_ws_rx) =
             mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
@@ -174,6 +175,7 @@ impl ProjectManager {
             clob,
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
+            last_snapshot_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state,
             account,
             split_done_by_market_id: Arc::new(RwLock::new(HashMap::new())),
@@ -372,9 +374,36 @@ impl ProjectManager {
             }
         }
         {
+            let mut last_snapshot_by_asset_id = self.last_snapshot_by_asset_id.write().await;
+            for asset_id in &asset_ids {
+                last_snapshot_by_asset_id.remove(asset_id);
+            }
+        }
+        {
             let mut slugs = self.slug_to_market_id.write().await;
             slugs.retain(|_, v| v != market_id);
         }
+    }
+
+    /// Поддерживает «живой» агрегированный снимок WS-стрима по `asset_id` для
+    /// быстрого StrictBook'а в [`crate::real_sim::tick_once`] (см.
+    /// [`Self::last_snapshot_by_asset_id`]).
+    ///
+    /// Новый WS-event мерджится поверх предыдущего через
+    /// [`aggregate_events`]: полные лестницы `book_bids/asks` сохраняются, если
+    /// текущий event их не несёт (например, `price_change` со чисто L1
+    /// `best_bid`/`best_ask`), `timestamp_ms` — `max` по входу. Без этого слепое
+    /// перезаписывание оставило бы кэш бесполезным после первого `book` —
+    /// последующие `price_change`-события не имеют bids/asks и StrictBook
+    /// собрать было бы нельзя.
+    pub async fn update_last_snapshot(&self, snapshot: &MarketSnapshot) {
+        let mut last_snapshot_by_asset_id = self.last_snapshot_by_asset_id.write().await;
+        let merged = match last_snapshot_by_asset_id.remove(&snapshot.asset_id) {
+            Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms)
+                .unwrap_or_else(|| snapshot.clone()),
+            None => snapshot.clone(),
+        };
+        last_snapshot_by_asset_id.insert(snapshot.asset_id.clone(), merged);
     }
 
     pub async fn append_ws_stream_entries(&self, entries: Vec<WsStreamEntry>) {

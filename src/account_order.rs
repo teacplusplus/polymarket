@@ -155,21 +155,18 @@ pub async fn post_order_on_clob(
 ) -> Result<PostOrderResult> {
     validate_post_order_request(&request)?;
 
-    // Снимок auth-стейта под read-локом. Клонируем оба — `clob::Client`
-    // обёртка над `Arc<ClientInner>` (дешёвый clone), `PrivateKeySigner`
-    // тоже Clone. После релиза лока сетевые вызовы идут без локов.
-    let (auth_client, signer) = {
-        let guard = account.read().await;
-        let client = guard.clob_authed.clone().ok_or_else(|| {
-            anyhow!(
-                "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
-            )
-        })?;
-        let signer = guard.clob_signer.clone().ok_or_else(|| {
-            anyhow!("post_order_on_clob: clob_signer=None — auth-цикл не запускался?")
-        })?;
-        (client, signer)
-    };
+    // Снимок auth-стейта через ArcSwap: hot-path без локов, оба `load()`
+    // консистентны на момент вызова. `clob::Client` — обёртка над
+    // `Arc<ClientInner>` (дешёвый clone), `PrivateKeySigner` тоже Clone;
+    // клонируем под snapshot Arc, чтобы не держать guard через сетевые вызовы.
+    let auth_client = (**account.clob_authed.load()).clone().ok_or_else(|| {
+        anyhow!(
+            "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
+        )
+    })?;
+    let signer = (**account.clob_signer.load()).clone().ok_or_else(|| {
+        anyhow!("post_order_on_clob: clob_signer=None — auth-цикл не запускался?")
+    })?;
 
     let token_id = U256::from_str(&request.asset_id).with_context(|| {
         format!(
@@ -567,18 +564,15 @@ pub async fn cancel_order_on_clob(
         bail!("cancel_order_on_clob: пустой order_id");
     }
 
-    // Снимок auth-клиента под read-локом. `clob::Client` — это обёртка
-    // над `Arc<ClientInner>`, clone дешёвый. Signer для отмены не
-    // требуется (в отличие от `post_order_on_clob`): SDK подписывает
-    // запрос HMAC'ом по API-key creds.
-    let auth_client = {
-        let guard = account.read().await;
-        guard.clob_authed.clone().ok_or_else(|| {
-            anyhow!(
-                "cancel_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
-            )
-        })?
-    };
+    // Снимок auth-клиента через ArcSwap.load() — без локов. `clob::Client` —
+    // обёртка над `Arc<ClientInner>`, clone дешёвый. Signer для отмены не
+    // требуется (в отличие от `post_order_on_clob`): SDK подписывает запрос
+    // HMAC'ом по API-key creds.
+    let auth_client = (**account.clob_authed.load()).clone().ok_or_else(|| {
+        anyhow!(
+            "cancel_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
+        )
+    })?;
 
     let resp = match tokio::time::timeout(
         request.timeout,
