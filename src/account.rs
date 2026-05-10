@@ -9,7 +9,9 @@
 //! — load без локов, swap атомарный.
 
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
-use crate::history_sim::{ClosingPosition, INITIAL_BANKROLL, OpenPosition, SimStats};
+use crate::history_sim::{
+    INITIAL_BANKROLL, SharedClosingPosition, SharedOpenPosition, SimStats,
+};
 use crate::real_sim::{RealSimState, interval_label, side_label};
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
@@ -46,8 +48,16 @@ pub type LaneKey = (String, XFrameIntervalKind, CurrencyUpDownOutcome);
 /// потребители брали лок ровно того, что им нужно. Порядок локов при
 /// одновременном захвате нескольких — как объявлены ниже:
 /// `bankroll → peak_bankroll → max_drawdown_pct → last_prob → positions →
-/// pending_resolution → closing → recently_resolved_markets`. Соблюдаем во
-/// всех потребителях, иначе deadlock.
+/// pending_resolution → closing → recently_resolved_markets → individual_pos_lock`.
+/// Соблюдаем во всех потребителях, иначе deadlock.
+///
+/// **Inner-локи на отдельные [`OpenPosition`] / [`ClosingPosition`]** (см.
+/// [`crate::history_sim::SharedOpenPosition`] / [`crate::history_sim::SharedClosingPosition`])
+/// лежат в самом конце канонического порядка: их разрешено брать **только
+/// после** взятия HashMap-лока контейнера, и в одной операции — **не более
+/// одного** inner-лока одновременно (иначе можно поймать deadlock на
+/// одной и той же позиции, попавшей через `Account.positions` и
+/// `ClosingPosition.position` одной и той же транзакцией).
 ///
 /// Sync-режимы ([`crate::history_sim`] / [`crate::train_mode`]) пользуются
 /// `try_read()` / `try_write()` с `.expect("uncontended")` — там Account живёт
@@ -63,10 +73,15 @@ pub struct Account {
     pub last_prob: Arc<RwLock<HashMap<LaneKey, f64>>>,
     /// Открытые позиции по лейну. Здесь же, а не `RealSimState`, чтобы Kelly видел entry_cost
     /// по всем валютам/лейнам. Пред-инициализация в `register_currency_lanes` для `get_mut().unwrap()`.
-    pub positions: Arc<RwLock<HashMap<LaneKey, Vec<OpenPosition>>>>,
+    ///
+    /// Каждая позиция — `Arc<RwLock<OpenPosition>>` (см.
+    /// [`SharedOpenPosition`]): тот же handle живёт в
+    /// [`Self::pending_resolution`] и в [`ClosingPosition::position`], так
+    /// что WS-fill пишет в одну запись, видимую отовсюду.
+    pub positions: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
     /// Позиции старого маркета после смены раунда в лейне; закрываются в [`Account::resolve_pending_market`],
     /// не через `manage_positions`.
-    pub pending_resolution: Arc<RwLock<HashMap<LaneKey, Vec<OpenPosition>>>>,
+    pub pending_resolution: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
     /// Записи о закрытиях позиций (TP/SL/Timeout/EV) для матчинга
     /// real-time подтверждений через user-WS канал
     /// (`wss://ws-subscriptions-clob.polymarket.com/ws/user`,
@@ -78,7 +93,11 @@ pub struct Account {
     /// В history_sim/real_sim сюда сразу идёт `Closed` (PnL уже учтён в
     /// `bankroll`), real-торговля будет создавать `PendingClose` и ждать
     /// колбека `apply_user_ws_event`.
-    pub closing: Arc<RwLock<HashMap<LaneKey, Vec<ClosingPosition>>>>,
+    ///
+    /// Каждая запись — `Arc<RwLock<ClosingPosition>>` (см.
+    /// [`SharedClosingPosition`]); spawned-таски (`account_submit`,
+    /// `account_ws`) держат тот же handle, статус апдейтится атомарно.
+    pub closing: Arc<RwLock<HashMap<LaneKey, Vec<SharedClosingPosition>>>>,
     /// Уже резолвнутые `condition_id` (см. [`RECENTLY_RESOLVED_MARKETS_CAP`]): не открывать сделку
     /// на маркет после резолюции при гонке HTTP/tick и колбека.
     pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
@@ -182,8 +201,20 @@ impl Account {
     ) {
         let mut state_guard = state.write().await;
 
+        // Собираем live TP-order_id'ы для отмены ниже (см. doc у
+        // `crate::account_submit::spawn_cancel_tp_orders_after_resolution`):
+        // auto-redeem забирает шеры, но висящие maker TP-лимитки CLOB
+        // оставит без явного DELETE, и они будут продолжать висеть до
+        // протухания. В виртуальных режимах `tp_order_id` всегда `None` —
+        // вектор останется пустым и спавна не будет.
+        // `Vec<SharedOpenPosition>` — позиции с активным `tp_order_id`
+        // (его и `id` заберёт сама `spawn_cancel_tp_orders_after_resolution`
+        // под write-lock'ом, см. doc там).
+        let mut positions_with_tp: Vec<crate::history_sim::SharedOpenPosition> = Vec::new();
+
         // Колбек резолюции может опередить смену `frame`: переносим совпадающие `market_id`
-        // из positions в pending. Берём оба лока в порядке объявления полей.
+        // из positions в pending. Берём оба лока в порядке объявления полей,
+        // плюс per-position write для чтения `market_id` и снятия `tp_order_id`.
         {
             let mut positions = account.positions.write().await;
             let mut pending = account.pending_resolution.write().await;
@@ -195,13 +226,36 @@ impl Account {
                 let pending_vec = pending.entry(key).or_default();
                 let mut idx = 0;
                 while idx < pos_vec.len() {
-                    if pos_vec[idx].market_id == market_id {
-                        pending_vec.push(pos_vec.swap_remove(idx));
+                    let matches_market = {
+                        let pos_g = pos_vec[idx].read().await;
+                        pos_g.market_id == market_id
+                    };
+                    if matches_market {
+                        let pos_arc = pos_vec.swap_remove(idx);
+                        // Если у позиции есть активный TP — тащим её Arc в
+                        // `positions_with_tp`. `take()` для `tp_order_id`
+                        // делает `spawn_cancel_tp_orders_after_resolution`
+                        // сама (под собственным write-lock'ом) — там же
+                        // читает `pos_id`. Здесь просто отмечаем кандидатов;
+                        // флаг `is_some` под коротким read-локом достаточен
+                        // (под этим же лок-фреймом доступа к pos_arc больше
+                        // ни у кого нет — мы её уже `swap_remove`-нули).
+                        let has_tp = pos_arc.read().await.tp_order_id.is_some();
+                        if has_tp {
+                            positions_with_tp.push(pos_arc.clone());
+                        }
+                        pending_vec.push(pos_arc);
                     } else {
                         idx += 1;
                     }
                 }
             }
+        }
+        if !positions_with_tp.is_empty() {
+            crate::account_submit::spawn_cancel_tp_orders_after_resolution(
+                account.clone(),
+                positions_with_tp,
+            );
         }
 
         let sim_stats = state_guard
@@ -268,8 +322,16 @@ impl Account {
 
             let mut i = 0;
             while i < vec.len() {
-                if vec[i].market_id == market_id {
-                    let pos = vec.swap_remove(i);
+                let matches_market = {
+                    let g = vec[i].read().await;
+                    g.market_id == market_id
+                };
+                if matches_market {
+                    let pos_arc = vec.swap_remove(i);
+                    // Снимаем полный snapshot позиции под одним read-локом —
+                    // сразу клонируем нужные поля, чтобы не держать pos-lock
+                    // через дальнейший stats / CSV-write.
+                    let pos = pos_arc.read().await.clone();
                     let pnl = if token_won {
                         pos.shares_held - pos.entry_cost
                     } else {
@@ -343,6 +405,7 @@ impl Account {
                             pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
                         });
                     }
+                    let _ = pos_arc;
                 } else {
                     i += 1;
                 }

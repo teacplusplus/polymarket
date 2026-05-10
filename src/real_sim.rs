@@ -7,7 +7,7 @@ use crate::account::SharedAccount;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
     BuyGate, any_position_would_sell, buy_gate, compute_p_win_now, compute_pnl_inference,
-    load_booster, manage_positions, print_sim_stats, try_open_position, OpenPosition,
+    load_booster, manage_positions, print_sim_stats, try_open_position,
     SimStats, StrictBook, HOLD_TO_END_THRESHOLD_SEC,
 };
 /// Тот же cap, что в [`crate::history_sim::manage_positions`] / `book_fill_*` (на TP при выполненном пороге VWAP — cap может игнорироваться).
@@ -162,7 +162,14 @@ pub(crate) fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
 }
 
 /// Загрузка моделей из `xframes/{currency}/{version}/`, 4 воркера → [`tick_once`].
-pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
+///
+/// `submit` — флаг режима [`crate::main::AppMode::RealSimWithSubmit`]. При
+/// `true` торговля идёт **реально**: BUY/SELL/cancel ордера летят на CLOB
+/// через [`crate::account_submit`], PnL финализируется по WS `trade` events
+/// в [`crate::account_ws`]. При `false` (`AppMode::RealSim`) — старое
+/// поведение: виртуальные fill'ы через `book_fill_*_strict`, PnL сразу
+/// учитывается в `bankroll`/`stats`.
+pub async fn run_real_sim(project_manager: Arc<ProjectManager>, submit: bool) -> Result<()> {
     let currency_arc = project_manager.currency.clone();
     let currency = currency_arc.as_str().to_string();
     let version_path = latest_version_path(&currency)
@@ -224,6 +231,7 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>) -> Result<()> {
             models,
             tag_prefix.clone(),
             rx,
+            submit,
         );
     }
 
@@ -241,6 +249,7 @@ fn spawn_side_worker(
     models: SideModels,
     tag_prefix: String,
     mut rx: mpsc::Receiver<LaneFrame>,
+    submit: bool,
 ) {
     tokio::spawn(async move {
         let tag = format!(
@@ -262,6 +271,7 @@ fn spawn_side_worker(
                 &tag,
                 &mut last_market_id,
                 lane_frame,
+                submit,
             ))
             .catch_unwind()
             .await;
@@ -343,6 +353,10 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// Один кадр: HTTP strict-book при необходимости, [`manage_positions`], опционально вход.
+///
+/// `submit=true` → торговая фаза идёт через `account_submit` (см. doc-комментарий
+/// у [`run_real_sim`]).
+#[allow(clippy::too_many_arguments)]
 async fn tick_once(
     book_tx: &mpsc::Sender<BookRequest>,
     state: &Arc<RwLock<RealSimState>>,
@@ -355,6 +369,7 @@ async fn tick_once(
     tag: &str,
     last_market_id: &mut Option<String>,
     lane_frame: LaneFrame,
+    submit: bool,
 ) -> Result<()> {
     let LaneFrame {
         market_id,
@@ -432,11 +447,12 @@ async fn tick_once(
         let this_positions = positions_guard
             .get(&lane_key)
             .expect("Account.positions pre-populated by run_real_sim");
-        let total_locked: f64 = positions_guard
-            .values()
-            .flat_map(|v| v.iter())
-            .map(|p| p.entry_cost)
-            .sum();
+        let mut total_locked = 0.0;
+        for v in positions_guard.values() {
+            for p in v.iter() {
+                total_locked += p.read().await.entry_cost;
+            }
+        }
         let available = (*bankroll_guard - total_locked).max(0.0);
         let dd_halt = match crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT {
             Some(threshold) => *max_dd_guard >= threshold,
@@ -445,7 +461,7 @@ async fn tick_once(
         let market_resolved = recently_resolved_guard.contains(market_id.as_str());
         (
             !this_positions.is_empty(),
-            any_position_would_sell(this_positions, &frame, None),
+            any_position_would_sell(this_positions, &frame, None).await,
             available,
             dd_halt,
             *max_dd_guard,
@@ -595,19 +611,23 @@ async fn tick_once(
         // Фаза 1: торговля (sold/bought из возвратов manage_positions / try_open_position).
         if has_positions || may_open {
             // Чужие лейны + их pending: entry_cost всё ещё занят до резолюции.
-            let cross_lanes_locked: f64 = positions_guard
-                .iter()
-                .filter(|(k, _)| *k != &lane_key)
-                .flat_map(|(_, v)| v.iter())
-                .map(|p| p.entry_cost)
-                .chain(
-                    pending_guard
-                        .iter()
-                        .filter(|(k, _)| *k != &lane_key)
-                        .flat_map(|(_, v)| v.iter())
-                        .map(|p| p.entry_cost),
-                )
-                .sum();
+            let mut cross_lanes_locked = 0.0;
+            for (k, v) in positions_guard.iter() {
+                if k == &lane_key {
+                    continue;
+                }
+                for p in v.iter() {
+                    cross_lanes_locked += p.read().await.entry_cost;
+                }
+            }
+            for (k, v) in pending_guard.iter() {
+                if k == &lane_key {
+                    continue;
+                }
+                for p in v.iter() {
+                    cross_lanes_locked += p.read().await.entry_cost;
+                }
+            }
 
             let stats: &mut SimStats = state_guard
                 .stats
@@ -619,13 +639,13 @@ async fn tick_once(
             };
 
             // Три разные HashMap — три get_mut на один lane_key без конфликта.
-            let this_positions: &mut Vec<OpenPosition> = positions_guard
+            let this_positions: &mut Vec<crate::history_sim::SharedOpenPosition> = positions_guard
                 .get_mut(&lane_key)
                 .expect("Account.positions pre-populated by run_real_sim");
-            let this_pending: &mut Vec<OpenPosition> = pending_guard
+            let this_pending: &mut Vec<crate::history_sim::SharedOpenPosition> = pending_guard
                 .get_mut(&lane_key)
                 .expect("Account.pending_resolution pre-populated by run_real_sim");
-            let this_closing: &mut Vec<crate::history_sim::ClosingPosition> = closing_guard
+            let this_closing: &mut Vec<crate::history_sim::SharedClosingPosition> = closing_guard
                 .get_mut(&lane_key)
                 .expect("Account.closing pre-populated by run_real_sim");
 
@@ -642,16 +662,21 @@ async fn tick_once(
                     &mut bankroll_guard,
                     strict_book.as_ref(),
                     None, // MINPOSITION_FRAMES — выдержка нужна только в history_sim
-                );
+                    submit,
+                    account,
+                )
+                .await;
             }
 
             // BUY: без входа при ws_lagging; bankroll после возможного sell этого лейна.
             if may_open && !ws_lagging {
-                let same_locked_post: f64 = this_positions
-                    .iter()
-                    .chain(this_pending.iter())
-                    .map(|p| p.entry_cost)
-                    .sum();
+                let mut same_locked_post = 0.0;
+                for p in this_positions.iter() {
+                    same_locked_post += p.read().await.entry_cost;
+                }
+                for p in this_pending.iter() {
+                    same_locked_post += p.read().await.entry_cost;
+                }
                 let available_bankroll_post =
                     (*bankroll_guard - cross_lanes_locked - same_locked_post).max(0.0);
                 let polymarket_url = polymarket_event_url_from_frame(
@@ -691,7 +716,10 @@ async fn tick_once(
                     gamma_question.as_deref(),
                     // SHAP уже посчитан вне локов; передаём строку как override.
                     pnl_top5_shap_at_open_precomputed,
-                );
+                    submit,
+                    account,
+                )
+                .await;
             }
         }
 
@@ -703,30 +731,32 @@ async fn tick_once(
         // Фаза 2: портфельный MtM каждый тик → update_drawdown. Активные: shares × prob (этот лейн — effective_prob,
         // остальные — last_prob, clamp). Pending: shares × buy_price (капитал заблокирован до резолюции).
         let total_value: f64 = {
-            let active: f64 = positions_guard
-                .iter()
-                .map(|((c, i, s), pos_vec)| {
-                    let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
-                        effective_prob
-                    } else {
-                        last_prob_guard
-                            .get(&(c.clone(), *i, *s))
-                            .copied()
-                            .unwrap_or(0.5)
-                    };
-                    let prob = if prob_raw.is_finite() {
-                        prob_raw.clamp(0.001, 0.999)
-                    } else {
-                        0.5
-                    };
-                    pos_vec.iter().map(|p| p.shares_held * prob).sum::<f64>()
-                })
-                .sum();
-            let pending: f64 = pending_guard
-                .values()
-                .flat_map(|v| v.iter())
-                .map(|p| p.shares_held * p.buy_price)
-                .sum();
+            let mut active = 0.0;
+            for ((c, i, s), pos_vec) in positions_guard.iter() {
+                let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
+                    effective_prob
+                } else {
+                    last_prob_guard
+                        .get(&(c.clone(), *i, *s))
+                        .copied()
+                        .unwrap_or(0.5)
+                };
+                let prob = if prob_raw.is_finite() {
+                    prob_raw.clamp(0.001, 0.999)
+                } else {
+                    0.5
+                };
+                for p in pos_vec.iter() {
+                    active += p.read().await.shares_held * prob;
+                }
+            }
+            let mut pending = 0.0;
+            for v in pending_guard.values() {
+                for p in v.iter() {
+                    let g = p.read().await;
+                    pending += g.shares_held * g.buy_price;
+                }
+            }
             active + pending
         };
         let equity = *bankroll_guard + total_value;

@@ -27,3 +27,4 @@ rand = "0.8"
 indexmap = "2.14.0"
 alloy = "1.8"
 arc-swap = "1.7"
+uuid = { version = "1.23.1", features = ["v4"] }

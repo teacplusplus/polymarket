@@ -14,6 +14,7 @@ pub mod train_mode;
 pub mod tee_log;
 pub mod history_sim;
 pub mod real_sim;
+pub mod account_submit;
 pub mod account;
 pub mod account_order;
 pub mod account_ws;
@@ -52,8 +53,28 @@ enum AppMode {
     TrainAndHistorySim,
     /// Реальная (виртуальная) торговля по живому WS потоку: поднимает тот же
     /// `ProjectManager` что и `Default`, плюс 4 tokio-воркера раз-в-секунду
-    /// (5m × 15m × up/down) с логикой из `history_sim`.
+    /// (5m × 15m × up/down) с логикой из `history_sim`. **Виртуальные fill'ы**:
+    /// `book_fill_*_strict` сразу даёт `shares_held`/`buy_price`, PnL финализируется
+    /// в `manage_positions`/`Account::resolve_pending_market`. CLOB-ордера НЕ
+    /// отправляются, heartbeat / user-WS / auth не поднимаются — для этого см.
+    /// [`AppMode::RealSimWithSubmit`].
     RealSim,
+    /// То же, что [`AppMode::RealSim`], но с **реальной отправкой ордеров**
+    /// на Polymarket CLOB через [`crate::account_order::post_order_on_clob`] /
+    /// [`crate::account_order::cancel_order_on_clob`]:
+    /// - вход taker BUY со slippage cap'ом ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]);
+    /// - TP — сразу maker SELL лимиткой по `pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP`
+    ///   (выставляется из WS-колбека `apply_user_ws_event_value` сразу после
+    ///   BUY-MATCHED + дублируется delayed-verify-таском, дедуп через
+    ///   `OpenPosition.tp_placement_attempted`);
+    /// - SL/Timeout/EvExit — отмена TP + taker SELL без slippage cap'а;
+    /// - PnL финализируется по реальным fills из user-WS `trade` events
+    ///   (см. [`crate::account_ws`]).
+    ///
+    /// Включает heartbeat ([`crate::account::spawn_heartbeat`]), auth-цикл
+    /// ([`crate::account::try_authenticate_clob_for_heartbeats`]) и user-WS
+    /// листенер ([`crate::account_ws::spawn_user_ws_listener`]).
+    RealSimWithSubmit,
     /// Одноразовая миграция дампов `xframes/...` под актуальную раскладку
     /// `XFrame` (см. `migration::run_migration`). Вызывается вручную через
     /// `STATUS=migrate`; идемпотентна — повторный запуск ничего не сделает.
@@ -80,6 +101,7 @@ impl AppMode {
             Ok("history_sim")           => AppMode::HistorySim,
             Ok("train_and_history_sim") => AppMode::TrainAndHistorySim,
             Ok("real_sim")              => AppMode::RealSim,
+            Ok("real_sim_with_submit")  => AppMode::RealSimWithSubmit,
             Ok("migrate")               => AppMode::Migrate,
             Ok("migrate_price_to_beat") => AppMode::MigratePriceToBeat,
             Ok("migrate_graph_html")    => AppMode::MigrateGraphHtml,
@@ -193,35 +215,65 @@ async fn main() -> Result<()> {
             trade_csv_log::set_current_regime("real_sim");
 
             // См. комментарий в `AppMode::Default` — общий счёт на процесс.
+            // В этом режиме CLOB-ордера НЕ отправляются, поэтому
+            // `try_authenticate_clob_for_heartbeats` / `spawn_heartbeat` /
+            // `spawn_user_ws_listener` НЕ запускаются — все эти таски нужны
+            // только для real-торговли (см. [`AppMode::RealSimWithSubmit`]).
+            let account = Account::new_shared();
+
+            for currency in CURRENCIES {
+                let project_manager =
+                    ProjectManager::new((*currency).to_string(), account.clone());
+                // submit=false → виртуальные fill'ы / закрытия как раньше
+                // (см. doc у [`real_sim::run_real_sim`]).
+                real_sim::run_real_sim(project_manager, false).await?;
+            }
+
+            std::future::pending::<()>().await;
+        }
+        AppMode::RealSimWithSubmit => {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
+
+            // Отдельные tee/CSV-файлы для submit-режима — чтобы анализировать
+            // прогоны с реальной торговлей независимо от чисто виртуальных.
+            tee_log::init_tee_log_file(
+                std::path::Path::new("xframes/last_real_sim_with_submit.txt"),
+                "real_sim_with_submit",
+            )?;
+            trade_csv_log::init_trade_csv_log_file(
+                std::path::Path::new("xframes/last_real_sim_with_submit_trades.csv"),
+            )?;
+            trade_csv_log::set_current_regime("real_sim_with_submit");
+
             let account = Account::new_shared();
 
             // CLOB L2-auth + кэш `clob_signer` до фоновых тасков: heartbeat и
             // user-WS читают готовый [`Account::clob_authed`] без гонки «ждём
-            // auth внутри heartbeat».
+            // auth внутри heartbeat». Без auth'а submit-режим бесполезен —
+            // `post_order_on_clob` упадёт на `clob_authed=None`, ордера не
+            // поедут. Лог об отсутствии `POLY_PRIVATE_KEY` поднимется внутри.
             account::try_authenticate_clob_for_heartbeats(&account).await;
 
-            // Глобальный CLOB heartbeat-таск (раз в 5s `POST /v1/heartbeats`,
-            // удерживает открытые ордера от автоматической отмены сервером).
-            // Один на процесс, не привязан к валюте: auth-сессия и
-            // [`Account.clob_authed`] — общий ресурс. Per-currency
-            // snapshot статистики (`print_sim_stats`) поднимается отдельно
-            // в [`real_sim::run_real_sim`] через `spawn_stats_snapshot`.
+            // Глобальный CLOB heartbeat-таск (раз в 5s `POST /v1/heartbeats`),
+            // удерживает открытые ордера от автоматической отмены сервером.
+            // Без heartbeat'а CLOB снимает все наши ордера через 10s тишины,
+            // а мы как раз держим maker TP-лимитки и pending taker'ы.
             account::spawn_heartbeat(account.clone());
 
-            // Глобальный user-WS листенер на процесс
-            // (`wss://ws-subscriptions-clob.polymarket.com/ws/user`):
-            // получает real-time `order`/`trade` события для
-            // подтверждения постановок/исполнений CLOB-ордеров и
-            // переводит статусы [`OpenPosition::open_status`] /
-            // [`ClosingPosition::close_status`]. [`Account::clob_authed`]
-            // поднимается выше через [`account::try_authenticate_clob_for_heartbeats`];
-            // листенер всё равно poll'ит на случай задержки, но обычно уже `Some`.
+            // Глобальный user-WS листенер на процесс — основной канал
+            // подтверждения постановок/исполнений и аккумуляции реальных
+            // fills для PnL (см. `crate::account_ws::apply_user_ws_event_value`).
+            // Без него мы остаёмся слепы относительно реальных shares/cost.
             account_ws::spawn_user_ws_listener(account.clone());
 
             for currency in CURRENCIES {
                 let project_manager =
                     ProjectManager::new((*currency).to_string(), account.clone());
-                real_sim::run_real_sim(project_manager).await?;
+                // submit=true → реальные `post_order_on_clob` / `cancel_order_on_clob`,
+                // PnL финализируется по WS `trade` events.
+                real_sim::run_real_sim(project_manager, true).await?;
             }
 
             std::future::pending::<()>().await;

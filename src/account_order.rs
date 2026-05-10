@@ -475,14 +475,14 @@ async fn compute_taker_cap_price(
 
 /// Лучший ask в [`StrictBook`]: первый уровень с положительной ценой и размером
 /// (как [`crate::history_sim::book_fill_buy_strict`] / [`crate::history_sim::effective_implied_prob`]).
-fn best_ask_strict(book: &StrictBook) -> Option<f64> {
+pub(crate) fn best_ask_strict(book: &StrictBook) -> Option<f64> {
     book.asks
         .iter()
         .find(|l| l.price > 0.0 && l.size > 0.0)
         .map(|l| l.price)
 }
 
-fn best_bid_strict(book: &StrictBook) -> Option<f64> {
+pub(crate) fn best_bid_strict(book: &StrictBook) -> Option<f64> {
     book.bids
         .iter()
         .find(|l| l.price > 0.0 && l.size > 0.0)
