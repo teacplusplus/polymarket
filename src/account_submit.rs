@@ -76,6 +76,21 @@ const SELL_TAKER_MAX_ATTEMPTS: u32 = 3;
 /// получаем ожидания 500ms и 1s между попытками.
 const SELL_TAKER_RETRY_INITIAL_MS: u64 = 500;
 
+/// Максимум попыток cancel'а maker-TP в [`spawn_cancel_tp_for_hold_zone`]
+/// (включая первую). Cancel сам по себе идемпотентен на стороне CLOB
+/// (`DELETE /order` на уже отменённой/сматченной лимитке вернёт
+/// `canceled=false` с `not_canceled[order_id]=reason`, но без ошибки),
+/// поэтому несколько HTTP-попыток здесь — это только защита от
+/// transient сетевых сбоев. На исчерпании попыток `tp_order_id` остаётся
+/// заполненным, а cancel при резолюции маркета подберёт лимитку через
+/// [`spawn_cancel_tp_orders_after_resolution`].
+const TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS: u32 = 3;
+
+/// Базовая задержка перед 1-м retry cancel'а TP в hold-zone; следующие
+/// удваиваются: `500ms → 1s → …` (exp-backoff). При
+/// [`TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS`]=3 — 500ms и 1s между попытками.
+const TP_HOLD_ZONE_CANCEL_RETRY_INITIAL_MS: u64 = 500;
+
 /// Спавнит таск отправки **BUY taker** на CLOB. Размер — в USDC
 /// (`amount=UsdNotional`).
 ///
@@ -275,6 +290,126 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
     spawn_polling_verify_tp(account.clone(), pos_arc.clone());
 }
 
+/// Спавнит таск **отмены maker-TP при входе позиции в hold-zone**.
+///
+/// Стратегический контекст: в hold-zone выходы должны быть только через
+/// resolution-модель (`EvExitProfit`/`EvExitLoss` taker'ом, см.
+/// [`crate::history_sim::sell_gate`] in-hold-zone ветка) или hard SL, чтобы
+/// зафиксировать ожидание выплаты от резолюции маркета вместо фиксированного
+/// `Y_TRAIN_TAKE_PROFIT_PP`-таргета maker-лимитки. Поэтому при первом же
+/// `SellGate::HoldResolution`-тике для позиции снимаем её TP-лимитку с CLOB.
+///
+/// **Дедуп**: caller (`manage_positions`-HoldResolution-ветка) **синхронно ДО**
+/// `tokio::spawn` атомарно проверяет/взводит
+/// [`crate::history_sim::OpenPosition::tp_cancel_attempted`]
+/// под inner-write `pos_arc`. Эта таска уже видит флаг `true` и в `pos_arc`
+/// ничего не меняет — её работа исключительно сетевая (`cancel_order_on_clob`)
+/// + аккуратное обнуление `tp_order_id` ровно на подтверждённом успехе.
+///
+/// **Гонка cancel ↔ TP-match (важно)**: между нашим HTTP `DELETE /order` и
+/// ответом CLOB лимитка теоретически может сматчиться. CLOB вернёт
+/// `canceled=false, not_canceled[id]="already filled"` (или похожее), а WS
+/// независимо доставит trade-event на этот же `order_id` в
+/// [`crate::account_ws::apply_sell_fill`] (TP-ветка), который ищет
+/// `pos.tp_order_id == order_id` в `Account.positions`. Поэтому:
+/// - `tp_order_id` НЕ обнуляем превентивно перед HTTP;
+/// - обнуляем ТОЛЬКО на `Ok(res) if res.canceled == true` — то есть когда
+///   CLOB подтвердил cancel и никакого TP-fill'а быть не может;
+/// - на `canceled=false` (already-filled / already-canceled / etc.) и на
+///   HTTP-ошибках — `tp_order_id` оставляем нетронутым, WS-фоллбэк
+///   корректно подберёт fill, либо `spawn_cancel_tp_orders_after_resolution`
+///   уберёт лимитку на резолюции.
+///
+/// **Локи и сеть**: под inner-read одной позиции только snapshot
+/// `(pos_id, asset_id, tp_order_id)`; HTTP идёт **без** локов; финальный
+/// `pos_arc.write()` (обнуление `tp_order_id`) — снова короткий inner-write
+/// только на успехе.
+pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpenPosition) {
+    tokio::spawn(async move {
+        // Snapshot под read-локом одной позиции: `tp_order_id` клонируем
+        // (не `take()`), чтобы при гонке cancel ↔ TP-match WS-фоллбэк в
+        // `apply_sell_fill` нашёл совпадение в `pos.tp_order_id`.
+        let (pos_id, asset_id, tp_order_id_opt) = {
+            let pos = pos_arc.read().await;
+            (pos.id.clone(), pos.asset_id.clone(), pos.tp_order_id.clone())
+        };
+        let Some(tp_id) = tp_order_id_opt else {
+            // Гонка: TP уже сматчился / был отменён до того, как мы вошли
+            // в таску, и кто-то (WS / polling) уже обнулил поле. Тут делать
+            // нечего — `tp_cancel_attempted=true` остаётся
+            // взведённым (повторов всё равно не будет), идемпотентность
+            // сохранена.
+            crate::tee_println!(
+                "[account_submit] TP cancel (hold-zone) skipped — tp_order_id=None: pos_id={pos_id}, asset={asset_id} (вероятно, гонка с WS-MATCHED)"
+            );
+            return;
+        };
+
+        let cancel_req = CancelOrderRequest {
+            order_id: tp_id.clone(),
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+        };
+        let mut last_result: Option<crate::account_order::CancelOrderResult> = None;
+        for attempt in 1..=TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS {
+            match cancel_order_on_clob(&account, cancel_req.clone()).await {
+                Ok(res) => {
+                    crate::tee_println!(
+                        "[account_submit] TP cancel (hold-zone) attempt {attempt}/{TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS}: pos_id={pos_id}, order_id={tp_id}, canceled={}, error_msg={:?}",
+                        res.canceled, res.error_msg,
+                    );
+                    last_result = Some(res);
+                    break;
+                }
+                Err(err) => {
+                    crate::tee_eprintln!(
+                        "[account_submit] TP cancel (hold-zone) HTTP-ошибка (attempt {attempt}/{TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}, tp_order_id={tp_id}: {err:#}"
+                    );
+                }
+            }
+            if attempt < TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS {
+                let delay_ms = TP_HOLD_ZONE_CANCEL_RETRY_INITIAL_MS << (attempt - 1);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+        }
+
+        match last_result {
+            Some(res) if res.canceled => {
+                // CLOB подтвердил: лимитка снята, никаких TP-fill'ов уже не будет.
+                // Обнуляем `tp_order_id` под коротким inner-write — теперь WS на
+                // этот `order_id` не найдёт совпадения и просто залогирует
+                // «не найден», что корректно (мы сами явно отменили).
+                let mut pw = pos_arc.write().await;
+                if pw.tp_order_id.as_deref() == Some(tp_id.as_str()) {
+                    pw.tp_order_id = None;
+                }
+                crate::tee_println!(
+                    "[account_submit] TP cancel (hold-zone) confirmed: pos_id={pos_id}, order_id={tp_id} — tp_order_id обнулён"
+                );
+            }
+            Some(_) => {
+                // `canceled=false` — лимитка уже была отменена / сматчена / нашлась
+                // в not_canceled с причиной. Поле `tp_order_id` оставляем как есть:
+                // если был TP-match в этот момент, WS его подберёт через
+                // `apply_sell_fill` TP-ветку; иначе резолюционный cleanup
+                // (`spawn_cancel_tp_orders_after_resolution`) дочистит.
+                crate::tee_println!(
+                    "[account_submit] TP cancel (hold-zone) не подтверждён CLOB: pos_id={pos_id}, order_id={tp_id} — оставляем tp_order_id живым, ждём WS-MATCHED / резолюцию"
+                );
+            }
+            None => {
+                // Все HTTP-попытки исчерпаны. `tp_order_id` оставляем — на
+                // резолюции `spawn_cancel_tp_orders_after_resolution` отменит.
+                // Флаг `tp_cancel_attempted=true` остаётся
+                // взведённым, повторных попыток отсюда не будет (по плану —
+                // в hold-zone не флудим cancel'ами).
+                crate::tee_eprintln!(
+                    "[account_submit] TP cancel (hold-zone) — все {TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS} попыток HTTP упали: pos_id={pos_id}, asset={asset_id}, tp_order_id={tp_id} — TP остаётся живым, будет снят резолюционным cleanup'ом"
+                );
+            }
+        }
+    });
+}
+
 /// Спавнит таск **закрытия позиции через taker SELL** (SL / Timeout / EvExit*):
 /// 1) если у `closing_arc.position` есть активный `tp_order_id` —
 ///    `cancel_order_on_clob` (поле `take()`-нится под write-локом, чтобы
@@ -299,54 +434,6 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
 /// — защита от повторного входа в `manage_positions`-сценарий для той же позиции.
 pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingPosition) {
     tokio::spawn(async move {
-        // Гейт по времени жизни маркета: если wall-clock уже за `event_end_ms`,
-        // SELL-taker на CLOB НЕ отправляем (и TP-maker не отменяем — пусть он
-        // имеет шанс ещё залиться до резолюции). Позиция доедет до
-        // [`crate::account::Account::resolve_pending_market`]: auto-redeem
-        // $1/$0, PnL/bankroll/SimStats и submit-CSV обновятся payout-колбеком
-        // (см. `record_market_outcome` / `record_submit_close_to_csv_and_stats`).
-        //
-        // Зачем нужно: `manage_positions` может дёрнуть SL/Timeout/EvExit на
-        // stale-кадре (когда `frame.event_remaining_ms` ещё > 0, потому что
-        // `snapshot.timestamp_ms` отстал, а wall-clock уже за `event_end_ms`).
-        // Без этого гейта мы бы тратили реальные taker-fee на SELL ровно в
-        // момент резолюции, при том что auto-redeem всё равно поднимет шеры
-        // до $1/$0 и закроет позицию. Зеркальный гейт по BUY стоит в
-        // [`crate::real_sim::tick_once`].
-        //
-        // Терминальное состояние записи: `close_status=CloseFailed`.
-        // `manage_positions` на следующем тике через `closing.retain` выкинет
-        // эту запись (см. doc-комментарий перед циклом cleanup), и `sell_gate`
-        // там же вернёт `HoldPnl` как только `frame.event_remaining_ms`
-        // догонит wall-clock (≤ 1с при здоровом WS). Если кадр ещё не догнал
-        // и `sell_gate` снова потребует close — спавн повторится и опять
-        // мгновенно отвалится по этому же гейту без HTTP. Когда маркет
-        // действительно резолвнется, `Account::resolve_pending_market`
-        // вытащит [`OpenPosition`] из `positions` в `pending_resolution`
-        // и проведёт бинарную выплату.
-        {
-            let now_wall_ms = crate::util::current_timestamp_ms();
-            let (event_end_ms_opt, pos_id_log, asset_id_log) = {
-                let pos_arc = closing_arc.read().await.position.clone();
-                let pos = pos_arc.read().await;
-                (pos.event_end_ms, pos.id.clone(), pos.asset_id.clone())
-            };
-            let past_event_end = match event_end_ms_opt {
-                Some(end_ms) => now_wall_ms >= end_ms,
-                None => false,
-            };
-            if past_event_end {
-                closing_arc.write().await.close_status = ClosingPositionStatus::CloseFailed;
-                crate::tee_println!(
-                    "[account_submit] SELL taker пропущен — wall-clock за event_end_ms: \
-                     pos_id={pos_id_log}, asset={asset_id_log}, now_wall_ms={now_wall_ms}, \
-                     event_end_ms={event_end_ms_opt:?} — ждём резолюцию через \
-                     Account::resolve_pending_market (PnL/bankroll/stats придут payout-колбеком)"
-                );
-                return;
-            }
-        }
-
         // Snapshot из позиции под коротким write-локом. Под этим же локом
         // делаем `take()` для `tp_order_id`, чтобы любой будущий код, заглянувший
         // в `pos.tp_order_id`, видел `None` (мы как раз его сейчас отменяем).

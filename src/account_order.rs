@@ -560,7 +560,7 @@ pub async fn cancel_order_on_clob(
     if request.timeout.is_zero() {
         bail!("cancel_order_on_clob: timeout=0 — DELETE /order не дождётся ответа");
     }
-    if request.order_id.trim().is_empty() {
+    if request.order_id.is_empty() {
         bail!("cancel_order_on_clob: пустой order_id");
     }
 

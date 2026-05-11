@@ -18,6 +18,7 @@ pub mod account_submit;
 pub mod account;
 pub mod account_order;
 pub mod account_ws;
+pub mod account_exit;
 pub mod migration;
 pub mod migration_price_to_beat;
 pub mod migration_graph_html;
@@ -266,6 +267,21 @@ async fn main() -> Result<()> {
             // `post_order_on_clob` упадёт на `clob_authed=None`, ордера не
             // поедут. Лог об отсутствии `POLY_PRIVATE_KEY` поднимется внутри.
             account::try_authenticate_clob_for_heartbeats(&account).await;
+            // Hard-stop: submit-режим без auth'а — это silent-misconfig, при
+            // котором каждый `post_order_on_clob` будет тихо падать
+            // с `clob_authed=None`, а позиции — копиться в `OpenFailed`.
+            // Логирование внутри `try_authenticate_clob_for_heartbeats`
+            // легко затеряется; единственный надёжный сигнал — упасть
+            // здесь сразу. Чтобы быть отказоустойчивым к рестартам,
+            // деплоймент должен гарантировать наличие `POLY_PRIVATE_KEY`
+            // в окружении до запуска бинаря.
+            assert!(
+                account.clob_authed.load().is_some(),
+                "[main/RealSimWithSubmit] CLOB auth не поднялся — submit-режим без \
+                 авторизации бесполезен. Проверьте `POLY_PRIVATE_KEY` в окружении \
+                 (см. `account::POLY_PRIVATE_KEY_ENV`) и сообщение от \
+                 `try_authenticate_clob_for_heartbeats` в логах выше.",
+            );
 
             // Глобальный CLOB heartbeat-таск (раз в 5s `POST /v1/heartbeats`),
             // удерживает открытые ордера от автоматической отмены сервером.
@@ -287,9 +303,71 @@ async fn main() -> Result<()> {
                 real_sim::run_real_sim(project_manager, true).await?;
             }
 
-            std::future::pending::<()>().await;
+            // Graceful shutdown по SIGINT (Ctrl+C) / SIGTERM (systemd, docker stop).
+            // Workflow (см. подробности в [`crate::account_exit::graceful_exit`]):
+            //   1. ставим [`account_exit::HALT_NEW_ORDERS`] = `true` —
+            //      все strategy-driven пути перестают спавнить новые
+            //      BUY/TP-maker ордера (`is_halted()`-гейт);
+            //   2. `DELETE /cancel-all` — снимаем все open-ордера одним
+            //      HTTP-вызовом;
+            //   3. `data/positions` → SELL-taker без slippage cap'а для
+            //      каждой позиции с shares > dust.
+            //
+            // Затем `std::process::exit(0)`: ждать «нормального» завершения
+            // фоновых tokio-тасок (heartbeat / user-WS / real-sim воркеры)
+            // на shutdown не имеет смысла — мы уже всё свернули; они
+            // прекратят работу при exit'е процесса.
+            wait_for_shutdown_signal().await;
+            crate::tee_println!("[main] получен shutdown-сигнал → graceful exit");
+            account_exit::graceful_exit(account.clone()).await;
+            std::process::exit(0);
         }
     }
 
     Ok(())
+}
+
+/// Ждёт `SIGINT` (Ctrl+C) или `SIGTERM` (systemd / docker stop / k8s graceful
+/// termination) и сразу возвращает управление. Используется только в
+/// [`AppMode::RealSimWithSubmit`]: остальные режимы либо терминальные
+/// (history-sim/train), либо ждут `Ctrl+C` через `tokio::signal::ctrl_c`
+/// напрямую без распределения по сигналам.
+///
+/// SIGTERM ловим через `tokio::signal::unix::signal(SignalKind::terminate())`
+/// — это unix-only, но `AppMode::RealSimWithSubmit` запускается из
+/// `linux 6.14.*` контейнера (см. `OS Version`), так что cross-platform
+/// поддержка не требуется. Если когда-нибудь захочется собрать под
+/// Windows — этот блок нужно будет окружить `#[cfg(unix)]` и добавить
+/// аналогичный ctrl_c-only вариант под `#[cfg(windows)]`.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(err) => {
+            tee_eprintln!(
+                "[main] не удалось зарегистрировать SIGTERM-хэндлер: {err:#}; \
+                 ждём только SIGINT (Ctrl+C)"
+            );
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tee_println!("[main] SIGINT (Ctrl+C)");
+        }
+        _ = sigterm.recv() => {
+            tee_println!("[main] SIGTERM");
+        }
+    }
+}
+
+/// Не-unix fallback: ловим только SIGINT (Ctrl+C) — на Windows
+/// SIGTERM-эквивалент идёт через CTRL_BREAK_EVENT, но мы туда не
+/// собираемся (см. doc у unix-варианта).
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+    tee_println!("[main] SIGINT (Ctrl+C)");
 }

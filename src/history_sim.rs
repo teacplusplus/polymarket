@@ -433,14 +433,68 @@ pub struct OpenPosition {
     /// и [`crate::account_submit::spawn_close_via_taker`] для отмены TP перед
     /// SELL taker по SL/Timeout/EvExit.
     pub(crate) tp_order_id: Option<String>,
-    /// Дедуп: `true` после первой попытки выставить TP-ордер (успех или нет).
-    /// Защищает от двойного `post_order_on_clob` при гонке между WS-колбеком
-    /// (`apply_user_ws_event_value` на BUY-MATCHED) и delayed-verify-таском
-    /// в [`crate::account_submit`]. Атомарно проверяется + взводится под коротким
-    /// `Account.positions` write-локом до сетевого вызова; HTTP идёт без лока.
-    /// В виртуальных режимах (history_sim / real_sim без submit) всегда `false` —
-    /// TP не выставляется как отдельный ордер.
+    /// Дедуп / pre-suppress: `true` означает «попытка выставить TP-maker уже
+    /// была — повторять не надо». Гейт в
+    /// [`crate::account_submit::try_place_tp_maker`] на этом флаге сразу
+    /// возвращается без HTTP. Два источника, где это поле уходит в `true`:
+    ///
+    /// 1. **Внутри `try_place_tp_maker`** — после взводящего snapshot'а ДО
+    ///    сетевого вызова `post_order_on_clob`. Защищает от двойного TP при
+    ///    гонке между WS-колбеком (`apply_user_ws_event_value` на BUY-MATCHED)
+    ///    и delayed-verify-таской из polling-flow `account_submit`.
+    /// 2. **На конструкции позиции в [`open_position`]**, если кадр входа уже
+    ///    лежит в hold-zone (`event_remaining_ms > 0 && <= HOLD_TO_END_THRESHOLD_SEC * 1000`).
+    ///    В hold-zone выходы должны идти только через resolution-модель
+    ///    (EvExit*-taker) или hard SL — TP-maker по фиксированному
+    ///    `Y_TRAIN_TAKE_PROFIT_PP` мешает поймать резолюционную выплату $1.
+    ///    Поэтому WS/polling-колбек BUY-MATCHED для такой позиции даже не
+    ///    попытается поставить TP — гейт в `try_place_tp_maker` отобьёт сразу.
+    ///
+    /// Атомарно проверяется + взводится под коротким inner-write `pos_arc` до
+    /// сетевого вызова; HTTP идёт без лока. В виртуальных режимах
+    /// (history_sim / real_sim без submit) попыток выставить TP вообще нет;
+    /// flag `true` только если опен случился в hold-zone (pre-suppress; в
+    /// virtual paths он всё равно никогда не читается).
     pub(crate) tp_placement_attempted: bool,
+    /// Дедуп: `true` означает «cancel maker-TP для этой позиции уже
+    /// инициирован — повторять не надо». Покрывает **оба** пути отмены
+    /// TP-лимитки (hold-zone и SELL-taker SL/Timeout/EvExit*), чтобы
+    /// не было двойного `DELETE /order` по одному `tp_order_id`:
+    ///
+    /// 1. **В `manage_positions`-ветке [`SellGate::HoldResolution`]**, когда
+    ///    позиция первый раз попадает в hold-zone с живой TP-лимиткой:
+    ///    атомарно (под inner-write `pos_arc`) проверяется
+    ///    `tp_order_id.is_some() && !tp_cancel_attempted`,
+    ///    флаг взводится в `true`, и спавнится
+    ///    [`crate::account_submit::spawn_cancel_tp_for_hold_zone`] →
+    ///    `cancel_order_on_clob`. Стратегия: в hold-zone выходы должны быть
+    ///    только через resolution-модель (`EvExitProfit`/`EvExitLoss` taker'ом)
+    ///    или hard SL, а не по фиксированному `Y_TRAIN_TAKE_PROFIT_PP`-таргету
+    ///    maker-лимитки.
+    /// 2. **В [`crate::account_submit::spawn_close_via_taker`]** перед
+    ///    отправкой SELL-taker'а (SL/Timeout/EvExit*): атомарно
+    ///    проверяется/взводится тот же флаг. Если кто-то уже инициировал
+    ///    cancel (например, hold-zone-ветка) — SELL-taker аборится
+    ///    (`CloseFailed`), следующий тик `manage_positions` повторит.
+    /// 3. **На конструкции позиции в [`open_position`]**, если кадр входа уже
+    ///    лежит в hold-zone. Парный pre-suppress со
+    ///    [`Self::tp_placement_attempted`] (см. doc там): для позиций,
+    ///    открытых уже внутри hold-zone, TP-maker не ставится ВООБЩЕ, и
+    ///    отменять тоже нечего — но флаг ставим в `true` для внутренней
+    ///    консистентности (никакая дальнейшая логика не должна интерпретировать
+    ///    отсутствие `tp_order_id` как «TP ещё не успел встать»).
+    ///
+    /// **Не путать с** [`Self::tp_order_id`]: то поле обнуляется только на
+    /// **подтверждённом** `canceled=true` из CLOB внутри cancel-таски, чтобы
+    /// не потерять TP-fill в гонке «cancel HTTP в полёте ↔ TP уже сматчился».
+    /// Этот флаг же — чисто локальный single-shot-маркер «cancel-таск
+    /// уже спавнили / cancel не требуется».
+    ///
+    /// В виртуальных режимах (history_sim / real_sim без submit) TP-лимитки
+    /// на CLOB не существует, флаг по большей части `false`, кроме случая
+    /// hold-zone-входа (там pre-suppress тоже выставляется — harmless, никто
+    /// не читает).
+    pub(crate) tp_cancel_attempted: bool,
     /// `true` после того, как ПЕРВЫЙ WS `trade` fill (BUY) этой позиции был
     /// замержен в [`Self::shares_held`] / [`Self::entry_cost`] / [`Self::buy_price`]
     /// в submit-режиме. Используется в [`crate::account_ws::apply_buy_fill`]
@@ -1469,6 +1523,15 @@ pub(crate) async fn try_open_position(
     submit: bool,
     account: &SharedAccount,
 ) -> bool {
+    // Graceful-shutdown гейт: в submit-режиме после `account_exit::graceful_exit`
+    // (SIGINT/SIGTERM) флаг `HALT_NEW_ORDERS` блокирует любые новые BUY-таски —
+    // мы как раз закрываем процесс, новых позиций открывать нельзя. В
+    // virtual-режимах `is_halted()` всегда `false` (флаг ставится только из
+    // `account_exit::graceful_exit`), так что эта проверка для них no-op.
+    if submit && crate::account_exit::is_halted() {
+        stats.late_entry_skips += 1;
+        return false;
+    }
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return false;
     };
@@ -1991,7 +2054,34 @@ pub(crate) async fn manage_positions(
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
             SellGate::HoldResolution { new_p_win_ema } => {
-                pos_arc.write().await.p_win_ema = new_p_win_ema;
+                // Атомарно: обновить EMA + проверить/взвести single-shot
+                // флаг cancel'а maker-TP в hold-zone. Спавн самой cancel-таски
+                // делаем вне inner-write, чтобы HTTP не шёл под локом позиции.
+                //
+                // Условие spawn'а: submit-режим (TP-лимитка на CLOB существует
+                // только тут), TP-maker ещё жив (`tp_order_id.is_some()`),
+                // cancel ещё не пробовали (`!tp_cancel_attempted`).
+                // Стратегия: в hold-zone выходы — только resolution-модель
+                // (EvExit*-taker) или hard SL; фиксированный TP-таргет лимитки
+                // мешает поймать резолюционную выплату $1, см. doc у
+                // `OpenPosition::tp_cancel_attempted`.
+                let needs_tp_cancel_in_hold_zone = {
+                    let mut pw = pos_arc.write().await;
+                    pw.p_win_ema = new_p_win_ema;
+                    let needs = submit
+                        && pw.tp_order_id.is_some()
+                        && !pw.tp_cancel_attempted;
+                    if needs {
+                        pw.tp_cancel_attempted = true;
+                    }
+                    needs
+                };
+                if needs_tp_cancel_in_hold_zone {
+                    crate::account_submit::spawn_cancel_tp_for_hold_zone(
+                        account.clone(),
+                        pos_arc.clone(),
+                    );
+                }
                 None
             }
             SellGate::HoldPnl => None,
@@ -2061,44 +2151,44 @@ pub(crate) async fn manage_positions(
                 // Реальные тип-счётчики (tp/sl/timeout/ev*) обновит WS-колбек по факту.
                 sold = true;
                 remaining.push(pos_arc);
-                continue;
-            }
-            match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
-                Some(pnl) => {
-                    *bankroll += pnl;
-                    sold = true;
-                    // Виртуальное закрытие: PnL уже в `bankroll`/`stats`,
-                    // теневая запись `Closed` нужна только для:
-                    //   (а) симметрии с real-flow (в обоих случаях
-                    //       завершённое закрытие проходит через `closing`),
-                    //   (б) того, чтобы cleanup-шаг следующего тика её
-                    //       отпустил — без cleanup'а Vec бы рос неограниченно.
-                    let closing_arc: SharedClosingPosition =
-                        std::sync::Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-                            position: pos_arc.clone(),
-                            exit_price,
-                            reason,
-                            pnl: Some(pnl),
-                            close_status: ClosingPositionStatus::Closed,
-                            close_order_id: None,
-                            close_placement_attempted: false,
-                            created_unix_ms: crate::util::current_timestamp_ms(),
-                        }));
-                    // Прямая Weak-ссылка (см. real-flow выше). Для виртуального
-                    // closure `pnl_finalized`-маркер не нужен (финализация
-                    // синхронная, прямо тут), но поле всё равно заполняем для
-                    // симметрии с submit-флоу и потенциальных будущих consumer'ов.
-                    {
-                        let mut pw = pos_arc.write().await;
-                        pw.set_closing_position(std::sync::Arc::downgrade(&closing_arc));
+            } else {
+                match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
+                    Some(pnl) => {
+                        *bankroll += pnl;
+                        sold = true;
+                        // Виртуальное закрытие: PnL уже в `bankroll`/`stats`,
+                        // теневая запись `Closed` нужна только для:
+                        //   (а) симметрии с real-flow (в обоих случаях
+                        //       завершённое закрытие проходит через `closing`),
+                        //   (б) того, чтобы cleanup-шаг следующего тика её
+                        //       отпустил — без cleanup'а Vec бы рос неограниченно.
+                        let closing_arc: SharedClosingPosition =
+                            std::sync::Arc::new(tokio::sync::RwLock::new(ClosingPosition {
+                                position: pos_arc.clone(),
+                                exit_price,
+                                reason,
+                                pnl: Some(pnl),
+                                close_status: ClosingPositionStatus::Closed,
+                                close_order_id: None,
+                                close_placement_attempted: false,
+                                created_unix_ms: crate::util::current_timestamp_ms(),
+                            }));
+                        // Прямая Weak-ссылка (см. real-flow выше). Для виртуального
+                        // closure `pnl_finalized`-маркер не нужен (финализация
+                        // синхронная, прямо тут), но поле всё равно заполняем для
+                        // симметрии с submit-флоу и потенциальных будущих consumer'ов.
+                        {
+                            let mut pw = pos_arc.write().await;
+                            pw.set_closing_position(std::sync::Arc::downgrade(&closing_arc));
+                        }
+                        closing.push(closing_arc);
                     }
-                    closing.push(closing_arc);
+                    None => {
+                        stats.kelly_strict_sell_skips += 1;
+                        remaining.push(pos_arc);
+                    }
                 }
-                None => {
-                    stats.kelly_strict_sell_skips += 1;
-                    remaining.push(pos_arc);
-                }
-            }
+            }            
         } else {
             remaining.push(pos_arc);
         }
@@ -2208,6 +2298,29 @@ fn open_position(
     };
     let sell_vwap_entry = (gross_sell / actual_shares).clamp(0.001, 0.999);
 
+    // Если вход случился уже внутри hold-zone (по `frame.event_remaining_ms`
+    // относительно `HOLD_TO_END_THRESHOLD_SEC`), то TP-maker для этой позиции
+    // создавать не надо — выходы должны идти только через resolution-модель
+    // (`EvExit*`-taker) или hard SL, как у любой позиции после перехода в
+    // hold-zone (см. doc у `OpenPosition::tp_cancel_attempted`
+    // и ветку `SellGate::HoldResolution` в `manage_positions`). Поэтому
+    // превентивно взводим оба `tp_*_attempted`-флага в `true`:
+    //   * `tp_placement_attempted=true` — гейт `try_place_tp_maker`
+    //     (`account_submit.rs:212-214` `if pos.tp_placement_attempted || pos.tp_order_id.is_some()`)
+    //     отбьёт любую попытку поставить TP в WS/polling-колбеке BUY-MATCHED;
+    //   * `tp_cancel_attempted=true` — single-shot-дедуп cancel'а
+    //     (cancel сам по себе тут и не дёрнется — `spawn_cancel_tp_for_hold_zone`
+    //     требует `tp_order_id.is_some()`, а оно `None`),
+    //     но держим флаги внутренне-консистентно.
+    //
+    // Условие in-hold-zone идентично `sell_gate` и `compute_p_win_now`:
+    // `event_remaining_ms > 0 && <= HOLD_TO_END_THRESHOLD_SEC * 1000`. При
+    // текущем production `HOLD_TO_END_THRESHOLD_SEC=0` условие ложно всегда,
+    // флаги остаются `false` — поведение не меняется. При повышении порога
+    // (например до 30–60s) логика активируется автоматически.
+    let entering_in_hold_zone: bool = frame.event_remaining_ms > 0
+        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+
     Some(OpenPosition {
         // Локальный uuid позиции — корреляционный ключ для логов submit-флоу;
         // см. doc у поля.
@@ -2253,7 +2366,11 @@ fn open_position(
         // TP/SL/Timeout управляются полностью внутри `manage_positions` —
         // в виртуальной торговле TP-ордера на CLOB нет.
         tp_order_id: None,
-        tp_placement_attempted: false,
+        // Если вход случился в hold-zone — оба TP-флага предварительно
+        // ставим в `true`, чтобы WS/polling-колбек BUY-MATCHED не дёрнул
+        // `try_place_tp_maker` (см. блок выше с расчётом `entering_in_hold_zone`).
+        tp_placement_attempted: entering_in_hold_zone,
+        tp_cancel_attempted: entering_in_hold_zone,
         // В виртуальной торговле оптимистичный fill сразу «реальный» — нечего
         // перезаписывать. В submit-режиме `apply_buy_fill` поставит этот флаг
         // в `true` после первого WS BUY trade event'а (см. doc у поля).

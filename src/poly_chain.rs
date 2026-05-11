@@ -240,7 +240,7 @@ fn create2_address(deployer: Address, salt: B256, init_code_hash: B256) -> Addre
 /// `safe = create2(SAFE_FACTORY, salt = keccak256(abi.encode(eoa)), SAFE_INIT_CODE_HASH)`,
 /// где `abi.encode(address)` для одного аргумента — это адрес,
 /// left-padded нулями до 32 байт.
-fn derive_safe_address(eoa: Address) -> Address {
+pub(crate) fn derive_safe_address(eoa: Address) -> Address {
     let mut salt_input = [0u8; 32];
     salt_input[12..32].copy_from_slice(eoa.as_slice());
     let salt = keccak256(salt_input);

@@ -573,15 +573,16 @@ pub(crate) const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
 /// `MissedTickBehavior::Delay` — если CLOB-вызов задержался (например,
 /// 502 + retry tcp), не догоняем burst'ом 10 heartbeat'ов сразу: следующий
 /// тик отсчитывается от момента возврата управления.
+/// Сколько подряд heartbeat-ошибок (401/timeout/etc.) ждать перед тем,
+/// как форсированно перевыпустить L2-auth через
+/// [`try_authenticate_clob_for_heartbeats`] с `force=true`. При интервале
+/// `CLOB_HEARTBEAT_INTERVAL_SEC=5s` две подряд ошибки = ~10s тишины — это
+/// уже на грани окна, за которое CLOB сам отменит наши открытые ордера.
+/// Поэтому реагируем агрессивно: пробуем re-auth уже после второго фейла.
+const HEARTBEAT_FAILS_BEFORE_REAUTH: u32 = 2;
+
 pub fn spawn_heartbeat(account: SharedAccount) {
     tokio::spawn(async move {
-        // Аутентификация выполняется в `main` до [`spawn_heartbeat`]:
-        // [`try_authenticate_clob_for_heartbeats`]. Здесь только снимаем
-        // снимок `clob_authed` через ArcSwap.load() — без локов; внутри
-        // `Arc<Option<…>>`, поэтому `.as_ref()` даёт `Option<&Client>`.
-        let auth_client: Option<clob::Client<Authenticated<Normal>>> =
-            (**account.clob_authed.load()).clone();
-
         let mut clob_tick = tokio::time::interval(Duration::from_secs(CLOB_HEARTBEAT_INTERVAL_SEC));
         clob_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // Первый tick срабатывает мгновенно — пропускаем: на старте сразу
@@ -601,14 +602,22 @@ pub fn spawn_heartbeat(account: SharedAccount) {
         // подтвердить «heartbeat жив». См. формат сообщений ниже.
         let mut last_was_success = false;
         let mut had_first_log = false;
+        let mut consecutive_errors: u32 = 0;
 
         loop {
             clob_tick.tick().await;
+            // Перечитываем `clob_authed` каждый тик: re-auth может его
+            // подменить (см. [`try_authenticate_clob_for_heartbeats`]
+            // с `force=true` ниже). Без этого таск гонял бы старый
+            // (возможно протухший) клиент пока сам не упадёт.
+            let auth_client: Option<clob::Client<Authenticated<Normal>>> =
+                (**account.clob_authed.load()).clone();
             let Some(client) = auth_client.as_ref() else {
                 // Auth выключен (нет POLY_PRIVATE_KEY или authenticate()
-                // упал) — таск крутится no-op'ом, ждать тут нечего, но
-                // rolling-проверки на появление auth не делаем:
-                // [`try_authenticate_clob_for_heartbeats`] уже отработала в main.
+                // упал) — таск крутится no-op'ом. Не вызываем re-auth
+                // самостоятельно: если main решил, что auth не нужен
+                // (например, в virtual-режимах), мы не должны его
+                // поднимать молча.
                 continue;
             };
             match client.post_heartbeat(heartbeat_id).await {
@@ -622,22 +631,36 @@ pub fn spawn_heartbeat(account: SharedAccount) {
                         had_first_log = true;
                     } else if !last_was_success {
                         crate::tee_println!(
-                            "[heartbeat] CLOB heartbeat восстановлен (heartbeat_id={})",
+                            "[heartbeat] CLOB heartbeat восстановлен после {consecutive_errors} ошибок (heartbeat_id={})",
                             resp.heartbeat_id,
                         );
                     }
                     last_was_success = true;
+                    consecutive_errors = 0;
                 }
                 Err(err) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
                     if last_was_success || !had_first_log {
                         crate::tee_eprintln!(
-                            "[heartbeat] CLOB heartbeat ошибка: {err:#} \
+                            "[heartbeat] CLOB heartbeat ошибка #{consecutive_errors}: {err:#} \
                              (открытые ордера могут быть отменены при тишине > 10s)",
                         );
                         had_first_log = true;
                     }
                     last_was_success = false;
                     heartbeat_id = None;
+
+                    // Re-auth на N подряд фейлах: возможно, протух L2-API-key
+                    // или поменялся IP/секрет на стороне сервера. После
+                    // успешного re-auth следующий tick прочитает новый
+                    // `clob_authed` и попробует снова.
+                    if consecutive_errors >= HEARTBEAT_FAILS_BEFORE_REAUTH {
+                        crate::tee_eprintln!(
+                            "[heartbeat] {consecutive_errors} подряд ошибок — пробуем форсированный re-auth (force=true)"
+                        );
+                        try_authenticate_clob_for_heartbeats_with_force(&account, true).await;
+                        consecutive_errors = 0;
+                    }
                 }
             }
         }
@@ -652,10 +675,13 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 /// именно оттуда.
 ///
 /// Идемпотентна: если в Account уже лежит `Arc::new(Some(_))`, функция выходит
-/// без сетевого вызова. На любой ошибке (нет env-ключа, парсинг
-/// провалился, `clob::Client::new` упал, `authenticate()` вернул
-/// ошибку) — лог + Account остаётся с `Arc::new(None)`; clob-тик в
-/// [`spawn_heartbeat`] в этом случае молча no-op.
+/// без сетевого вызова. Для **форсированного** re-auth (когда уже-сохранённый
+/// клиент перестал работать — например, API-key revoke на стороне сервера)
+/// используйте [`try_authenticate_clob_for_heartbeats_with_force`] напрямую.
+///
+/// На любой ошибке (нет env-ключа, парсинг провалился, `clob::Client::new`
+/// упал, `authenticate()` вернул ошибку) — лог + Account остаётся с
+/// `Arc::new(None)`; clob-тик в [`spawn_heartbeat`] в этом случае молча no-op.
 ///
 /// Аутентификация = `create_or_derive_api_key` (внутри `authenticate()`):
 /// EIP-712 ClobAuth на `chain_id=POLYGON`, signature_type=Eoa (дефолт).
@@ -664,7 +690,26 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 /// `signature_type=GnosisSafe + funder=<safe>` (тот же EOA сможет
 /// переиспользовать API-ключ).
 pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount) {
-    if account.clob_authed.load().is_some() {
+    try_authenticate_clob_for_heartbeats_with_force(account, false).await
+}
+
+/// Полный auth-цикл с возможностью форсированной перевыпуска
+/// (используется heartbeat-таском после N подряд ошибок, см.
+/// [`HEARTBEAT_FAILS_BEFORE_REAUTH`]).
+///
+/// - `force=false` (нормальный путь): идемпотентно — если в Account уже
+///   лежит `Some(_)`, возвращается без HTTP.
+/// - `force=true`: пропускает идемпотентный шорткат, делает полный
+///   `authentication_builder().authenticate()` и заменяет
+///   `clob_authed`/`clob_signer` на новые. Старый `Arc` остаётся живым
+///   у тех, кто его захватил (`(**account.clob_authed.load()).clone()`),
+///   и тихо упадёт на следующем запросе — ничего страшного не случится,
+///   следующий tick перечитает свежий клиент через ArcSwap.
+pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
+    account: &SharedAccount,
+    force: bool,
+) {
+    if !force && account.clob_authed.load().is_some() {
         return;
     }
     let private_key = match std::env::var(POLY_PRIVATE_KEY_ENV) {
@@ -697,13 +742,19 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount
             // ArcSwap.store даёт атомарную замену без локов.
             account.clob_authed.store(Arc::new(Some(authed)));
             account.clob_signer.store(Arc::new(Some(signer)));
+            let mode = if force { "FORCE re-auth" } else { "authenticate" };
             crate::tee_println!(
-                "[heartbeat] CLOB authenticate OK (eoa={address:#x}); heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
+                "[heartbeat] CLOB {mode} OK (eoa={address:#x}); heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
             );
         }
         Err(err) => {
+            let mode = if force {
+                "FORCE re-auth"
+            } else {
+                "authenticate"
+            };
             crate::tee_eprintln!(
-                "[heartbeat] CLOB authenticate провалился: {err:#}; CLOB heartbeat отключён",
+                "[heartbeat] CLOB {mode} провалился: {err:#}; CLOB heartbeat отключён (для re-auth — следующая попытка через {HEARTBEAT_FAILS_BEFORE_REAUTH} ошибок)",
             );
         }
     }

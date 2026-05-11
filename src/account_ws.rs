@@ -85,37 +85,49 @@ pub fn spawn_user_ws_listener(account: SharedAccount) {
     tokio::spawn(async move {
         // Polymarket CLOB user-WS требует API key/secret/passphrase в самом
         // subscribe-сообщении. Auth в RealSim — в `main` до спавна (см.
-        // [`crate::account::try_authenticate_clob_for_heartbeats`]). Здесь
-        // ждём `Account::clob_authed`, чтобы забрать креды под subscribe
-        // (поллинг остаётся для нестандартных entrypoints / тестов).
-        // По таймауту `USER_WS_WAIT_AUTH_MAX_SECS` ниже — паника: нет ключей /
-        // `authenticate()` упал уже в `main`, а канал статусов без кредитов
-        // только замаскирует мисконфиг.
-        let credentials = match wait_for_clob_credentials(&account).await {
-            Some(creds) => creds,
-            None => {
-                // Без auth'а user-WS бесполезен (нет ордеров на матчинг),
-                // но молча выйти нельзя: в `RealSim` пайплайн рассчитывает
-                // на live-канал статусов, и молчащий таск маскирует
-                // мисконфигурацию (отсутствие `POLY_PRIVATE_KEY`, упавший
-                // `authenticate()`) — паникуем, чтобы это бросалось в
-                // глаза в логах. `tokio::spawn` пропустит панику в
-                // task-handler, но `tee_eprintln` ниже + tokio runtime
-                // logs покажут причину.
-                crate::tee_eprintln!(
-                    "[user_ws] auth не появился за {USER_WS_WAIT_AUTH_MAX_SECS}s — паникую: проверьте POLY_PRIVATE_KEY и [heartbeat] CLOB authenticate в логах",
-                );
-                panic!(
-                    "[user_ws] CLOB auth не поднялся за {USER_WS_WAIT_AUTH_MAX_SECS}s — user-канал не запускается"
-                );
-            }
-        };
-
+        // [`crate::account::try_authenticate_clob_for_heartbeats`]). На
+        // **первой** итерации ждём `Account::clob_authed` с длинным
+        // таймаутом и паникуем при тишине (single-shot мисконфиг-detector);
+        // на последующих итерациях reconnect'а просто перечитываем
+        // ArcSwap (короткий wait, без паники), чтобы heartbeat-таск с
+        // force-reauth (см. [`crate::account::HEARTBEAT_FAILS_BEFORE_REAUTH`])
+        // мог подкинуть свежие креды, и subscribe ушёл уже с ними.
         crate::tee_println!(
             "[user_ws] стартую: connect {POLYMARKET_USER_WS_URL}",
         );
-
+        let mut first_iteration = true;
         loop {
+            // Перечитываем `clob_authed` на КАЖДОЙ итерации reconnect-loop'а.
+            // Это критично для долгих сессий: force-reauth в heartbeat-таске
+            // меняет `clob_authed` через ArcSwap; без перечитывания мы бы
+            // подключались со старыми (отозванными сервером) ключами.
+            let credentials = match wait_for_clob_credentials(&account).await {
+                Some(creds) => creds,
+                None => {
+                    if first_iteration {
+                        // Без auth'а user-WS бесполезен — паникуем (см.
+                        // подробный комментарий выше).
+                        crate::tee_eprintln!(
+                            "[user_ws] auth не появился за {USER_WS_WAIT_AUTH_MAX_SECS}s — паникую: проверьте POLY_PRIVATE_KEY и [heartbeat] CLOB authenticate в логах",
+                        );
+                        panic!(
+                            "[user_ws] CLOB auth не поднялся за {USER_WS_WAIT_AUTH_MAX_SECS}s — user-канал не запускается"
+                        );
+                    } else {
+                        // На reconnect'е auth может быть в процессе
+                        // force-reauth (heartbeat-таск работает асинхронно
+                        // с нами). Не паникуем, просто ждём и пробуем
+                        // снова на следующей итерации.
+                        crate::tee_eprintln!(
+                            "[user_ws] reconnect-итерация: clob_authed=None в момент wait_for_clob_credentials \
+                             — ждём re-auth (sleep {USER_WS_RECONNECT_DELAY_SECS}s)"
+                        );
+                        sleep(Duration::from_secs(USER_WS_RECONNECT_DELAY_SECS)).await;
+                        continue;
+                    }
+                }
+            };
+            first_iteration = false;
             if let Err(err) = run_user_ws_session(&account, &credentials).await {
                 crate::tee_eprintln!("[user_ws] сессия упала: {err:#}");
             } else {
