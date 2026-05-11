@@ -18,9 +18,7 @@
 
 use crate::account::SharedAccount;
 use crate::account_order::OrderRole;
-use crate::history_sim::{
-    CloseReason, ClosingPosition, ClosingPositionStatus, OpenPositionStatus,
-};
+use crate::history_sim::{CloseReason, ClosingPosition, ClosingPositionStatus, OpenPositionStatus};
 use crate::util::current_timestamp_ms;
 use futures_util::{SinkExt, StreamExt};
 use polymarket_client_sdk::auth::Credentials;
@@ -804,9 +802,16 @@ pub(crate) async fn apply_sell_fill(
         );
         return;
     };
-    let (pos_id, entry_cost, shares_held) = {
+    let (pos_id, entry_cost, shares_held, existing_closing) = {
         let p = pos_arc.read().await;
-        (p.id.clone(), p.entry_cost, p.shares_held)
+        (
+            p.id.clone(),
+            p.entry_cost,
+            p.shares_held,
+            p.closing_position
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade),
+        )
     };
     let exit_price = if shares_held > 0.0 {
         net_usdc / shares_held
@@ -814,6 +819,35 @@ pub(crate) async fn apply_sell_fill(
         price
     };
     let pnl = net_usdc - entry_cost;
+
+    if let Some(c_arc) = existing_closing {
+        // Гонка с SELL-taker close-flow: морфируем существующую PendingClose-запись.
+        // Подменяем `close_order_id` на TP-id, чтобы finalize_tp_close_after_creation
+        // нашёл её. `close_placement_attempted` оставляем `true` (уже взведено
+        // manage_positions'ом). `spawn_close_via_taker` через post-cancel re-check
+        // увидит `close_status==Closed` и не пойдёт в SELL-taker retry-loop.
+        {
+            let mut c = c_arc.write().await;
+            let prev_close_order_id = c.close_order_id.clone();
+            let prev_reason = c.reason.clone();
+            let prev_status = c.close_status;
+            c.close_status = ClosingPositionStatus::Closed;
+            c.reason = CloseReason::TakeProfit;
+            c.pnl = Some(pnl);
+            c.close_order_id = Some(order_id.to_string());
+            c.exit_price = exit_price;
+            crate::tee_println!(
+                "[user_ws] TP maker fill (raced SELL-taker close): pos_id={pos_id}, order_id={order_id}, size={size:.4}, price={price:.4}, net_usdc={net_usdc:.4}, entry_cost={entry_cost:.4}, pnl={pnl:.4} \
+                 — morphed existing ClosingPosition: status {prev_status:?} → Closed, reason {prev_reason:?} → TakeProfit, close_order_id {prev_close_order_id:?} → Some({order_id})"
+            );
+        }
+        // lane_key уже извлечён из positions выше; в `closing` запись уже лежит
+        // (manage_positions её туда добавила синхронно), новой push'и не нужно.
+        let _ = lane_key;
+        finalize_tp_close_after_creation(account, order_id, "Ws").await;
+        return;
+    }
+
     crate::tee_println!(
         "[user_ws] TP maker fill: pos_id={pos_id}, order_id={order_id}, size={size:.4}, price={price:.4}, net_usdc={net_usdc:.4}, entry_cost={entry_cost:.4}, pnl={pnl:.4}"
     );
@@ -841,9 +875,6 @@ pub(crate) async fn apply_sell_fill(
     {
         let mut closing = account.closing.write().await;
         closing.entry(lane_key).or_default().push(c_arc);
-        // Финализируем из этого же лока — bankroll/stats апдейтит helper.
-        // Но `finalize_close_pnl_in_place` сам берёт лок `bankroll` — отпускаем
-        // closing-лок и зовём отдельно, иначе lock-ordering нарушается.
     }
     // Финализация под собственными локами в каноническом порядке.
     finalize_tp_close_after_creation(account, order_id, "Ws").await;

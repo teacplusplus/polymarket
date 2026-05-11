@@ -617,3 +617,183 @@ pub async fn cancel_order_on_clob(
         error_msg,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::{Account, POLY_PRIVATE_KEY_ENV, try_authenticate_clob_for_heartbeats};
+    use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
+    use crate::util::{current_timestamp_ms, fetch_gamma_event_data_for_slug};
+    use polymarket_client_sdk::clob::types::OrderStatusType;
+    use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
+    use polymarket_client_sdk::types::U256;
+    const BTC_UPDOWN_5M_PERIOD_SEC: i64 = 300;
+    const LIVE_ORDER_HTTP_TIMEOUT_SEC: u64 = 20;
+
+    fn current_btc_updown_5m_slug(now_ms: i64) -> String {
+        let poly_sec = now_ms / 1000;
+        let window_start_sec = (poly_sec / BTC_UPDOWN_5M_PERIOD_SEC) * BTC_UPDOWN_5M_PERIOD_SEC;
+        format!("btc-updown-5m-{window_start_sec}")
+    }
+
+    fn decimal_to_f64(d: &polymarket_client_sdk::types::Decimal) -> anyhow::Result<f64> {
+        d.to_string()
+            .parse::<f64>()
+            .map_err(|err| anyhow::anyhow!("Decimal {d} → f64: {err}"))
+    }
+
+    fn min_taker_buy_usd_notional(min_order_size: f64, best_ask: f64) -> f64 {
+        let raw = min_order_size * best_ask;
+        let rounded = (raw * 100.0).ceil() / 100.0;
+        rounded.max(0.01)
+    }
+
+    /// Live round-trip: taker BUY на минимальный notional в текущем 5m BTC
+    /// up/down маркете, затем taker SELL всех полученных shares.
+    ///
+    /// ```bash
+    /// POLY_PRIVATE_KEY=0x… \
+    ///     cargo test --bin poly account_order::tests::live_taker_roundtrip_btc_updown_5m -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live network: требует POLY_PRIVATE_KEY и USDC на Polymarket Safe; делает реальные CLOB-ордера"]
+    async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
+        let _ = dotenvy::dotenv();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let private_key_set = std::env::var(POLY_PRIVATE_KEY_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some();
+        if !private_key_set {
+            eprintln!(
+                "live_taker_roundtrip_btc_updown_5m: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
+            );
+            return Ok(());
+        }
+
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC))
+            .build()?;
+        let slug = current_btc_updown_5m_slug(current_timestamp_ms());
+        let gamma = fetch_gamma_event_data_for_slug(&http, &slug).await?;
+        let asset_id = gamma
+            .currency_up_down_by_asset_id
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Gamma не вернул clobTokenIds для slug={slug}"))?;
+
+        let account = Account::new_shared();
+        try_authenticate_clob_for_heartbeats(&account).await;
+        anyhow::ensure!(
+            account.clob_authed.load().is_some(),
+            "CLOB auth не поднялся — проверьте {POLY_PRIVATE_KEY_ENV} и логи [heartbeat]",
+        );
+
+        let token_id = U256::from_str(&asset_id)
+            .with_context(|| format!("невалидный asset_id={asset_id} из Gamma slug={slug}"))?;
+        let book_request = OrderBookSummaryRequest::builder()
+            .token_id(token_id)
+            .build();
+        let book = account
+            .clob
+            .order_book(&book_request)
+            .await
+            .with_context(|| format!("order_book({asset_id}) для slug={slug}"))?;
+        let min_order_size = decimal_to_f64(&book.min_order_size)?;
+        let best_ask = best_ask_sdk(&book)
+            .ok_or_else(|| anyhow::anyhow!("пустой asks book для asset_id={asset_id} slug={slug}"))?;
+        let best_ask_f64 = decimal_to_f64(&best_ask)?;
+        let buy_usd = min_taker_buy_usd_notional(min_order_size, best_ask_f64);
+        let worst_acceptable_buy = (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
+
+        eprintln!(
+            "live_taker_roundtrip_btc_updown_5m: slug={slug}, asset_id={asset_id}, \
+             min_order_size={min_order_size:.4}, best_ask={best_ask_f64:.4}, buy_usd={buy_usd:.4}, \
+             worst_acceptable_buy={worst_acceptable_buy:.4}",
+        );
+
+        // let buy_result = post_order_on_clob(
+        //     &account,
+        //     PostOrderRequest {
+        //         asset_id: asset_id.clone(),
+        //         side: Side::Buy,
+        //         role: OrderRole::Taker,
+        //         amount: OrderAmount::UsdNotional(buy_usd),
+        //         price: Some(worst_acceptable_buy),
+        //         max_slippage_pp: None,
+        //         expiration: None,
+        //         timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
+        //         strict_book: None,
+        //     },
+        // )
+        // .await
+        // .with_context(|| format!("BUY taker slug={slug} asset_id={asset_id}"))?;
+        // anyhow::ensure!(
+        //     buy_result.success,
+        //     "BUY taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
+        //     buy_result.status,
+        //     buy_result.error_msg,
+        //     buy_result.order_id,
+        // );
+        // anyhow::ensure!(
+        //     matches!(
+        //         buy_result.status,
+        //         OrderStatusType::Matched | OrderStatusType::Delayed
+        //     ),
+        //     "BUY taker не исполнен: status={:?}, order_id={}",
+        //     buy_result.status,
+        //     buy_result.order_id,
+        // );
+        //
+        // let shares_to_sell = decimal_to_f64(&buy_result.taking_amount)?;
+        // anyhow::ensure!(
+        //     shares_to_sell > 0.0 && shares_to_sell.is_finite(),
+        //     "BUY taker не дал shares: taking_amount={}, order_id={}",
+        //     buy_result.taking_amount,
+        //     buy_result.order_id,
+        // );
+        //
+        // let sell_result = post_order_on_clob(
+        //     &account,
+        //     PostOrderRequest {
+        //         asset_id: asset_id.clone(),
+        //         side: Side::Sell,
+        //         role: OrderRole::Taker,
+        //         amount: OrderAmount::Shares(shares_to_sell),
+        //         price: None,
+        //         max_slippage_pp: None,
+        //         expiration: None,
+        //         timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
+        //         strict_book: None,
+        //     },
+        // )
+        // .await
+        // .with_context(|| format!("SELL taker slug={slug} asset_id={asset_id}"))?;
+        // anyhow::ensure!(
+        //     sell_result.success,
+        //     "SELL taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
+        //     sell_result.status,
+        //     sell_result.error_msg,
+        //     sell_result.order_id,
+        // );
+        // anyhow::ensure!(
+        //     matches!(
+        //         sell_result.status,
+        //         OrderStatusType::Matched | OrderStatusType::Delayed
+        //     ),
+        //     "SELL taker не исполнен: status={:?}, order_id={}",
+        //     sell_result.status,
+        //     sell_result.order_id,
+        // );
+        //
+        // eprintln!(
+        //     "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={}, sell_order_id={}, \
+        //      buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
+        //     buy_result.order_id,
+        //     sell_result.order_id,
+        // );
+        Ok(())
+    }
+}

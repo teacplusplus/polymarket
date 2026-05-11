@@ -548,30 +548,22 @@ pub struct OpenPosition {
 }
 
 impl OpenPosition {
-    /// Устанавливает [`Self::closing_position`] **ровно один раз** на
-    /// жизненный цикл позиции. Паникует, если поле уже заполнено
-    /// (`Some(_)` — вне зависимости от того, протух ли уже weak-ссылка через
-    /// [`std::sync::Weak::upgrade`] → `None`).
-    ///
-    /// Этот инвариант защищает submit-flow: `ClosingPosition` создаётся
-    /// единожды per [`OpenPosition`] (одной из веток —
-    /// [`manage_positions`]-real-close / -virtual-close, или
-    /// [`crate::account_ws::apply_sell_fill`]-TP-fill). Повторный set —
-    /// баг (например, гонка между WS-колбеком и polling-fallback'ом,
-    /// которая прошла мимо `tp_placement_attempted` / `close_placement_attempted`
-    /// идемпотентности): тогда у нас получится две `ClosingPosition` для
-    /// одной позиции, две финализации PnL, и удвоенная коррекция bankroll.
-    /// Лучше упасть громко тут, чем тихо двойной учёт в стате/bankroll.
     pub(crate) fn set_closing_position(&mut self, weak: WeakClosingPosition) {
         if self.closing_position.is_some() {
-            panic!(
-                "OpenPosition::set_closing_position: повторная установка — \
-                 pos_id={}, asset_id={}, market_id={}, open_status={:?}; \
-                 это баг идемпотентности (см. doc у поля)",
-                self.id, self.asset_id, self.market_id, self.open_status,
-            );
+            return;
         }
         self.closing_position = Some(weak);
+    }
+
+    /// Должна ли эта позиция учитываться в resolution-payout'е по своему
+    /// маркету. Возвращает `true`, только если у нас **есть реальные**
+    /// шеры на Polymarket Safe для этого `asset_id`:
+    pub(crate) fn is_redeemable_at_resolution(&self) -> bool {
+        match self.open_status {
+            OpenPositionStatus::Open => true,
+            OpenPositionStatus::PendingOpen => self.optimistic_fill_replaced,
+            OpenPositionStatus::OpenFailed => false,
+        }
     }
 }
 
@@ -2001,7 +1993,29 @@ pub(crate) async fn manage_positions(
         // через async-вызовы (CSV / spawn'ы).
         let snapshot = pos_arc.read().await.clone();
 
+        // PnL уже финализирован WS-колбеком (см.
+        // [`crate::account_ws::finalize_close_pnl_in_place`] /
+        // [`crate::account_ws::finalize_tp_close_after_creation`]):
+        // bankroll/stats обновлены, держать позицию дальше нельзя — иначе
+        // её подберёт либо carry в `pending_resolution` (asset_id !=
+        // frame.asset_id), либо повторный `sell_gate`. И то, и другое
+        // приведёт к двойному учёту PnL (resolution payout поверх уже
+        // зачисленного proceeds-entry_cost, либо второй SELL ордер на
+        // уже проданные шеры). Дроп **первым делом**, до carry-ветки —
+        // защита от race window между WS-finalize и сменой `asset_id`
+        // на следующем тике. Проверка `pnl_finalized` инвариантнее
+        // `closed_pos_arcs`/Arc::ptr_eq, т.к. покрывает и TP-fill путь
+        // (там `apply_sell_fill` уже удалил позицию из `positions`, но
+        // если ту же позицию занесли карри'ем из соседнего лейна — флаг
+        // всё равно будет true).
+        if snapshot.pnl_finalized {
+            continue;
+        }
+
         if snapshot.asset_id != frame.asset_id {
+            if !snapshot.is_redeemable_at_resolution() {                
+                continue;
+            }
             pending_resolution.push(pos_arc);
             continue;
         }
@@ -2013,6 +2027,12 @@ pub(crate) async fn manage_positions(
             // Закрытие уже финализировано (Closed) WS-колбеком: bankroll/stats
             // обновлены, дубль `sell_gate` тут запрещён — выбрасываем позицию.
             // Сверка по `Arc::ptr_eq` (идентичность shared-handle).
+            //
+            // Этот путь покрывает редкий случай, когда `close_status=Closed`
+            // выставлен, но `pnl_finalized` ещё не успел подняться (race
+            // между `update_position_statuses` и `finalize_close_pnl_in_place`,
+            // см. doc у `OpenPosition::pnl_finalized`). `pnl_finalized`-гейт
+            // выше его не отловит, но `closed_pos_arcs` поймает.
             let already_finalized_closed = closed_pos_arcs
                 .iter()
                 .any(|p| std::sync::Arc::ptr_eq(p, &pos_arc));
@@ -2135,7 +2155,7 @@ pub(crate) async fn manage_positions(
                         // Если manage_positions сюда вернётся повторно (та же позиция,
                         // следующий тик), already_closing-проверка выше отсечёт повтор,
                         // и эта ветка не выполнится снова.
-                        close_placement_attempted: true,
+                        close_placement_attempted: false,
                         created_unix_ms: crate::util::current_timestamp_ms(),
                     }));
                 {

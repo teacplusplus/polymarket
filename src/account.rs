@@ -22,6 +22,7 @@ use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::Uuid as ClobUuid;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
+use polymarket_client_sdk::clob::types::SignatureType;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -257,6 +258,19 @@ impl Account {
         // Колбек резолюции может опередить смену `frame`: переносим совпадающие `market_id`
         // из positions в pending. Берём оба лока в порядке объявления полей,
         // плюс per-position write для чтения `market_id` и снятия `tp_order_id`.
+        //
+        // **Идемпотентность относительно WS-finalize PnL**: позиции с уже
+        // финализированным PnL (`pnl_finalized=true`) **не переносим** в
+        // `pending_resolution`, а молча дропаем из `positions`. Их PnL уже
+        // зачислен в bankroll через [`crate::account_ws::finalize_close_pnl_in_place`]
+        // / [`crate::account_ws::finalize_tp_close_after_creation`], а
+        // [`Self::resolve_pending_market_sync`] начислил бы поверх ещё
+        // `shares_held - entry_cost` (или `-entry_cost`) — двойной счёт PnL,
+        // расходящийся с реальным USDC на Safe. Сама `ClosingPosition` в
+        // `closing` остаётся со статусом `Closed` — её подберёт `closing.retain`
+        // в следующем `manage_positions` tick'е.
+        let mut skipped_finalized: usize = 0;
+        let mut skipped_non_redeemable: usize = 0;
         {
             let mut positions = account.positions.write().await;
             let mut pending = account.pending_resolution.write().await;
@@ -268,30 +282,79 @@ impl Account {
                 let pending_vec = pending.entry(key).or_default();
                 let mut idx = 0;
                 while idx < pos_vec.len() {
-                    let matches_market = {
+                    let (
+                        matches_market,
+                        pnl_finalized,
+                        redeemable,
+                        open_status,
+                        optimistic_fill_replaced,
+                        pos_id_for_log,
+                    ) = {
                         let pos_g = pos_vec[idx].read().await;
-                        pos_g.market_id == market_id
+                        (
+                            pos_g.market_id == market_id,
+                            pos_g.pnl_finalized,
+                            pos_g.is_redeemable_at_resolution(),
+                            pos_g.open_status,
+                            pos_g.optimistic_fill_replaced,
+                            pos_g.id.clone(),
+                        )
                     };
-                    if matches_market {
-                        let pos_arc = pos_vec.swap_remove(idx);
-                        // Если у позиции есть активный TP — тащим её Arc в
-                        // `positions_with_tp`. `take()` для `tp_order_id`
-                        // делает `spawn_cancel_tp_orders_after_resolution`
-                        // сама (под собственным write-lock'ом) — там же
-                        // читает `pos_id`. Здесь просто отмечаем кандидатов;
-                        // флаг `is_some` под коротким read-локом достаточен
-                        // (под этим же лок-фреймом доступа к pos_arc больше
-                        // ни у кого нет — мы её уже `swap_remove`-нули).
-                        let has_tp = pos_arc.read().await.tp_order_id.is_some();
-                        if has_tp {
-                            positions_with_tp.push(pos_arc.clone());
-                        }
-                        pending_vec.push(pos_arc);
-                    } else {
+                    if !matches_market {
                         idx += 1;
+                        continue;
                     }
+                    if pnl_finalized {
+                        // PnL уже учтён — выбрасываем из `positions` без
+                        // переноса в `pending_resolution`, чтобы избежать
+                        // двойного начисления в `resolve_pending_market_sync`.
+                        let _ = pos_vec.swap_remove(idx);
+                        skipped_finalized += 1;
+                        crate::tee_println!(
+                            "[resolve] skip already-finalized pos: pos_id={pos_id_for_log}, market_id={market_id}, currency={currency}, interval={interval:?} \
+                             (PnL уже учтён WS-finalize'ом, не переносим в pending_resolution — иначе двойной счёт)"
+                        );
+                        continue;
+                    }
+                    if !redeemable {
+                        // Защита от **фиктивного** resolution-payout'а (#2).
+                        let _ = pos_vec.swap_remove(idx);
+                        skipped_non_redeemable += 1;
+                        crate::tee_println!(
+                            "[resolve] skip non-redeemable pos: pos_id={pos_id_for_log}, market_id={market_id}, currency={currency}, interval={interval:?}, \
+                             open_status={open_status:?}, optimistic_fill_replaced={optimistic_fill_replaced} \
+                             (нет реальных шер на Safe — payout не начисляем, дропаем из positions)"
+                        );
+                        continue;
+                    }
+                    let pos_arc = pos_vec.swap_remove(idx);
+                    // Если у позиции есть активный TP — тащим её Arc в
+                    // `positions_with_tp`. `take()` для `tp_order_id`
+                    // делает `spawn_cancel_tp_orders_after_resolution`
+                    // сама (под собственным write-lock'ом) — там же
+                    // читает `pos_id`. Здесь просто отмечаем кандидатов;
+                    // флаг `is_some` под коротким read-локом достаточен
+                    // (под этим же лок-фреймом доступа к pos_arc больше
+                    // ни у кого нет — мы её уже `swap_remove`-нули).
+                    let has_tp = pos_arc.read().await.tp_order_id.is_some();
+                    if has_tp {
+                        positions_with_tp.push(pos_arc.clone());
+                    }
+                    pending_vec.push(pos_arc);
                 }
             }
+        }
+        if skipped_finalized > 0 {
+            crate::tee_println!(
+                "[resolve] market_id={market_id} currency={currency} interval={interval:?}: \
+                 пропустили {skipped_finalized} уже финализированных позиций при carry в pending_resolution",
+            );
+        }
+        if skipped_non_redeemable > 0 {
+            crate::tee_println!(
+                "[resolve] market_id={market_id} currency={currency} interval={interval:?}: \
+                 пропустили {skipped_non_redeemable} non-redeemable позиций (OpenFailed / PendingOpen без real fills) при carry в pending_resolution",
+            );
         }
         if !positions_with_tp.is_empty() {
             crate::account_submit::spawn_cancel_tp_orders_after_resolution(
@@ -364,11 +427,50 @@ impl Account {
 
             let mut i = 0;
             while i < vec.len() {
-                let matches_market = {
+                let (matches_market, pnl_already_finalized, redeemable) = {
                     let g = vec[i].read().await;
-                    g.market_id == market_id
+                    (
+                        g.market_id == market_id,
+                        g.pnl_finalized,
+                        g.is_redeemable_at_resolution(),
+                    )
                 };
-                if matches_market {
+                if !matches_market {
+                    i += 1;
+                    continue;
+                }
+                // Defence-in-depth относительно `resolve_pending_market`-carry:
+                // нормально такие позиции туда не должны попадать (см.
+                // `pnl_finalized`-гейт в `resolve_pending_market` и в
+                // `manage_positions`). Но carry мог проскочить, если WS
+                // финализировал PnL ПОСЛЕ того, как `manage_positions`
+                // утянул позицию в `pending_resolution` по `asset_id !=
+                // frame.asset_id` (смена раунда на лейне до прихода
+                // SELL/TP-fill'а). Тогда `pnl_finalized=true`, но
+                // позиция уже здесь — payout не начисляем, иначе двойной
+                // счёт: bankroll сначала получит `proceeds - entry_cost`
+                // (WS-finalize), потом ещё `shares_held - entry_cost`
+                // (или `-entry_cost`) от резолюции на одних и тех же
+                // шерах.
+                if pnl_already_finalized {
+                    let pos_arc = vec.swap_remove(i);
+                    let pos_id_for_log = pos_arc.read().await.id.clone();
+                    crate::tee_println!(
+                        "[resolve_sync] skip already-finalized pos: pos_id={pos_id_for_log}, \
+                         market_id={market_id}, currency={currency}, interval={int_kind:?}, side={side:?} \
+                         (PnL уже учтён WS-finalize'ом, payout пропускаем — иначе двойной счёт; \
+                         запись `Resolution`/`AutoRedeem` в submit-CSV тоже не пишем — \
+                         финальная строка трейда уже записана в `finalize_close_pnl_in_place`)"
+                    );
+                    continue;
+                }
+                // Defence-in-depth относительно carry'ев `OpenFailed` /
+                // `PendingOpen` без real fills (#2).
+                if !redeemable {
+                    let _ = vec.swap_remove(i);
+                    continue;
+                }
+                {
                     let pos_arc = vec.swap_remove(i);
                     // Снимаем полный snapshot позиции под одним read-локом —
                     // сразу клонируем нужные поля, чтобы не держать pos-lock
@@ -379,6 +481,23 @@ impl Account {
                     } else {
                         -pos.entry_cost
                     };
+                    // Race-guard против поздних WS-trade events на этом же
+                    // ордере: если за время `resolve_pending_market_sync`
+                    // прилетит `apply_sell_fill` → `finalize_close_pnl_in_place`
+                    // для (например) задержавшегося taker SELL fill'а, он
+                    // прочитает `pnl_finalized=true` на самом первом
+                    // read'е и сделает no-op. Без этого маркера poздний
+                    // fill начислил бы `proceeds - entry_cost` поверх
+                    // resolution-payout'а. Ставим **до** `*bankroll += pnl`,
+                    // чтобы инвариант «pnl_finalized=true ⇒ bankroll
+                    // обновлён или в процессе обновления» сохранялся под
+                    // bankroll-write-lock'ом, который мы здесь держим.
+                    {
+                        let mut pw = pos_arc.write().await;
+                        if !pw.pnl_finalized {
+                            pw.pnl_finalized = true;
+                        }
+                    }
                     *bankroll += pnl;
                     side_stats.pnl_usd += pnl;
                     side_stats.trades += 1;
@@ -494,9 +613,12 @@ impl Account {
                         );
                     }
                     let _ = pos_arc;
-                } else {
-                    i += 1;
                 }
+                // Не инкрементим `i`: и matches_market-ветка с
+                // pnl_finalized=true, и обычный payout сверху делают
+                // `swap_remove(i)` — в slot `i` уехала **другая** запись,
+                // её надо проверить тем же индексом ещё раз. Не-match
+                // выходит через `continue` с явным `i += 1` выше.
             }
         }
         drop(pending_resolution);
@@ -684,11 +806,11 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 /// `Arc::new(None)`; clob-тик в [`spawn_heartbeat`] в этом случае молча no-op.
 ///
 /// Аутентификация = `create_or_derive_api_key` (внутри `authenticate()`):
-/// EIP-712 ClobAuth на `chain_id=POLYGON`, signature_type=Eoa (дефолт).
-/// Этого хватает для heartbeat'а; реальная постановка ордеров через
-/// Polymarket Safe потребует отдельного клиента с
-/// `signature_type=GnosisSafe + funder=<safe>` (тот же EOA сможет
-/// переиспользовать API-ключ).
+/// EIP-712 ClobAuth на `chain_id=POLYGON` с
+/// `signature_type=GnosisSafe` — funder (Polymarket Safe) SDK
+/// деривает CREATE2 от EOA (см. [`crate::poly_chain::derive_safe_address`]).
+/// Один и тот же authed-клиент используется и для heartbeat'а, и для
+/// `post_order_on_clob` / `cancel_order_on_clob`.
 pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount) {
     try_authenticate_clob_for_heartbeats_with_force(account, false).await
 }
@@ -726,7 +848,8 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
         }
     };
     let signer = signer.with_chain_id(Some(POLYGON));
-    let address = signer.address();
+    let eoa = signer.address();
+    let safe = crate::poly_chain::derive_safe_address(eoa);
     // Берём общий unauth-клиент из [`Account::clob`] (создаётся ровно один
     // раз в [`Account::new`]) и клонируем его — `clob::Client` это
     // обёртка над `Arc<ClientInner>`, `clone()` это инкремент счётчика.
@@ -734,7 +857,12 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
     // нельзя «вынуть» клиент из `Arc<clob::Client>` в Account, не
     // ломая остальных потребителей (`ProjectManager.clob` и т.п.).
     let unauth: clob::Client = (*account.clob).clone();
-    match unauth.authentication_builder(&signer).authenticate().await {
+    match unauth
+        .authentication_builder(&signer)
+        .signature_type(SignatureType::GnosisSafe)
+        .authenticate()
+        .await
+    {
         Ok(authed) => {
             // signer кэшируем рядом с authed-клиентом — нужен для
             // [`post_order_on_clob`] (`auth_client.sign(&signer, …)`),
@@ -744,7 +872,8 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
             account.clob_signer.store(Arc::new(Some(signer)));
             let mode = if force { "FORCE re-auth" } else { "authenticate" };
             crate::tee_println!(
-                "[heartbeat] CLOB {mode} OK (eoa={address:#x}); heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
+                "[heartbeat] CLOB {mode} OK (eoa={eoa:#x}, safe={safe:#x}, signature_type=GnosisSafe); \
+                 heartbeat каждые {CLOB_HEARTBEAT_INTERVAL_SEC}s",
             );
         }
         Err(err) => {

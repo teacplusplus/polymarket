@@ -138,10 +138,8 @@ impl ProjectManager {
         );
         let gamma = Arc::new(gamma::Client::default());
         // CLOB-клиент берём из `Account` (single source of truth, см.
-        // `Account::clob` doc). `Arc::clone` ⇒ один инкремент счётчика,
-        // обёртка над тем же `ClientInner` внутри SDK — никаких
-        // дублирующих `reqwest::Client` / DNS-резолверов. Поле уже
-        // `Arc<clob::Client>`, лок не нужен.
+        // `Account::clob` doc). `clone` ⇒ клон `Arc` без `await` под
+        // локом — тот же `ClientInner` внутри SDK.
         let clob = account.clob.clone();
 
         let (market_ws_tx, market_ws_rx) =
@@ -799,14 +797,6 @@ impl ProjectManager {
             if lane == 0 && entry.frame.stable
                 && let Some(kind) = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type)
                 && let Some(side) = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
-                // RSS теперь хранится в `Account.real_sim_state_by_currency`
-                // (а не в PM): lookup по `self.currency` под коротким
-                // read'ом внешнего map'а. До `run_real_sim` ключа ещё
-                // нет — `None`, и `lane_frame` отправлять некуда:
-                // пропускаем send (нормально на ранних кадрах ещё до
-                // старта `run_real_sim` этой валюты). `xframes_by_market`
-                // ниже всё равно заполняем (исторический буфер кадров
-                // независим от submit-flow).
                 && let Some(state_arc) = self
                     .account
                     .real_sim_state_for_currency(self.currency.as_str())
