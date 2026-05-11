@@ -714,86 +714,86 @@ mod tests {
              worst_acceptable_buy={worst_acceptable_buy:.4}",
         );
 
-        // let buy_result = post_order_on_clob(
-        //     &account,
-        //     PostOrderRequest {
-        //         asset_id: asset_id.clone(),
-        //         side: Side::Buy,
-        //         role: OrderRole::Taker,
-        //         amount: OrderAmount::UsdNotional(buy_usd),
-        //         price: Some(worst_acceptable_buy),
-        //         max_slippage_pp: None,
-        //         expiration: None,
-        //         timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
-        //         strict_book: None,
-        //     },
-        // )
-        // .await
-        // .with_context(|| format!("BUY taker slug={slug} asset_id={asset_id}"))?;
-        // anyhow::ensure!(
-        //     buy_result.success,
-        //     "BUY taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
-        //     buy_result.status,
-        //     buy_result.error_msg,
-        //     buy_result.order_id,
-        // );
-        // anyhow::ensure!(
-        //     matches!(
-        //         buy_result.status,
-        //         OrderStatusType::Matched | OrderStatusType::Delayed
-        //     ),
-        //     "BUY taker не исполнен: status={:?}, order_id={}",
-        //     buy_result.status,
-        //     buy_result.order_id,
-        // );
-        //
-        // let shares_to_sell = decimal_to_f64(&buy_result.taking_amount)?;
-        // anyhow::ensure!(
-        //     shares_to_sell > 0.0 && shares_to_sell.is_finite(),
-        //     "BUY taker не дал shares: taking_amount={}, order_id={}",
-        //     buy_result.taking_amount,
-        //     buy_result.order_id,
-        // );
-        //
-        // let sell_result = post_order_on_clob(
-        //     &account,
-        //     PostOrderRequest {
-        //         asset_id: asset_id.clone(),
-        //         side: Side::Sell,
-        //         role: OrderRole::Taker,
-        //         amount: OrderAmount::Shares(shares_to_sell),
-        //         price: None,
-        //         max_slippage_pp: None,
-        //         expiration: None,
-        //         timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
-        //         strict_book: None,
-        //     },
-        // )
-        // .await
-        // .with_context(|| format!("SELL taker slug={slug} asset_id={asset_id}"))?;
-        // anyhow::ensure!(
-        //     sell_result.success,
-        //     "SELL taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
-        //     sell_result.status,
-        //     sell_result.error_msg,
-        //     sell_result.order_id,
-        // );
-        // anyhow::ensure!(
-        //     matches!(
-        //         sell_result.status,
-        //         OrderStatusType::Matched | OrderStatusType::Delayed
-        //     ),
-        //     "SELL taker не исполнен: status={:?}, order_id={}",
-        //     sell_result.status,
-        //     sell_result.order_id,
-        // );
-        //
-        // eprintln!(
-        //     "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={}, sell_order_id={}, \
-        //      buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
-        //     buy_result.order_id,
-        //     sell_result.order_id,
-        // );
+        let buy_result = post_order_on_clob(
+            &account,
+            PostOrderRequest {
+                asset_id: asset_id.clone(),
+                side: Side::Buy,
+                role: OrderRole::Taker,
+                amount: OrderAmount::UsdNotional(buy_usd),
+                price: Some(worst_acceptable_buy),
+                max_slippage_pp: None,
+                expiration: None,
+                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
+                strict_book: None,
+            },
+        )
+        .await
+        .with_context(|| format!("BUY taker slug={slug} asset_id={asset_id}"))?;
+        anyhow::ensure!(
+            buy_result.success,
+            "BUY taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
+            buy_result.status,
+            buy_result.error_msg,
+            buy_result.order_id,
+        );
+        anyhow::ensure!(
+            matches!(
+                buy_result.status,
+                OrderStatusType::Matched | OrderStatusType::Delayed
+            ),
+            "BUY taker не исполнен: status={:?}, order_id={}",
+            buy_result.status,
+            buy_result.order_id,
+        );
+
+        let shares_to_sell = decimal_to_f64(&buy_result.taking_amount)?;
+        anyhow::ensure!(
+            shares_to_sell > 0.0 && shares_to_sell.is_finite(),
+            "BUY taker не дал shares: taking_amount={}, order_id={}",
+            buy_result.taking_amount,
+            buy_result.order_id,
+        );
+
+        let sell_result = post_order_on_clob(
+            &account,
+            PostOrderRequest {
+                asset_id: asset_id.clone(),
+                side: Side::Sell,
+                role: OrderRole::Taker,
+                amount: OrderAmount::Shares(shares_to_sell),
+                price: None,
+                max_slippage_pp: None,
+                expiration: None,
+                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
+                strict_book: None,
+            },
+        )
+        .await
+        .with_context(|| format!("SELL taker slug={slug} asset_id={asset_id}"))?;
+        anyhow::ensure!(
+            sell_result.success,
+            "SELL taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
+            sell_result.status,
+            sell_result.error_msg,
+            sell_result.order_id,
+        );
+        anyhow::ensure!(
+            matches!(
+                sell_result.status,
+                OrderStatusType::Matched | OrderStatusType::Delayed
+            ),
+            "SELL taker не исполнен: status={:?}, order_id={}",
+            sell_result.status,
+            sell_result.order_id,
+        );
+
+        eprintln!(
+            "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={}, sell_order_id={}, \
+             buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
+            buy_result.order_id,
+            sell_result.order_id,
+        );
         Ok(())
     }
 }

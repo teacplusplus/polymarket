@@ -850,13 +850,11 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
     let signer = signer.with_chain_id(Some(POLYGON));
     let eoa = signer.address();
     let safe = crate::poly_chain::derive_safe_address(eoa);
-    // Берём общий unauth-клиент из [`Account::clob`] (создаётся ровно один
-    // раз в [`Account::new`]) и клонируем его — `clob::Client` это
-    // обёртка над `Arc<ClientInner>`, `clone()` это инкремент счётчика.
-    // `authentication_builder` потребляет `self`, поэтому клон обязателен:
-    // нельзя «вынуть» клиент из `Arc<clob::Client>` в Account, не
-    // ломая остальных потребителей (`ProjectManager.clob` и т.п.).
-    let unauth: clob::Client = (*account.clob).clone();
+    // Отдельный unauth-клиент только для auth: `authenticate()` в SDK делает
+    // `Arc::into_inner` над `ClientInner` и падает с `Synchronization`, если
+    // на тот же inner ещё висит clone (см. `account.clob` / `ProjectManager`).
+    let unauth = clob::Client::new(account.clob.host().as_str(), clob::Config::default())
+        .expect("failed to create Polymarket CLOB client for auth");
     match unauth
         .authentication_builder(&signer)
         .signature_type(SignatureType::GnosisSafe)

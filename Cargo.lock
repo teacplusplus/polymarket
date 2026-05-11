@@ -3036,7 +3036,7 @@ dependencies = [
  "futures-util",
  "indexmap 2.14.0",
  "optimizer",
- "polymarket-client-sdk",
+ "polymarket_client_sdk_v2",
  "rand 0.8.5",
  "reqwest 0.12.28",
  "rustls",
@@ -3052,10 +3052,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "polymarket-client-sdk"
-version = "0.4.4"
+name = "polymarket_client_sdk_v2"
+version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0852dbe6df78c4964452d6071abdc7ec0f649042c76733a075cb79e322745eaa"
+checksum = "594de0bf0e129e266946f02acbf579253951afbbee92fc1564da3c9179303aea"
 dependencies = [
  "alloy",
  "async-stream",
@@ -3077,6 +3077,7 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "serde_with",
+ "sha1",
  "sha2",
  "strum_macros 0.28.0",
  "url",
