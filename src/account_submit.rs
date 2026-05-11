@@ -299,6 +299,54 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
 /// — защита от повторного входа в `manage_positions`-сценарий для той же позиции.
 pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingPosition) {
     tokio::spawn(async move {
+        // Гейт по времени жизни маркета: если wall-clock уже за `event_end_ms`,
+        // SELL-taker на CLOB НЕ отправляем (и TP-maker не отменяем — пусть он
+        // имеет шанс ещё залиться до резолюции). Позиция доедет до
+        // [`crate::account::Account::resolve_pending_market`]: auto-redeem
+        // $1/$0, PnL/bankroll/SimStats и submit-CSV обновятся payout-колбеком
+        // (см. `record_market_outcome` / `record_submit_close_to_csv_and_stats`).
+        //
+        // Зачем нужно: `manage_positions` может дёрнуть SL/Timeout/EvExit на
+        // stale-кадре (когда `frame.event_remaining_ms` ещё > 0, потому что
+        // `snapshot.timestamp_ms` отстал, а wall-clock уже за `event_end_ms`).
+        // Без этого гейта мы бы тратили реальные taker-fee на SELL ровно в
+        // момент резолюции, при том что auto-redeem всё равно поднимет шеры
+        // до $1/$0 и закроет позицию. Зеркальный гейт по BUY стоит в
+        // [`crate::real_sim::tick_once`].
+        //
+        // Терминальное состояние записи: `close_status=CloseFailed`.
+        // `manage_positions` на следующем тике через `closing.retain` выкинет
+        // эту запись (см. doc-комментарий перед циклом cleanup), и `sell_gate`
+        // там же вернёт `HoldPnl` как только `frame.event_remaining_ms`
+        // догонит wall-clock (≤ 1с при здоровом WS). Если кадр ещё не догнал
+        // и `sell_gate` снова потребует close — спавн повторится и опять
+        // мгновенно отвалится по этому же гейту без HTTP. Когда маркет
+        // действительно резолвнется, `Account::resolve_pending_market`
+        // вытащит [`OpenPosition`] из `positions` в `pending_resolution`
+        // и проведёт бинарную выплату.
+        {
+            let now_wall_ms = crate::util::current_timestamp_ms();
+            let (event_end_ms_opt, pos_id_log, asset_id_log) = {
+                let pos_arc = closing_arc.read().await.position.clone();
+                let pos = pos_arc.read().await;
+                (pos.event_end_ms, pos.id.clone(), pos.asset_id.clone())
+            };
+            let past_event_end = match event_end_ms_opt {
+                Some(end_ms) => now_wall_ms >= end_ms,
+                None => false,
+            };
+            if past_event_end {
+                closing_arc.write().await.close_status = ClosingPositionStatus::CloseFailed;
+                crate::tee_println!(
+                    "[account_submit] SELL taker пропущен — wall-clock за event_end_ms: \
+                     pos_id={pos_id_log}, asset={asset_id_log}, now_wall_ms={now_wall_ms}, \
+                     event_end_ms={event_end_ms_opt:?} — ждём резолюцию через \
+                     Account::resolve_pending_market (PnL/bankroll/stats придут payout-колбеком)"
+                );
+                return;
+            }
+        }
+
         // Snapshot из позиции под коротким write-локом. Под этим же локом
         // делаем `take()` для `tp_order_id`, чтобы любой будущий код, заглянувший
         // в `pos.tp_order_id`, видел `None` (мы как раз его сейчас отменяем).
@@ -719,7 +767,7 @@ async fn drive_close_pnl_finalization_via_polling(
     crate::tee_println!(
         "[account_submit/poll] close_status({oid:?}) → Closed (pos_id={pos_id})",
     );
-    crate::account_ws::finalize_close_pnl_in_place(account, c_arc.clone()).await;
+    crate::account_ws::finalize_close_pnl_in_place(account, c_arc.clone(), "Polling").await;
 }
 
 /// PnL-финализация для maker TP при polling-fallback'е:
@@ -765,7 +813,7 @@ async fn drive_tp_pnl_finalization_via_polling(
         crate::tee_println!(
             "[account_submit/poll] tp_order_id({tp_id}) → Matched (ClosingPosition уже создана WS — финализируем) (pos_id={pos_id})",
         );
-        crate::account_ws::finalize_tp_close_after_creation(account, &tp_id).await;
+        crate::account_ws::finalize_tp_close_after_creation(account, &tp_id, "Polling").await;
     } else {
         // WS не успел; REST-fallback. `apply_sell_fill` (TP-ветка) сам создаст
         // `ClosingPosition` (и проставит `pos.closing_position`!) и

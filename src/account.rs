@@ -134,6 +134,25 @@ pub struct Account {
     /// `clob_authed`; `Arc<None>` ↔ auth не поднимался / упал.
     /// `PrivateKeySigner: Clone`, hot-path `load()` без локов.
     pub clob_signer: ArcSwapAny<Arc<Option<PrivateKeySigner>>>,
+    /// Registry `currency → Arc<RwLock<RealSimState>>` — per-currency
+    /// sim-state, опубликованный для read-side: WS-/polling-финализаторы
+    /// в [`crate::account_ws`] / [`crate::account_submit`] апдейтят
+    /// [`crate::history_sim::SimStats`] выбирая нужный `RealSimState` по
+    /// `OpenPosition.currency`; [`crate::xframe_dump`] / [`ProjectManager::ingest_snapshot`]
+    /// читают `lane_frame_channels`.
+    ///
+    /// Заполняется один раз per-currency в начале
+    /// [`crate::real_sim::run_real_sim`] (`insert(currency.clone(), state.clone())`);
+    /// дальше read-only — внешний `RwLock` берётся write только на
+    /// `insert`, read — на каждый lookup (миллисекундный hold, clone Arc'а
+    /// и выход).
+    ///
+    /// **Lock-ordering:** этот лок берётся ОТДЕЛЬНО от canonical chain
+    /// `bankroll → … → individual_pos_lock`; держится максимально кратко
+    /// (только пока клонируем `Arc<RwLock<RealSimState>>`), внутрь
+    /// `RealSimState` уходим уже без удерживаемого внешнего лока. Никаких
+    /// `.await` под удерживаемым read'ом этого мапа нет.
+    pub real_sim_state_by_currency: Arc<RwLock<HashMap<String, Arc<RwLock<RealSimState>>>>>,
 }
 
 impl Account {
@@ -154,7 +173,20 @@ impl Account {
             clob,
             clob_authed: ArcSwapAny::new(Arc::new(None)),
             clob_signer: ArcSwapAny::new(Arc::new(None)),
+            real_sim_state_by_currency: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Snapshot `Arc<RwLock<RealSimState>>` для заданной `currency` через
+    /// внешний read-лок [`Self::real_sim_state_by_currency`]. Lock-hold —
+    /// миллисекундный (только clone `Arc`'а), без `.await` под ним.
+    /// `None` если `run_real_sim` для этой валюты ещё не зарегистрировал
+    /// state (тесты / history_sim / ранняя инициализация).
+    pub async fn real_sim_state_for_currency(
+        &self,
+        currency: &str,
+    ) -> Option<Arc<RwLock<RealSimState>>> {
+        self.real_sim_state_by_currency.read().await.get(currency).cloned()
     }
 
     /// Пустые `positions` / `pending_resolution` / `closing` для всех лейнов валюты
@@ -178,11 +210,16 @@ impl Account {
     /// Закрывает pending по `market_id` бинарной выплатой CTF (как `CloseReason::Resolution` в `close_position`).
     /// Победа токена: `pnl = shares_held - entry_cost`, иначе `pnl = -entry_cost`; комиссии на redeem нет.
     ///
-    /// **Параметры:** `account`, `state` — счёт и `RealSimState` этой валюты; `currency` / `interval` —
+    /// **Параметры:** `account` — счёт; `currency` / `interval` —
     /// фильтр лейнов; `market_id` — `condition_id`; `up_won` — см. [`crate::xframe_dump::MarketXFramesDump::up_won`];
     /// `final_price` — фактическая цена закрытия окна, прокидывается в CSV-колонку `final_price`
     /// resolution-строки (на момент входа в позицию неизвестна, появляется только в callback'е
     /// [`crate::xframe_dump::spawn_dump_market_xframes_binary`]).
+    ///
+    /// `RealSimState` для `currency` берётся из
+    /// [`Self::real_sim_state_by_currency`] (опубликована в начале
+    /// [`crate::real_sim::run_real_sim`] этой валюты). Если в map'е её ещё
+    /// нет — silent return (currency не торгуется, резолвить нечего).
     ///
     /// **Lock order:** сначала `state.write()` (RealSimState — внешний `RwLock`),
     /// затем поля `Account` в порядке объявления (`bankroll → positions →
@@ -192,13 +229,18 @@ impl Account {
     /// Drawdown здесь не обновляют — следующий `tick_once` вызовет `update_drawdown`.
     pub async fn resolve_pending_market(
         account: &SharedAccount,
-        state: &Arc<RwLock<RealSimState>>,
         currency: &str,
         interval: XFrameIntervalKind,
         market_id: &str,
         up_won: bool,
         final_price: f64,
     ) {
+        // Lookup per-currency RSS — лок внешнего мапа держим миллисекундно
+        // (clone Arc'а + drop). Дальше `state_guard` под собственным
+        // `RwLock<RealSimState>` берётся в canonical порядке ниже.
+        let Some(state) = account.real_sim_state_for_currency(currency).await else {
+            return;
+        };
         let mut state_guard = state.write().await;
 
         // Собираем live TP-order_id'ы для отмены ниже (см. doc у
@@ -404,6 +446,52 @@ impl Account {
                             graph_html_file_uri: graph_html_file_uri.as_str(),
                             pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
                         });
+                        // Дубль-запись в submit-CSV (`last_real_sim_with_submit_trades.csv`)
+                        // в расширенном формате [`SubmitTradeCsvRow`]. В virtual
+                        // режиме `SUBMIT_TRADE_CSV_LOG` не открыт — вызов no-op.
+                        // В submit-режиме базовый `TRADE_CSV_LOG` не открыт, а
+                        // `write_submit_trade_csv_row` пишет сразу на диск
+                        // (без `record_market_outcome` — outcome для submit
+                        // строки и так известен из `exit_reason`).
+                        crate::trade_csv_log::write_submit_trade_csv_row(
+                            crate::trade_csv_log::SubmitTradeCsvRow {
+                                pos_id: &pos.id,
+                                polymarket_url: &pos.polymarket_url,
+                                price_to_beat: pos.price_to_beat,
+                                final_price: final_price.or(pos.final_price),
+                                currency: cur,
+                                interval: interval_str,
+                                side: side_str,
+                                market_id,
+                                asset_id: &pos.asset_id,
+                                exit_reason,
+                                fill_role: "AutoRedeem",
+                                finalized_via: "Resolution",
+                                planned_buy_price: pos.planned_buy_price,
+                                buy_price: pos.buy_price,
+                                planned_shares_held: pos.planned_shares_held,
+                                shares_held: pos.shares_held,
+                                planned_entry_cost: pos.planned_entry_cost,
+                                entry_cost: pos.entry_cost,
+                                exit_price: if token_won { 1.0 } else { 0.0 },
+                                fee_usdc: 0.0,
+                                pnl,
+                                open_order_id: pos.open_order_id.as_deref(),
+                                tp_order_id: pos.tp_order_id.as_deref(),
+                                close_order_id: None,
+                                raw_pred: pos.raw_pred_at_open,
+                                cal_pred: pos.cal_pred_at_open,
+                                kelly_f: pos.kelly_f_at_open,
+                                p_win_ema_at_close: pos.p_win_ema,
+                                frames_held: pos.frames_held,
+                                event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
+                                event_remaining_ms_at_close: 0,
+                                open_unix_ms,
+                                close_unix_ms,
+                                graph_html_file_uri: graph_html_file_uri.as_str(),
+                                pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
+                            },
+                        );
                     }
                     let _ = pos_arc;
                 } else {

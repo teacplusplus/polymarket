@@ -242,7 +242,18 @@ async fn main() -> Result<()> {
                 std::path::Path::new("xframes/last_real_sim_with_submit.txt"),
                 "real_sim_with_submit",
             )?;
-            trade_csv_log::init_trade_csv_log_file(
+            // Единственный CSV для submit-режима — расширенный формат
+            // [`SubmitTradeCsvRow`]. Сюда пишутся:
+            //   * taker SELL match'и (SL/Timeout/EvExit*) + maker TP fill'ы
+            //     из `account_ws::finalize_*` (через `write_submit_trade_csv_row`);
+            //   * resolution-payout строки из `Account::resolve_pending_market`
+            //     (через тот же `write_submit_trade_csv_row` с
+            //     `fill_role=AutoRedeem`, `finalized_via=Resolution`).
+            // Базовый `TRADE_CSV_LOG` (использующийся в virtual sim) в этом
+            // режиме сознательно НЕ открываем — все `write_trade_csv_row`
+            // вызовы выше по стеку (resolve_pending_market) становятся no-op
+            // через no-init guard в trade_csv_log.
+            trade_csv_log::init_submit_trade_csv_log_file(
                 std::path::Path::new("xframes/last_real_sim_with_submit_trades.csv"),
             )?;
             trade_csv_log::set_current_regime("real_sim_with_submit");

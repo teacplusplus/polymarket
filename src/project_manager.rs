@@ -17,7 +17,6 @@ use crate::data_ws::{
     MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws, WsCommand,
 };
 use crate::account::SharedAccount;
-use crate::real_sim::RealSimState;
 use crate::xframe::{
     currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
     find_same_outcome_sibling_asset_id, XFrame, SIZE,
@@ -114,7 +113,6 @@ pub struct ProjectManager {
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
-    pub real_sim_state: Arc<RwLock<RealSimState>>,
     pub account: SharedAccount,
     pub split_done_by_market_id: Arc<RwLock<HashMap<String, bool>>>,
 }
@@ -149,10 +147,8 @@ impl ProjectManager {
         let (market_ws_tx, market_ws_rx) =
             mpsc::channel::<WsCommand>(MARKET_WS_SUBSCRIPTION_CHANNEL_CAP);
 
-        let real_sim_state = Arc::new(RwLock::new(RealSimState::new()));
-
         let project_manager = Arc::new(Self {
-            currency: Arc::new(currency),
+            currency: Arc::new(currency.clone()),
             xframes_by_market: (0..FRAME_BUILD_INTERVALS_SEC.len())
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
@@ -176,7 +172,6 @@ impl ProjectManager {
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             last_snapshot_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
-            real_sim_state,
             account,
             split_done_by_market_id: Arc::new(RwLock::new(HashMap::new())),
         });
@@ -801,46 +796,56 @@ impl ProjectManager {
                 run_log::xframe_stored(&entry.frame);
             }
 
-            if lane == 0 && entry.frame.stable {
-                let kind = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type);
-                let side = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome);
-                if let (Some(kind), Some(side)) = (kind, side) {
-                    let channels_arc = self
-                        .real_sim_state
-                        .read()
-                        .await
-                        .lane_frame_channels
-                        .channels
-                        .clone();
-                    let channels_guard = channels_arc.read().await;
-                    if let Some(tx) = channels_guard.get(&(kind, side)) {
-                        let event_start_ms = event_start_ms_by_market
-                            .get(&entry.market_id)
-                            .copied()
-                            .flatten();
-                        let event_end_ms = event_end_ms_by_market
-                            .get(&entry.market_id)
-                            .copied()
-                            .flatten();
-                        let price_to_beat = price_to_beat_by_market_snapshot
-                            .get(&entry.market_id)
-                            .copied()
-                            .flatten();
-                        let gamma_question = gamma_question_by_market
-                            .get(&entry.market_id)
-                            .cloned()
-                            .flatten();
-                        let lane_frame = LaneFrame {
-                            market_id: entry.market_id.clone(),
-                            asset_id: entry.asset_id.clone(),
-                            event_start_ms,
-                            event_end_ms,
-                            price_to_beat,
-                            gamma_question,
-                            frame: entry.frame.clone(),
-                        };
-                        let _ = tx.send(lane_frame).await;
-                    }
+            if lane == 0 && entry.frame.stable
+                && let Some(kind) = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type)
+                && let Some(side) = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
+                // RSS теперь хранится в `Account.real_sim_state_by_currency`
+                // (а не в PM): lookup по `self.currency` под коротким
+                // read'ом внешнего map'а. До `run_real_sim` ключа ещё
+                // нет — `None`, и `lane_frame` отправлять некуда:
+                // пропускаем send (нормально на ранних кадрах ещё до
+                // старта `run_real_sim` этой валюты). `xframes_by_market`
+                // ниже всё равно заполняем (исторический буфер кадров
+                // независим от submit-flow).
+                && let Some(state_arc) = self
+                    .account
+                    .real_sim_state_for_currency(self.currency.as_str())
+                    .await
+            {
+                let channels_arc = state_arc
+                    .read()
+                    .await
+                    .lane_frame_channels
+                    .channels
+                    .clone();
+                let channels_guard = channels_arc.read().await;
+                if let Some(tx) = channels_guard.get(&(kind, side)) {
+                    let event_start_ms = event_start_ms_by_market
+                        .get(&entry.market_id)
+                        .copied()
+                        .flatten();
+                    let event_end_ms = event_end_ms_by_market
+                        .get(&entry.market_id)
+                        .copied()
+                        .flatten();
+                    let price_to_beat = price_to_beat_by_market_snapshot
+                        .get(&entry.market_id)
+                        .copied()
+                        .flatten();
+                    let gamma_question = gamma_question_by_market
+                        .get(&entry.market_id)
+                        .cloned()
+                        .flatten();
+                    let lane_frame = LaneFrame {
+                        market_id: entry.market_id.clone(),
+                        asset_id: entry.asset_id.clone(),
+                        event_start_ms,
+                        event_end_ms,
+                        price_to_beat,
+                        gamma_question,
+                        frame: entry.frame.clone(),
+                    };
+                    let _ = tx.send(lane_frame).await;
                 }
             }
             let mut xframes_by_market_lock = self.xframes_by_market[lane].write().await;

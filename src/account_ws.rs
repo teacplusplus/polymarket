@@ -674,8 +674,11 @@ async fn apply_buy_fill(
             }
             hit = true;
             crate::tee_println!(
-                "[user_ws] BUY fill: pos_id={}, order_id={order_id}, size={size:.4}, price={price:.4}, fee_rate_bps={fee_rate_bps:.2} → shares_held={:.4}, entry_cost={:.4}, buy_price={:.4}",
-                pos.id, pos.shares_held, pos.entry_cost, pos.buy_price,
+                "[user_ws] BUY fill: pos_id={}, order_id={order_id}, size={size:.4}, price={price:.4}, fee_rate_bps={fee_rate_bps:.2} → shares_held={:.4} (plan {:.4}), entry_cost={:.4} (plan {:.4}), buy_price={:.4} (plan {:.4})",
+                pos.id,
+                pos.shares_held, pos.planned_shares_held,
+                pos.entry_cost, pos.planned_entry_cost,
+                pos.buy_price, pos.planned_buy_price,
             );
         }
     }
@@ -754,7 +757,7 @@ pub(crate) async fn apply_sell_fill(
                 );
             }
             if let Some(c_arc) = to_finalize {
-                finalize_close_pnl_in_place(account, c_arc).await;
+                finalize_close_pnl_in_place(account, c_arc, "Ws").await;
             }
             return;
         }
@@ -821,7 +824,7 @@ pub(crate) async fn apply_sell_fill(
     // порядка, конфликта нет, но всё равно держим максимально кратко).
     {
         let mut p = pos_arc.write().await;
-        p.closing_position = Some(std::sync::Arc::downgrade(&c_arc));
+        p.set_closing_position(std::sync::Arc::downgrade(&c_arc));
     }
     {
         let mut closing = account.closing.write().await;
@@ -831,7 +834,7 @@ pub(crate) async fn apply_sell_fill(
         // closing-лок и зовём отдельно, иначе lock-ordering нарушается.
     }
     // Финализация под собственными локами в каноническом порядке.
-    finalize_tp_close_after_creation(account, order_id).await;
+    finalize_tp_close_after_creation(account, order_id, "Ws").await;
 }
 
 /// Финализирует `pnl` (вычитает `entry_cost`) для уже-в-`Closed`-состоянии
@@ -846,6 +849,7 @@ pub(crate) async fn apply_sell_fill(
 pub(crate) async fn finalize_close_pnl_in_place(
     account: &SharedAccount,
     c_arc: crate::history_sim::SharedClosingPosition,
+    finalized_via: &'static str,
 ) {
     // Шаг 1: snapshot из ClosingPosition (clone Arc'а на position и pnl).
     let (pos_arc, raw_pnl) = {
@@ -873,46 +877,69 @@ pub(crate) async fn finalize_close_pnl_in_place(
         p.pnl_finalized = true;
     }
 
-    // Шаг 5: bankroll write в фоне. Отдаём в spawned-таску, потому что
-    // вызыватель может всё ещё держать closing-HashMap-лок выше по стеку
-    // (например `apply_sell_fill`); brankroll должен браться ПЕРЕД closing
-    // в каноническом порядке, но мы пришли сюда с уже-удержанным closing —
-    // отвязываем апдейт от текущего lock-стека.
-    let bankroll_arc = account.bankroll.clone();
-    let pnl_for_bg = pnl;
-    tokio::spawn(async move {
-        let mut bankroll = bankroll_arc.write().await;
-        *bankroll += pnl_for_bg;
-        crate::tee_println!(
-            "[user_ws] finalize SELL: pos_id={pos_id}, pnl={pnl_for_bg:.4} → bankroll={:.4}",
-            *bankroll,
-        );
-    });
+    // Шаг 5: bankroll апдейт inline. Прежний `tokio::spawn` тут был
+    // workaround'ом против case'а «caller всё ещё держит closing-HashMap-лок»,
+    // но сейчас оба call-site'а (`apply_sell_fill` после `drop(closing)` и
+    // `drive_close_pnl_finalization_via_polling`) приходят без удержанных
+    // HashMap-локов, поэтому никакой инверсии canonical order'а
+    // (`bankroll → … → closing`) нет — пишем напрямую.
+    let new_bankroll = {
+        let mut bankroll = account.bankroll.write().await;
+        *bankroll += pnl;
+        *bankroll
+    };
+    crate::tee_println!(
+        "[user_ws] finalize SELL: pos_id={pos_id}, pnl={pnl:.4} → bankroll={new_bankroll:.4}",
+    );
+    // Шаг 6: peak/dd inline. Equity тут = cash-bankroll без MtM остальных
+    // открытых позиций — это нижняя граница (MtM прибавит ≥0 к equity,
+    // если у других OpenPosition'ов положительный MtM). На следующем
+    // real_sim MtM-тике peak/dd пересчитается с учётом MtM-добавок;
+    // здесь — «поспешный» update, чтобы emergency-halt сработал как
+    // можно раньше после фиксации убытка.
+    account.update_drawdown(new_bankroll).await;
+    // Шаг 7: stats-каунтеры (per-side `pnl_tp` / `pnl_sl` / etc.) + строка
+    // submit-orders CSV. Идёт после bankroll/peak — никаких Account-локов
+    // тут уже не удерживается, lock-ordering чистый. Helper сам no-op'нет,
+    // если real_sim_state не зарегистрирован (тесты / history_sim).
+    record_submit_close_to_csv_and_stats(account, &pos_arc, &c_arc, pnl, finalized_via).await;
 }
 
 /// Финализирует TP-fill после того, как `apply_sell_fill` (TP ветка) создала
 /// `ClosingPosition` с уже корректным `pnl` (т.е. proceeds − entry_cost).
 /// Здесь только апдейт bankroll/stats — идемпотентно через тот же
 /// [`crate::history_sim::OpenPosition::pnl_finalized`] маркер.
-pub(crate) async fn finalize_tp_close_after_creation(account: &SharedAccount, order_id: &str) {
-    // Сначала снимаем snapshot {pos_arc, pnl} под closing-HashMap-локом +
+pub(crate) async fn finalize_tp_close_after_creation(
+    account: &SharedAccount,
+    order_id: &str,
+    finalized_via: &'static str,
+) {
+    // Сначала снимаем snapshot {pos_arc, c_arc, pnl} под closing-HashMap-локом +
     // c-write inner. Чтобы не держать оба inner'а одновременно, маркер на
     // OpenPosition ставим уже после отпускания c-write.
-    let target: Option<(crate::history_sim::SharedOpenPosition, f64)> = {
+    let target: Option<(
+        crate::history_sim::SharedOpenPosition,
+        crate::history_sim::SharedClosingPosition,
+        f64,
+    )> = {
         let closing = account.closing.read().await;
-        let mut found: Option<(crate::history_sim::SharedOpenPosition, f64)> = None;
+        let mut found: Option<(
+            crate::history_sim::SharedOpenPosition,
+            crate::history_sim::SharedClosingPosition,
+            f64,
+        )> = None;
         'outer: for vec in closing.values() {
             for c_arc in vec.iter() {
                 let c = c_arc.read().await;
                 if c.close_order_id.as_deref() == Some(order_id) {
-                    found = Some((c.position.clone(), c.pnl.unwrap_or(0.0)));
+                    found = Some((c.position.clone(), c_arc.clone(), c.pnl.unwrap_or(0.0)));
                     break 'outer;
                 }
             }
         }
         found
     };
-    let Some((pos_arc, pnl)) = target else {
+    let Some((pos_arc, c_arc, pnl)) = target else {
         return;
     };
     // Идемпотентность: если маркер уже стоит — выходим. Заодно snapshot'им pos_id для лога.
@@ -924,10 +951,202 @@ pub(crate) async fn finalize_tp_close_after_creation(account: &SharedAccount, or
         p.pnl_finalized = true;
         p.id.clone()
     };
-    let mut bankroll = account.bankroll.write().await;
-    *bankroll += pnl;
+    let new_bankroll = {
+        let mut bankroll = account.bankroll.write().await;
+        *bankroll += pnl;
+        *bankroll
+    };
     crate::tee_println!(
-        "[user_ws] finalize TP: pos_id={pos_id}, pnl={pnl:.4} → bankroll={:.4}",
-        *bankroll,
+        "[user_ws] finalize TP: pos_id={pos_id}, pnl={pnl:.4} → bankroll={new_bankroll:.4}",
     );
+    // Inline peak/dd update — см. `finalize_close_pnl_in_place` Шаг 6.
+    account.update_drawdown(new_bankroll).await;
+    // Stats + submit-orders CSV — см. `finalize_close_pnl_in_place` Шаг 7.
+    record_submit_close_to_csv_and_stats(account, &pos_arc, &c_arc, pnl, finalized_via).await;
+}
+
+/// Бампит per-side stats-каунтеры (через [`crate::history_sim::apply_close_to_side_stats`])
+/// и пишет одну строку в submit-orders CSV
+/// (через [`crate::trade_csv_log::write_submit_trade_csv_row`]) для одной
+/// финализованной submit-сделки.
+///
+/// **Lock-ordering:** не удерживает никакие Account-локи. Берёт под коротким
+/// read'ом `pos_arc` (для snapshot всех полей включая `id`/`currency`/`interval`
+/// /…/`graph_dump_bin_path_for_trade_csv_uri`), потом отпускает, потом `c_arc.read()`
+/// для `reason`/`exit_price`/`close_order_id`, отпускает, потом
+/// `account.real_sim_state_by_currency.read()` миллисекундно (clone Arc'а), и
+/// уже отдельно `state.write()` (Arc<RwLock<RealSimState>>) для bump'а stats — это
+/// отдельный лок, к canonical Account-order'у не привязан.
+///
+/// No-op если:
+/// - `currency` не зарегистрирован в [`crate::account::Account::real_sim_state_by_currency`]
+///   (history_sim / тесты / ранний crash без `run_real_sim`);
+/// - `interval` или `side` пары не парсятся (`unknown` — старые позиции/баги).
+async fn record_submit_close_to_csv_and_stats(
+    account: &SharedAccount,
+    pos_arc: &crate::history_sim::SharedOpenPosition,
+    c_arc: &crate::history_sim::SharedClosingPosition,
+    pnl: f64,
+    finalized_via: &'static str,
+) {
+    use crate::xframe::CurrencyUpDownOutcome;
+    use crate::xframe::XFrameIntervalKind;
+
+    // -------- snapshot pos --------
+    let (
+        pos_id,
+        asset_id,
+        market_id,
+        currency,
+        polymarket_url,
+        side_idx,
+        interval_type,
+        raw_pred,
+        cal_pred,
+        kelly_f,
+        planned_buy_price,
+        buy_price,
+        planned_shares_held,
+        shares_held,
+        planned_entry_cost,
+        entry_cost,
+        p_win_ema,
+        frames_held,
+        event_end_ms,
+        event_remaining_ms_at_open,
+        open_order_id,
+        tp_order_id,
+        price_to_beat,
+        final_price,
+        pnl_top5_shap,
+        graph_html_file_uri,
+    ) = {
+        let p = pos_arc.read().await;
+        let open_unix_ms_for_uri = p.event_end_ms.map(|e| e - p.event_remaining_ms_at_open);
+        let close_unix_ms_for_uri = Some(crate::util::current_timestamp_ms());
+        let side_str_for_uri = crate::history_sim::position_side_label(&p);
+        let graph_html_file_uri = crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&p)
+            .map(|bin_path| {
+                crate::xframe_graph_dump::graph_html_trade_file_uri(
+                    &bin_path,
+                    open_unix_ms_for_uri,
+                    close_unix_ms_for_uri,
+                    Some(side_str_for_uri),
+                )
+            })
+            .unwrap_or_default();
+        (
+            p.id.clone(),
+            p.asset_id.clone(),
+            p.market_id.clone(),
+            p.currency.clone(),
+            p.polymarket_url.clone(),
+            p.currency_up_down_outcome_at_open,
+            p.xframe_interval_type_at_open,
+            p.raw_pred_at_open,
+            p.cal_pred_at_open,
+            p.kelly_f_at_open,
+            p.planned_buy_price,
+            p.buy_price,
+            p.planned_shares_held,
+            p.shares_held,
+            p.planned_entry_cost,
+            p.entry_cost,
+            p.p_win_ema,
+            p.frames_held,
+            p.event_end_ms,
+            p.event_remaining_ms_at_open,
+            p.open_order_id.clone(),
+            p.tp_order_id.clone(),
+            p.price_to_beat,
+            p.final_price,
+            p.pnl_top5_shap_at_open.clone(),
+            graph_html_file_uri,
+        )
+    };
+
+    // -------- snapshot c --------
+    let (reason, exit_price, close_order_id) = {
+        let c = c_arc.read().await;
+        (c.reason.clone(), c.exit_price, c.close_order_id.clone())
+    };
+
+    // -------- маппинг interval / side --------
+    let interval_kind = XFrameIntervalKind::from_i32(interval_type);
+    let side_outcome = CurrencyUpDownOutcome::from_i32(side_idx);
+    let interval_str = interval_kind
+        .map(crate::real_sim::interval_label)
+        .unwrap_or("unknown");
+    let side_str = side_outcome
+        .map(crate::real_sim::side_label)
+        .unwrap_or("unknown");
+
+    // -------- fill_role: TP = Maker, всё остальное (SL/Timeout/EvExit*) = Taker --------
+    let fill_role: &'static str =
+        if matches!(reason, crate::history_sim::CloseReason::TakeProfit) {
+            "Maker"
+        } else {
+            "Taker"
+        };
+
+    // -------- bump per-side stats --------
+    if let (Some(interval), Some(side_kind)) = (interval_kind, side_outcome)
+        && let Some(state_arc) = account.real_sim_state_for_currency(&currency).await
+    {
+        let mut state = state_arc.write().await;
+        if let Some(stats) = state.stats.get_mut(&interval) {
+            let side_stats = match side_kind {
+                CurrencyUpDownOutcome::Up => &mut stats.up,
+                CurrencyUpDownOutcome::Down => &mut stats.down,
+            };
+            crate::history_sim::apply_close_to_side_stats(side_stats, &reason, pnl, raw_pred);
+        }
+    }
+
+    // -------- submit-orders CSV --------
+    let now_ms = crate::util::current_timestamp_ms();
+    let open_unix_ms = event_end_ms.map(|e| e - event_remaining_ms_at_open);
+    let close_unix_ms = Some(now_ms);
+    let event_remaining_ms_at_close = event_end_ms.map(|e| e - now_ms).unwrap_or(0);
+    crate::trade_csv_log::write_submit_trade_csv_row(crate::trade_csv_log::SubmitTradeCsvRow {
+        pos_id: &pos_id,
+        polymarket_url: &polymarket_url,
+        price_to_beat,
+        final_price,
+        currency: &currency,
+        interval: interval_str,
+        side: side_str,
+        market_id: &market_id,
+        asset_id: &asset_id,
+        exit_reason: crate::history_sim::trade_csv_close_reason_label(&reason),
+        fill_role,
+        finalized_via,
+        planned_buy_price,
+        buy_price,
+        planned_shares_held,
+        shares_held,
+        planned_entry_cost,
+        entry_cost,
+        exit_price,
+        // Polymarket fee уже учтена в `c.pnl` (см. `apply_sell_fill`:
+        // `net_usdc = usd_received × (1 − fee_rate)`); отдельно gross/fee
+        // не аккумулируем — отдельная колонка стоила бы поля в
+        // `ClosingPosition`. Если нужно — добавить `fee_usdc_accumulated`.
+        fee_usdc: 0.0,
+        pnl,
+        open_order_id: open_order_id.as_deref(),
+        tp_order_id: tp_order_id.as_deref(),
+        close_order_id: close_order_id.as_deref(),
+        raw_pred,
+        cal_pred,
+        kelly_f,
+        p_win_ema_at_close: p_win_ema,
+        frames_held,
+        event_remaining_ms_at_open,
+        event_remaining_ms_at_close,
+        open_unix_ms,
+        close_unix_ms,
+        graph_html_file_uri: graph_html_file_uri.as_str(),
+        pnl_top5_shap: pnl_top5_shap.as_str(),
+    });
 }

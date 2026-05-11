@@ -334,18 +334,61 @@ pub struct OpenPosition {
     #[allow(dead_code)]
     pub(crate) market_id: String,
     /// Количество шерсов после вычета комиссии при покупке.
+    ///
+    /// **В submit-режиме это поле «живое»**: при первом WS BUY trade event'е
+    /// [`crate::account_ws::apply_buy_fill`] обнуляет его и аккумулирует
+    /// реальные fills (см. [`Self::optimistic_fill_replaced`]). Если нужны
+    /// **исходные теоретические шеры** (то, что насчитал
+    /// `book_fill_buy_strict` на кадре входа) — читай
+    /// [`Self::planned_shares_held`].
     pub(crate) shares_held: f64,
     /// Отображаемая prob на входе; пайплайн оценки использует только [`Self::buy_price`].
     #[allow(dead_code)]
     pub(crate) entry_prob: f64,
     /// VWAP покупки — база для TP/SL, pending MtM, CSV `buy_price`, гистограмма входов.
+    ///
+    /// **В submit-режиме это поле «живое»**: в [`crate::account_ws::apply_buy_fill`]
+    /// пересчитывается из реальных fills как `entry_cost / shares_held` после
+    /// замержа всех partial-fills. Исходный теоретический VWAP, посчитанный
+    /// `book_fill_buy_strict` на кадре входа, — в [`Self::planned_buy_price`].
     pub(crate) buy_price: f64,
     /// Sell VWAP на кадре входа для [`Self::shares_held`] с cap к L1 ([`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]);
     /// gross walk / шеры, как у voluntary-ветки. Для SL: urgent VWAP должен просесть относительно
     /// этого уровня не меньше [`crate::xframe::Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`].
     pub(crate) sell_vwap_entry: f64,
     /// USDC потраченные на покупку (= POSITION_SIZE_USD).
+    ///
+    /// **В submit-режиме это поле «живое»**: при первом WS BUY trade event'е
+    /// [`crate::account_ws::apply_buy_fill`] обнуляет его и аккумулирует
+    /// реальный `Σ size × price` от Polymarket (см.
+    /// [`Self::optimistic_fill_replaced`]). Исходный плановый размер позиции
+    /// (`POSITION_SIZE_USD` в submit / `book_fill_buy_strict` для виртуальных
+    /// режимов) — в [`Self::planned_entry_cost`].
     pub(crate) entry_cost: f64,
+    /// **Plan-snapshot** [`Self::shares_held`] на кадре входа — то, что вернул
+    /// `book_fill_buy_strict` (или эквивалент для submit-flow) до того, как
+    /// долетели реальные WS fills. Никогда не модифицируется после
+    /// [`open_position`]. Используется как референс «сколько мы хотели
+    /// купить» для аналитики (slippage по объёму = `1 - shares_held /
+    /// planned_shares_held`), CSV-логов и сравнения «план vs факт». Для
+    /// виртуальных режимов (history_sim / real_sim без submit)
+    /// `shares_held == planned_shares_held` весь жизненный цикл позиции.
+    pub(crate) planned_shares_held: f64,
+    /// **Plan-snapshot** [`Self::buy_price`] на кадре входа — теоретический
+    /// VWAP покупки из `book_fill_buy_strict`. Никогда не модифицируется
+    /// после [`open_position`]. Slippage по цене входа =
+    /// `buy_price - planned_buy_price`. Та же логика «план vs факт», что
+    /// у [`Self::planned_shares_held`].
+    pub(crate) planned_buy_price: f64,
+    /// **Plan-snapshot** [`Self::entry_cost`] на кадре входа —
+    /// `POSITION_SIZE_USD` для submit-flow (то, что мы готовы потратить /
+    /// чем лочим bankroll) или фактический gross walk от
+    /// `book_fill_buy_strict` для виртуальных режимов. Никогда не
+    /// модифицируется после [`open_position`]. Slippage по сумме =
+    /// `planned_entry_cost - entry_cost` (FAK taker мог взять меньше из-за
+    /// тонкой книги). Та же логика «план vs факт», что у
+    /// [`Self::planned_shares_held`].
+    pub(crate) planned_entry_cost: f64,
     /// L1 bid на входе: maker vs taker для модельной TP-лимитки в [`close_position`].
     pub(crate) best_bid_at_entry: Option<f64>,
     /// Сколько кадров позиция уже удерживается (для таймаута).
@@ -448,6 +491,34 @@ pub struct OpenPosition {
     /// нормальный случай (cleanup в `manage_positions` уже её выкинул, либо
     /// этой позиции вообще не было `ClosingPosition`).
     pub(crate) closing_position: Option<WeakClosingPosition>,
+}
+
+impl OpenPosition {
+    /// Устанавливает [`Self::closing_position`] **ровно один раз** на
+    /// жизненный цикл позиции. Паникует, если поле уже заполнено
+    /// (`Some(_)` — вне зависимости от того, протух ли уже weak-ссылка через
+    /// [`std::sync::Weak::upgrade`] → `None`).
+    ///
+    /// Этот инвариант защищает submit-flow: `ClosingPosition` создаётся
+    /// единожды per [`OpenPosition`] (одной из веток —
+    /// [`manage_positions`]-real-close / -virtual-close, или
+    /// [`crate::account_ws::apply_sell_fill`]-TP-fill). Повторный set —
+    /// баг (например, гонка между WS-колбеком и polling-fallback'ом,
+    /// которая прошла мимо `tp_placement_attempted` / `close_placement_attempted`
+    /// идемпотентности): тогда у нас получится две `ClosingPosition` для
+    /// одной позиции, две финализации PnL, и удвоенная коррекция bankroll.
+    /// Лучше упасть громко тут, чем тихо двойной учёт в стате/bankroll.
+    pub(crate) fn set_closing_position(&mut self, weak: WeakClosingPosition) {
+        if self.closing_position.is_some() {
+            panic!(
+                "OpenPosition::set_closing_position: повторная установка — \
+                 pos_id={}, asset_id={}, market_id={}, open_status={:?}; \
+                 это баг идемпотентности (см. doc у поля)",
+                self.id, self.asset_id, self.market_id, self.open_status,
+            );
+        }
+        self.closing_position = Some(weak);
+    }
 }
 
 /// Жизненный цикл live-ордера на закрытие позиции (SELL) на Polymarket CLOB.
@@ -1982,7 +2053,7 @@ pub(crate) async fn manage_positions(
                     pw.tp_placement_attempted = true;
                     // Прямая Weak-ссылка на ClosingPosition — единственный путь
                     // матчинга для polling-fallback (без скана `Account.closing`).
-                    pw.closing_position = Some(std::sync::Arc::downgrade(&closing_arc));
+                    pw.set_closing_position(std::sync::Arc::downgrade(&closing_arc));
                 }
                 closing.push(closing_arc.clone());
                 crate::account_submit::spawn_close_via_taker(account.clone(), closing_arc);
@@ -2019,7 +2090,7 @@ pub(crate) async fn manage_positions(
                     // симметрии с submit-флоу и потенциальных будущих consumer'ов.
                     {
                         let mut pw = pos_arc.write().await;
-                        pw.closing_position = Some(std::sync::Arc::downgrade(&closing_arc));
+                        pw.set_closing_position(std::sync::Arc::downgrade(&closing_arc));
                     }
                     closing.push(closing_arc);
                 }
@@ -2148,6 +2219,15 @@ fn open_position(
         buy_price,
         sell_vwap_entry,
         entry_cost: position_size,
+        // Plan-snapshot: фиксируем то, что насчитал `book_fill_buy_strict`
+        // на кадре входа. После долёта реальных WS BUY fills'ов
+        // `apply_buy_fill` затрёт «живые» `shares_held`/`entry_cost`/`buy_price`
+        // реальными числами, а эти три останутся неизменными — референс
+        // для slippage/«план vs факт». Для виртуальных режимов всегда
+        // совпадают с «живыми» (apply_buy_fill не вызывается).
+        planned_shares_held: actual_shares,
+        planned_buy_price: buy_price,
+        planned_entry_cost: position_size,
         best_bid_at_entry,
         frames_held: 0,
         p_win_ema: None,
@@ -2233,6 +2313,61 @@ fn gross_usdc_sell_take_profit(
     }
 }
 
+/// Бампит счётчики [`SideStats`] для одного закрытия позиции:
+/// `pnl_usd`, `trades`, `wins`/`losses`, `closed_trade_entries`
+/// и per-[`CloseReason`] пары `*_count` / `pnl_*`.
+///
+/// **Не трогает `fees_paid`** — комиссия в virtual-flow известна заранее (расчёт
+/// `gross_usdc → fee_usdc → net_usdc`), а в submit-flow финализаторы получают
+/// уже net'нутый `pnl` (Polymarket прислал fee как поле trade-event'а, оно
+/// вошло в `c.pnl` через `apply_sell_fill`). Caller сам решает, нужно ли
+/// дополнительно прибавлять `fees_paid`.
+///
+/// Используется как в виртуальной `close_position`, так и в submit-финализаторах
+/// [`crate::account_ws::finalize_close_pnl_in_place`] и
+/// [`crate::account_ws::finalize_tp_close_after_creation`] — единая точка
+/// обновления per-side-счётчиков, нет дрейфа между путями.
+pub(crate) fn apply_close_to_side_stats(
+    stats: &mut SideStats,
+    reason: &CloseReason,
+    pnl: f64,
+    raw_pred_at_open: f32,
+) {
+    stats.pnl_usd += pnl;
+    stats.trades += 1;
+    if pnl >= 0.0 {
+        stats.wins += 1;
+    } else {
+        stats.losses += 1;
+    }
+    // См. doc у `SideStats::closed_trade_entries`. В обычных прогонах никто
+    // не читает — но если sim запущен из `train_mode` ради калибровки,
+    // именно эти пары (raw, won) идут в isotonic вместо per-frame y-меток.
+    stats.closed_trade_entries.push((raw_pred_at_open, pnl > 0.0));
+    match reason {
+        CloseReason::TakeProfit => {
+            stats.tp_count += 1;
+            stats.pnl_tp += pnl;
+        }
+        CloseReason::StopLoss => {
+            stats.sl_count += 1;
+            stats.pnl_sl += pnl;
+        }
+        CloseReason::Timeout => {
+            stats.timeout_count += 1;
+            stats.pnl_timeout += pnl;
+        }
+        CloseReason::EvExitProfit => {
+            stats.ev_exit_profit_count += 1;
+            stats.pnl_ev_exit_profit += pnl;
+        }
+        CloseReason::EvExitLoss => {
+            stats.ev_exit_loss_count += 1;
+            stats.pnl_ev_exit_loss += pnl;
+        }
+    }
+}
+
 /// Рыночный выход (TP/SL/Timeout/EvExit): bid-walk, fee. Резолюция — в [`crate::account::Account`].
 fn close_position(
     pos: &OpenPosition,
@@ -2276,23 +2411,7 @@ fn close_position(
     let net_usdc = gross_usdc - fee_usdc;
 
     let pnl = net_usdc - pos.entry_cost;
-    stats.pnl_usd += pnl;
-
-    stats.trades += 1;
-    if pnl >= 0.0 { stats.wins += 1; } else { stats.losses += 1; }
-
-    // См. doc у `SideStats::closed_trade_entries`. В обычных прогонах никто
-    // не читает — но если sim запущен из `train_mode` ради калибровки,
-    // именно эти пары (raw, won) идут в isotonic вместо per-frame y-меток.
-    stats.closed_trade_entries.push((pos.raw_pred_at_open, pnl > 0.0));
-
-    match reason {
-        CloseReason::TakeProfit   => { stats.tp_count += 1;              stats.pnl_tp += pnl; }
-        CloseReason::StopLoss     => { stats.sl_count += 1;              stats.pnl_sl += pnl; }
-        CloseReason::Timeout      => { stats.timeout_count += 1;         stats.pnl_timeout += pnl; }
-        CloseReason::EvExitProfit => { stats.ev_exit_profit_count += 1;  stats.pnl_ev_exit_profit += pnl; }
-        CloseReason::EvExitLoss   => { stats.ev_exit_loss_count += 1;    stats.pnl_ev_exit_loss += pnl; }
-    }
+    apply_close_to_side_stats(stats, reason, pnl, pos.raw_pred_at_open);
 
     // Per-trade CSV-лог (если открыт через `init_trade_csv_log_file`).
     // Пишется ровно одной строкой на закрытие; resolution-закрытия

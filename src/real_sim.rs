@@ -83,6 +83,7 @@ const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
 ];
 
 /// Таблица `Sender` для фанаута lane 0; реальный `rx` у воркера, в карте — dummy пара для типа.
+#[derive(Debug)]
 pub struct LaneFrameChannels {
     pub channels: Arc<RwLock<HashMap<(XFrameIntervalKind, CurrencyUpDownOutcome), mpsc::Sender<LaneFrame>>>>,
 }
@@ -96,6 +97,7 @@ impl LaneFrameChannels {
 }
 
 /// [`SimStats`] по интервалам, каналы кадров, dedupe `events` через `seen_market_ids`.
+#[derive(Debug)]
 pub struct RealSimState {
     /// Агрегированная статистика по интервалам (per-interval счётчики).
     /// Карта инициализируется оба ключа сразу, воркеры делают
@@ -121,6 +123,17 @@ impl RealSimState {
         }
     }
 }
+
+// Per-currency `Arc<RwLock<RealSimState>>` теперь живёт прямо в
+// [`crate::account::Account::real_sim_state_by_currency`] и публикуется
+// из [`run_real_sim`] (`insert` под write'ом внешнего map'а). Снимок
+// читается через [`crate::account::Account::real_sim_state_for_currency`].
+//
+// Прежний глобал `SIM_STATE_BY_CURRENCY` + lookup-функция убраны — лишний
+// уровень косвенности (тот же `currency → Arc` map, только хранящийся
+// process-wide за пределами Account'а) ничего не давал, а добавлял
+// `LazyLock<std::sync::Mutex<…>>` и второй источник истины для одного
+// и того же состояния.
 
 /// Модели одной стороны одного интервала (PnL обязательная, Resolution — опциональная).
 struct SideModels {
@@ -184,9 +197,21 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>, submit: bool) ->
         version_path.display(),
     );
 
-    let state = project_manager.real_sim_state.clone();
     let account = project_manager.account.clone();
     let last_snapshot_by_asset_id = project_manager.last_snapshot_by_asset_id.clone();
+
+    // `RealSimState` теперь создаётся прямо тут (а не в `ProjectManager::new`)
+    // и публикуется в [`crate::account::Account::real_sim_state_by_currency`]:
+    // submit-flow финализаторы ([`crate::account_ws::record_submit_close_to_csv_and_stats`])
+    // / `xframe_dump` / `ProjectManager::ingest_snapshot` читают его оттуда
+    // по `currency`. Insert — под write'ом внешнего map'а, **до** spawn'а
+    // воркеров, чтобы первый же WS trade event этой валюты имел доступ к
+    // stats (см. doc у `Account::real_sim_state_by_currency`).
+    let state = Arc::new(RwLock::new(RealSimState::new()));
+    {
+        let mut map = account.real_sim_state_by_currency.write().await;
+        map.insert(currency.to_string(), state.clone());
+    }
     let channels = state.read().await.lane_frame_channels.channels.clone();
 
     account
@@ -488,7 +513,33 @@ async fn tick_once(
         buy_gate(&frame, pnl_inference, available_bankroll_pre, None, true),
         BuyGate::Proceed { .. }
     );
-    let may_open = !dd_halt_active && !market_already_resolved && buy_gate_proceed;
+    // Submit-режим: реальные ордера в Polymarket отправляем только пока
+    // маркет «живой» — т.е. wall-clock попадает в окно
+    // `[event_start_ms, event_end_ms)`, известное по Gamma. Без этого
+    // гейта возможны два неприятных сценария:
+    //   * Gamma-данные ещё не подтянулись (`event_start_ms`/`event_end_ms`
+    //     = `None`) → дедлайн неизвестен, `account_submit::spawn_open_buy_taker`
+    //     уходит с дефолтным `POLL_TIMEOUT_SEC`, а маркет может уже
+    //     резолвнуться;
+    //   * `frame.event_remaining_ms` (по которому работает `buy_gate::LateEntry`)
+    //     посчитан от `snapshot.timestamp_ms` и может быть оптимистичнее
+    //     wall-clock на десятки секунд при задержке WS — в этот зазор
+    //     `LateEntry` (порог [`MIN_ENTRY_REMAINING_MS`] = 10s) ещё не сработал,
+    //     а реальный маркет уже за резолюцией.
+    // Гейт затрагивает только новые открытия; ведение/закрытие уже открытых
+    // позиций идёт обычным путём через `manage_positions`. В виртуальных
+    // режимах (`submit=false`, `RealSim` / `history_sim`) логика не меняется.
+    let now_wall_ms = current_timestamp_ms();
+    let submit_market_window_open: bool = if submit {
+        match (event_start_ms, event_end_ms) {
+            (Some(start_ms), Some(end_ms)) => now_wall_ms >= start_ms && now_wall_ms < end_ms,
+            _ => false,
+        }
+    } else {
+        true
+    };
+    let may_open =
+        !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
     if buy_gate_proceed && dd_halt_active {
         crate::tee_eprintln!(
             "[real_sim] {tag}: halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
@@ -501,6 +552,13 @@ async fn tick_once(
             "[real_sim] {tag}: skip open — market={market_id} уже резолвнулся, кадр пришёл с задержкой"
         );
     }
+    if buy_gate_proceed && submit && !submit_market_window_open {
+        crate::tee_eprintln!(
+            "[real_sim] {tag}: skip open — submit-режим: маркет вне окна жизни \
+             (now_wall_ms={now_wall_ms}, event_start_ms={event_start_ms:?}, \
+             event_end_ms={event_end_ms:?}, market={market_id})"
+        );
+    }
     let needs_http = needs_sell || may_open;
 
     // Сначала пробуем «живой» WS-снимок: если в кэше
@@ -510,9 +568,7 @@ async fn tick_once(
     // батч-окно `BOOK_BATCH_*` + сетевой roundtrip). При отсутствии/протухании
     // кэша поведение прежнее: один request через `run_book_coordinator`.
     let strict_book: Option<StrictBook> = if needs_http {
-        match try_fresh_ws_strict_book(last_snapshot_by_asset_id, &asset_id, current_timestamp_ms())
-            .await
-        {
+        match try_fresh_ws_strict_book(last_snapshot_by_asset_id, &asset_id, now_wall_ms).await {
             Some(book) => Some(book),
             None => fetch_http_strict_book(book_tx, &asset_id, tag).await,
         }

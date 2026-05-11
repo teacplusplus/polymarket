@@ -75,7 +75,6 @@ pub fn spawn_dump_market_xframes_binary(
         // (см. `Account::resolve_pending_market`).
         crate::account::Account::resolve_pending_market(
             &project_manager.account,
-            &project_manager.real_sim_state,
             project_manager.currency.as_str(),
             interval_kind,
             &market_id,
