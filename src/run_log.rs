@@ -65,11 +65,7 @@ pub fn price_to_beat_from_rtds(
 }
 
 /// `fetch_price_to_beat_from_vatic_api`: сразу или отложенное обновление после rtds.
-pub fn price_to_beat_from_event_page(
-    period: &str,
-    slug: &str,
-    price: f64,
-) {
+pub fn price_to_beat_from_event_page(period: &str, slug: &str, price: f64) {
     if !WS_LOG_ENABLED {
         return;
     }
@@ -216,9 +212,7 @@ pub fn market_ws_session_err(err: impl std::fmt::Display) {
 }
 
 /// Финальный кадр после merge other/sibling, непосредственно перед записью в `xframes_by_market`.
-pub fn xframe_stored(
-    _frame: &crate::xframe::XFrame<{ crate::xframe::SIZE }>,
-) {
+pub fn xframe_stored(_frame: &crate::xframe::XFrame<{ crate::xframe::SIZE }>) {
     if !XFRAME_LOG_ENABLED {
         return;
     }
@@ -245,7 +239,9 @@ pub fn xframe_dump_written(
 
 pub fn rtds_watchdog_reconnect(pair_symbol: &str, latest_ts_ms: Option<i64>, now_ms: i64) {
     match latest_ts_ms {
-        None => crate::tee_eprintln!("rtds watchdog ({pair_symbol}): нет данных — форсируем реконнект"),
+        None => {
+            crate::tee_eprintln!("rtds watchdog ({pair_symbol}): нет данных — форсируем реконнект")
+        }
         Some(ts) => crate::tee_eprintln!(
             "rtds watchdog ({pair_symbol}): данные устарели на {}ms (latest_ts_ms={ts}, now={now_ms}) — форсируем реконнект",
             now_ms - ts,

@@ -1,141 +1,48 @@
-//! Submit-режим [`crate::main::AppMode::RealSimWithSubmit`]: реальная отправка
-//! BUY/SELL/cancel ордеров на Polymarket CLOB через [`crate::account_order`]
-//! и асинхронная верификация через `client.order(...)` (fallback к WS, см.
-//! [`crate::account_ws`]).
+//! `RealSimWithSubmit`: CLOB ордеры через [`crate::account_order`], подтверждение прежде всего WS
+//! ([`crate::account_ws`]), дополнительно polling `client.order` ([`spawn_polling_verify`]).
 //!
-//! # Архитектура
-//!
-//! Все async-таски модуля идут через `tokio::spawn` без удержания глобальных
-//! локов `Account.positions`/`closing` через сетевые вызовы. Дедуп
-//! постановки/отмены — через локальные флаги
-//! [`crate::history_sim::OpenPosition::tp_placement_attempted`] /
-//! [`crate::history_sim::ClosingPosition::close_placement_attempted`], которые
-//! атомарно выставляются под коротким write-локом ДО HTTP-вызова.
-//!
-//! # In-flight идентификация позиций
-//!
-//! Никаких synthetic-id'шников. Когда [`crate::history_sim::try_open_position`]
-//! пушит позицию в `Account.positions` (для лочки `entry_cost` в расчёте
-//! available bankroll), `OpenPosition.open_order_id` остаётся `None`, а
-//! `open_status = PendingOpen` — это и есть индикатор «отправили, ждём
-//! подтверждения CLOB». [`spawn_open_buy_taker`] получает в параметрах сам
-//! Arc на эту запись (см. [`crate::history_sim::SharedOpenPosition`]) и
-//! пишет real `order_id` напрямую через inner-RwLock. Аналогично с
-//! [`crate::history_sim::ClosingPosition`] / [`spawn_close_via_taker`].
-//!
-//! # Polling-verify
-//!
-//! WS-канал может отстать или упасть (см. watchdog в [`crate::account_ws`]).
-//! Чтобы не зависнуть в `PendingOpen`/`PendingClose`, после получения real
-//! `order_id` спавним polling-таску: каждые [`POLL_INTERVAL_SEC`] секунд
-//! `client.order(order_id)` до терминального статуса
-//! ([`OrderStatusType::Matched`] / `Canceled` / etc.) или таймаута
-//! [`POLL_TIMEOUT_SEC`]. На терминальном статусе таска вызывает те же
-//! апдейты, что и WS-колбек (через
-//! [`apply_order_status_from_polling`]).
+//! Таски через `spawn` без долгих локов на `positions`/`closing`; дедуп TP/cancel/closing —
+//! атомики/флаги на позиции до HTTP. После BUY/close/TP — poll до терминального статуса или
+//! `event_end_ms`/`POLL_TIMEOUT_SEC`, затем [`apply_order_status_from_polling`] (как WS).
 
 use crate::account::SharedAccount;
 use crate::account_order::{
-    cancel_order_on_clob, post_order_on_clob, CancelOrderRequest, OrderAmount, OrderRole,
-    PostOrderRequest,
+    CancelOrderRequest, OrderAmount, OrderRole, PostOrderRequest, cancel_order_on_clob,
+    post_order_on_clob,
 };
 use crate::history_sim::{
-    ClosingPositionStatus, OpenPositionStatus, SharedClosingPosition, SharedOpenPosition,
-    StrictBook, SIM_MAX_SLIPPAGE_FROM_L1_PCT,
+    ClosingPositionStatus, OpenPositionStatus, SIM_MAX_SLIPPAGE_FROM_L1_PCT, SharedClosingPosition,
+    SharedOpenPosition, StrictBook,
 };
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
 use polymarket_client_sdk::clob::types::request::TradesRequest;
 use polymarket_client_sdk::clob::types::{OrderStatusType, Side};
 use std::time::Duration;
 
-/// HTTP-таймаут одного `POST /order` / `DELETE /order` в submit-флоу.
-/// Сетевые вызовы идут в `tokio::spawn`, так что блокировки лейн-воркера нет;
-/// но per-call таймаут нужен, чтобы умершие сокеты не съедали task'и часами.
+/// Таймаут одного POST/DELETE в submit-спавнах.
 const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
 
-/// Период polling'а статуса ордера в [`spawn_polling_verify`] до терминального
-/// статуса. WS — основной канал, polling — fallback при тишине.
+/// Интервал `client.order` в [`spawn_polling_verify`].
 const POLL_INTERVAL_SEC: u64 = 3;
 
-/// Хард-таймаут polling-верификации: после N секунд без терминального статуса
-/// бросаем таску и оставляем позицию в pending — следующий тик `manage_positions`
-/// или ручная диагностика разрулит. Не делаем `OpenFailed` автоматически:
-/// возможно, ордер реально лежит live и заполнится позже.
+/// Запас по времени polling, если нет «жёсткого» дедлайна маркета.
 const POLL_TIMEOUT_SEC: u64 = 30;
 
-/// Максимум попыток отправки SELL taker в [`spawn_close_via_taker`] (включая
-/// первую). На исчерпании всех попыток `ClosingPosition.close_status` ставим
-/// в `CloseFailed`, и следующий тик `manage_positions` после cleanup'а вновь
-/// зайдёт в `sell_gate` и попробует — то есть retry-уровней два:
-/// in-task (быстрый, exp-backoff) и tick-based (медленный, fallback).
+/// Попытки SELL taker подряд (exp-backoff), иначе `CloseFailed`.
 const SELL_TAKER_MAX_ATTEMPTS: u32 = 3;
 
-/// Базовая задержка перед 1-м retry SELL-taker'а; следующие удваиваются:
-/// `500ms → 1s → 2s → …` (exp-backoff). С [`SELL_TAKER_MAX_ATTEMPTS`]=3
-/// получаем ожидания 500ms и 1s между попытками.
+/// Первая пауза между retry SELL taker («<< attempt» даёт 500ms, 1s, …).
 const SELL_TAKER_RETRY_INITIAL_MS: u64 = 500;
 
-/// Максимум попыток cancel'а maker-TP в [`spawn_cancel_tp_for_hold_zone`]
-/// (включая первую). Cancel сам по себе идемпотентен на стороне CLOB
-/// (`DELETE /order` на уже отменённой/сматченной лимитке вернёт
-/// `canceled=false` с `not_canceled[order_id]=reason`, но без ошибки),
-/// поэтому несколько HTTP-попыток здесь — это только защита от
-/// transient сетевых сбоев. На исчерпании попыток `tp_order_id` остаётся
-/// заполненным, а cancel при резолюции маркета подберёт лимитку через
-/// [`spawn_cancel_tp_orders_after_resolution`].
+/// Попытки cancel TP из hold-zone при сетевых ошибках.
 const TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS: u32 = 3;
 
-/// Базовая задержка перед 1-м retry cancel'а TP в hold-zone; следующие
-/// удваиваются: `500ms → 1s → …` (exp-backoff). При
-/// [`TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS`]=3 — 500ms и 1s между попытками.
+/// Первая пауза между retry cancel TP (hold-zone).
 const TP_HOLD_ZONE_CANCEL_RETRY_INITIAL_MS: u64 = 500;
 
-/// Спавнит таск отправки **BUY taker** на CLOB. Размер — в USDC
-/// (`amount=UsdNotional`).
-///
-/// # Worst-acceptable price (`price` / `max_slippage_pp`)
-///
-/// Поведение зависит от наличия `decision_price`:
-/// - `Some(p)` — explicit worst-acceptable, **зафиксированный на момент
-///   decision-time** в [`crate::history_sim::try_open_position`] из L1 ask
-///   tick'ового [`StrictBook`] + [`SIM_MAX_SLIPPAGE_FROM_L1_PCT`]. Передаётся
-///   в `PostOrderRequest::price`; SDK использует его как worst-acceptable
-///   и игнорирует `max_slippage_pp` (см. контракт в
-///   [`crate::account_order::PostOrderRequest::price`]). Этот вариант
-///   предпочтителен: cap считается от той же L1, на которой `buy_gate` принял
-///   решение, без дополнительного `GET /book` внутри SDK.
-/// - `None` — fallback: tick'овый snapshot был недоступен (HTTP-fail или
-///   ws-lag в [`crate::real_sim`]). Тогда `price=None`,
-///   `max_slippage_pp=Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)` — SDK сам сделает
-///   `GET /book` и посчитает cap от свежей L1.
-///
-/// Поле `strict_book` в `PostOrderRequest` тоже пробрасываем
-/// (`decision_book`) — оно используется SDK только в fallback-ветке (price=None)
-/// для расчёта slippage cap'а **без HTTP** ([`crate::account_order`]:
-/// `compute_taker_cap_price`); если есть и `decision_price` и `decision_book`,
-/// SDK видит первый и игнорирует второй (harmless).
-///
-/// # Идентификация in-flight позиции
-///
-/// Через переданный `pos_arc` (см. [`SharedOpenPosition`]); `open_order_id`
-/// пишется напрямую через inner-RwLock после получения real `order_id` от
-/// CLOB.
-///
-/// # Семантика терминальных статусов
-///
-/// На успехе: записывает real `order_id` в `pos_arc.open_order_id`. Дальше
-/// real-time апдейты летят через user-WS
-/// ([`crate::account_ws::apply_user_ws_event_value`]).
-///
-/// На ошибке (HTTP падение или CLOB rejection): позиция помечается
-/// `OpenPositionStatus::OpenFailed`. `manage_positions` (или cleanup в
-/// submit-режиме) уберёт её и вернёт `entry_cost` в свободный bankroll
-/// (фактически ничего не списано).
-///
-/// **Не блокирует** вызывающего: вся работа в `tokio::spawn`. После
-/// HTTP-ответа спавнит [`spawn_polling_verify_open`] для fallback'а на
-/// случай, если WS прокатится и не доедет.
-/// [проверено]
+/// BUY taker, `UsdNotional = entry_cost`. `price`: worst с decision-L1 (предпочтительно);
+/// если `None` — slip от свежей книги/SDK и опционально `strict_book` без GET.
+/// Успех → `open_order_id` + [`spawn_polling_verify_open`]; ошибка → `OpenFailed`.
 pub(crate) fn spawn_open_buy_taker(
     account: SharedAccount,
     pos_arc: SharedOpenPosition,
@@ -143,37 +50,34 @@ pub(crate) fn spawn_open_buy_taker(
     strict_book: Option<StrictBook>,
 ) {
     tokio::spawn(async move {
-        // Snapshot из позиции — `asset_id` и `entry_cost` (он же
-        // `position_size_usd` для `UsdNotional`) уже лежат в `pos_arc`,
-        // отдельные параметры передавать не нужно. Берём под коротким
-        // read-локом, дальше HTTP идёт без локов.
         let (pos_id, asset_id, position_size_usd) = {
             let pos = pos_arc.read().await;
             (pos.id.clone(), pos.asset_id.clone(), pos.entry_cost)
         };
-        // explicit price → max_slippage_pp игнорируется SDK; иначе — slippage-cap-флоу.
         let max_slippage_pp = if price.is_some() {
             None
         } else {
             Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
         };
         let request = PostOrderRequest {
-            asset_id: asset_id.clone(),
-            side: Side::Buy,
-            role: OrderRole::Taker,
-            amount: OrderAmount::UsdNotional(position_size_usd),
-            price,
-            max_slippage_pp,
-            expiration: None,
-            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-            strict_book,
+            asset_id: asset_id.clone(),                           // CLOB tokenId
+            side: Side::Buy,                                      // вход
+            role: OrderRole::Taker,                               // FAK BUY
+            amount: OrderAmount::UsdNotional(position_size_usd),  // notional
+            price,                                                // worst или None → slip
+            max_slippage_pp,                                      // только если price None
+            expiration: None,                                     // taker
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
+            strict_book,                                          // L1 для slip без GET
         };
         match post_order_on_clob(&account, request).await {
             Ok(result) => {
                 if !result.success {
                     crate::tee_eprintln!(
                         "[account_submit] BUY taker отвергнут CLOB: pos_id={pos_id}, error_msg={:?}, status={:?}, order_id={}",
-                        result.error_msg, result.status, result.order_id,
+                        result.error_msg,
+                        result.status,
+                        result.order_id,
                     );
                     pos_arc.write().await.open_status = OpenPositionStatus::OpenFailed;
                     return;
@@ -196,32 +100,9 @@ pub(crate) fn spawn_open_buy_taker(
     });
 }
 
-
-/// Идемпотентная постановка **maker SELL TP-лимитки** для уже открытой позиции.
-/// Цена — точно `pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP` (без slippage cap'а;
-/// см. ответ пользователя в дискуссии настройки модуля).
-///
-/// Идентификация позиции — через переданный `pos_arc` (см.
-/// [`SharedOpenPosition`]); никаких поисков по `open_order_id`. Caller (WS-колбек
-/// в [`crate::account_ws::apply_user_ws_event_value`] / polling-verify в
-/// [`apply_order_status_from_polling`]) уже знает, какая
-/// именно позиция перешла `PendingOpen → Open`, и передаёт её Arc напрямую.
-///
-/// Дедуп: атомарно проверяет + взводит
-/// [`crate::history_sim::OpenPosition::tp_placement_attempted`] под inner-write
-/// `pos_arc`; если флаг уже `true` или `tp_order_id` уже `Some(_)` —
-/// выходит без HTTP. Гонка между WS-колбеком и [`spawn_polling_verify_open`]
-/// поэтому безопасна.
-///
-/// **Локи и сеть:** под inner-write одной позиции только проверка/взвод флага
-/// и снятие snapshot'а параметров; HTTP-вызов идёт **без** локов; запись
-/// `tp_order_id` — снова под коротким inner-локом.
-/// [проверено]
+/// Maker TP по цене `buy_price + Y_TRAIN_TAKE_PROFIT_PP`. Идемпотентно через
+/// `tp_placement_attempted` / существующий `tp_order_id`. Успех → `spawn_polling_verify_tp`.
 pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosition) {
-    // Этап 1: snapshot + взвод флага под inner-write одной позиции.
-    // Кортеж: `(pos_id, asset_id, shares, tp_price, open_order_id)`. Поле
-    // `open_order_id` — только для логов (трассировка BUY → TP); на матчинг
-    // не влияет (позиция идентифицируется через переданный `pos_arc`).
     let (pos_id, asset_id, shares, tp_price, open_order_id) = {
         let mut pos = pos_arc.write().await;
         if pos.tp_placement_attempted || pos.tp_order_id.is_some() {
@@ -243,17 +124,16 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
         )
     };
 
-    // Этап 2: HTTP без локов.
     let request = PostOrderRequest {
-        asset_id: asset_id.clone(),
-        side: Side::Sell,
-        role: OrderRole::Maker,
-        amount: OrderAmount::Shares(shares),
-        price: Some(tp_price),
-        max_slippage_pp: None,
-        expiration: None,
-        timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-        strict_book: None,
+        asset_id: asset_id.clone(),                           // outcome token
+        side: Side::Sell,                                     // TP short
+        role: OrderRole::Maker,                               // post-only в SDK
+        amount: OrderAmount::Shares(shares),                  // размер TP
+        price: Some(tp_price),                                // limit
+        max_slippage_pp: None,                                // не для maker
+        expiration: None,                                     // GTC
+        timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
+        strict_book: None,                                    // книга не нужна
     };
     let result = match post_order_on_clob(&account, request).await {
         Ok(r) => r,
@@ -267,77 +147,35 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
     if !result.success {
         crate::tee_eprintln!(
             "[account_submit] TP maker отвергнут CLOB: pos_id={pos_id}, error_msg={:?}, status={:?}, order_id={}",
-            result.error_msg, result.status, result.order_id,
+            result.error_msg,
+            result.status,
+            result.order_id,
         );
         return;
     }
     let tp_order_id = result.order_id.clone();
 
-    // Этап 3: запись `tp_order_id` напрямую через inner-write `pos_arc`.
     pos_arc.write().await.tp_order_id = Some(tp_order_id.clone());
 
     crate::tee_println!(
         "[account_submit] TP maker размещён: pos_id={pos_id}, tp_order_id={tp_order_id}, open_order_id={open_order_id:?}, price={tp_price:.4}, shares={shares:.4}",
     );
-    // Polling-fallback симметрично BUY-taker'у: WS-канал может пропустить
-    // `trade` event на TP-fill, поэтому отдельная таска опрашивает
-    // `client.order(tp_order_id)` до Matched/Canceled или до `event_end_ms`
-    // маркета (см. [`PollingPositionKind::TpMaker`]). На Matched, если
-    // финализация PnL ещё не прошла через WS, polling фетчит
-    // `client.trades(...)` и сам прогонит TP-ветку `apply_sell_fill` →
-    // `finalize_tp_close_after_creation`.
     spawn_polling_verify_tp(account.clone(), pos_arc.clone());
 }
 
-/// Спавнит таск **отмены maker-TP при входе позиции в hold-zone**.
-///
-/// Стратегический контекст: в hold-zone выходы должны быть только через
-/// resolution-модель (`EvExitProfit`/`EvExitLoss` taker'ом, см.
-/// [`crate::history_sim::sell_gate`] in-hold-zone ветка) или hard SL, чтобы
-/// зафиксировать ожидание выплаты от резолюции маркета вместо фиксированного
-/// `Y_TRAIN_TAKE_PROFIT_PP`-таргета maker-лимитки. Поэтому при первом же
-/// `SellGate::HoldResolution`-тике для позиции снимаем её TP-лимитку с CLOB.
-///
-/// **Дедуп**: caller (`manage_positions`-HoldResolution-ветка) **синхронно ДО**
-/// `tokio::spawn` атомарно проверяет/взводит
-/// [`crate::history_sim::OpenPosition::tp_cancel_attempted`]
-/// под inner-write `pos_arc`. Эта таска уже видит флаг `true` и в `pos_arc`
-/// ничего не меняет — её работа исключительно сетевая (`cancel_order_on_clob`)
-/// + аккуратное обнуление `tp_order_id` ровно на подтверждённом успехе.
-///
-/// **Гонка cancel ↔ TP-match (важно)**: между нашим HTTP `DELETE /order` и
-/// ответом CLOB лимитка теоретически может сматчиться. CLOB вернёт
-/// `canceled=false, not_canceled[id]="already filled"` (или похожее), а WS
-/// независимо доставит trade-event на этот же `order_id` в
-/// [`crate::account_ws::apply_sell_fill`] (TP-ветка), который ищет
-/// `pos.tp_order_id == order_id` в `Account.positions`. Поэтому:
-/// - `tp_order_id` НЕ обнуляем превентивно перед HTTP;
-/// - обнуляем ТОЛЬКО на `Ok(res) if res.canceled == true` — то есть когда
-///   CLOB подтвердил cancel и никакого TP-fill'а быть не может;
-/// - на `canceled=false` (already-filled / already-canceled / etc.) и на
-///   HTTP-ошибках — `tp_order_id` оставляем нетронутым, WS-фоллбэк
-///   корректно подберёт fill, либо `spawn_cancel_tp_orders_after_resolution`
-///   уберёт лимитку на резолюции.
-///
-/// **Локи и сеть**: под inner-read одной позиции только snapshot
-/// `(pos_id, asset_id, tp_order_id)`; HTTP идёт **без** локов; финальный
-/// `pos_arc.write()` (обнуление `tp_order_id`) — снова короткий inner-write
-/// только на успехе.
+/// Снять TP при `HoldResolution`: caller уже взвёл `tp_cancel_attempted`.
+/// `tp_order_id` только клонируем; обнуляем при `canceled=true`; иначе ждём WS/резолюцию.
 pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpenPosition) {
     tokio::spawn(async move {
-        // Snapshot под read-локом одной позиции: `tp_order_id` клонируем
-        // (не `take()`), чтобы при гонке cancel ↔ TP-match WS-фоллбэк в
-        // `apply_sell_fill` нашёл совпадение в `pos.tp_order_id`.
         let (pos_id, asset_id, tp_order_id_opt) = {
             let pos = pos_arc.read().await;
-            (pos.id.clone(), pos.asset_id.clone(), pos.tp_order_id.clone())
+            (
+                pos.id.clone(),
+                pos.asset_id.clone(),
+                pos.tp_order_id.clone(),
+            )
         };
         let Some(tp_id) = tp_order_id_opt else {
-            // Гонка: TP уже сматчился / был отменён до того, как мы вошли
-            // в таску, и кто-то (WS / polling) уже обнулил поле. Тут делать
-            // нечего — `tp_cancel_attempted=true` остаётся
-            // взведённым (повторов всё равно не будет), идемпотентность
-            // сохранена.
             crate::tee_println!(
                 "[account_submit] TP cancel (hold-zone) skipped — tp_order_id=None: pos_id={pos_id}, asset={asset_id} (вероятно, гонка с WS-MATCHED)"
             );
@@ -345,8 +183,8 @@ pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpen
         };
 
         let cancel_req = CancelOrderRequest {
-            order_id: tp_id.clone(),
-            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+            order_id: tp_id.clone(),                              // maker TP id
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // cancel HTTP timeout
         };
         let mut last_result: Option<crate::account_order::CancelOrderResult> = None;
         for attempt in 1..=TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS {
@@ -354,7 +192,8 @@ pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpen
                 Ok(res) => {
                     crate::tee_println!(
                         "[account_submit] TP cancel (hold-zone) attempt {attempt}/{TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS}: pos_id={pos_id}, order_id={tp_id}, canceled={}, error_msg={:?}",
-                        res.canceled, res.error_msg,
+                        res.canceled,
+                        res.error_msg,
                     );
                     last_result = Some(res);
                     break;
@@ -382,21 +221,11 @@ pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpen
                 );
             }
             Some(_) => {
-                // `canceled=false` — лимитка уже была отменена / сматчена / нашлась
-                // в not_canceled с причиной. Поле `tp_order_id` оставляем как есть:
-                // если был TP-match в этот момент, WS его подберёт через
-                // `apply_sell_fill` TP-ветку; иначе резолюционный cleanup
-                // (`spawn_cancel_tp_orders_after_resolution`) дочистит.
                 crate::tee_println!(
                     "[account_submit] TP cancel (hold-zone) не подтверждён CLOB: pos_id={pos_id}, order_id={tp_id} — оставляем tp_order_id живым, ждём WS-MATCHED / резолюцию"
                 );
             }
             None => {
-                // Все HTTP-попытки исчерпаны. `tp_order_id` оставляем — на
-                // резолюции `spawn_cancel_tp_orders_after_resolution` отменит.
-                // Флаг `tp_cancel_attempted=true` остаётся
-                // взведённым, повторных попыток отсюда не будет (по плану —
-                // в hold-zone не флудим cancel'ами).
                 crate::tee_eprintln!(
                     "[account_submit] TP cancel (hold-zone) — все {TP_HOLD_ZONE_CANCEL_MAX_ATTEMPTS} попыток HTTP упали: pos_id={pos_id}, asset={asset_id}, tp_order_id={tp_id} — TP остаётся живым, будет снят резолюционным cleanup'ом"
                 );
@@ -405,56 +234,10 @@ pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpen
     });
 }
 
-/// Спавнит таск **закрытия позиции через taker SELL** (SL / Timeout / EvExit*):
-/// 1) если у `closing_arc.position` есть активный `tp_order_id` —
-///    `cancel_order_on_clob` (поле `take()`-нится **только** на подтверждённом
-///    `canceled=true`; превентивно НЕ обнуляем — см. ниже);
-/// 2) post-cancel re-check: если TP сматчился в окне cancel-HTTP ↔ ответ CLOB,
-///    [`crate::account_ws::apply_sell_fill`] TP-ветка уже морфировала наш
-///    `closing_arc` в `Closed/TakeProfit` и финализировала PnL → SELL-taker
-///    больше не нужен, возвращаемся из таски;
-/// 3) `post_order_on_clob` SELL taker без slippage cap'а
-///    (`max_slippage_pp=None` → CLOB зальёт сколько успеет с `Amount::shares`);
-/// 4) обновляет `closing_arc.close_order_id` на real `order_id` напрямую через
-///    inner-write;
-/// 5) спавнит [`spawn_polling_verify_close`] для fallback'а к WS-колбеку.
-///
-/// **Гонка cancel ↔ TP-match (важно)**: между нашим HTTP `DELETE /order` и
-/// ответом CLOB лимитка может сматчиться (низкий ask дошёл до нашей цены),
-/// CLOB вернёт `canceled=false, not_canceled[id]="already filled"`, а WS
-/// независимо доставит trade-event на этот же `order_id` в
-/// [`crate::account_ws::apply_sell_fill`] TP-ветку. Если бы мы превентивно
-/// сделали `tp_order_id.take()` ДО HTTP, WS-fallback не нашёл бы позицию по
-/// `pos.tp_order_id` → fill потерян в local state'е, шерсы на Safe ушли по TP,
-/// и дальше SELL-taker на пустых шерах CLOB бы отверг N раз. Поэтому:
-/// - `tp_order_id` НЕ обнуляем превентивно (клонируем для cancel-HTTP);
-/// - обнуляем ТОЛЬКО на `Ok(res) if res.canceled == true` (CLOB подтвердил cancel,
-///   никакого TP-fill'а уже не будет);
-/// - на `canceled=false` / HTTP-ошибке — `tp_order_id` оставляем нетронутым,
-///   WS-фоллбэк подберёт fill через `apply_sell_fill` TP-ветку (морф
-///   существующей PendingClose-записи в Closed/TakeProfit — см. doc там).
-///
-/// Симметрия с [`spawn_cancel_tp_for_hold_zone`]: то же правило про cancel'ные
-/// гонки, только hold-zone-вариант никогда не создаёт собственной
-/// `ClosingPosition` (просто снимает TP без последующего SELL).
-///
-/// Идентификация in-flight записи о закрытии — через переданный `closing_arc`
-/// (см. [`SharedClosingPosition`]); `close_order_id` пишется напрямую через
-/// inner-RwLock после получения real `order_id` от CLOB. `asset_id`,
-/// `shares_held` и `tp_order_id` snapshot'ятся из `closing_arc.position` под
-/// коротким read-локом в начале таски — отдельным параметрам в сигнатуре места нет.
-///
-/// Дедуп: caller (`manage_positions` в submit-режиме) уже взводит
-/// `OpenPosition.tp_placement_attempted = true` под write-локом самой позиции
-/// **синхронно ДО** вызова этой функции (защита от запоздавшего WS/polling
-/// `try_place_tp_maker` в окне между push'ем `ClosingPosition` и стартом
-/// этой `tokio::spawn`-таски). И `ClosingPosition.close_placement_attempted = true`
-/// — защита от повторного входа в `manage_positions`-сценарий для той же позиции.
+/// SL/timeout/EvExit: cancel TP если есть (`tp_order_id` не take до HTTP — гонка с TP-fill),
+/// иначе SELL taker с retry; `close_order_id` + polling. Caller взвёл `close_placement_attempted`.
 pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingPosition) {
     tokio::spawn(async move {
-        // Snapshot из позиции под коротким read-локом. `tp_order_id` КЛОНИРУЕМ
-        // (не `take()`) — превентивный `take()` создаёт окно для гонки
-        // cancel ↔ TP-match: см. doc у функции выше.
         let (pos_id, asset_id, tp_order_id_to_cancel) = {
             let pos_arc = closing_arc.read().await.position.clone();
             let pos = pos_arc.read().await;
@@ -475,15 +258,16 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
 
         if let Some(tp_id) = tp_order_id_to_cancel.as_deref() {
             let cancel_req = CancelOrderRequest {
-                order_id: tp_id.to_string(),
-                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                order_id: tp_id.to_string(),                          // TP перед SELL
+                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // DELETE
             };
             match cancel_order_on_clob(&account, cancel_req).await {
                 Ok(res) => {
                     crate::tee_println!(
-                    "[account_submit] TP cancel: pos_id={pos_id}, order_id={tp_id}, canceled={}, error_msg={:?}",
-                    res.canceled, res.error_msg,
-                );
+                        "[account_submit] TP cancel: pos_id={pos_id}, order_id={tp_id}, canceled={}, error_msg={:?}",
+                        res.canceled,
+                        res.error_msg,
+                    );
                     if res.canceled {
                         let pos_arc = closing_arc.read().await.position.clone();
                         let mut pw = pos_arc.write().await;
@@ -494,52 +278,37 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 }
                 Err(err) => {
                     crate::tee_eprintln!(
-                    "[account_submit] TP cancel упал: pos_id={pos_id}, tp_order_id={tp_id}: {err:#} — \
+                        "[account_submit] TP cancel упал: pos_id={pos_id}, tp_order_id={tp_id}: {err:#} — \
                      оставляем tp_order_id живым (WS-фоллбэк подберёт fill при гонке), продолжаем SELL taker"
-                );
+                    );
                 }
             }
         }
 
-
-        // Шаг 2: bail-out после cancel-HTTP. TP мог сматчиться в окне
-        // cancel-HTTP ↔ ответ CLOB; тогда apply_sell_fill уже отработал
-        // морф и финализацию PnL.
         if bail_if_superseded().await {
             return;
         }
 
-        // `shares_to_sell` re-snapshot'им после cancel'а — апплоудимые BUY
-        // partial-fill'ы через WS могли подмерджить актуальное значение
-        // (`optimistic_fill_replaced`-флоу в apply_buy_fill).
         let shares_to_sell = {
             let pos_arc = closing_arc.read().await.position.clone();
             let p = pos_arc.read().await;
             p.shares_held
         };
 
-        // Шаг 3: SELL taker без slippage cap'а.
-        // Retry-loop с exp-backoff (500ms → 1s → 2s → …) до
-        // [`SELL_TAKER_MAX_ATTEMPTS`] попыток. Retry'им и HTTP-падения, и
-        // CLOB-rejection'ы (transient: rate limits, internal errors, network).
-        // На исчерпании всех попыток ставим `CloseFailed`; следующий
-        // `manage_positions`-тик после cleanup'а зайдёт в `sell_gate` снова
-        // (tick-based retry на fallback'е).
         let request_template = PostOrderRequest {
-            asset_id: asset_id.clone(),
-            side: Side::Sell,
+            asset_id: asset_id.clone(), // outcome token
+            side: Side::Sell,           // close long
             role: OrderRole::Taker,
-            amount: OrderAmount::Shares(shares_to_sell),
-            price: None,
-            max_slippage_pp: None,
-            expiration: None,
-            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-            strict_book: None,
+            amount: OrderAmount::Shares(shares_to_sell), // после cancel TP
+            price: None,                                 // worst из книги
+            max_slippage_pp: None,                       // без cap
+            expiration: None,                            // taker FAK
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
+            strict_book: None,                           // HTTP book внутри
         };
         let mut accepted: Option<crate::account_order::PostOrderResult> = None;
         for attempt in 1..=SELL_TAKER_MAX_ATTEMPTS {
-            if bail_if_superseded().await
-            {
+            if bail_if_superseded().await {
                 return;
             }
             {
@@ -550,7 +319,8 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 Ok(r) if r.success => {
                     crate::tee_println!(
                         "[account_submit] SELL taker принят (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, order_id={}, status={:?}",
-                        r.order_id, r.status,
+                        r.order_id,
+                        r.status,
                     );
                     accepted = Some(r);
                     break;
@@ -558,7 +328,9 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 Ok(r) => {
                     crate::tee_eprintln!(
                         "[account_submit] SELL taker отвергнут CLOB (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}, error_msg={:?}, status={:?}, order_id={}",
-                        r.error_msg, r.status, r.order_id,
+                        r.error_msg,
+                        r.status,
+                        r.order_id,
                     );
                 }
                 Err(err) => {
@@ -568,7 +340,6 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 }
             }
             if attempt < SELL_TAKER_MAX_ATTEMPTS {
-                // exp-backoff: 500ms, 1s, 2s, 4s, …
                 let delay_ms = SELL_TAKER_RETRY_INITIAL_MS << (attempt - 1);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
@@ -591,90 +362,48 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
     });
 }
 
-/// Polling-fallback: каждые [`POLL_INTERVAL_SEC`] дёргает `client.order(order_id)`
-/// до терминального статуса (`MATCHED`/`CANCELED`/etc.) или таймаута
-/// [`POLL_TIMEOUT_SEC`]. На терминальном статусе вызывает
-/// [`apply_order_status_from_polling`] — те же транзишены,
-/// что и WS-колбек, идемпотентно. Полезно для случая, когда WS-канал
-/// прилёг и пропустил наше событие.
-///
-/// **Идентификация ордера — через Arc внутри [`PollingPositionKind`]**:
-/// `order_id` снимается snapshot'ом из `pos.open_order_id` или
-/// `c.close_order_id` в начале таски; отдельным параметром не передаётся.
-/// [проверено]
+/// Poll `client.order` для BUY после post (см. [`PollingPositionKind::Open`]).
 fn spawn_polling_verify_open(account: SharedAccount, pos_arc: SharedOpenPosition) {
     spawn_polling_verify(account, PollingPositionKind::Open(pos_arc));
 }
-/// [проверено]
+
+/// Poll для SELL close (`close_order_id`).
 fn spawn_polling_verify_close(account: SharedAccount, c_arc: SharedClosingPosition) {
     spawn_polling_verify(account, PollingPositionKind::Close(c_arc));
 }
-/// Polling-fallback для maker TP (`pos.tp_order_id`): симметрично
-/// [`spawn_polling_verify_open`] / [`spawn_polling_verify_close`]; на Matched
-/// фетчим `client.trades(...)` и финализируем PnL (TP-ветка) если WS
-/// не успел; на Canceled — TP отменён нами / CLOB протух, no-op.
-/// [проверено]
+
+/// Poll для maker TP (`tp_order_id`).
 fn spawn_polling_verify_tp(account: SharedAccount, pos_arc: SharedOpenPosition) {
     spawn_polling_verify(account, PollingPositionKind::TpMaker(pos_arc));
 }
 
-/// Дискриминатор + ссылка на конкретную in-flight запись для polling-флоу.
-/// Каждый variant держит `Arc` на ту структуру, которую `apply_order_status_from_polling`
-/// будет напрямую (без поиска по id) обновлять на терминальном статусе.
-/// `order_id` для `client.order(...)` читается из соответствующего поля
-/// (`open_order_id` / `close_order_id` / `tp_order_id`) этой же структуры.
+/// Какую запись дергать при poll; `order_id` из соответствующего поля структуры.
 #[derive(Clone)]
 pub(crate) enum PollingPositionKind {
-    /// BUY taker: poll `pos.open_order_id`; на `Matched` → `OpenPositionStatus::Open`
-    /// (+ trigger `try_place_tp_maker`); на `Canceled`/etc. → `OpenFailed`.
+    /// `open_order_id`, Matched → Open + TP.
     Open(SharedOpenPosition),
-    /// SELL taker (SL/Timeout/EvExit-taker): poll `c.close_order_id`;
-    /// на `Matched` → `ClosingPositionStatus::Closed` + финализация PnL
-    /// (fallback к WS: если `c.pnl=None` — фетчим `client.trades(...)` и
-    /// прогоняем `apply_sell_fill` на каждый trade; иначе только
-    /// `finalize_close_pnl_in_place`); на `Canceled`/etc. → `CloseFailed`.
+    /// `close_order_id`, Matched → финализация close PnL.
     Close(SharedClosingPosition),
-    /// Maker TP: poll `pos.tp_order_id` (наша лимитка SELL, выставленная
-    /// в [`try_place_tp_maker`]); на `Matched` — TP сам залился, идёт тот же
-    /// PnL-fallback что и у `Close` (см. ниже), но через TP-ветку
-    /// `apply_sell_fill` (создаёт `ClosingPosition { reason=TakeProfit,
-    /// close_status=Closed }` и вызывает `finalize_tp_close_after_creation`);
-    /// на `Canceled` — TP отменён нами в [`spawn_close_via_taker`] перед SELL
-    /// taker'ом или CLOB протух — no-op, дальнейшую обработку драйвит
-    /// тот SELL-taker.
+    /// `tp_order_id`, Matched → финализация TP PnL.
     TpMaker(SharedOpenPosition),
 }
 
-/// Результат одного цикла polling'а: терминальность + опционально follow-up
-/// действие (TP-spawn / PnL-финализация). Все side-effects'ы, требующие HTTP
-/// (REST-fallback fetch trades, TP-постановка), выполняет **caller**
-/// [`spawn_polling_verify`] — внутри [`apply_order_status_from_polling`] идут
-/// только локальные мутации state'ов под inner-локами (никаких сетевых
-/// вызовов, симметрично WS-колбеку [`crate::account_ws::apply_user_ws_event_value`]).
+/// Следующий шаг после [`apply_order_status_from_polling`] (HTTP только в caller).
 pub(crate) enum PollingApplyOutcome {
-    /// Не-терминальный статус (`Live`/`Delayed`) — polling продолжается.
+    /// Live/Delayed — ещё poll.
     Continue,
-    /// Терминальный (`Matched`/`Canceled`), без follow-up действия.
+    /// Конец без spawn PnL/TP.
     Terminal,
-    /// Терминальный + позиция перешла `PendingOpen → Open` — caller обязан
-    /// поставить TP-лимитку для переданного Arc (идемпотентно через
-    /// `tp_placement_attempted`, гонка с WS-колбеком безопасна).
+    /// Matched open → поставить TP.
     TerminalTriggerTp(SharedOpenPosition),
-    /// Терминальный `Matched` для SELL-taker close — caller обязан довести
-    /// PnL-финализацию через [`drive_close_pnl_finalization_via_polling`]
-    /// (REST-fallback на `client.trades(...)` + `finalize_close_pnl_in_place`).
-    /// Идемпотентно через `OpenPosition.pnl_finalized`.
+    /// Matched SELL close → REST/trades + finalize.
     TerminalFinalizeClose(SharedClosingPosition),
-    /// Терминальный `Matched` для maker TP — caller обязан довести
-    /// PnL-финализацию через [`drive_tp_pnl_finalization_via_polling`]
-    /// (REST-fallback + `finalize_tp_close_after_creation`).
-    /// Идемпотентно через `OpenPosition.pnl_finalized`.
+    /// Matched TP maker → REST/trades + finalize TP.
     TerminalFinalizeTp(SharedOpenPosition),
 }
 
 impl PollingPositionKind {
-    /// Имя варианта для логов (вместо `Debug`-формата `Arc<RwLock<…>>`,
-    /// который был бы шумным и потенциально брал бы лок при печати).
+    /// Короткое имя варианта для логов.
     fn variant_name(&self) -> &'static str {
         match self {
             Self::Open(_) => "Open",
@@ -683,9 +412,7 @@ impl PollingPositionKind {
         }
     }
 
-    /// Snapshot real `order_id` из соответствующего Arc'а под коротким
-    /// read-локом. `None` означает «id ещё не получили от CLOB» — caller
-    /// в этом случае не должен запускать polling, см. защитный return ниже.
+    /// `open_order_id` / `close_order_id` / `tp_order_id`; `None` — poll не стартуем.
     async fn snapshot_order_id(&self) -> Option<String> {
         match self {
             Self::Open(pos_arc) => pos_arc.read().await.open_order_id.clone(),
@@ -694,11 +421,7 @@ impl PollingPositionKind {
         }
     }
 
-    /// Snapshot локального uuid позиции
-    /// (см. [`crate::history_sim::OpenPosition::id`]) — для корреляции
-    /// логов polling-таски с остальными submit-флоу логами. Lock-ordering:
-    /// для `Close` сначала `c.read()` чтобы клонировать `position` Arc, дроп,
-    /// потом `pos.read()` (max один inner-lock одновременно).
+    /// `OpenPosition.id` для логов (`Close` через `c.position`).
     async fn pos_id(&self) -> String {
         match self {
             Self::Open(pos_arc) | Self::TpMaker(pos_arc) => pos_arc.read().await.id.clone(),
@@ -713,12 +436,7 @@ impl PollingPositionKind {
         }
     }
 
-    /// Snapshot `event_end_ms` (UTC мс конца окна маркета) — дедлайн polling-таски.
-    /// Для `Open` / `TpMaker` — `pos.event_end_ms` напрямую; для `Close` — через
-    /// `c.position` (ссылается на тот же `OpenPosition`). `None` означает, что
-    /// дедлайн неизвестен — caller использует [`POLL_TIMEOUT_SEC`] как fallback.
-    /// Lock-ordering: внешний `c.read()` отпускаем до взятия `pos.read()` — max
-    /// один inner-lock одновременно.
+    /// Дедлайн poll (`event_end_ms` или fallback `POLL_TIMEOUT_SEC`).
     async fn event_end_ms(&self) -> Option<i64> {
         match self {
             Self::Open(pos_arc) | Self::TpMaker(pos_arc) => pos_arc.read().await.event_end_ms,
@@ -733,23 +451,7 @@ impl PollingPositionKind {
     }
 }
 
-/// Polling-fallback из [`spawn_polling_verify`]: применяет статус из
-/// `client.order(...)` к локальному состоянию **напрямую через `Arc`**,
-/// зашитый в [`PollingPositionKind`] (без поиска по `order_id`). Возвращает
-/// [`PollingApplyOutcome`], сигнализирующий caller'у, что делать дальше.
-///
-/// **HTTP-вызовы здесь не делаются** — функция симметрична WS-колбеку
-/// [`crate::account_ws::apply_user_ws_event_value`] и работает только с
-/// локальным state'ом под inner-локами. REST-fallback PnL-финализации (для
-/// `Close::Matched` / `TpMaker::Matched`) и постановка TP-лимитки (для
-/// `Open::Matched` после `PendingOpen → Open`) выполняются **caller'ом**
-/// [`spawn_polling_verify`] через `tokio::spawn` после возврата —
-/// см. матч на `PollingApplyOutcome` ниже по файлу.
-///
-/// Идемпотентность с WS гарантируется маркерами:
-/// - [`crate::history_sim::OpenPosition::pnl_finalized`] — для PnL.
-/// - [`crate::history_sim::OpenPosition::tp_placement_attempted`] — для TP.
-/// [проверено]
+/// Локальные переходы как у WS; HTTP (trades, TP) — только в [`spawn_polling_verify`] по [`PollingApplyOutcome`].
 pub(crate) async fn apply_order_status_from_polling(
     status: &OrderStatusType,
     kind: PollingPositionKind,
@@ -762,11 +464,6 @@ pub(crate) async fn apply_order_status_from_polling(
                 Canceled => OpenPositionStatus::OpenFailed,
                 _ => return PollingApplyOutcome::Continue,
             };
-            // Транзишн PendingOpen → Open (по polling'у) триггерит TP, как и
-            // в WS-колбеке. Идемпотентность через `tp_placement_attempted`
-            // гарантирует, что повтор от WS не задвоит ордер. Сам spawn TP
-            // делает caller (`spawn_polling_verify`) — здесь только сигнализируем
-            // о необходимости.
             let trigger_tp = {
                 let mut pos = pos_arc.write().await;
                 let was_pending = matches!(pos.open_status, OpenPositionStatus::PendingOpen);
@@ -787,11 +484,6 @@ pub(crate) async fn apply_order_status_from_polling(
         }
         PollingPositionKind::Close(c_arc) => match status {
             Matched => {
-                // Никаких HTTP здесь — финализацию доводит caller через
-                // `drive_close_pnl_finalization_via_polling` (REST-fallback +
-                // finalize). `close_status` тоже ставит он, **после**
-                // прогона REST-fills (иначе `apply_sell_fill` дёрнет
-                // finalize преждевременно — см. doc у драйвера).
                 let (oid, pos_id) = {
                     let c = c_arc.read().await;
                     let pos_arc_inner = c.position.clone();
@@ -821,9 +513,6 @@ pub(crate) async fn apply_order_status_from_polling(
         },
         PollingPositionKind::TpMaker(pos_arc) => match status {
             Matched => {
-                // Никаких HTTP здесь — финализацию доводит caller через
-                // `drive_tp_pnl_finalization_via_polling` (REST-fallback +
-                // finalize_tp_close_after_creation).
                 let (tp_id, pos_id) = {
                     let p = pos_arc.read().await;
                     (p.tp_order_id.clone(), p.id.clone())
@@ -834,11 +523,6 @@ pub(crate) async fn apply_order_status_from_polling(
                 PollingApplyOutcome::TerminalFinalizeTp(pos_arc)
             }
             Canceled => {
-                // TP отменён нами в `spawn_close_via_taker` перед SELL taker'ом
-                // или CLOB протух (например, после market resolution через
-                // `spawn_cancel_tp_orders_after_resolution`). В обоих случаях
-                // соответствующий close-flow обработает позицию дальше — здесь
-                // только лог.
                 let (tp_id, pos_id) = {
                     let p = pos_arc.read().await;
                     (p.tp_order_id.clone(), p.id.clone())
@@ -853,22 +537,11 @@ pub(crate) async fn apply_order_status_from_polling(
     }
 }
 
-/// Шаги PnL-финализации для SELL-taker close при polling-fallback'е
-/// (см. [`apply_order_status_from_polling`]):
-/// 1. Snapshot `pnl_finalized` (маркер «уже финализировано»), `c.pnl`,
-///    `close_order_id`, `asset_id`.
-/// 2. Если `pos.pnl_finalized == true` — выходим, finalize уже отработал.
-/// 3. Если `c.pnl.is_none()` — WS ничего не дал; тащим fills из REST
-///    (`client.trades(...)`) и прогоняем через `apply_sell_fill` с
-///    `close_status=PendingClose` (без auto-finalize).
-/// 4. Атомарно ставим `close_status=Closed` и зовём
-///    [`crate::account_ws::finalize_close_pnl_in_place`] — он вычтет
-///    `entry_cost`, проставит `pnl_finalized=true`, обновит bankroll.
+/// После poll Matched на SELL close: опционально REST fills, затем `finalize_close_pnl_in_place`.
 async fn drive_close_pnl_finalization_via_polling(
     account: &SharedAccount,
     c_arc: &SharedClosingPosition,
 ) {
-    // Snapshot: pos_arc + (pnl_finalized, pos_id) под коротким read'ом.
     let pos_arc = {
         let c = c_arc.read().await;
         c.position.clone()
@@ -891,10 +564,6 @@ async fn drive_close_pnl_finalization_via_polling(
 
     if !pnl_already_some {
         if let Some(order_id) = oid.as_deref() {
-            // REST-fallback. close_status пока остаётся `PendingClose`, чтобы
-            // `apply_sell_fill` не дёрнул finalize_close_pnl_in_place раньше
-            // времени (мы хотим аккумулировать ВСЕ fills, прежде чем вычесть
-            // entry_cost ровно один раз).
             fetch_and_apply_trades_for_order(account, &pos_id, order_id, OrderRole::Taker).await;
         }
     } else {
@@ -903,30 +572,15 @@ async fn drive_close_pnl_finalization_via_polling(
         );
     }
 
-    // Только теперь — атомарно ставим Closed и финализируем.
     {
         let mut c = c_arc.write().await;
         c.close_status = ClosingPositionStatus::Closed;
     }
-    crate::tee_println!(
-        "[account_submit/poll] close_status({oid:?}) → Closed (pos_id={pos_id})",
-    );
+    crate::tee_println!("[account_submit/poll] close_status({oid:?}) → Closed (pos_id={pos_id})",);
     crate::account_ws::finalize_close_pnl_in_place(account, c_arc.clone(), "Polling").await;
 }
 
-/// PnL-финализация для maker TP при polling-fallback'е:
-/// 1. Snapshot из [`crate::history_sim::OpenPosition`]: `tp_order_id`,
-///    `asset_id`, `pnl_finalized`, и Weak-ссылка `closing_position`
-///    (point-of-truth, проставленная в момент создания `ClosingPosition` в
-///    [`crate::account_ws::apply_sell_fill`] TP-ветка / `manage_positions`).
-/// 2. Если `pnl_finalized=true` — выходим (WS уже отработал).
-/// 3. Если `closing_position.upgrade()` отдаёт `Some(_)` — `ClosingPosition`
-///    уже создана WS-колбеком; зовём
-///    [`crate::account_ws::finalize_tp_close_after_creation`] (идемпотентно).
-/// 4. Если `None` — WS ничего не дал; тащим fills из REST и прогоняем
-///    через [`crate::account_ws::apply_sell_fill`]. TP-ветка `apply_sell_fill`
-///    сама создаст `ClosingPosition { reason=TakeProfit, close_status=Closed,
-///    pnl=Some(net-entry_cost) }` и зовёт `finalize_tp_close_after_creation`.
+/// После poll Matched на TP: финал если уже есть ClosingPosition; иначе trades + `apply_sell_fill`.
 async fn drive_tp_pnl_finalization_via_polling(
     account: &SharedAccount,
     pos_arc: &SharedOpenPosition,
@@ -937,7 +591,9 @@ async fn drive_tp_pnl_finalization_via_polling(
             p.tp_order_id.clone(),
             p.pnl_finalized,
             p.id.clone(),
-            p.closing_position.as_ref().and_then(std::sync::Weak::upgrade),
+            p.closing_position
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade),
         )
     };
     let Some(tp_id) = tp_order_id else {
@@ -952,18 +608,11 @@ async fn drive_tp_pnl_finalization_via_polling(
     }
 
     if existing_close.is_some() {
-        // WS уже создал ClosingPosition; финализируем (идемпотентно через
-        // `pnl_finalized`-маркер).
         crate::tee_println!(
             "[account_submit/poll] tp_order_id({tp_id}) → Matched (ClosingPosition уже создана WS — финализируем) (pos_id={pos_id})",
         );
         crate::account_ws::finalize_tp_close_after_creation(account, &tp_id, "Polling").await;
     } else {
-        // WS не успел; REST-fallback. `apply_sell_fill` (TP-ветка) сам создаст
-        // `ClosingPosition` (и проставит `pos.closing_position`!) и
-        // финализирует bankroll. Если придёт несколько partial-fills — первый
-        // создаст, остальные пойдут close-веткой и финализируются (no-op после
-        // первого) через `finalize_close_pnl_in_place`.
         crate::tee_println!(
             "[account_submit/poll] tp_order_id({tp_id}) → Matched (REST-fallback: тащим trades и финализируем) (pos_id={pos_id})",
         );
@@ -971,17 +620,8 @@ async fn drive_tp_pnl_finalization_via_polling(
     }
 }
 
-/// REST-fallback для PnL-финализации: тащит `client.trades(...)` (страничный
-/// фетч; SDK сам фильтрует по нашему юзеру) для заданного `asset_id`,
-/// постфильтрует по `order_id` и применяет каждый fill через
-/// [`crate::account_ws::apply_sell_fill`] — тот же путь, что у WS.
-///
-/// `role` определяет, в каком поле trade'а искать наш `order_id`:
-/// - [`OrderRole::Taker`] — `trade.taker_order_id`.
-/// - [`OrderRole::Maker`] — `trade.maker_orders[i].order_id` (наш TP).
-///
-/// Конверсия `Decimal → f64` через `to_string().parse::<f64>()` — тот же приём,
-/// что в `account_order::f64_to_decimal` (predictable scale без IEEE-754 шума).
+/// `client.order` → `associate_trades`, затем `client.trades` по id; fills в `apply_sell_fill`.
+/// `role`: taker — `taker_order_id`, maker — `maker_orders[].order_id`.
 async fn fetch_and_apply_trades_for_order(
     account: &SharedAccount,
     pos_id: &str,
@@ -997,14 +637,6 @@ async fn fetch_and_apply_trades_for_order(
             return;
         }
     };
-    // Шаг 1: `client.order(order_id)` → `associate_trades: Vec<String>` —
-    // готовый список trade-id'ов, относящихся именно к нашему ордеру. Это
-    // делает `/data/trades?asset_id=…` + постфильтр по `taker_order_id` /
-    // `maker_orders[i].order_id` ненужным: вместо страничного walk'а тащим
-    // только нужные трейды точечно по `id`. Бонусом `client.order` уже
-    // используется в polling-loop'е (см. `auth_client.order(...)` в
-    // `spawn_polling_verify`), а тут — отдельный «свежий» снимок: между
-    // последним polling-tick'ом и этим вызовом могли долететь partial fills.
     let order_resp = match tokio::time::timeout(
         Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
         auth_client.order(order_id),
@@ -1033,16 +665,9 @@ async fn fetch_and_apply_trades_for_order(
         return;
     }
 
-    // Шаг 2: для каждого `trade_id` точечно `client.trades(TradesRequest {
-    // id: Some(trade_id), … })` — у /data/trades есть фильтр по `id`
-    // (см. `polymarket_client_sdk::clob::types::request::TradesRequest`).
-    // Возвращается `Page<TradeResponse>` с одной записью; пагинации не нужно
-    // (точечный запрос). Постфильтр по `order_id` всё равно делаем (паранойя:
-    // у trade'а может быть несколько `maker_orders[]` — нас интересует
-    // конкретно наш).
     let mut applied_count: usize = 0;
     for trade_id in trade_ids {
-        let request = TradesRequest::builder().id(trade_id.clone()).build();
+        let request = TradesRequest::builder().id(trade_id.clone()).build(); // фильтр по trade id
         let page = match tokio::time::timeout(
             Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
             auth_client.trades(&request, None),
@@ -1072,9 +697,7 @@ async fn fetch_and_apply_trades_for_order(
                     let size = decimal_to_f64(&trade.size);
                     let price = decimal_to_f64(&trade.price);
                     let fee_rate_bps = decimal_to_f64(&trade.fee_rate_bps);
-                    if !(size > 0.0 && size.is_finite())
-                        || !(price > 0.0 && price.is_finite())
-                    {
+                    if !(size > 0.0 && size.is_finite()) || !(price > 0.0 && price.is_finite()) {
                         continue;
                     }
                     crate::account_ws::apply_sell_fill(
@@ -1096,8 +719,7 @@ async fn fetch_and_apply_trades_for_order(
                         let size = decimal_to_f64(&m.matched_amount);
                         let price = decimal_to_f64(&m.price);
                         let fee_rate_bps = decimal_to_f64(&m.fee_rate_bps);
-                        if !(size > 0.0 && size.is_finite())
-                            || !(price > 0.0 && price.is_finite())
+                        if !(size > 0.0 && size.is_finite()) || !(price > 0.0 && price.is_finite())
                         {
                             continue;
                         }
@@ -1121,22 +743,16 @@ async fn fetch_and_apply_trades_for_order(
     );
 }
 
-/// Конверсия `polymarket_client_sdk::types::Decimal → f64` через строковый
-/// roundtrip (тот же приём, что у `account_order::f64_to_decimal` в обратную
-/// сторону: предсказуемая точность, нет IEEE-754 шума).
+/// `Decimal` → `f64` через строку (без двоичного шума).
 fn decimal_to_f64(d: &polymarket_client_sdk::types::Decimal) -> f64 {
     d.to_string().parse::<f64>().unwrap_or(0.0)
 }
 
-/// [проверено]
+/// Цикл `client.order` до дедлайна (`event_end_ms` или now+[`POLL_TIMEOUT_SEC`]); исход → spawn TP/PnL.
 fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
     tokio::spawn(async move {
         let kind_label = kind.variant_name();
-        // Snapshot pos_id (корреляция логов) — ровно один раз, в начале таски.
         let pos_id = kind.pos_id().await;
-        // Snapshot real `order_id` один раз в начале — после получения HTTP-
-        // ответа caller успел его записать в Arc, дальше он неизменен (CLOB
-        // id присваивается один раз).
         let order_id = match kind.snapshot_order_id().await {
             Some(id) => id,
             None => {
@@ -1146,12 +762,6 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
                 return;
             }
         };
-        // Дедлайн polling'а — `OpenPosition.event_end_ms` (UTC мс конца окна
-        // маркета). После него Polymarket уже резолвит маркет, и активный
-        // ордер либо заматчился (TP), либо отменён системой (наш taker SELL —
-        // unlikely, но возможно). Если `event_end_ms=None` (не должно быть для
-        // submit-флоу: real_sim проставляет его в `try_open_position`) —
-        // fallback на короткий [`POLL_TIMEOUT_SEC`].
         let now_ms = crate::util::current_timestamp_ms();
         let deadline_ms: i64 = match kind.event_end_ms().await {
             Some(end) if end > now_ms => end,
@@ -1165,9 +775,6 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
         };
         let mut tick = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SEC));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // первый tick мгновенный — пропускаем, чтобы не гонять API сразу
-        // после успешного post_order (у CLOB может быть мини-задержка
-        // согласованности «POST принят, GET ещё не показывает»).
         tick.tick().await;
         loop {
             tick.tick().await;
@@ -1181,7 +788,6 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
             let auth_client = match (**account.clob_authed.load()).clone() {
                 Some(c) => c,
                 None => {
-                    // Auth исчез/не поднялся — идём дальше, может авто-восстановится.
                     continue;
                 }
             };
@@ -1205,17 +811,9 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
                     continue;
                 }
             };
-            // Передаём в общий обработчик — апдейт идёт напрямую через Arc
-            // внутри `kind`, без повторного поиска по `order_id`. **HTTP-
-            // вызовы (REST-fallback / TP-постановка) тут не делаются —
-            // только локальные мутации**; follow-up действия выполняем ниже,
-            // после возврата, чтобы `apply_order_status_from_polling` оставался
-            // симметричным WS-колбеку (`apply_user_ws_event_value`).
             let outcome = apply_order_status_from_polling(&resp.status, kind.clone()).await;
             match outcome {
-                PollingApplyOutcome::Continue => {
-                    // Не-терминальный — продолжаем polling.
-                }
+                PollingApplyOutcome::Continue => {}
                 PollingApplyOutcome::Terminal => {
                     crate::tee_println!(
                         "[account_submit/poll] {kind_label} order_id={order_id} терминальный статус {:?}, polling завершён (pos_id={pos_id})",
@@ -1235,13 +833,6 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
                     return;
                 }
                 PollingApplyOutcome::TerminalFinalizeClose(c_arc) => {
-                    // PnL-финализация для SELL-taker close: REST-fallback на
-                    // `client.trades(...)` + `finalize_close_pnl_in_place`.
-                    // Запускаем в отдельной spawn-таске, чтобы не блокировать
-                    // exit polling-таски (она сама и так заканчивается, но
-                    // драйвер делает HTTP, который может занять секунды; мы
-                    // не хотим, чтобы тег «polling завершён» в логах ждал
-                    // окончания HTTP).
                     let acc = account.clone();
                     tokio::spawn(async move {
                         drive_close_pnl_finalization_via_polling(&acc, &c_arc).await;
@@ -1253,8 +844,6 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
                     return;
                 }
                 PollingApplyOutcome::TerminalFinalizeTp(pos_arc) => {
-                    // PnL-финализация для maker TP: REST-fallback +
-                    // `finalize_tp_close_after_creation`. Аналогично выше.
                     let acc = account.clone();
                     tokio::spawn(async move {
                         drive_tp_pnl_finalization_via_polling(&acc, &pos_arc).await;
@@ -1270,12 +859,7 @@ fn spawn_polling_verify(account: SharedAccount, kind: PollingPositionKind) {
     });
 }
 
-/// Отменяет TP-ордера на резолвнутых маркетах — вызывается из
-/// [`crate::account::Account::resolve_pending_market`] после
-/// payout'а. Auto-redeem забирает шеры в USDC, но висящие maker-лимитки
-/// CLOB сам не снимает: на следующем раунде маркета они либо протухают
-/// (asset_id больше не торгуется), либо CLOB отдаст ошибку — в любом
-/// случае мы их уберём явно. На failures просто логируем — не критично.
+/// Снять висящие TP после резолва маркета ([`crate::account::Account::resolve_pending_market`]).
 pub fn spawn_cancel_tp_orders_after_resolution(
     account: SharedAccount,
     positions: Vec<crate::history_sim::SharedOpenPosition>,
@@ -1294,14 +878,15 @@ pub fn spawn_cancel_tp_orders_after_resolution(
                 }
             };
             let request = CancelOrderRequest {
-                order_id: tp_id.clone(),
-                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                order_id: tp_id.clone(),                              // maker TP
+                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // cancel HTTP timeout
             };
             match cancel_order_on_clob(&account, request).await {
                 Ok(res) => {
                     crate::tee_println!(
                         "[account_submit] TP cancel after resolution: pos_id={pos_id}, order_id={tp_id}, canceled={}, error_msg={:?}",
-                        res.canceled, res.error_msg,
+                        res.canceled,
+                        res.error_msg,
                     );
                     if res.canceled {
                         let mut pw = pos_arc.write().await;

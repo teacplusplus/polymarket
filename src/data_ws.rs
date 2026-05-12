@@ -2,20 +2,19 @@ use crate::currency_updown_sibling::update_currency_updown_sibling_slots;
 use crate::project_manager::{ProjectManager, WsStreamEntry};
 use crate::run_log;
 use crate::util::current_timestamp_ms;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
+use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub use crate::market_snapshot::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, MarketSnapshot, TradeSide, XFrameIntervalKind,
 };
 use crate::xframe::BookLevel;
-
 
 const POLYMARKET_MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const WS_RECONNECT_DELAY_SECS: u64 = 3;
@@ -136,7 +135,8 @@ async fn run_persistent_interval_market_ws_inner(
     let mut had_prior_successful_market_subscription = false;
 
     loop {
-        let (websocket_stream, _http_response) = match connect_async(POLYMARKET_MARKET_WS_URL).await {
+        let (websocket_stream, _http_response) = match connect_async(POLYMARKET_MARKET_WS_URL).await
+        {
             Ok(stream_and_response) => stream_and_response,
             Err(connect_err) => {
                 run_log::market_ws_session_err(&connect_err);
@@ -174,7 +174,9 @@ async fn run_persistent_interval_market_ws_inner(
             )
             .await;
             let all_asset_ids: Vec<String> = active_asset_ids.iter().cloned().collect();
-            project_manager.record_ws_connect_wall_ms_for_asset_ids(&all_asset_ids).await;
+            project_manager
+                .record_ws_connect_wall_ms_for_asset_ids(&all_asset_ids)
+                .await;
             had_prior_successful_market_subscription = true;
         }
 
@@ -368,10 +370,7 @@ async fn run_persistent_interval_market_ws_inner(
     }
 }
 
-async fn ingest_json_event(
-    project_manager: &Arc<ProjectManager>,
-    raw_payload: &str,
-) -> Result<()> {
+async fn ingest_json_event(project_manager: &Arc<ProjectManager>, raw_payload: &str) -> Result<()> {
     let Ok(value) = serde_json::from_str::<Value>(raw_payload) else {
         return Ok(());
     };
@@ -392,10 +391,7 @@ async fn ingest_single(
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
     };
-    let currency_up_down_by_asset_id = project_manager
-        .currency_up_down_by_asset_id
-        .read()
-        .await;
+    let currency_up_down_by_asset_id = project_manager.currency_up_down_by_asset_id.read().await;
     let interval_by_asset = project_manager
         .xframe_interval_kind_by_asset_id
         .read()
@@ -520,7 +516,8 @@ fn parse_single_snapshot(
         tick_size: parse_f64(value.get("new_tick_size")).or(parse_f64(value.get("tick_size"))),
         spread: parse_f64(value.get("spread")),
         // WS trade event uses `price` for last trade value.
-        last_trade_price: parse_f64(value.get("price")).or(parse_f64(value.get("last_trade_price"))),
+        last_trade_price: parse_f64(value.get("price"))
+            .or(parse_f64(value.get("last_trade_price"))),
         last_trade_size: parse_f64(value.get("size")),
         trade_volume_bucket: None,
         trade_side: parse_trade_side(value.get("side")),

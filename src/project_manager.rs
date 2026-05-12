@@ -1,33 +1,33 @@
-use crate::market_snapshot::aggregate_events;
-use anyhow::bail;
+use crate::account::SharedAccount;
 use crate::constants::XFrameIntervalKind;
-use crate::run_log;
-use crate::util::{
-    current_timestamp_ms, fetch_gamma_event_data_for_slug,
-    fetch_price_to_beat_from_vatic_api, CurrencyEventSlugData,
-};
-use crate::xframe_dump;
-pub use crate::currency_updown_sibling::{
-    five_min_belongs_to_fifteen_window, CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingState,
-};
 pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC};
+pub use crate::currency_updown_sibling::{
+    CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingState, five_min_belongs_to_fifteen_window,
+};
 use crate::currency_ws::RTDS_MS_MAX_LAG_FOR_STABLE_FRAME;
 use crate::data_ws::{
-    make_ws_channel, spawn_persistent_interval_market_ws, CurrencyUpDownOutcome, MarketSnapshot,
-    MarketSnapshotBuffer, MarketSnapshotBufferMut, MarketWsSubscription, Ws, WsCommand,
+    CurrencyUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer, MarketSnapshotBufferMut,
+    MarketWsSubscription, Ws, WsCommand, make_ws_channel, spawn_persistent_interval_market_ws,
 };
-use crate::account::SharedAccount;
+use crate::market_snapshot::aggregate_events;
+use crate::run_log;
+use crate::util::{
+    CurrencyEventSlugData, current_timestamp_ms, fetch_gamma_event_data_for_slug,
+    fetch_price_to_beat_from_vatic_api,
+};
 use crate::xframe::{
-    currency_price_z_score_from_sec_history, compute_xframe_stable, find_opposite_asset_id,
-    find_same_outcome_sibling_asset_id, XFrame, SIZE,
+    SIZE, XFrame, compute_xframe_stable, currency_price_z_score_from_sec_history,
+    find_opposite_asset_id, find_same_outcome_sibling_asset_id,
 };
+use crate::xframe_dump;
+use anyhow::bail;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::{self, Duration};
 
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
@@ -114,7 +114,6 @@ pub struct ProjectManager {
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
     pub account: SharedAccount,
-    pub split_done_by_market_id: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl ProjectManager {
@@ -157,9 +156,14 @@ impl ProjectManager {
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             slug_to_market_id: Arc::new(RwLock::new(HashMap::new())),
             price_to_beat_by_market: Arc::new(RwLock::new(HashMap::new())),
-            currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<String, CurrencyUpDownOutcome>::new())),
+            currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<
+                String,
+                CurrencyUpDownOutcome,
+            >::new())),
             ws_connect_wall_ms_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
-            currency_updown_sibling_state: Arc::new(RwLock::new(CurrencyUpDownSiblingState::default())),
+            currency_updown_sibling_state: Arc::new(RwLock::new(
+                CurrencyUpDownSiblingState::default(),
+            )),
             rtds_currency_prices_by_ms: Arc::new(RwLock::new(BTreeMap::new())),
             rtds_currency_prices_by_sec: Arc::new(RwLock::new(BTreeMap::new())),
             market_asset_ids_by_market: Arc::new(RwLock::new(HashMap::new())),
@@ -171,7 +175,6 @@ impl ProjectManager {
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             last_snapshot_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             account,
-            split_done_by_market_id: Arc::new(RwLock::new(HashMap::new())),
         });
 
         spawn_persistent_interval_market_ws(project_manager.clone(), market_ws_rx);
@@ -180,7 +183,10 @@ impl ProjectManager {
         let project_manager_cloned = project_manager.clone();
         tokio::spawn(async move {
             while let Some(snapshot_arc) = ws_snapshot_receiver.recv().await {
-                if let Err(err) = project_manager_cloned.ingest_snapshot((*snapshot_arc).clone()).await {
+                if let Err(err) = project_manager_cloned
+                    .ingest_snapshot((*snapshot_arc).clone())
+                    .await
+                {
                     eprintln!("ingest_snapshot: {err:#}");
                 }
             }
@@ -194,7 +200,9 @@ impl ProjectManager {
         });
         let pm_15m = project_manager.clone();
         tokio::spawn(async move {
-            pm_15m.run_currency_updown_interval(FIFTEEN_MIN_SEC, "15m").await;
+            pm_15m
+                .run_currency_updown_interval(FIFTEEN_MIN_SEC, "15m")
+                .await;
         });
 
         project_manager
@@ -214,7 +222,9 @@ impl ProjectManager {
 
         let mut event_data_by_market_lock = self.event_data_by_market.write().await;
         for (market_id, start_ms) in starts {
-            let entry = event_data_by_market_lock.entry(market_id.clone()).or_default();
+            let entry = event_data_by_market_lock
+                .entry(market_id.clone())
+                .or_default();
             entry.start_ms = *start_ms;
             if let Some(ref q) = gamma_question {
                 entry.gamma_question = Some(q.clone());
@@ -222,7 +232,9 @@ impl ProjectManager {
         }
 
         for (market_id, end_ms) in ends {
-            let entry = event_data_by_market_lock.entry(market_id.clone()).or_default();
+            let entry = event_data_by_market_lock
+                .entry(market_id.clone())
+                .or_default();
             entry.end_ms = *end_ms;
             if let Some(ref q) = gamma_question {
                 entry.gamma_question = Some(q.clone());
@@ -238,7 +250,8 @@ impl ProjectManager {
         }
 
         if !currency_up_down_by_asset_id.is_empty() {
-            let mut currency_up_down_by_asset_id_lock = self.currency_up_down_by_asset_id.write().await;
+            let mut currency_up_down_by_asset_id_lock =
+                self.currency_up_down_by_asset_id.write().await;
             for (asset_id, code) in currency_up_down_by_asset_id.iter() {
                 currency_up_down_by_asset_id_lock.insert(asset_id.clone(), *code);
             }
@@ -349,13 +362,15 @@ impl ProjectManager {
         self.price_to_beat_by_market.write().await.remove(market_id);
 
         {
-            let mut currency_up_down_by_asset_id_lock = self.currency_up_down_by_asset_id.write().await;
+            let mut currency_up_down_by_asset_id_lock =
+                self.currency_up_down_by_asset_id.write().await;
             for asset_id in &asset_ids {
                 currency_up_down_by_asset_id_lock.remove(asset_id);
             }
         }
         {
-            let mut ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.write().await;
+            let mut ws_connect_wall_ms_by_asset_id_lock =
+                self.ws_connect_wall_ms_by_asset_id.write().await;
             for asset_id in &asset_ids {
                 ws_connect_wall_ms_by_asset_id_lock.remove(asset_id);
             }
@@ -460,7 +475,8 @@ impl ProjectManager {
     /// После подписки на market WS — wall time для [`compute_xframe_stable`](crate::xframe::compute_xframe_stable).
     pub async fn record_ws_connect_wall_ms_for_asset_ids(&self, asset_ids: &[String]) {
         let now_ms = current_timestamp_ms();
-        let mut ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.write().await;
+        let mut ws_connect_wall_ms_by_asset_id_lock =
+            self.ws_connect_wall_ms_by_asset_id.write().await;
         for asset_id in asset_ids {
             ws_connect_wall_ms_by_asset_id_lock.insert(asset_id.clone(), now_ms);
         }
@@ -496,7 +512,9 @@ impl ProjectManager {
                 let mut interval = time::interval(Duration::from_secs(secs));
                 loop {
                     interval.tick().await;
-                    project_manager.build_frames_from_buffer_lane_once(lane).await;
+                    project_manager
+                        .build_frames_from_buffer_lane_once(lane)
+                        .await;
                 }
             });
         }
@@ -518,12 +536,9 @@ impl ProjectManager {
         for (market_id, by_asset) in drained {
             for (asset_id, events) in by_asset {
                 for snapshot in events {
-                    let aligned_ts = align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
-                    let key = (
-                        market_id.clone(),
-                        asset_id.clone(),
-                        aligned_ts,
-                    );
+                    let aligned_ts =
+                        align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
+                    let key = (market_id.clone(), asset_id.clone(), aligned_ts);
                     by_bucket.entry(key).or_default().push(snapshot);
                 }
             }
@@ -598,7 +613,8 @@ impl ProjectManager {
             };
 
             let ws_connect_wall_ms = {
-                let ws_connect_wall_ms_by_asset_id_lock = self.ws_connect_wall_ms_by_asset_id.read().await;
+                let ws_connect_wall_ms_by_asset_id_lock =
+                    self.ws_connect_wall_ms_by_asset_id.read().await;
                 ws_connect_wall_ms_by_asset_id_lock.get(&asset_id).copied()
             };
 
@@ -630,7 +646,6 @@ impl ProjectManager {
                 frame,
             });
         }
-
 
         let mut batch_assets_by_market: HashMap<String, HashSet<String>> = HashMap::new();
         for entry in &built_xframes {
@@ -690,10 +705,7 @@ impl ProjectManager {
                 ) {
                     Ok(id) => id,
                     Err(err) => {
-                        eprintln!(
-                            "{} find_opposite_asset_id: {err:#}",
-                            current_timestamp_ms()
-                        );
+                        eprintln!("{} find_opposite_asset_id: {err:#}", current_timestamp_ms());
                         continue;
                     }
                 };
@@ -746,7 +758,9 @@ impl ProjectManager {
                 ) else {
                     continue;
                 };
-                entry.frame.merge_sibling_market_features_from(sibling_frame);
+                entry
+                    .frame
+                    .merge_sibling_market_features_from(sibling_frame);
             }
         }
 
@@ -794,20 +808,17 @@ impl ProjectManager {
                 run_log::xframe_stored(&entry.frame);
             }
 
-            if lane == 0 && entry.frame.stable
+            if lane == 0
+                && entry.frame.stable
                 && let Some(kind) = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type)
-                && let Some(side) = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
+                && let Some(side) =
+                    CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
                 && let Some(state_arc) = self
                     .account
                     .real_sim_state_for_currency(self.currency.as_str())
                     .await
             {
-                let channels_arc = state_arc
-                    .read()
-                    .await
-                    .lane_frame_channels
-                    .channels
-                    .clone();
+                let channels_arc = state_arc.read().await.lane_frame_channels.channels.clone();
                 let channels_guard = channels_arc.read().await;
                 if let Some(tx) = channels_guard.get(&(kind, side)) {
                     let event_start_ms = event_start_ms_by_market
@@ -846,10 +857,14 @@ impl ProjectManager {
                 .or_insert_with(BTreeMap::new)
                 .insert(entry.aligned_ts, entry.frame);
             drop(xframes_by_market_lock);
-        }    
+        }
     }
 
-    pub async fn run_currency_updown_interval(self: Arc<Self>, period_sec: i64, period: &'static str) {
+    pub async fn run_currency_updown_interval(
+        self: Arc<Self>,
+        period_sec: i64,
+        period: &'static str,
+    ) {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
@@ -867,22 +882,33 @@ impl ProjectManager {
                 continue;
             }
 
-            
-            let slug = format!("{}-updown-{period}-{window_start_sec}", self.currency.to_lowercase());
+            let slug = format!(
+                "{}-updown-{period}-{window_start_sec}",
+                self.currency.to_lowercase()
+            );
 
-            let (market_event_start_ms, market_event_end_ms, gamma_question, currency_up_down_by_asset_id) =
-                if let Some(restored) = self.try_restore_currency_event_from_slug_cache(&slug).await {
-                    run_log::gamma_event_data_from_cache(period, &slug);
-                    restored
-                } else if let Some(fetched) = self.fetch_currency_event_from_gamma_and_merge(&slug, period).await {
-                    fetched
-                } else {
-                    continue;
-                };
+            let (
+                market_event_start_ms,
+                market_event_end_ms,
+                gamma_question,
+                currency_up_down_by_asset_id,
+            ) = if let Some(restored) = self.try_restore_currency_event_from_slug_cache(&slug).await
+            {
+                run_log::gamma_event_data_from_cache(period, &slug);
+                restored
+            } else if let Some(fetched) = self
+                .fetch_currency_event_from_gamma_and_merge(&slug, period)
+                .await
+            {
+                fetched
+            } else {
+                continue;
+            };
 
             {
                 let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
-                let mut xframe_interval_kind_by_asset_id_lock = self.xframe_interval_kind_by_asset_id.write().await;
+                let mut xframe_interval_kind_by_asset_id_lock =
+                    self.xframe_interval_kind_by_asset_id.write().await;
                 for asset_id in currency_up_down_by_asset_id.keys() {
                     xframe_interval_kind_by_asset_id_lock.insert(asset_id.clone(), interval_kind);
                 }
@@ -894,49 +920,51 @@ impl ProjectManager {
                 let currency_lower = self.currency.to_lowercase();
                 let prefetch_period_sec = period_sec;
                 tokio::spawn(async move {
-                    let prefetch_interval_kind = XFrameIntervalKind::from_period_sec(prefetch_period_sec);
+                    let prefetch_interval_kind =
+                        XFrameIntervalKind::from_period_sec(prefetch_period_sec);
                     const PREFETCH_UPCOMING_WINDOW_SLUGS: i64 = 3;
                     for k in 1_i64..=PREFETCH_UPCOMING_WINDOW_SLUGS {
-                        let next_window_start_sec = window_start_sec.saturating_add(prefetch_period_sec.saturating_mul(k));
-                        let prefetch_slug = format!("{currency_lower}-updown-{period}-{next_window_start_sec}");
-                        if project_manager_cloned.slug_currency_event_fully_cached(&prefetch_slug).await {
+                        let next_window_start_sec =
+                            window_start_sec.saturating_add(prefetch_period_sec.saturating_mul(k));
+                        let prefetch_slug =
+                            format!("{currency_lower}-updown-{period}-{next_window_start_sec}");
+                        if project_manager_cloned
+                            .slug_currency_event_fully_cached(&prefetch_slug)
+                            .await
+                        {
                             continue;
                         }
-                        if let Some((ref market_event_start_ms, _, _, ref currency_up_down_by_asset_id)) =
-                            project_manager_cloned.fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period).await
+                        if let Some((_, _, _, ref currency_up_down_by_asset_id)) =
+                            project_manager_cloned
+                                .fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period)
+                                .await
                         {
                             run_log::gamma_event_prefetch_fetched(period, &prefetch_slug);
-                            let now_ms = current_timestamp_ms();
-                            for (condition_id, start_ms_opt) in market_event_start_ms.iter() {
-                                let Some(start_ms) = *start_ms_opt else { continue };
-                                if start_ms <= now_ms {
-                                    continue;
-                                }
-                                crate::poly_chain::schedule_split_for_future_market(
-                                    project_manager_cloned.http.clone(),
-                                    &currency_lower,
-                                    period,
-                                    condition_id.clone(),
-                                    project_manager_cloned.split_done_by_market_id.clone(),
-                                );
-                            }
+
                             {
-                                let mut xframe_interval_kind_by_asset_id_lock = project_manager_cloned
-                                    .xframe_interval_kind_by_asset_id
-                                    .write()
-                                    .await;
+                                let mut xframe_interval_kind_by_asset_id_lock =
+                                    project_manager_cloned
+                                        .xframe_interval_kind_by_asset_id
+                                        .write()
+                                        .await;
                                 for asset_id in currency_up_down_by_asset_id.keys() {
-                                    xframe_interval_kind_by_asset_id_lock.insert(asset_id.clone(), prefetch_interval_kind);
+                                    xframe_interval_kind_by_asset_id_lock
+                                        .insert(asset_id.clone(), prefetch_interval_kind);
                                 }
                             }
-                            let mut asset_ids: Vec<String> = currency_up_down_by_asset_id.keys().cloned().collect();
+                            let mut asset_ids: Vec<String> =
+                                currency_up_down_by_asset_id.keys().cloned().collect();
                             asset_ids.sort_unstable();
                             match project_manager_cloned
                                 .market_ws_tx
                                 .send(WsCommand::PrefetchSubscribe { asset_ids })
                                 .await
                             {
-                                Err(_) => run_log::ws_spawn_err(period, &prefetch_slug, "market ws command channel closed"),
+                                Err(_) => run_log::ws_spawn_err(
+                                    period,
+                                    &prefetch_slug,
+                                    "market ws command channel closed",
+                                ),
                                 _ => {}
                             }
                         }
@@ -956,11 +984,7 @@ impl ProjectManager {
 
             let market_id: Option<String> = market_event_end_ms.keys().next().cloned();
 
-            let market_start_ms = market_event_start_ms
-                .values()
-                .copied()
-                .flatten()
-                .min();
+            let market_start_ms = market_event_start_ms.values().copied().flatten().min();
 
             let project_manager_cloned = self.clone();
             let currency = self.currency.clone();
@@ -968,7 +992,10 @@ impl ProjectManager {
             // Быстрый PTB в кэш (RTDS по start_ms или Vatic API target/timestamp); exact подтянет фон.
             let inline_ptb_opt: Option<f64> = match market_start_ms {
                 Some(start_ms) => {
-                    let rtds_currency_prices_by_ms_lock = project_manager_cloned.rtds_currency_prices_by_ms.read().await;
+                    let rtds_currency_prices_by_ms_lock = project_manager_cloned
+                        .rtds_currency_prices_by_ms
+                        .read()
+                        .await;
                     if let Some(&price) = rtds_currency_prices_by_ms_lock.get(&start_ms) {
                         run_log::price_to_beat_from_rtds(
                             period,
@@ -1068,14 +1095,17 @@ impl ProjectManager {
             if !ids.is_empty() {
                 match self
                     .market_ws_tx
-                    .send(WsCommand::PruneStaleIds { stale_ids: ids.clone() })
+                    .send(WsCommand::PruneStaleIds {
+                        stale_ids: ids.clone(),
+                    })
                     .await
                 {
                     Ok(()) => {}
-                    Err(_) => run_log::ws_spawn_err(period, &slug, "market ws command channel closed"),
+                    Err(_) => {
+                        run_log::ws_spawn_err(period, &slug, "market ws command channel closed")
+                    }
                 }
             }
-            
         }
     }
 }
@@ -1220,7 +1250,10 @@ fn lookup_frame_for_leg_merge<'a>(
     if let Some(frame) = by_ts.get(&aligned_ts) {
         return Some(frame);
     }
-    by_ts.range(..=aligned_ts).next_back().map(|(_, frame)| frame)
+    by_ts
+        .range(..=aligned_ts)
+        .next_back()
+        .map(|(_, frame)| frame)
 }
 
 /// `(beat - spot) / beat * 100`; положительно, если spot ниже beat.

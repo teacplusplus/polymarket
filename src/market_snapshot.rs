@@ -36,7 +36,10 @@ pub struct MarketSnapshot {
 /// `bucket_start_ms` — начало интервала агрегации (ключ бакета); в результате [`MarketSnapshot::timestamp_ms`]
 /// — время **последнего** события в бакете (`max` по входным меткам), чтобы `event_remaining_ms` и скользящие
 /// окна в [`crate::xframe::XFrame`] соответствовали моменту фактического состояния стакана/сделок.
-pub fn aggregate_events(events: Vec<MarketSnapshot>, bucket_start_ms: i64) -> Option<MarketSnapshot> {
+pub fn aggregate_events(
+    events: Vec<MarketSnapshot>,
+    bucket_start_ms: i64,
+) -> Option<MarketSnapshot> {
     let first_event_snapshot = events.first()?;
     let timestamp_ms = events
         .iter()
@@ -131,7 +134,9 @@ pub fn aggregate_events(events: Vec<MarketSnapshot>, bucket_start_ms: i64) -> Op
         if event_market_snapshot.last_trade_price.is_some() {
             aggregated_market_snapshot.last_trade_price = event_market_snapshot.last_trade_price;
         }
-        if let Some(size) = event_market_snapshot.last_trade_size && size > 0.0 {
+        if let Some(size) = event_market_snapshot.last_trade_size
+            && size > 0.0
+        {
             bucket_trade_volume += size;
             aggregated_market_snapshot.last_trade_size = Some(size);
             if let Some(side) = event_market_snapshot.trade_side {

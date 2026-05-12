@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
-use tokio::time::{interval, Duration, MissedTickBehavior};
+use tokio::time::{Duration, MissedTickBehavior, interval};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 /// Аналог market CLOB WS — endpoint RTDS.
@@ -37,11 +37,12 @@ async fn run_spot_second_sampler(project_manager: Arc<ProjectManager>) {
         tick.tick().await;
         let bucket_sec = current_timestamp_ms() / 1000;
         let tail = {
-            let rtds_currency_prices_by_ms_lock = project_manager
-                .rtds_currency_prices_by_ms
-                .read()
-                .await;
-            rtds_currency_prices_by_ms_lock.iter().next_back().map(|(&ts_ms, &price)| (ts_ms, price))
+            let rtds_currency_prices_by_ms_lock =
+                project_manager.rtds_currency_prices_by_ms.read().await;
+            rtds_currency_prices_by_ms_lock
+                .iter()
+                .next_back()
+                .map(|(&ts_ms, &price)| (ts_ms, price))
         };
         if let Some((price_ts_ms, price)) = tail {
             let mut map = project_manager.rtds_currency_prices_by_sec.write().await;
@@ -217,11 +218,9 @@ async fn ingest_rtds_spot_update_item(
     {
         let now_ms = current_timestamp_ms();
         let cutoff = now_ms.saturating_sub(RTDS_PAYLOAD_TS_HISTORY_MS);
-        let mut rtds_currency_prices_by_ms_lock = project_manager
-            .rtds_currency_prices_by_ms
-            .write()
-            .await;
-            rtds_currency_prices_by_ms_lock.insert(payload_ts_ms, price_value);
+        let mut rtds_currency_prices_by_ms_lock =
+            project_manager.rtds_currency_prices_by_ms.write().await;
+        rtds_currency_prices_by_ms_lock.insert(payload_ts_ms, price_value);
         while let Some(&k) = rtds_currency_prices_by_ms_lock.keys().next() {
             if k < cutoff {
                 rtds_currency_prices_by_ms_lock.remove(&k);

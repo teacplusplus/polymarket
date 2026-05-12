@@ -5,15 +5,15 @@
 use crate::account::Account;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
-    HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS,
-    SideStats, SimStats, load_market_xframes, run_side_simulation,
+    HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS, load_market_xframes, run_side_simulation,
     window_bounds_from_dump_path,
 };
+use crate::sim_stats::{SideStats, SimStats};
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::tee_log::TEE_LOG;
 use crate::xframe::{
-    apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution, XFrame, SIZE,
-    Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_TAKE_PROFIT_PP, Y_TRAIN_STOP_LOSS_PP,
+    SIZE, XFrame, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_STOP_LOSS_PP, Y_TRAIN_TAKE_PROFIT_PP,
+    apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution,
 };
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println};
@@ -24,7 +24,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use xgb::parameters::learning::{EvaluationMetric, LearningTaskParametersBuilder, Metrics, Objective};
+use xgb::parameters::learning::{
+    EvaluationMetric, LearningTaskParametersBuilder, Metrics, Objective,
+};
 use xgb::parameters::tree::{TreeBoosterParametersBuilder, TreeMethod};
 use xgb::parameters::{BoosterParametersBuilder, BoosterType, TrainingParametersBuilder};
 use xgb::{Booster, DMatrix};
@@ -75,7 +77,12 @@ const LAG_DOWNWEIGHT_FACTOR: Option<f32> = Some(0.3);
 const LAG_DOWNWEIGHT_PER_STEP: f32 = 0.88;
 /// Имена фич, которым автоматически понижается `feature_weight` при обучении.
 // const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "currency_price_vs_beat_pct", "sibling_currency_price_vs_beat_pct"];
-const DOWNWEIGHTED_FEATURES: &[&str] = &["event_remaining_ms", "sibling_event_remaining_ms", "sibling_currency_price_vs_beat_pct", "currency_implied_prob"];
+const DOWNWEIGHTED_FEATURES: &[&str] = &[
+    "event_remaining_ms",
+    "sibling_event_remaining_ms",
+    "sibling_currency_price_vs_beat_pct",
+    "currency_implied_prob",
+];
 /// Ниже этого порога сохраняется identity-калибровка.
 const CALIBRATION_MIN_AUC: f32 = 0.60;
 /// Эпсилон для клиппинга выходов isotonic regression: исключает 0/1 значения,
@@ -249,7 +256,10 @@ impl Calibration {
     /// Тождественная калибровка `apply(raw) = raw` — используется как fallback
     /// при слабом AUC или пустом калибровочном сете.
     pub fn identity() -> Self {
-        Self { xs: vec![0.0, 1.0], ys: vec![0.0, 1.0] }
+        Self {
+            xs: vec![0.0, 1.0],
+            ys: vec![0.0, 1.0],
+        }
     }
 
     /// Применяет isotonic к сырому предсказанию XGBoost.
@@ -272,7 +282,9 @@ impl Calibration {
         }
         // Бинарный поиск интервала: xs[idx - 1] ≤ raw_pred ≤ xs[idx].
         let idx = match self.xs.binary_search_by(|probe| {
-            probe.partial_cmp(&raw_pred).unwrap_or(std::cmp::Ordering::Equal)
+            probe
+                .partial_cmp(&raw_pred)
+                .unwrap_or(std::cmp::Ordering::Equal)
         }) {
             Ok(i) => return self.ys[i],
             Err(i) => i,
@@ -380,33 +392,32 @@ async fn fit_calibration_via_sim_replay(
     // `booster_pnl` / `calibration_pnl` идут в PnL-канал `run_side_simulation`,
     // `booster_resolution` — в resolution-канал. Hold-zone определяет окно,
     // в котором собираются точки для калибровки Resolution (см. doc).
-    let (booster_pnl, calibration_pnl, booster_resolution, is_kelly, hold_sec) =
-        match model_type {
-            ModelType::Pnl => (
-                booster_for_calibration,
-                &identity,
-                None,
-                false,
-                PNL_CALIBRATION_HOLD_SEC,
-            ),
-            ModelType::Resolution => {
-                let Some((pnl_b, pnl_c)) = pnl_for_entries else {
-                    tee_eprintln!(
-                        "[calibration-sim] {tag}: ModelType::Resolution требует \
+    let (booster_pnl, calibration_pnl, booster_resolution, is_kelly, hold_sec) = match model_type {
+        ModelType::Pnl => (
+            booster_for_calibration,
+            &identity,
+            None,
+            false,
+            PNL_CALIBRATION_HOLD_SEC,
+        ),
+        ModelType::Resolution => {
+            let Some((pnl_b, pnl_c)) = pnl_for_entries else {
+                tee_eprintln!(
+                    "[calibration-sim] {tag}: ModelType::Resolution требует \
                          pnl_for_entries (PnL booster + калибровку для драйва entry); \
                          sim-replay пропущен — будет fallback на per-frame."
-                    );
-                    return Vec::new();
-                };
-                (
-                    pnl_b,
-                    pnl_c,
-                    Some(booster_for_calibration),
-                    true,
-                    RESOLUTION_CALIBRATION_HOLD_SEC,
-                )
-            }
-        };
+                );
+                return Vec::new();
+            };
+            (
+                pnl_b,
+                pnl_c,
+                Some(booster_for_calibration),
+                true,
+                RESOLUTION_CALIBRATION_HOLD_SEC,
+            )
+        }
+    };
 
     let mut entries: Vec<(f32, bool)> = Vec::new();
 
@@ -444,8 +455,8 @@ async fn fit_calibration_via_sim_replay(
         *account.peak_bankroll.write().await = CALIBRATION_REPLAY_BANKROLL_USD;
         let mut sim_stats = SimStats::new();
 
-        let event_end_ms = window_bounds_from_dump_path(path, interval_kind)
-            .map(|b| b.event_end_ms);
+        let event_end_ms =
+            window_bounds_from_dump_path(path, interval_kind).map(|b| b.event_end_ms);
         let bin_dump_path = path.to_string_lossy().into_owned();
         let market_id_opt = frames_vec.first().map(|f| f.market_id.clone());
         let up_won = dump.up_won();
@@ -456,7 +467,7 @@ async fn fit_calibration_via_sim_replay(
 
         {
             let side_stats: &mut SideStats = match side {
-                FrameSide::Up   => &mut sim_stats.up,
+                FrameSide::Up => &mut sim_stats.up,
                 FrameSide::Down => &mut sim_stats.down,
             };
             run_side_simulation(
@@ -497,7 +508,7 @@ async fn fit_calibration_via_sim_replay(
         }
 
         let side_stats_ref: &SideStats = match side {
-            FrameSide::Up   => &sim_stats.up,
+            FrameSide::Up => &sim_stats.up,
             FrameSide::Down => &sim_stats.down,
         };
         match model_type {
@@ -534,14 +545,30 @@ async fn fit_calibration_via_sim_replay(
     let n_won = entries.iter().filter(|(_, w)| *w).count();
     let n_lost = entries.len() - n_won;
     let mean_raw_won: f64 = if n_won > 0 {
-        entries.iter().filter(|(_, w)| *w).map(|(r, _)| *r as f64).sum::<f64>() / n_won as f64
-    } else { 0.0 };
+        entries
+            .iter()
+            .filter(|(_, w)| *w)
+            .map(|(r, _)| *r as f64)
+            .sum::<f64>()
+            / n_won as f64
+    } else {
+        0.0
+    };
     let mean_raw_lost: f64 = if n_lost > 0 {
-        entries.iter().filter(|(_, w)| !*w).map(|(r, _)| *r as f64).sum::<f64>() / n_lost as f64
-    } else { 0.0 };
+        entries
+            .iter()
+            .filter(|(_, w)| !*w)
+            .map(|(r, _)| *r as f64)
+            .sum::<f64>()
+            / n_lost as f64
+    } else {
+        0.0
+    };
     let win_rate = if !entries.is_empty() {
         n_won as f64 / entries.len() as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     let label = match model_type {
         ModelType::Pnl => "trades",
         ModelType::Resolution => "hold_frames",
@@ -601,20 +628,29 @@ async fn fit_calibration(
     tag: &str,
 ) -> anyhow::Result<Calibration> {
     let preds = booster.predict(dmat)?;
-    let y: Vec<f32> = val_markets.iter().flat_map(|m| m.y.iter().copied()).collect();
+    let y: Vec<f32> = val_markets
+        .iter()
+        .flat_map(|m| m.y.iter().copied())
+        .collect();
     debug_assert_eq!(preds.len(), y.len());
 
     // ── Диагностика на полном per-frame сете (для сравнения) ─────────────
     let n_pos_full = y.iter().filter(|&&v| v >= 1.0).count();
     let n_neg_full = y.len() - n_pos_full;
-    let mean_pred_pos_full: f64 = preds.iter().zip(y.iter())
+    let mean_pred_pos_full: f64 = preds
+        .iter()
+        .zip(y.iter())
         .filter(|(_, yv)| **yv >= 1.0)
         .map(|(&p, _)| p as f64)
-        .sum::<f64>() / n_pos_full.max(1) as f64;
-    let mean_pred_neg_full: f64 = preds.iter().zip(y.iter())
+        .sum::<f64>()
+        / n_pos_full.max(1) as f64;
+    let mean_pred_neg_full: f64 = preds
+        .iter()
+        .zip(y.iter())
         .filter(|(_, yv)| **yv < 1.0)
         .map(|(&p, _)| p as f64)
-        .sum::<f64>() / n_neg_full.max(1) as f64;
+        .sum::<f64>()
+        / n_neg_full.max(1) as f64;
     let cal_auc_full = calc_auc(&preds, &y);
     tee_println!(
         "[calibration] {tag}: full per-frame: n_pos={n_pos_full} n_neg={n_neg_full} \
@@ -642,29 +678,35 @@ async fn fit_calibration(
     )
     .await;
     let preds_sim: Vec<f32> = entries.iter().map(|(r, _)| *r).collect();
-    let y_sim: Vec<f32> = entries.iter().map(|(_, w)| if *w { 1.0 } else { 0.0 }).collect();
+    let y_sim: Vec<f32> = entries
+        .iter()
+        .map(|(_, w)| if *w { 1.0 } else { 0.0 })
+        .collect();
     let n_pos_sim = entries.iter().filter(|(_, w)| *w).count();
     let n_neg_sim = entries.len() - n_pos_sim;
 
     // Решаем какой набор кормить в PAV.
-    let (cal_preds, cal_y, source_label): (&[f32], &[f32], &'static str) =
-        if entries.len() >= CALIBRATION_MIN_FILTERED_SAMPLES && n_pos_sim > 0 && n_neg_sim > 0 {
-            (preds_sim.as_slice(), y_sim.as_slice(), "sim-replay")
-        } else {
-            tee_eprintln!(
-                "[calibration] {tag}: sim-replay набор слишком мал ({} < {CALIBRATION_MIN_FILTERED_SAMPLES}) \
+    let (cal_preds, cal_y, source_label): (&[f32], &[f32], &'static str) = if entries.len()
+        >= CALIBRATION_MIN_FILTERED_SAMPLES
+        && n_pos_sim > 0
+        && n_neg_sim > 0
+    {
+        (preds_sim.as_slice(), y_sim.as_slice(), "sim-replay")
+    } else {
+        tee_eprintln!(
+            "[calibration] {tag}: sim-replay набор слишком мал ({} < {CALIBRATION_MIN_FILTERED_SAMPLES}) \
                  или один класс пуст (won={n_pos_sim} lost={n_neg_sim}) — fallback на per-frame.",
-                entries.len(),
-            );
-            if n_pos_full == 0 || n_neg_full == 0 {
-                tee_eprintln!(
-                    "[calibration] {tag}: per-frame набор тоже без двух классов \
+            entries.len(),
+        );
+        if n_pos_full == 0 || n_neg_full == 0 {
+            tee_eprintln!(
+                "[calibration] {tag}: per-frame набор тоже без двух классов \
                      (n_pos={n_pos_full}, n_neg={n_neg_full}). Используется identity."
-                );
-                return Ok(Calibration::identity());
-            }
-            (preds.as_slice(), y.as_slice(), "per-frame")
-        };
+            );
+            return Ok(Calibration::identity());
+        }
+        (preds.as_slice(), y.as_slice(), "per-frame")
+    };
 
     let cal = isotonic_fit(cal_preds, cal_y);
     tee_println!(
@@ -702,15 +744,23 @@ fn isotonic_fit(preds: &[f32], y: &[f32]) -> Calibration {
         return Calibration::identity();
     }
 
-    let mut pairs: Vec<(f32, f32)> = preds.iter().zip(y.iter())
+    let mut pairs: Vec<(f32, f32)> = preds
+        .iter()
+        .zip(y.iter())
         .map(|(&p, &yv)| (p, if yv >= 1.0 { 1.0_f32 } else { 0.0_f32 }))
         .collect();
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     #[derive(Clone, Copy)]
-    struct Block { sum_x: f64, sum_y: f64, weight: f64 }
+    struct Block {
+        sum_x: f64,
+        sum_y: f64,
+        weight: f64,
+    }
     impl Block {
-        fn value(&self) -> f64 { self.sum_y / self.weight }
+        fn value(&self) -> f64 {
+            self.sum_y / self.weight
+        }
     }
 
     // Шаг 1: предагрегация точек с идентичным raw в один блок.
@@ -727,7 +777,11 @@ fn isotonic_fit(preds: &[f32], y: &[f32]) -> Calibration {
                 continue;
             }
         }
-        blocks.push(Block { sum_x: x as f64, sum_y: y_i as f64, weight: 1.0 });
+        blocks.push(Block {
+            sum_x: x as f64,
+            sum_y: y_i as f64,
+            weight: 1.0,
+        });
     }
 
     // Шаг 2: собственно PAV — стек блоков с неубывающими значениями.
@@ -863,14 +917,14 @@ enum FrameSide {
 impl FrameSide {
     fn label(self) -> &'static str {
         match self {
-            Self::Up   => "up",
+            Self::Up => "up",
             Self::Down => "down",
         }
     }
 
     fn frames<'a>(&self, dump: &'a MarketXFramesDump) -> &'a [XFrame<SIZE>] {
         match self {
-            Self::Up   => &dump.frames_up,
+            Self::Up => &dump.frames_up,
             Self::Down => &dump.frames_down,
         }
     }
@@ -879,7 +933,7 @@ impl FrameSide {
     /// в обоих модулях (UP-токен / DOWN-токен).
     fn to_outcome(self) -> CurrencyUpDownOutcome {
         match self {
-            Self::Up   => CurrencyUpDownOutcome::Up,
+            Self::Up => CurrencyUpDownOutcome::Up,
             Self::Down => CurrencyUpDownOutcome::Down,
         }
     }
@@ -960,10 +1014,12 @@ pub async fn run_train_mode() -> anyhow::Result<()> {
                 // с лейном sim'а в [`fit_calibration_via_sim_replay`] (через
                 // `lane_key = (currency, interval_kind, outcome)`).
                 let interval_kind = match interval {
-                    "5m"  => XFrameIntervalKind::FiveMin,
+                    "5m" => XFrameIntervalKind::FiveMin,
                     "15m" => XFrameIntervalKind::FifteenMin,
                     other => {
-                        tee_eprintln!("[train] {currency}/{version_str}/{other}: неизвестный interval, пропуск");
+                        tee_eprintln!(
+                            "[train] {currency}/{version_str}/{other}: неизвестный interval, пропуск"
+                        );
                         continue;
                     }
                 };
@@ -986,8 +1042,8 @@ pub async fn run_train_mode() -> anyhow::Result<()> {
                     // только после сплита, чтобы битые/пустые маркеты не сдвигали границы.
                     let (train_count, val_count, test_count) = split_counts(paths.len());
                     let train_paths = &paths[..train_count];
-                    let val_paths   = &paths[train_count..train_count + val_count];
-                    let test_paths  = &paths[train_count + val_count..];
+                    let val_paths = &paths[train_count..train_count + val_count];
+                    let test_paths = &paths[train_count + val_count..];
                     tee_println!(
                         "[train] {tag_prefix}: маркетов {} → сплит {train_count} train / {val_count} val / {test_count} test",
                         paths.len(),
@@ -1110,9 +1166,12 @@ async fn train_all_variants(
                 ModelType::Pnl => PNL_MAX_LAG,
             };
 
-            let (train_markets, train_stats) = build_market_datasets(train_paths, side, model_type, max_lag);
-            let (val_markets, val_stats) = build_market_datasets(val_paths, side, model_type, max_lag);
-            let (test_markets, test_stats) = build_market_datasets(test_paths, side, model_type, max_lag);
+            let (train_markets, train_stats) =
+                build_market_datasets(train_paths, side, model_type, max_lag);
+            let (val_markets, val_stats) =
+                build_market_datasets(val_paths, side, model_type, max_lag);
+            let (test_markets, test_stats) =
+                build_market_datasets(test_paths, side, model_type, max_lag);
 
             let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
             if total_markets == 0 {
@@ -1124,13 +1183,19 @@ async fn train_all_variants(
                 Some(n) => XFrame::<SIZE>::count_features_n(n),
                 None => XFrame::<SIZE>::count_features(),
             };
-            let total_rows: usize = train_markets.iter().chain(val_markets.iter()).chain(test_markets.iter())
+            let total_rows: usize = train_markets
+                .iter()
+                .chain(val_markets.iter())
+                .chain(test_markets.iter())
                 .map(|m| m.y.len())
                 .sum();
             tee_println!(
                 "[train] {tag}: маркетов {}/{}/{} (train/val/test), {} строк, {} признаков",
-                train_markets.len(), val_markets.len(), test_markets.len(),
-                total_rows, feature_count,
+                train_markets.len(),
+                val_markets.len(),
+                test_markets.len(),
+                total_rows,
+                feature_count,
             );
 
             // Воронка разметки: сколько кадров отвалилось до попадания в y.
@@ -1138,8 +1203,8 @@ async fn train_all_variants(
             // например, `y_none` в test (например, из-за переключения y_train
             // на версию с walk-обходом — на тонком стакане `None` будет чаще).
             print_append_stats(&tag, "train", &train_stats);
-            print_append_stats(&tag, "val",   &val_stats);
-            print_append_stats(&tag, "test",  &test_stats);
+            print_append_stats(&tag, "val", &val_stats);
+            print_append_stats(&tag, "test", &test_stats);
 
             let model_path = version_path.join(format!(
                 "model_{interval}_{step_sec}s_{}_{}.ubj",
@@ -1164,13 +1229,24 @@ async fn train_all_variants(
             };
 
             match train_and_save(
-                &train_markets, &val_markets, &test_markets,
-                val_paths, currency, interval_kind, side,
-                &model_path, pnl_model_path.as_deref(), &tag, model_type, max_lag,
+                &train_markets,
+                &val_markets,
+                &test_markets,
+                val_paths,
+                currency,
+                interval_kind,
+                side,
+                &model_path,
+                pnl_model_path.as_deref(),
+                &tag,
+                model_type,
+                max_lag,
             )
             .await
             {
-                Ok(()) => tee_println!("[train] {tag}: модель сохранена → {}", model_path.display()),
+                Ok(()) => {
+                    tee_println!("[train] {tag}: модель сохранена → {}", model_path.display())
+                }
                 Err(err) => tee_eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
             }
         }
@@ -1238,7 +1314,12 @@ fn try_load_dump_from_path(path: &Path) -> Option<MarketXFramesDump> {
 ///
 /// Возвращает агрегированный [`AppendStats`] по всем дампам — для печати
 /// диагностики «сколько кадров отвалилось до разметки». См. [`AppendStats`].
-fn build_market_datasets(paths: &[PathBuf], side: FrameSide, model_type: ModelType, max_lag: Option<usize>) -> (Vec<MarketDataset>, AppendStats) {
+fn build_market_datasets(
+    paths: &[PathBuf],
+    side: FrameSide,
+    model_type: ModelType,
+    max_lag: Option<usize>,
+) -> (Vec<MarketDataset>, AppendStats) {
     let feature_count = match max_lag {
         Some(n) => XFrame::<SIZE>::count_features_n(n),
         None => XFrame::<SIZE>::count_features(),
@@ -1446,9 +1527,7 @@ async fn train_and_save(
     let test_preds = booster.predict(&dtest)?;
     let test_auc = calc_auc(&test_preds, &y_test);
     let test_logloss = calc_logloss(&test_preds, &y_test);
-    tee_println!(
-        "[train] {tag}: held-out test: logloss={test_logloss:.5}  AUC={test_auc:.6}"
-    );
+    tee_println!("[train] {tag}: held-out test: logloss={test_logloss:.5}  AUC={test_auc:.6}");
 
     print_y_distribution(&y_train, &y_val, &y_test, tag);
     print_contributions(&booster, &dtest, tag, max_lag);
@@ -1507,8 +1586,16 @@ async fn train_and_save(
         };
 
     match fit_calibration(
-        &booster, &dval, val_markets, val_paths, currency,
-        interval_kind, side, model_type, pnl_for_entries, tag,
+        &booster,
+        &dval,
+        val_markets,
+        val_paths,
+        currency,
+        interval_kind,
+        side,
+        model_type,
+        pnl_for_entries,
+        tag,
     )
     .await
     {
@@ -1517,10 +1604,15 @@ async fn train_and_save(
                 "[train] {tag}: calibration: breakpoints={} \
                  (примеры: raw 0.50→{:.3}, 0.70→{:.3}, 0.85→{:.3}, 0.95→{:.3})",
                 cal.xs.len(),
-                cal.apply(0.50), cal.apply(0.70), cal.apply(0.85), cal.apply(0.95),
+                cal.apply(0.50),
+                cal.apply(0.70),
+                cal.apply(0.85),
+                cal.apply(0.95),
             );
             match save_calibration(&cal, model_path) {
-                Ok(path) => tee_println!("[train] {tag}: калибровка сохранена → {}", path.display()),
+                Ok(path) => {
+                    tee_println!("[train] {tag}: калибровка сохранена → {}", path.display())
+                }
                 Err(err) => tee_eprintln!("[train] {tag}: ошибка сохранения калибровки: {err:#}"),
             }
         }
@@ -1587,7 +1679,9 @@ fn print_contributions(booster: &Booster, dtest: &DMatrix, tag: &str, max_lag: O
         .collect();
 
     contributions.sort_by(|(_, _, pct_a), (_, _, pct_b)| {
-        pct_b.partial_cmp(pct_a).unwrap_or(std::cmp::Ordering::Equal)
+        pct_b
+            .partial_cmp(pct_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     tee_println!("[train] {tag}: SHAP contributions (первая строка теста, топ-20):");
@@ -1610,10 +1704,15 @@ fn print_append_stats(tag: &str, split: &str, s: &AppendStats) {
     let late_entry_pct = s.late_entry as f64 / s.total_frames as f64 * 100.0;
     tee_println!(
         "[train] {tag}: append_stats ({split}): frames={} marked={} ({:.1}%) y_none={} ({:.1}%) out_of_hold_zone={} ({:.1}%) late_entry={} ({:.1}%) feature_mismatch={}",
-        s.total_frames, s.marked, marked_pct,
-        s.y_none, y_none_pct,
-        s.out_of_hold_zone, out_pct,
-        s.late_entry, late_entry_pct,
+        s.total_frames,
+        s.marked,
+        marked_pct,
+        s.y_none,
+        y_none_pct,
+        s.out_of_hold_zone,
+        out_pct,
+        s.late_entry,
+        late_entry_pct,
         s.feature_mismatch,
     );
 }
@@ -1643,7 +1742,6 @@ fn print_y_distribution(y_train: &[f32], y_val: &[f32], y_test: &[f32], tag: &st
     print_counts("val", y_val);
     print_counts("test", y_test);
 }
-
 
 /// Метрики одного TPE-trial'а на eval-сете (имя сета — `"test"`, см. caller'а
 /// `tune_xgboost_optimizer`). Считаются за одно обучение в [`eval_xgboost`]
@@ -1782,8 +1880,10 @@ fn fit_booster_with_early_stopping(
     // Метрики на момент лучшего раунда: metric -> {split -> val}.
     // Сохраняем здесь, а не переоцениваем после load_buffer —
     // так как load_buffer не восстанавливает eval_metric параметры booster'а.
-    let mut best_eval_results: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f32>> =
-        Default::default();
+    let mut best_eval_results: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, f32>,
+    > = Default::default();
 
     for round in 0..BOOST_ROUNDS {
         bst.update(dtrain, round as i32)?;
@@ -1809,10 +1909,16 @@ fn fit_booster_with_early_stopping(
             best_eval_results.clear();
             let train_metrics = bst.evaluate(dtrain)?;
             for (metric, val) in train_metrics {
-                best_eval_results.entry(metric).or_default().insert("train".to_string(), val);
+                best_eval_results
+                    .entry(metric)
+                    .or_default()
+                    .insert("train".to_string(), val);
             }
             for (metric, val) in test_metrics {
-                best_eval_results.entry(metric).or_default().insert("test".to_string(), val);
+                best_eval_results
+                    .entry(metric)
+                    .or_default()
+                    .insert("test".to_string(), val);
             }
         } else {
             rounds_without_improvement += 1;

@@ -1,16 +1,16 @@
-use derivative::Derivative;
-use anyhow::bail;
+pub use crate::constants::{
+    CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind,
+};
+use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
+pub use crate::history_sim::POLYMARKET_CRYPTO_TAKER_FEE_RATE;
 use crate::market_snapshot::MarketSnapshot;
+use anyhow::bail;
+use derivative::Derivative;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use xframe_features::FeatureLen;
 use xframe_features_derive::XFeatures;
-pub use crate::constants::{
-    CurrencyUpDownDelayClass, CurrencyUpDownOutcome, TradeSide, XFrameIntervalKind,
-};
-pub use crate::history_sim::{POLYMARKET_CRYPTO_TAKER_FEE_RATE};
-use crate::gamma_question::currency_up_down_five_min_slot_from_gamma_question;
 
 pub const SIZE: usize = 15;
 
@@ -446,10 +446,8 @@ pub fn apply_side_symmetry<const N: usize>(frame: &mut XFrame<N>) {
     if let Some(kind) = XFrameIntervalKind::from_i32(frame.xframe_interval_type) {
         let self_interval_ms = kind.interval_ms();
         if self_interval_ms > 0 {
-            frame.event_remaining_ms = frame
-                .event_remaining_ms
-                .saturating_mul(NORMALIZED_SCALE)
-                / self_interval_ms;
+            frame.event_remaining_ms =
+                frame.event_remaining_ms.saturating_mul(NORMALIZED_SCALE) / self_interval_ms;
         }
 
         let sibling_interval_ms = kind.sibling().interval_ms();
@@ -616,11 +614,9 @@ impl<const N: usize> XFrame<N> {
             None => 0,
         };
 
-        let currency_up_down_delay_class = compute_currency_up_down_delay_class(
-            snapshot.xframe_interval_kind,
-            gamma_question,
-        )
-        .as_i32();
+        let currency_up_down_delay_class =
+            compute_currency_up_down_delay_class(snapshot.xframe_interval_kind, gamma_question)
+                .as_i32();
 
         let currency_implied_prob = currency_implied_prob_polymarket_style(
             book_bid_l1_price,
@@ -772,16 +768,8 @@ impl<const N: usize> XFrame<N> {
         window_ms: i64,
     ) {
         let window_start = wall_ts_ms.saturating_sub(window_ms.max(0));
-        let mut buy_count_window = if self.bucket_flow_sign > 0 {
-            1
-        } else {
-            0
-        };
-        let mut sell_count_window = if self.bucket_flow_sign < 0 {
-            1
-        } else {
-            0
-        };
+        let mut buy_count_window = if self.bucket_flow_sign > 0 { 1 } else { 0 };
+        let mut sell_count_window = if self.bucket_flow_sign < 0 { 1 } else { 0 };
 
         for (&_aligned_timestamp_ms, prior_xframe) in frames.range(window_start..=wall_ts_ms) {
             if Self::frame_has_trade(prior_xframe) {
@@ -871,13 +859,11 @@ impl<const N: usize> XFrame<N> {
                     (Some(current), Some(prior)) => Some(current - prior),
                     _ => None,
                 };
-            self.delta_n_last_trade_price[lag_index] = match (
-                self.last_trade_price,
-                prior_frame.last_trade_price,
-            ) {
-                (Some(current_price), Some(prior_price)) => Some(current_price - prior_price),
-                _ => None,
-            };
+            self.delta_n_last_trade_price[lag_index] =
+                match (self.last_trade_price, prior_frame.last_trade_price) {
+                    (Some(current_price), Some(prior_price)) => Some(current_price - prior_price),
+                    _ => None,
+                };
             self.delta_n_trade_size[lag_index] = Some(self.trade_size - prior_frame.trade_size);
             self.delta_n_trade_volume_bucket[lag_index] =
                 Some(self.trade_volume_bucket - prior_frame.trade_volume_bucket);
@@ -967,7 +953,6 @@ pub fn currency_price_z_score_from_sec_history(
     }
     Some((current_price - mu) / sigma)
 }
-
 
 /// Минимальная чистая доходность (после комиссий) для метки y=1 (Take Profit).
 /// Например, 0.05 означает: вложенный 1 USDC должен принести ≥ 1.05 USDC нетто.
@@ -1074,9 +1059,7 @@ struct WalkSellResult {
 fn collect_walk_ask_levels<const N: usize>(frame: &XFrame<N>) -> Vec<(f64, f64)> {
     if let Some(book) = &frame.book_asks {
         book.iter()
-            .filter_map(|l| {
-                (l.price > 0.0 && l.size > 0.0).then_some((l.price, l.size))
-            })
+            .filter_map(|l| (l.price > 0.0 && l.size > 0.0).then_some((l.price, l.size)))
             .collect()
     } else {
         [
@@ -1132,7 +1115,8 @@ fn walk_buy_xfeatures<const N: usize>(
         // Polymarket fee per share = rate × p × (1 − p); честно считаем
         // **по уровню**, а не на VWAP'е — на разнопрайсной книге это
         // даёт другую сумму fee.
-        fee_usdc_total += shares_at_level * POLYMARKET_CRYPTO_TAKER_FEE_RATE * price * (1.0 - price);
+        fee_usdc_total +=
+            shares_at_level * POLYMARKET_CRYPTO_TAKER_FEE_RATE * price * (1.0 - price);
         remaining_usdc -= usdc_at_level;
         if remaining_usdc <= 1e-9 {
             break;
@@ -1161,9 +1145,7 @@ fn walk_buy_xfeatures<const N: usize>(
 fn collect_walk_bid_levels<const N: usize>(frame: &XFrame<N>) -> Vec<(f64, f64)> {
     if let Some(book) = &frame.book_bids {
         book.iter()
-            .filter_map(|l| {
-                (l.price > 0.0 && l.size > 0.0).then_some((l.price, l.size))
-            })
+            .filter_map(|l| (l.price > 0.0 && l.size > 0.0).then_some((l.price, l.size)))
             .collect()
     } else {
         [
@@ -1186,10 +1168,7 @@ fn collect_walk_bid_levels<const N: usize>(frame: &XFrame<N>) -> Vec<(f64, f64)>
 /// полный bid-стакан; иначе фолбэк на `book_bid_l{1,2,3}_{price,size}`.
 /// Fee per-level через `level_shares × rate × p × (1 − p)`;
 /// возвращает `None`, если глубины не хватило на весь `shares`.
-fn walk_sell_xfeatures<const N: usize>(
-    frame: &XFrame<N>,
-    shares: f64,
-) -> Option<WalkSellResult> {
+fn walk_sell_xfeatures<const N: usize>(frame: &XFrame<N>, shares: f64) -> Option<WalkSellResult> {
     if !shares.is_finite() || shares <= 0.0 {
         return None;
     }
@@ -1223,7 +1202,6 @@ fn walk_sell_xfeatures<const N: usize>(
         best_bid,
     })
 }
-
 
 /// Метка y для PnL-модели — `«успеет ли позиция $200 нотиналом отбить TP до
 /// конца горизонта или попадёт в SL»`.
@@ -1327,14 +1305,14 @@ pub fn calc_y_train_pnl(
 
     let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
         None => return Some(0.0),
-        Some(buy) => buy
+        Some(buy) => buy,
     };
     // Slippage cap на входе: реальный `book_fill_buy_strict` зарубил бы
     // такой ордер. Семантически это «позиция не открылась» → сэмпл не
     // учим (а не размечаем как лосс — лосс это уже про *открытую*
     // позицию, которая выбила SL).
     if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
-        return Some(0.0)
+        return Some(0.0);
     }
     let actual_shares = buy.actual_shares;
     // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.
@@ -1402,7 +1380,7 @@ pub fn calc_y_train_pnl(
         // urgent [`WalkSellResult::vwap`] должен просесть относительно входного ref
         // не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`] (симметрично runtime SL).
         if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP
-            // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
+        // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
         {
             return Some(0.0);
         }
@@ -1426,7 +1404,6 @@ pub fn calc_y_train_pnl(
     }
     Some(0.0)
 }
-
 
 // pub fn calc_y_train_pnl(n: usize, x_frames: &[XFrame<SIZE>], index: usize, price_to_beat: f64, final_price: f64, _: f64) -> Option<f32> {
 //     let up_won = final_price >= price_to_beat;
@@ -1607,13 +1584,13 @@ pub fn calc_y_train_resolution(
 
     let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
         None => return Some(0.0),
-        Some(buy) => buy
+        Some(buy) => buy,
     };
 
     if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
-        return Some(0.0)
+        return Some(0.0);
     }
-    
+
     let actual_shares = buy.actual_shares;
     // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.
     // let sell_vwap_at_entry = match walk_sell_xfeatures(current, actual_shares) {
@@ -1657,7 +1634,7 @@ pub fn calc_y_train_resolution(
         // Симметрично с обработкой SL в [`calc_y_train_pnl`].
         let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
         if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP
-            // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
+        // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
         {
             return Some(0.0);
         }
@@ -1668,7 +1645,6 @@ pub fn calc_y_train_resolution(
     // `Some(0.0)`, иначе ⇒ `Some(1.0)`.
     Some(1.0)
 }
-
 
 // pub fn calc_y_train_resolution(
 //     n: usize,
@@ -1742,17 +1718,16 @@ pub(crate) fn currency_implied_prob_polymarket_style(
     last_trade_price: Option<f64>,
 ) -> Option<f64> {
     let mid = book_l1_mid_price(best_bid, best_ask);
-    let spread_effective = spread_reported
-        .filter(|s| s.is_finite())
-        .or_else(|| match (best_bid, best_ask) {
-            (Some(b), Some(a)) if b.is_finite() && a.is_finite() => Some((a - b).max(0.0)),
-            _ => None,
-        });
+    let spread_effective =
+        spread_reported
+            .filter(|s| s.is_finite())
+            .or_else(|| match (best_bid, best_ask) {
+                (Some(b), Some(a)) if b.is_finite() && a.is_finite() => Some((a - b).max(0.0)),
+                _ => None,
+            });
 
     if spread_effective.map(|s| s > POLYMARKET_WIDE_SPREAD_USD) == Some(true) {
-        last_trade_price
-            .filter(|p| p.is_finite())
-            .or(mid)
+        last_trade_price.filter(|p| p.is_finite()).or(mid)
     } else {
         mid
     }

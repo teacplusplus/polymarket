@@ -1,13 +1,13 @@
 //! Сохранение накопленных [`crate::xframe::XFrame`] в бинарный файл при пересоздании WS.
 
 use crate::constants::XFrameIntervalKind;
-use crate::project_manager::{ProjectManager, FRAME_BUILD_INTERVALS_SEC};
+use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager};
 use crate::run_log;
 use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
-use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
+use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -84,29 +84,29 @@ pub fn spawn_dump_market_xframes_binary(
         .await;
 
         for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
-            if let Err(err) =
-                dump_market_xframes_binary_lane(
-                    project_manager.clone(),
-                    market_id.clone(),
-                    gamma_question.clone(),
-                    interval_kind,
-                    lane,
-                    price_to_beat,
-                    final_price,
-                ).await
+            if let Err(err) = dump_market_xframes_binary_lane(
+                project_manager.clone(),
+                market_id.clone(),
+                gamma_question.clone(),
+                interval_kind,
+                lane,
+                price_to_beat,
+                final_price,
+            )
+            .await
             {
                 eprintln!("xframe_dump lane={lane}: {err:#}");
             }
-            if let Err(err) =
-                crate::xframe_graph_dump::dump_market_graph_html_lane(
-                    project_manager.clone(),
-                    market_id.clone(),
-                    gamma_question.clone(),
-                    interval_kind,
-                    lane,
-                    price_to_beat,
-                    final_price,
-                ).await
+            if let Err(err) = crate::xframe_graph_dump::dump_market_graph_html_lane(
+                project_manager.clone(),
+                market_id.clone(),
+                gamma_question.clone(),
+                interval_kind,
+                lane,
+                price_to_beat,
+                final_price,
+            )
+            .await
             {
                 eprintln!("graph_dump lane={lane}: {err:#}");
             }
@@ -170,14 +170,19 @@ pub async fn dump_market_xframes_binary_lane(
     }
 
     let interval_label = match interval_kind {
-        XFrameIntervalKind::FiveMin    => "5m",
+        XFrameIntervalKind::FiveMin => "5m",
         XFrameIntervalKind::FifteenMin => "15m",
     };
 
     let step_secs = FRAME_BUILD_INTERVALS_SEC[lane];
 
     let frame_count = frames_up.len() + frames_down.len();
-    let dump = MarketXFramesDump { frames_up, frames_down, price_to_beat, final_price };
+    let dump = MarketXFramesDump {
+        frames_up,
+        frames_down,
+        price_to_beat,
+        final_price,
+    };
 
     // Версия схемы дампа — см. [`crate::xframe::xframe_bincode_schema_size_bytes`].
     let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
@@ -295,17 +300,17 @@ pub async fn dump_market_ws_stream_txt(
         writeln!(&mut out, "asset_id={asset_id}").ok();
         writeln!(&mut out, "currency={}", project_manager.currency).ok();
         writeln!(&mut out, "interval={interval_label}").ok();
-        writeln!(&mut out, "format=ingest_wall_ms|event_ts_ms|asset_id|event_type|payload_raw").ok();
+        writeln!(
+            &mut out,
+            "format=ingest_wall_ms|event_ts_ms|asset_id|event_type|payload_raw"
+        )
+        .ok();
         for e in asset_entries {
             let payload_one_line = e.payload_raw.replace('\n', "\\n");
             writeln!(
                 &mut out,
                 "{}|{}|{}|{}|{}",
-                e.ingest_wall_ms,
-                e.event_timestamp_ms,
-                e.asset_id,
-                e.event_type,
-                payload_one_line
+                e.ingest_wall_ms, e.event_timestamp_ms, e.asset_id, e.event_type, payload_one_line
             )
             .ok();
         }

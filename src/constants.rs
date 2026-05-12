@@ -44,7 +44,9 @@ pub enum TradeSide {
 }
 
 /// Тип окна up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[repr(i32)]
 pub enum XFrameIntervalKind {
     #[default]
@@ -71,7 +73,7 @@ impl XFrameIntervalKind {
     #[inline]
     pub const fn from_period_sec(sec: i64) -> Self {
         match sec {
-            FIVE_MIN_SEC    => Self::FiveMin,
+            FIVE_MIN_SEC => Self::FiveMin,
             FIFTEEN_MIN_SEC => Self::FifteenMin,
             _ => Self::FifteenMin,
         }
@@ -99,7 +101,9 @@ impl XFrameIntervalKind {
 }
 
 /// Исход токена up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`-дискриминант).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[repr(i32)]
 pub enum CurrencyUpDownOutcome {
     #[default]
@@ -132,7 +136,9 @@ impl CurrencyUpDownOutcome {
 }
 
 /// Класс сдвига / номер пятиминутки в 15m-блоке для up/down по валюте (в [`crate::xframe::XFrame`] хранится как `i32`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[repr(i32)]
 pub enum CurrencyUpDownDelayClass {
     /// 15m-рынок или первая пятиминутка в блоке.

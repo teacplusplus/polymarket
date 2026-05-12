@@ -18,7 +18,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 xframe-features = { path = "./lib/xframe-features" }
 xframe-features-derive = { path = "./lib/xframe-features-derive" }
-polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "0.5.1", features = ["gamma", "data", "clob"] }
+polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0-canary.1", features = ["gamma", "data", "clob"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dotenvy = "0.15"
 xgb = { path = "./lib/xgb", default-features = false, features = ["local_build"] }

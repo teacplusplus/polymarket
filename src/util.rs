@@ -5,6 +5,9 @@ use std::collections::HashMap;
 
 use crate::constants::CurrencyUpDownOutcome;
 
+/// Макс. длина имени в [`sanitized_filename_from_gamma_question`] до обрезки с `...`.
+const MAX_SANITIZED_FILENAME_LEN: usize = 180;
+
 pub fn current_timestamp_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
@@ -13,7 +16,7 @@ pub fn current_timestamp_ms() -> i64 {
     now.as_millis() as i64
 }
 
-/// Имя файла из текста Gamma `question`: безопасные символы и ограничение длины.
+/// Имя файла из Gamma `question`: недопустимые символы → `_`, обрезка по длине.
 pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
     let raw = q.unwrap_or("no_question");
     let s: String = raw
@@ -24,15 +27,14 @@ pub fn sanitized_filename_from_gamma_question(q: Option<&str>) -> String {
             c => c,
         })
         .collect();
-    const MAX: usize = 180;
-    if s.len() > MAX {
-        format!("{}...", &s[..MAX])
+    if s.len() > MAX_SANITIZED_FILENAME_LEN {
+        format!("{}...", &s[..MAX_SANITIZED_FILENAME_LEN])
     } else {
         s
     }
 }
 
-/// Локальный абсолютный путь в `file://` URI: оставляем `A-Za-z0-9/._-()`, остальное — `%XX`.
+/// Абсолютный путь → `file://` URI безопасными символами, остальное `%XX`.
 pub fn encode_path_as_file_uri(abs_path: &str) -> String {
     let mut out = String::from("file://");
     for ch in abs_path.chars() {
@@ -50,30 +52,18 @@ pub fn encode_path_as_file_uri(abs_path: &str) -> String {
 }
 
 pub struct CurrencyEventSlugData {
+    /// Исход токена по `asset_id`: Up / Down.
     pub currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
+    /// Старт окна по `conditionId` (`eventStartTime` / fallback из Gamma).
     pub market_event_start_ms: HashMap<String, Option<i64>>,
+    /// Конец окна по `conditionId` (`endDate`, не `umaEndDate`).
     pub market_event_end_ms: HashMap<String, Option<i64>>,
+    /// Поле `question` маркета Gamma.
     pub gamma_question: Option<String>,
 }
 
-/// `priceToBeat` (target/opening price) окна Polymarket из публичного Vatic API.
-///
-/// Заменяет старую логику чтения `__NEXT_DATA__` со страницы
-/// `polymarket.com/event/{slug}` на единый GET к
-/// `https://api.vatic.trading/api/v1/targets/timestamp?asset={currency}&type={5min|15min}&timestamp={window_start_sec}`
-/// (см. <https://docs.vatic.trading/api-reference/targets/timestamp.md>).
-///
-/// `currency` — тикер как в [`crate::project_manager::ProjectManager::currency`]
-/// (`btc`/`eth`/...), в URL уходит **в нижнем** регистре.
-///
-/// `slug` ожидается формата `{currency}-updown-{5m|15m}-{window_start_sec}`
-/// (тот же, что лежит в `polymarket.com/event/{slug}`); из него извлекается
-/// тип интервала и Unix-секунды окна.
-///
-/// Vatic возвращает точную опеновую цену окна (Chainlink Data Streams для
-/// 5min/15min с retention ~14 дней), внутри уже делает 4 повтора с задержкой
-/// 1с против publish-лага на границе окна — fallback-логика с предыдущим
-/// `closePrice` больше не нужна.
+/// Price-to-beat окна через Vatic [`targets/timestamp`](https://docs.vatic.trading/api-reference/targets/timestamp.md).
+/// Slug `{currency}-updown-{5m|15m}-{window_start_sec}`, `currency` в URL — lower-case.
 pub async fn fetch_price_to_beat_from_vatic_api(
     http: &reqwest::Client,
     slug: &str,
@@ -121,9 +111,7 @@ pub async fn fetch_price_to_beat_from_vatic_api(
     Ok(price)
 }
 
-/// Парсит `{currency}-updown-{5m|15m}-{ts}` → `(window_sec, market_type)`,
-/// где `market_type` — значение параметра `type` в Vatic API
-/// (`5min`/`15min`, см. <https://docs.vatic.trading/concepts/market-types.md>).
+/// Slug Polymarket → `(window_start_sec, type)` для Vatic (`5min` / `15min`).
 fn vatic_slug_window_sec_and_market_type(
     currency: &str,
     slug: &str,
@@ -160,8 +148,8 @@ pub async fn fetch_gamma_event_data_for_slug(
 
     let clob_token_ids = parse_clob_token_ids_from_gamma_market(&v)
         .with_context(|| format!("clobTokenIds slug={slug}"))?;
-    let outcomes = parse_outcomes_from_gamma_market(&v)
-        .with_context(|| format!("outcomes slug={slug}"))?;
+    let outcomes =
+        parse_outcomes_from_gamma_market(&v).with_context(|| format!("outcomes slug={slug}"))?;
     if outcomes.is_empty() {
         anyhow::bail!("пустой outcomes в ответе Gamma для slug={slug:?}");
     }
@@ -176,12 +164,15 @@ pub async fn fetch_gamma_event_data_for_slug(
     let mut market_event_start_ms = HashMap::new();
     let mut market_event_end_ms = HashMap::new();
 
-    if let Some(cid) = v.get("conditionId").and_then(|x| x.as_str()).map(str::to_string) {
+    if let Some(cid) = v
+        .get("conditionId")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+    {
         let event0 = v
             .get("events")
             .and_then(Value::as_array)
             .and_then(|a| a.first());
-        // Старт окна: в первую очередь `eventStartTime` (маркет, затем `events[0]`), далее `startTime` / `startDate`.
         let start_ms = gamma_json_date_ms(v.get("eventStartTime"))
             .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("eventStartTime"))))
             .or_else(|| gamma_json_date_ms(v.get("startTime")))
@@ -189,7 +180,6 @@ pub async fn fetch_gamma_event_data_for_slug(
             .or_else(|| gamma_json_date_ms(v.get("startDate")))
             .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("startDate"))));
         market_event_start_ms.insert(cid.clone(), start_ms);
-        // Конец окна: в Gamma нет `eventEndTime`; `endDate` (UTC RFC3339) — граница окна, не путать с `umaEndDate` (UMA).
         let end_ms = gamma_json_date_ms(v.get("endDate"))
             .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("endDate"))));
         market_event_end_ms.insert(cid, end_ms);
@@ -246,7 +236,7 @@ fn parse_outcomes_from_gamma_market(v: &Value) -> anyhow::Result<Vec<String>> {
     }
 }
 
-/// RFC3339 с `Z` или оффсетом — в миллисекунды UTC ([`DateTime::timestamp_millis`]).
+/// RFC3339 из Gamma JSON → Unix ms UTC.
 fn gamma_json_date_ms(v: Option<&Value>) -> Option<i64> {
     let s = v?.as_str()?;
     DateTime::parse_from_rfc3339(s)
@@ -265,20 +255,14 @@ fn parse_clob_token_ids_from_gamma_market(v: &Value) -> anyhow::Result<Vec<Strin
     }
 }
 
-/// Результат [`detect_country_and_ip`] — страна и внешний IP исходящего
-/// соединения, оба поля независимо опциональны (если в ответе отсутствует).
 pub struct CountryAndIp {
+    /// Код страны из ifconfig.co (если есть).
     pub country: Option<String>,
-    pub ip:      Option<String>,
+    /// Внешний IP (если есть).
+    pub ip: Option<String>,
 }
 
-/// Узнаёт страну и внешний IP через `https://ifconfig.co/json`
-/// (тот же сервис, что `curl -s https://ifconfig.co/json`). Используется
-/// только для печати в самом начале запуска — чтобы по логу было сразу
-/// видно, через какую гео-точку (VPN/прокси) сейчас стучимся к биржам.
-/// Любая ошибка (нет сети, таймаут, не-200, кривой JSON) не должна валить
-/// запуск, поэтому возвращаем [`Option<CountryAndIp>`] и обрабатываем `None`
-/// как «определить не удалось».
+/// Страна и IP для стартового лога (`ifconfig.co/json`); сбой → `None`, без паники.
 pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -286,8 +270,6 @@ pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
         .ok()?;
     let resp = client
         .get("https://ifconfig.co/json")
-        // Без `User-Agent: curl/...` сервис отдаёт HTML по этому URL,
-        // а не JSON; ставим явный «curl-подобный» UA, чтобы получить JSON.
         .header(reqwest::header::USER_AGENT, "curl/8.9.1")
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
@@ -305,7 +287,7 @@ pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
     };
     Some(CountryAndIp {
         country: pick("country"),
-        ip:      pick("ip"),
+        ip: pick("ip"),
     })
 }
 
@@ -313,29 +295,10 @@ pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
 mod tests {
     use super::*;
 
-    /// Лайв-тест [`fetch_price_to_beat_from_vatic_api`]: реальный GET к
-    /// `api.vatic.trading` за target/opening price конкретного 5-минутного
-    /// окна Polymarket'а
-    /// [`btc-updown-5m-1778267400`](https://polymarket.com/event/btc-updown-5m-1778267400)
-    /// (May 8 2026, 3:10–3:15PM ET, 19:10:00 UTC) и сверка с `$80,061.62` —
-    /// точное значение Chainlink BTC/USD на открытии этого окна.
-    ///
-    /// Запуск:
-    ///
-    /// ```bash
-    /// cargo test --bin poly util::tests::live_fetch_price_to_beat_from_vatic_btc_updown_5m_1778267400 -- --ignored --nocapture
-    /// ```
-    ///
-    /// `#[ignore]` — не хотим бить по живому API в обычном `cargo test`.
-    /// Помимо самого окна тест зависит от Chainlink retention (~14 дней
-    /// для 5min), поэтому при запуске позже середины мая 2026 Vatic может
-    /// вернуть 410 — это уже не баг функции.
+    /// Лайв: Vatic priceToBeat для `btc-updown-5m-1778267400` ≈ $80,061.62. `cargo test … -- --ignored`.
     #[tokio::test]
     #[ignore = "live network: GET https://api.vatic.trading/api/v1/targets/timestamp"]
     async fn live_fetch_price_to_beat_from_vatic_btc_updown_5m_1778267400() -> anyhow::Result<()> {
-        // rustls 0.23 требует CryptoProvider до первого TLS-запроса; в
-        // обычном бинарнике это делает `main`, а в `tokio::test` — мы
-        // сами. `install_default()` идемпотентен — повтор молча даст Err.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let http = reqwest::Client::builder()
@@ -345,9 +308,6 @@ mod tests {
         let slug = "btc-updown-5m-1778267400";
         let price = fetch_price_to_beat_from_vatic_api(&http, slug, "btc").await?;
 
-        // Округлённое до 2 знаков должно дать ровно 80061.62 (на странице
-        // Polymarket "Price to Beat" показан как `$80,061.62`). Реальное
-        // значение Chainlink: ~80061.61963627425.
         let price_2dp = (price * 100.0).round() / 100.0;
         anyhow::ensure!(
             (price_2dp - 80061.62).abs() < 1e-9,

@@ -290,10 +290,7 @@ struct PendingTradeRow {
 /// На любых nan/inf числовых значениях позже будет записана пустая ячейка
 /// (см. [`fmt_f64`]/[`fmt_f32`]) — анализаторы CSV не любят `NaN`/`Inf`.
 pub fn write_trade_csv_row(row: TradeCsvRow<'_>) {
-    let regime: &'static str = CURRENT_REGIME
-        .lock()
-        .map(|g| *g)
-        .unwrap_or("");
+    let regime: &'static str = CURRENT_REGIME.lock().map(|g| *g).unwrap_or("");
     let owned = PendingTradeRow {
         regime,
         polymarket_url: row.polymarket_url.to_string(),
@@ -378,8 +375,20 @@ pub fn record_market_outcome(market_id: &str, up_won: bool) {
 /// Вспомогательная: маппинг `side` → `win`/`loss` по флагу `up_won`.
 fn outcome_for_side(side: &str, up_won: bool) -> &'static str {
     match side {
-        "up" => if up_won { "win" } else { "loss" },
-        "down" => if up_won { "loss" } else { "win" },
+        "up" => {
+            if up_won {
+                "win"
+            } else {
+                "loss"
+            }
+        }
+        "down" => {
+            if up_won {
+                "loss"
+            } else {
+                "win"
+            }
+        }
         _ => "unknown",
     }
 }
@@ -388,11 +397,7 @@ fn outcome_for_side(side: &str, up_won: bool) -> &'static str {
 /// внешний параметр, потому что одна и та же буферная строка может
 /// быть выписана и с известным исходом ([`record_market_outcome`]),
 /// и с `unknown` ([`finish_trade_csv_log`]).
-fn write_pending_row_to_file(
-    w: &mut BufWriter<File>,
-    row: &PendingTradeRow,
-    final_outcome: &str,
-) {
+fn write_pending_row_to_file(w: &mut BufWriter<File>, row: &PendingTradeRow, final_outcome: &str) {
     let _ = writeln!(
         w,
         "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",

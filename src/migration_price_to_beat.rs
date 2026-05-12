@@ -47,7 +47,7 @@
 
 use crate::constants::XFrameIntervalKind;
 use crate::util::fetch_price_to_beat_from_vatic_api;
-use crate::xframe::{XFrame, SIZE};
+use crate::xframe::{SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -134,9 +134,7 @@ pub async fn run_price_to_beat_migration() -> Result<()> {
                 }
             }
         }
-        println!(
-            "[migration_ptb] {currency}: HTTP fetched={fetched} failed={failed}"
-        );
+        println!("[migration_ptb] {currency}: HTTP fetched={fetched} failed={failed}");
 
         // Pass 3: переписываем дампы. Если для окна нет exact ptb (HTTP упал) —
         // дамп этого окна тоже не трогаем. Sibling в зависимом поле кадра
@@ -150,7 +148,13 @@ pub async fn run_price_to_beat_migration() -> Result<()> {
                 skipped_no_ptb += 1;
                 continue;
             };
-            match rewrite_dump(path, *interval_kind, *window_start_sec, new_ptb, &correct_ptb) {
+            match rewrite_dump(
+                path,
+                *interval_kind,
+                *window_start_sec,
+                new_ptb,
+                &correct_ptb,
+            ) {
                 Ok(RewriteResult::Rewritten) => rewritten += 1,
                 Ok(RewriteResult::Unchanged) => unchanged += 1,
                 Err(err) => {
@@ -184,8 +188,8 @@ fn rewrite_dump(
     correct_ptb: &HashMap<(XFrameIntervalKind, i64), f64>,
 ) -> Result<RewriteResult> {
     let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let mut dump: MarketXFramesDump = bincode::deserialize(&bytes)
-        .with_context(|| format!("deserialize {}", path.display()))?;
+    let mut dump: MarketXFramesDump =
+        bincode::deserialize(&bytes).with_context(|| format!("deserialize {}", path.display()))?;
     let old_ptb = dump.price_to_beat;
 
     if !old_ptb.is_finite() || !new_ptb.is_finite() {
@@ -230,8 +234,8 @@ fn rewrite_dump(
     }
 
     dump.price_to_beat = new_ptb;
-    let serialized = bincode::serialize(&dump)
-        .with_context(|| format!("serialize {}", path.display()))?;
+    let serialized =
+        bincode::serialize(&dump).with_context(|| format!("serialize {}", path.display()))?;
     fs::write(path, serialized).with_context(|| format!("write {}", path.display()))?;
     Ok(RewriteResult::Rewritten)
 }
@@ -365,10 +369,9 @@ fn collect_dump_files_with_window(
                     if file_path.extension().and_then(|s| s.to_str()) != Some("bin") {
                         continue;
                     }
-                    let Some(bounds) = crate::history_sim::window_bounds_from_dump_path(
-                        &file_path,
-                        interval_kind,
-                    ) else {
+                    let Some(bounds) =
+                        crate::history_sim::window_bounds_from_dump_path(&file_path, interval_kind)
+                    else {
                         continue;
                     };
                     out.push((file_path, interval_kind, bounds.window_start_sec));

@@ -68,7 +68,9 @@ pub async fn update_currency_updown_sibling_slots(
     let Some((parsed_start_unix, duration_min)) =
         currency_updown_question_window_start_unix_sec(question, slug_window_start_unix_sec)
     else {
-        eprintln!("currency_updown_sibling: не разобрать окно из question для market_id={condition_id}");
+        eprintln!(
+            "currency_updown_sibling: не разобрать окно из question для market_id={condition_id}"
+        );
         return;
     };
 
@@ -77,7 +79,9 @@ pub async fn update_currency_updown_sibling_slots(
     };
     let expected_dur_min = horizon.duration_minutes();
     if duration_min != expected_dur_min {
-        eprintln!("currency_updown_sibling: в question длительность {duration_min} мин, ожидалось {expected_dur_min} для interval_sec={interval_sec} (market_id={condition_id})");
+        eprintln!(
+            "currency_updown_sibling: в question длительность {duration_min} мин, ожидалось {expected_dur_min} для interval_sec={interval_sec} (market_id={condition_id})"
+        );
         return;
     }
 
@@ -88,7 +92,8 @@ pub async fn update_currency_updown_sibling_slots(
                 .fifteen_min
                 .as_ref()
                 .map(|s| s.window_start_sec);
-            if sibling_state_lock.five_min.is_some() && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev)
+            if sibling_state_lock.five_min.is_some()
+                && prev_fifteen_start.is_some_and(|prev| parsed_start_unix > prev)
             {
                 sibling_state_lock.five_min = None;
             }
@@ -99,7 +104,10 @@ pub async fn update_currency_updown_sibling_slots(
         }
         CurrencyUpDownInterval::FiveMin => {
             if let Some(ref fifteen_slot) = sibling_state_lock.fifteen_min {
-                if !five_min_belongs_to_fifteen_window(parsed_start_unix, fifteen_slot.window_start_sec) {
+                if !five_min_belongs_to_fifteen_window(
+                    parsed_start_unix,
+                    fifteen_slot.window_start_sec,
+                ) {
                     return;
                 }
             }

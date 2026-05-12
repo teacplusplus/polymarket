@@ -34,7 +34,7 @@
 //! Команда идемпотентна: после успешного прогона устаревших каталогов
 //! `<old_size>` не остаётся, повторный запуск ничего не делает.
 
-use crate::xframe::{BookLevel, XFrame, SIZE};
+use crate::xframe::{BookLevel, SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::{Context, Result};
 use derivative::Derivative;
@@ -547,17 +547,22 @@ fn legacy_size_dirs(currency_root: &Path, current_size: usize) -> Result<Vec<Pat
 }
 
 fn migrate_file_in_place(src: &Path) -> Result<bool> {
-    let bytes = fs::read(src)
-        .with_context(|| format!("read {}", src.display()))?;
+    let bytes = fs::read(src).with_context(|| format!("read {}", src.display()))?;
     let legacy: LegacyMarketXFramesDump = match bincode::deserialize(&bytes) {
         Ok(d) => d,
         Err(_) => return Ok(false),
     };
 
-    let frames_up: Vec<XFrame<SIZE>> =
-        legacy.frames_up.into_iter().map(legacy_to_current).collect();
-    let frames_down: Vec<XFrame<SIZE>> =
-        legacy.frames_down.into_iter().map(legacy_to_current).collect();
+    let frames_up: Vec<XFrame<SIZE>> = legacy
+        .frames_up
+        .into_iter()
+        .map(legacy_to_current)
+        .collect();
+    let frames_down: Vec<XFrame<SIZE>> = legacy
+        .frames_down
+        .into_iter()
+        .map(legacy_to_current)
+        .collect();
     let dump = MarketXFramesDump {
         frames_up,
         frames_down,
@@ -567,8 +572,7 @@ fn migrate_file_in_place(src: &Path) -> Result<bool> {
 
     let serialized = bincode::serialize(&dump)
         .with_context(|| format!("serialize migrated dump for {}", src.display()))?;
-    fs::write(src, serialized)
-        .with_context(|| format!("write {}", src.display()))?;
+    fs::write(src, serialized).with_context(|| format!("write {}", src.display()))?;
     Ok(true)
 }
 
@@ -588,9 +592,7 @@ fn migrate_file_in_place(src: &Path) -> Result<bool> {
 pub fn run_migration() -> Result<()> {
     let current_size = current_schema_size();
     let legacy_size = legacy_schema_size();
-    println!(
-        "[migration] schema_size: current={current_size} legacy(expected_old)={legacy_size}"
-    );
+    println!("[migration] schema_size: current={current_size} legacy(expected_old)={legacy_size}");
 
     for currency in crate::CURRENCIES {
         let currency_root = Path::new("xframes").join(currency);
@@ -649,11 +651,7 @@ pub fn run_migration() -> Result<()> {
         println!("[migration]   migrated={migrated} skipped={skipped}");
 
         fs::rename(legacy_root, &dst_root).with_context(|| {
-            format!(
-                "rename {} → {}",
-                legacy_root.display(),
-                dst_root.display()
-            )
+            format!("rename {} → {}", legacy_root.display(), dst_root.display())
         })?;
         println!(
             "[migration]   {} → {}",
@@ -690,8 +688,7 @@ mod tests {
     fn legacy_default_round_trip() {
         let legacy = LegacyXFrame::<SIZE>::default();
         let bytes = bincode::serialize(&legacy).expect("serialize legacy");
-        let _: LegacyXFrame<SIZE> =
-            bincode::deserialize(&bytes).expect("deserialize legacy back");
+        let _: LegacyXFrame<SIZE> = bincode::deserialize(&bytes).expect("deserialize legacy back");
     }
 
     /// У легаси-дампов полной лестницы стакана не было — миграция оставляет

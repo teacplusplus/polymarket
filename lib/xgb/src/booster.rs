@@ -126,7 +126,10 @@ impl Booster {
             &mut handle
         ))?;
 
-        let mut booster = Booster { handle, eval_dmat_results: Default::default() };
+        let mut booster = Booster {
+            handle,
+            eval_dmat_results: Default::default(),
+        };
         booster.set_params(params)?;
         Ok(booster)
     }
@@ -168,7 +171,10 @@ impl Booster {
         let mut handle = ptr::null_mut();
         xgb_call!(xgboost_sys::XGBoosterCreate(ptr::null(), 0, &mut handle))?;
         xgb_call!(xgboost_sys::XGBoosterLoadModel(handle, fname.as_ptr()))?;
-        Ok(Booster { handle, eval_dmat_results: Default::default() })
+        Ok(Booster {
+            handle,
+            eval_dmat_results: Default::default(),
+        })
     }
 
     /// Load a Booster directly from a buffer.
@@ -182,7 +188,10 @@ impl Booster {
             bytes.as_ptr() as *const _,
             bytes.len() as u64
         ))?;
-        Ok(Booster { handle, eval_dmat_results: Default::default() })
+        Ok(Booster {
+            handle,
+            eval_dmat_results: Default::default(),
+        })
     }
 
     /// Convenience function for creating/training a new Booster.
@@ -237,7 +246,10 @@ impl Booster {
                 // let mut eval_dmat_results = BTreeMap::new();
                 for (dmat_name, eval_results) in &dmat_eval_results {
                     for (eval_name, result) in eval_results {
-                        let dmat_results = bst.eval_dmat_results.entry(eval_name.clone()).or_insert_with(BTreeMap::new);
+                        let dmat_results = bst
+                            .eval_dmat_results
+                            .entry(eval_name.clone())
+                            .or_insert_with(BTreeMap::new);
                         dmat_results.insert(dmat_name.clone(), *result);
                     }
                 }

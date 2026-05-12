@@ -2,12 +2,12 @@
 
 use crate::constants::XFrameIntervalKind;
 use crate::history_sim::{
-    book_fill_buy, book_fill_sell, OpenPosition, NO_KELLY_POSITION_SIZE_USD,
-    SIM_MAX_SLIPPAGE_FROM_L1_PCT,
+    NO_KELLY_POSITION_SIZE_USD, OpenPosition, SIM_MAX_SLIPPAGE_FROM_L1_PCT, book_fill_buy,
+    book_fill_sell,
 };
-use crate::project_manager::{ProjectManager, FRAME_BUILD_INTERVALS_SEC};
+use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager};
 use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
-use crate::xframe::{CurrencyUpDownOutcome, XFrame, SIZE};
+use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::Context as _;
 use serde::Serialize;
@@ -339,7 +339,10 @@ fn lane_window_start_ms_from_rows<'a>(
 
 /// Время на оси X для кадра из `.bin`: `event_end_ms - event_remaining_ms`
 /// (та же логика wall-time, что при пересчёте полей от `price_to_beat`).
-fn graph_html_rows_from_dump_frames(frames: &[XFrame<SIZE>], event_end_ms: i64) -> Vec<GraphHtmlRow> {
+fn graph_html_rows_from_dump_frames(
+    frames: &[XFrame<SIZE>],
+    event_end_ms: i64,
+) -> Vec<GraphHtmlRow> {
     frames
         .iter()
         .filter(|f| f.stable)

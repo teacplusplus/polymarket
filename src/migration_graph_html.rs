@@ -7,7 +7,7 @@
 
 use crate::constants::XFrameIntervalKind;
 use crate::xframe_dump::MarketXFramesDump;
-use crate::xframe_graph_dump::{try_write_graph_html_from_bin_dump, GraphHtmlFromBinOutcome};
+use crate::xframe_graph_dump::{GraphHtmlFromBinOutcome, try_write_graph_html_from_bin_dump};
 use anyhow::{Context as _, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 pub fn run_graph_html_migration() -> Result<()> {
     let root = Path::new("xframes");
     if !root.exists() {
-        println!("[migration_graph_html] каталог {} отсутствует — нечего делать", root.display());
+        println!(
+            "[migration_graph_html] каталог {} отсутствует — нечего делать",
+            root.display()
+        );
         return Ok(());
     }
 
@@ -95,7 +98,9 @@ fn collect_bin_files_under_currency(cur_root: &Path) -> Result<Vec<(PathBuf, XFr
         if !size_path.is_dir() {
             continue;
         }
-        for interval_entry in fs::read_dir(&size_path).with_context(|| size_path.display().to_string())?.flatten()
+        for interval_entry in fs::read_dir(&size_path)
+            .with_context(|| size_path.display().to_string())?
+            .flatten()
         {
             let interval_path = interval_entry.path();
             if !interval_path.is_dir() {

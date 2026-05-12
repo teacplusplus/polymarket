@@ -1,15 +1,6 @@
-//! Постановка/отмена ордеров на Polymarket CLOB поверх
-//! [`crate::account::Account`]: примитивы [`post_order_on_clob`] и
-//! [`cancel_order_on_clob`] плюс публичные типы запроса/ответа.
-//! Аутентифицированный `clob::Client` и EOA-подписант берутся из
-//! [`crate::account::Account::clob_authed`] /
-//! [`crate::account::Account::clob_signer`] (заполняются
-//! [`crate::account::try_authenticate_clob_for_heartbeats`] на старте
-//! `RealSim`); сам модуль состояние счёта не трогает.
-//!
-//! Документация эндпоинтов:
-//! - <https://docs.polymarket.com/api-reference/trade/post-a-new-order>
-//! - <https://docs.polymarket.com/api-reference/trade/cancel-single-order>
+//! CLOB: [`post_order_on_clob`] ([POST /order](https://docs.polymarket.com/api-reference/trade/post-a-new-order)),
+//! [`cancel_order_on_clob`](https://docs.polymarket.com/api-reference/trade/cancel-single-order).
+//! `clob_authed` / `clob_signer` — из [`crate::account::Account`] ([`crate::account::try_authenticate_clob_for_heartbeats`]).
 
 use crate::account::{POLY_PRIVATE_KEY_ENV, SharedAccount};
 use crate::history_sim::StrictBook;
@@ -20,145 +11,80 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::response::PostOrderResponse;
-use polymarket_client_sdk::clob::types::{
-    Amount, OrderStatusType, OrderType, Side, SignableOrder,
-};
+use polymarket_client_sdk::clob::types::{Amount, OrderStatusType, OrderType, Side, SignableOrder};
 use polymarket_client_sdk::types::{Decimal, U256};
 use std::str::FromStr;
 use std::time::Duration;
 
-/// Роль ордера на CLOB:
-/// - [`OrderRole::Taker`] — съедает встречную ликвидность (`market_order` →
-///   `OrderType::FAK` по умолчанию: что не зальётся — отменяется);
-///   опционально лимит-цена / cap слиппеджа от L1 (см. [`PostOrderRequest`]).
-/// - [`OrderRole::Maker`] — лежит лимиткой (`limit_order` + `post_only=true`,
-///   `OrderType::GTC` или `GTD` если задан `expiration`); цена обязательна.
+/// Маркет (FAK) или лимит post-only (GTC/GTD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderRole {
+    /// `market_order`, съём встречной ликвидности.
     Taker,
+    /// `limit_order` + post-only; нужны цена и `Shares`.
     Maker,
 }
 
-/// `amount` для [`PostOrderRequest`]: единицы зависят от role × side.
-/// SDK сам валидирует (`Amount::usdc` / `Amount::shares`).
-///
-/// - `UsdNotional(usd)` — только для taker BUY (тратим N USDC, получаем
-///   столько shares, сколько даст cutoff).
-/// - `Shares(n)` — taker SELL / любой maker (мы знаем размер позиции в shares).
+/// Объём: USDC только у taker BUY; shares у SELL и у maker.
 #[derive(Debug, Clone, Copy)]
 pub enum OrderAmount {
+    /// Спендить N USDC (taker BUY).
     UsdNotional(f64),
+    /// Кол-во outcome-shares.
     Shares(f64),
 }
 
-/// Параметры запроса к [`post_order_on_clob`]. Обязательные комбинации:
-/// - **Taker BUY с USDC-нотионалом и слиппеджем** → `role=Taker`,
-///   `side=Buy`, `amount=UsdNotional`, `price=None`,
-///   `max_slippage_pp=Some`. SDK сам выведет cutoff из book; cap = best ask + slip.
-/// - **Maker TP (limit SELL на ближайшее будущее)** → `role=Maker`,
-///   `side=Sell`, `amount=Shares`, `price=Some`,
-///   `expiration=Some(now + T)` (`OrderType::GTD` + `post_only`).
-/// - **Taker SELL всех shares без слиппеджа** → `role=Taker`,
-///   `side=Sell`, `amount=Shares`, `price=None`,
-///   `max_slippage_pp=None` (SDK выведет cutoff из bids book; FAK
-///   зальёт сколько успеет).
-///
-/// **Снимок стакана:** при `max_slippage_pp = Some(..)` без явного `price`
-/// нужен лучший L1 для расчёта cap'а. Если задан [`StrictBook`], его
-/// уровни используются без лишнего `GET …/book`; иначе делается
-/// [`clob::Client::order_book`].
+/// Вход для [`post_order_on_clob`]: taker BUY (UsdNotional±slippage/worst-price), TP maker (Shares+price+[expiration]), taker SELL (Shares).
 #[derive(Debug, Clone)]
 pub struct PostOrderRequest {
-    /// `tokenId` (десятичная строка U256), совпадает с `OpenPosition.asset_id`.
+    /// Десятичный `tokenId` (= `OpenPosition.asset_id`).
     pub asset_id: String,
-    /// `BUY` (открытие YES/NO) или `SELL` (закрытие/TP).
+    /// SDK `Side::Buy` / `Side::Sell`.
     pub side: Side,
+    /// Taker vs maker (см. enum).
     pub role: OrderRole,
+    /// USDC notional (taker BUY) или shares.
     pub amount: OrderAmount,
-    /// Лимит-цена в probability `[tick_size, 1 - tick_size]`. Для maker —
-    /// обязательна; для taker, если задана, выступает worst-acceptable
-    /// (если задан и `max_slippage_pp` — `price` имеет приоритет).
-    /// Округление до tick_size — на стороне вызывающего (SDK иначе вернёт
-    /// validation error).
+    /// Prob. [0,1], кратно tick; maker обязателен; для taker — worst-acceptable (выше slip-cap).
     pub price: Option<f64>,
-    /// Cap слиппеджа в probability-units от best L1 (e.g. `0.02` ≈ 2pp).
-    /// Применяется только для taker без `price`. `None` — без cap'а.
+    /// Cap от best L1 (prob.), только taker без явного `price`.
     pub max_slippage_pp: Option<f64>,
-    /// Истечение для maker GTD. Для taker должно быть `None`.
+    /// GTD для maker; у taker `None`.
     pub expiration: Option<DateTime<Utc>>,
-    /// HTTP-таймаут на сам `POST /order` (без учёта `order_book` для
-    /// slippage cap'а). Большие значения держат вызывающего под локом.
+    /// Таймаут HTTP только на `POST /order`.
     pub timeout: Duration,
-    /// Уже имеющийся HTTP-снимок стакана (`real_sim` / батч `order_books`).
-    /// Учитывается только если нужен L1 для `max_slippage_pp` при отсутствии
-    /// `price`; иначе игнорируется. Видимость `pub(crate)`, т.к. тип
-    /// [`StrictBook`] — `pub(crate)` внутри этого крейта.
+    /// При slip-cap без `price`: L1 без лишнего GET /book.
     pub(crate) strict_book: Option<StrictBook>,
 }
 
-/// Ответ [`post_order_on_clob`] — упакованный [`PostOrderResponse`] SDK.
-/// `success=false + error_msg=Some` означает «сервер принял запрос, но
-/// отверг ордер» (см. 400-кейсы в OpenAPI). `success=true + status=Live` —
-/// лежит в book'е; `Matched` — частично/полностью залился (см.
-/// `transaction_hashes`/`trade_ids`); `Delayed` — попал в risk-delay.
+/// Распакованный ответ POST /order (поля как у SDK).
 #[derive(Debug, Clone)]
 pub struct PostOrderResult {
-    /// Идентификатор ордера на CLOB (хэш ордера, поле API `orderID`). Им
-    /// матчится user-WS и локальные `open_order_id` / `close_order_id`.
+    /// `orderID` для user-WS и `*_order_id`.
     pub order_id: String,
-    /// Статус после обработки матчинг-движком: например **`Live`** —
-    /// ордер в стакане; **`Matched`** — было исполнение (в т.ч. частичное);
-    /// **`Delayed`** — задержка (например риск-слой); иные значения —
-    /// см. [`OrderStatusType`].
+    /// Live / Matched / Delayed / …
     pub status: OrderStatusType,
-    /// `true`, если сервер **принял и успешно обработал** заявку (ордер мог
-    /// лечь live или быть сматчен). При `false` смотреть [`Self::error_msg`]
-    /// и см. ошибки OpenAPI `/order`.
+    /// HTTP-ответ успешно обработан (ордер мог остаться live).
     pub success: bool,
-    /// Сколько **maker** даёт контрагента по факту операции (`makingAmount`).
-    /// Fixed-point число как в ответе CLOB (до **6** знаков дробной части /
-    /// «микропорции», интерпретация BUY/SELL см. модель контрактов маркета).
+    /// `makingAmount`.
     pub making_amount: Decimal,
-    /// Сколько **taker** даёт поперечно (`takingAmount`). Та же fixed-point
-    /// семантика, что у [`Self::making_amount`].
+    /// `takingAmount`.
     pub taking_amount: Decimal,
-    /// Сообщение об ошибке от API при отклонении ордера (`errorMsg`).
-    /// Пустые строки превращаем в `None`.
+    /// `errorMsg` если success=false или отклонено.
     pub error_msg: Option<String>,
-    /// Хэши on-chain транзакций после исполнения (`transactionsHashes`);
-    /// строки вида `0x…` после сериализации из SDK.
+    /// `transactionsHashes`, строки `0x…`.
     pub transaction_hashes: Vec<String>,
-    /// Внутренние идентификаторы сделок Polymarket (`tradeIDs`), когда ордер
-    /// дал matche(es).
+    /// `tradeIDs`.
     pub trade_ids: Vec<String>,
 }
 
-/// Универсальный примитив постановки ордера на CLOB Polymarket
-/// ([POST /order](https://docs.polymarket.com/api-reference/trade/post-a-new-order)).
-/// На этом примитиве дальше можно собрать pnl-логику:
-/// - **buy USD как taker со слиппеджем** — `role=Taker, side=Buy, amount=UsdNotional, max_slippage_pp=Some`.
-/// - **TP-мейкер на ближайшее будущее** — `role=Maker, side=Sell, amount=Shares, price=Some, expiration=Some`.
-/// - **sell all shares как taker без слиппеджа** — `role=Taker, side=Sell, amount=Shares, max_slippage_pp=None`.
-///
-/// **Состояние Account** функция не трогает: вызывающий отвечает за
-/// создание `OpenPosition`/`ClosingPosition` со статусом `Pending*` и
-/// сохранение `order_id` из [`PostOrderResult`]; финальное подтверждение
-/// (Open/Closed) приходит асинхронно через [`crate::account_ws`].
-///
-/// **Требования к Account**: `clob_authed = Some(_)` и
-/// `clob_signer = Some(_)` (оба ставятся
-/// [`crate::account::try_authenticate_clob_for_heartbeats`] на старте
-/// `RealSim`). Иначе — `Err`.
+/// Подписать ордер EOA и отправить на CLOB. Нужны `clob_authed` + `clob_signer`. Account не изменяется.
 pub async fn post_order_on_clob(
     account: &SharedAccount,
     request: PostOrderRequest,
 ) -> Result<PostOrderResult> {
     validate_post_order_request(&request)?;
 
-    // Снимок auth-стейта через ArcSwap: hot-path без локов, оба `load()`
-    // консистентны на момент вызова. `clob::Client` — обёртка над
-    // `Arc<ClientInner>` (дешёвый clone), `PrivateKeySigner` тоже Clone;
-    // клонируем под snapshot Arc, чтобы не держать guard через сетевые вызовы.
     let auth_client = (**account.clob_authed.load()).clone().ok_or_else(|| {
         anyhow!(
             "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
@@ -221,17 +147,13 @@ pub async fn post_order_on_clob(
     })
 }
 
-/// Структурная валидация [`PostOrderRequest`] — ловит ошибки до сетевых
-/// вызовов и до `OrderBuilder::build()`, чтобы вызывающий получал
-/// человекочитаемые сообщения, а не `Error::validation` из SDK.
+/// Ошибки комбинаций полей до сети/SDK `build`.
 fn validate_post_order_request(req: &PostOrderRequest) -> Result<()> {
     if req.timeout.is_zero() {
         bail!("post_order_on_clob: timeout=0 — POST /order не дождётся ответа");
     }
     match req.side {
         Side::Buy | Side::Sell => {}
-        // `Side` помечен `#[non_exhaustive]` SDK'ом — `Unknown` + любые
-        // будущие варианты в нашем коде не имеют семантики, отбрасываем.
         _ => bail!(
             "post_order_on_clob: side={:?} не поддерживается (ожидается Buy/Sell)",
             req.side
@@ -284,10 +206,7 @@ fn validate_post_order_request(req: &PostOrderRequest) -> Result<()> {
     Ok(())
 }
 
-/// Конверсия `f64` → `Decimal` через строковый roundtrip (тот же приём,
-/// что в `real_sim::http_level`: избавляется от шума IEEE-754, точное
-/// представление `0.1` и т.п.). `Decimal::try_from(f64)` тоже бы сработал,
-/// но текстовый roundtrip даёт предсказуемый scale (ровно как в литерале).
+/// `f64` → `Decimal` через строку (стабильнее двоичного float).
 fn f64_to_decimal(f: f64, ctx: &str) -> Result<Decimal> {
     if !f.is_finite() {
         bail!("post_order_on_clob: {ctx}: значение {f} не finite");
@@ -297,18 +216,13 @@ fn f64_to_decimal(f: f64, ctx: &str) -> Result<Decimal> {
         .with_context(|| format!("post_order_on_clob: {ctx}: f64 {f} → Decimal не сконвертился"))
 }
 
-/// Maker = `limit_order().post_only(true)`, `OrderType::GTC` (или `GTD`,
-/// если задан `expiration`). Цена и size обязательны и пройдут SDK-
-/// валидацию по tick_size / lot_size / `fee_rate_bps` (последний берётся
-/// SDK'ом из `markets/{condition_id}` при `build()`).
+/// `limit_order` post_only, GTC или GTD если есть `expiration`.
 async fn build_maker_signable(
     client: &clob::Client<Authenticated<Normal>>,
     token_id: U256,
     req: &PostOrderRequest,
 ) -> Result<SignableOrder> {
-    let price = req
-        .price
-        .expect("validated in validate_post_order_request");
+    let price = req.price.expect("validated in validate_post_order_request");
     let shares = match req.amount {
         OrderAmount::Shares(s) => s,
         OrderAmount::UsdNotional(_) => unreachable!("validated"),
@@ -341,11 +255,7 @@ async fn build_maker_signable(
         .map_err(|err| anyhow!("post_order_on_clob: limit_order().build() упал: {err:#}"))
 }
 
-/// Taker = `market_order()` с `OrderType::FAK` (заливаем сколько можем,
-/// остаток отменяется). Если задан `price` — это явный worst-acceptable;
-/// если задан только `max_slippage_pp` — cap от L1 из [`PostOrderRequest::strict_book`]
-/// или HTTP [`clob::Client::order_book`] ([`compute_taker_cap_price`]); если оба
-/// `None` — отдаём SDK'у самому вывести cutoff из books.
+/// `market_order` FAK; cap из `price` или L1±`max_slippage_pp`, иначе SDK сам режет книгу.
 async fn build_taker_signable(
     client: &clob::Client<Authenticated<Normal>>,
     token_id: U256,
@@ -382,12 +292,7 @@ async fn build_taker_signable(
         .map_err(|err| anyhow!("post_order_on_clob: market_order().build() упал: {err:#}"))
 }
 
-/// Считает worst-acceptable price для taker:
-/// - `req.price.is_some()` → возвращаем его (приоритет над slippage).
-/// - `req.max_slippage_pp.is_some()` → L1 + slip: при [`PostOrderRequest::strict_book`] =
-///   `Some` берём лучший bid/ask из снимка (`history_sim::StrictBook`),
-///   иначе — HTTP [`clob::Client::order_book`].
-/// - оба `None` (`price` и `max_slippage_pp`) → `Ok(None)`, SDK сам режет cutoff.
+/// Worst допустимая цена для taker: явный `price`, иначе L1±slip или `None` (режет SDK).
 async fn compute_taker_cap_price(
     client: &clob::Client<Authenticated<Normal>>,
     token_id: U256,
@@ -415,8 +320,9 @@ async fn compute_taker_cap_price(
                     f64_to_decimal(px, "strict_book best ask")?
                 }
                 None => {
-                    let book_request =
-                        OrderBookSummaryRequest::builder().token_id(token_id).build();
+                    let book_request = OrderBookSummaryRequest::builder()
+                        .token_id(token_id)
+                        .build();
                     let book = client.order_book(&book_request).await.map_err(|err| {
                         anyhow!(
                             "post_order_on_clob: order_book({token_id:#x}) для slippage cap упал: \
@@ -431,7 +337,9 @@ async fn compute_taker_cap_price(
                     })?
                 }
             };
-            (best_ask_dec + slip_dec).min(Decimal::ONE).max(Decimal::ZERO)
+            (best_ask_dec + slip_dec)
+                .min(Decimal::ONE)
+                .max(Decimal::ZERO)
         }
         Side::Sell => {
             let best_bid_dec = match &req.strict_book {
@@ -446,8 +354,9 @@ async fn compute_taker_cap_price(
                     f64_to_decimal(px, "strict_book best bid")?
                 }
                 None => {
-                    let book_request =
-                        OrderBookSummaryRequest::builder().token_id(token_id).build();
+                    let book_request = OrderBookSummaryRequest::builder()
+                        .token_id(token_id)
+                        .build();
                     let book = client.order_book(&book_request).await.map_err(|err| {
                         anyhow!(
                             "post_order_on_clob: order_book({token_id:#x}) для slippage cap упал: \
@@ -462,7 +371,9 @@ async fn compute_taker_cap_price(
                     })?
                 }
             };
-            (best_bid_dec - slip_dec).max(Decimal::ZERO).min(Decimal::ONE)
+            (best_bid_dec - slip_dec)
+                .max(Decimal::ZERO)
+                .min(Decimal::ONE)
         }
         _ => bail!(
             "post_order_on_clob: side={:?} не поддерживается (ожидается Buy/Sell)",
@@ -473,8 +384,7 @@ async fn compute_taker_cap_price(
     Ok(Some(cap))
 }
 
-/// Лучший ask в [`StrictBook`]: первый уровень с положительной ценой и размером
-/// (как [`crate::history_sim::book_fill_buy_strict`] / [`crate::history_sim::effective_implied_prob`]).
+/// Лучший ask из локального книжного снимка (первая ненулевая строка).
 pub(crate) fn best_ask_strict(book: &StrictBook) -> Option<f64> {
     book.asks
         .iter()
@@ -482,6 +392,7 @@ pub(crate) fn best_ask_strict(book: &StrictBook) -> Option<f64> {
         .map(|l| l.price)
 }
 
+/// Лучший bid из локального книжного снимка (первая ненулевая строка).
 pub(crate) fn best_bid_strict(book: &StrictBook) -> Option<f64> {
     book.bids
         .iter()
@@ -489,70 +400,39 @@ pub(crate) fn best_bid_strict(book: &StrictBook) -> Option<f64> {
         .map(|l| l.price)
 }
 
-fn best_ask_sdk(book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse) -> Option<Decimal> {
+fn best_ask_sdk(
+    book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse,
+) -> Option<Decimal> {
     book.asks.iter().map(|l| l.price).min()
 }
 
-fn best_bid_sdk(book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse) -> Option<Decimal> {
+fn best_bid_sdk(
+    book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse,
+) -> Option<Decimal> {
     book.bids.iter().map(|l| l.price).max()
 }
 
-/// Параметры запроса к [`cancel_order_on_clob`].
+/// Вход в [`cancel_order_on_clob`].
 #[derive(Debug, Clone)]
 pub struct CancelOrderRequest {
-    /// CLOB `orderID` (хэш ордера, формат `0x…`). Тот же `order_id`,
-    /// что вернул [`PostOrderResult`] и которым матчатся события
-    /// user-WS / локальные `open_order_id` / `close_order_id`.
+    /// CLOB `orderID` (совпадает с [`PostOrderResult::order_id`]).
     pub order_id: String,
-    /// HTTP-таймаут на сам `DELETE /order`. Большие значения держат
-    /// вызывающего под локом auth-снимка.
+    /// Таймаут HTTP на `DELETE /order`.
     pub timeout: Duration,
 }
 
-/// Ответ [`cancel_order_on_clob`] — распакованный
-/// [`polymarket_client_sdk::clob::types::response::CancelOrdersResponse`]
-/// под одиночный orderID.
-///
-/// HTTP 200 на `DELETE /order` сам по себе **не означает**, что ордер
-/// реально отменён: CLOB может вернуть его в `not_canceled` (например,
-/// уже сматчен/уже отменён/не найден — см. OpenAPI). Различай по
-/// [`Self::canceled`] и [`Self::error_msg`].
+/// Одна запись из ответа cancel: смотреть [`Self::canceled`] и [`Self::error_msg`].
 #[derive(Debug, Clone)]
 pub struct CancelOrderResult {
-    /// Эхо `order_id` из запроса (упрощает логирование на стороне
-    /// вызывающего).
+    /// Эхо из запроса.
     pub order_id: String,
-    /// `true`, если `order_id` пришёл в массиве `canceled` ответа.
-    /// `false` — если CLOB вернул его в `not_canceled` map'е (см.
-    /// [`Self::error_msg`] для причины).
+    /// Попали в массив `canceled`.
     pub canceled: bool,
-    /// Сообщение-причина из `not_canceled[order_id]` при
-    /// `canceled=false` (например `"Order not found or already canceled"`).
-    /// Пустые строки превращаем в `None`.
+    /// Текст из `not_canceled` при `canceled == false`.
     pub error_msg: Option<String>,
 }
 
-/// Отмена одиночного ордера на CLOB Polymarket
-/// ([DELETE /order](https://docs.polymarket.com/api-reference/trade/cancel-single-order)).
-/// Работает даже в cancel-only mode (см. 503 в OpenAPI: «cancels still
-/// work in cancel-only mode»).
-///
-/// **Семантика результата:** успешный сетевой ответ (`Ok(_)`) ещё не
-/// значит, что ордер действительно снят с книги — нужно проверить
-/// [`CancelOrderResult::canceled`]:
-/// - `canceled=true`  → orderID попал в `canceled[]` ответа CLOB.
-/// - `canceled=false` → orderID был в `not_canceled` map'е, причина в
-///   [`CancelOrderResult::error_msg`] (типичные причины: ордер уже
-///   исполнен, уже отменён, не принадлежит этому API-ключу, не найден).
-///
-/// **Состояние Account** функция не трогает: вызывающий сам обновляет
-/// локальные `OpenPosition`/`ClosingPosition`. Если ставка делается
-/// на финальное подтверждение через user-WS — снимок состояния обновится
-/// по событию из [`crate::account_ws`].
-///
-/// **Требования к Account**: `clob_authed = Some(_)` (signer не нужен —
-/// эндпоинт использует только API-key аутентификацию, без EOA-подписи).
-/// Иначе — `Err`.
+/// `DELETE /order` под API-key; нужен только `clob_authed`. `Ok` не гарантирует снятие — проверьте поля результата.
 pub async fn cancel_order_on_clob(
     account: &SharedAccount,
     request: CancelOrderRequest,
@@ -564,36 +444,24 @@ pub async fn cancel_order_on_clob(
         bail!("cancel_order_on_clob: пустой order_id");
     }
 
-    // Снимок auth-клиента через ArcSwap.load() — без локов. `clob::Client` —
-    // обёртка над `Arc<ClientInner>`, clone дешёвый. Signer для отмены не
-    // требуется (в отличие от `post_order_on_clob`): SDK подписывает запрос
-    // HMAC'ом по API-key creds.
     let auth_client = (**account.clob_authed.load()).clone().ok_or_else(|| {
         anyhow!(
             "cancel_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
         )
     })?;
 
-    let resp = match tokio::time::timeout(
-        request.timeout,
-        auth_client.cancel_order(&request.order_id),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(err)) => bail!("cancel_order_on_clob: DELETE /order упал: {err:#}"),
-        Err(_elapsed) => bail!(
-            "cancel_order_on_clob: DELETE /order не уложился в {:?}",
-            request.timeout
-        ),
-    };
+    let resp =
+        match tokio::time::timeout(request.timeout, auth_client.cancel_order(&request.order_id))
+            .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(err)) => bail!("cancel_order_on_clob: DELETE /order упал: {err:#}"),
+            Err(_elapsed) => bail!(
+                "cancel_order_on_clob: DELETE /order не уложился в {:?}",
+                request.timeout
+            ),
+        };
 
-    // Запросили один orderID — ожидаем, что ровно один из массивов
-    // `canceled` / `not_canceled` непустой. Регистр / `0x`-префикс
-    // CLOB'а сравнивать с нашим вводом не пытаемся (на практике
-    // совпадает, но защищаемся проверкой по структуре, а не по
-    // ID): если есть запись в `not_canceled` — берём её причину,
-    // иначе — считаем отменённым по факту наличия в `canceled`.
     let (canceled, error_msg) = if !resp.not_canceled.is_empty() {
         let msg = resp
             .not_canceled
@@ -627,7 +495,10 @@ mod tests {
     use polymarket_client_sdk::clob::types::OrderStatusType;
     use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
     use polymarket_client_sdk::types::U256;
+
+    /// Период в секундах у slug `btc-updown-5m-{ts}`.
     const BTC_UPDOWN_5M_PERIOD_SEC: i64 = 300;
+    /// Общий HTTP timeout в live-сценарии теста.
     const LIVE_ORDER_HTTP_TIMEOUT_SEC: u64 = 20;
 
     fn current_btc_updown_5m_slug(now_ms: i64) -> String {
@@ -648,15 +519,14 @@ mod tests {
         rounded.max(0.01)
     }
 
-    /// Live round-trip: taker BUY на минимальный notional в текущем 5m BTC
-    /// up/down маркете, затем taker SELL всех полученных shares.
+    /// Live BUY→SELL taker минимального notional по текущему 5m BTC up/down рынку.
     ///
     /// ```bash
     /// POLY_PRIVATE_KEY=0x… \
     ///     cargo test --bin poly account_order::tests::live_taker_roundtrip_btc_updown_5m -- --ignored --nocapture
     /// ```
     #[tokio::test]
-    #[ignore = "live network: требует POLY_PRIVATE_KEY и USDC на Polymarket Safe; делает реальные CLOB-ордера"]
+    #[ignore = "live network: требует POLY_PRIVATE_KEY и pUSD на Polymarket Safe; делает реальные CLOB-ордера"]
     async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -671,7 +541,6 @@ mod tests {
             );
             return Ok(());
         }
-
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC))
             .build()?;
@@ -702,11 +571,13 @@ mod tests {
             .await
             .with_context(|| format!("order_book({asset_id}) для slug={slug}"))?;
         let min_order_size = decimal_to_f64(&book.min_order_size)?;
-        let best_ask = best_ask_sdk(&book)
-            .ok_or_else(|| anyhow::anyhow!("пустой asks book для asset_id={asset_id} slug={slug}"))?;
+        let best_ask = best_ask_sdk(&book).ok_or_else(|| {
+            anyhow::anyhow!("пустой asks book для asset_id={asset_id} slug={slug}")
+        })?;
         let best_ask_f64 = decimal_to_f64(&best_ask)?;
         let buy_usd = min_taker_buy_usd_notional(min_order_size, best_ask_f64);
-        let worst_acceptable_buy = (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
+        let worst_acceptable_buy =
+            (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
 
         eprintln!(
             "live_taker_roundtrip_btc_updown_5m: slug={slug}, asset_id={asset_id}, \
@@ -717,15 +588,15 @@ mod tests {
         let buy_result = post_order_on_clob(
             &account,
             PostOrderRequest {
-                asset_id: asset_id.clone(),
-                side: Side::Buy,
-                role: OrderRole::Taker,
-                amount: OrderAmount::UsdNotional(buy_usd),
-                price: Some(worst_acceptable_buy),
-                max_slippage_pp: None,
-                expiration: None,
-                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
-                strict_book: None,
+                asset_id: asset_id.clone(),                // Gamma outcome token
+                side: Side::Buy,                           // вход long
+                role: OrderRole::Taker,                    // FAK
+                amount: OrderAmount::UsdNotional(buy_usd), // мин. допустимый notional
+                price: Some(worst_acceptable_buy),         // явный worst-acceptable
+                max_slippage_pp: None,                     // не используем slip от L1
+                expiration: None,                          // taker
+                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
+                strict_book: None,                         // GET book выше
             },
         )
         .await
@@ -758,15 +629,15 @@ mod tests {
         let sell_result = post_order_on_clob(
             &account,
             PostOrderRequest {
-                asset_id: asset_id.clone(),
-                side: Side::Sell,
-                role: OrderRole::Taker,
-                amount: OrderAmount::Shares(shares_to_sell),
-                price: None,
-                max_slippage_pp: None,
-                expiration: None,
-                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
-                strict_book: None,
+                asset_id: asset_id.clone(),                                // тот же токен
+                side: Side::Sell,                                          // unwind
+                role: OrderRole::Taker,                                    // FAK
+                amount: OrderAmount::Shares(shares_to_sell),               // весь fill с BUY
+                price: None,                                               // маркет-продажа в bid
+                max_slippage_pp: None,                                     // без cap
+                expiration: None,                                          // taker
+                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
+                strict_book: None,                                         // нет локального book
             },
         )
         .await
@@ -791,8 +662,7 @@ mod tests {
         eprintln!(
             "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={}, sell_order_id={}, \
              buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
-            buy_result.order_id,
-            sell_result.order_id,
+            buy_result.order_id, sell_result.order_id,
         );
         Ok(())
     }
