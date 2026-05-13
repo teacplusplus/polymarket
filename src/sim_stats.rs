@@ -133,7 +133,7 @@ impl SimStats {
     }
 }
 
-pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bool) {
+pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bool) {
     let n = s.raw_above_threshold.max(1) as f64;
     let diag = if is_kelly {
         format!(
@@ -238,7 +238,7 @@ pub(crate) fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_ke
 }
 
 /// Итог прогона; `initial_bankroll` — старт USDC для ROI (`[`crate::history_sim::INITIAL_BANKROLL`]` при history/real_sim).
-pub(crate) fn print_sim_stats(
+pub fn print_sim_stats(
     tag: &str,
     sim_stats: &SimStats,
     bankroll_now: f64,

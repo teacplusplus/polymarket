@@ -2,6 +2,9 @@
 //! Креды из `Account.clob_authed` ([`crate::account::try_authenticate_clob_for_heartbeats`] перед спавном).
 //! Каркас как у interval/market WS: PING ([`USER_WS_PING_INTERVAL_SECS`]), watchdog ([`USER_WS_STALE_MAX_AGE_MS`]), reconnect ([`USER_WS_RECONNECT_DELAY_SECS`]).
 use crate::account::SharedAccount;
+use crate::account_order_completion::{
+    accumulate_invoke_from_ws_trade, notify_terminal_ws_order_snapshot,
+};
 use crate::account_order::OrderRole;
 use crate::history_sim::{CloseReason, ClosingPosition, ClosingPositionStatus, OpenPositionStatus};
 use crate::util::current_timestamp_ms;
@@ -228,6 +231,12 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             if order_id.is_empty() {
                 return;
             }
+            notify_terminal_ws_order_snapshot(
+                &account.order_invoke_hub,
+                order_id,
+                order_status,
+            )
+            .await;
             let new_open = order_status_to_open_position_status(order_kind, order_status);
             let new_close = order_status_to_closing_position_status(order_kind, order_status);
             // После перехода в Open триггерим TP (идемпотентно внутри позиции).
@@ -268,6 +277,13 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                 trigger_tp_arcs_for_taker =
                     update_position_statuses(account, taker_order_id, new_open, new_close).await;
                 if is_terminal && let (Some(size), Some(price)) = (trade_size, trade_price) {
+                    accumulate_invoke_from_ws_trade(
+                        &account.order_invoke_hub,
+                        taker_order_id,
+                        size,
+                        price,
+                    )
+                    .await;
                     apply_user_ws_trade_fill(
                         account,
                         taker_order_id,
@@ -301,6 +317,13 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                         "maker_order_id не должен матчиться по open_order_id"
                     );
                     if is_terminal && let (Some(size), Some(price)) = (maker_size, maker_price) {
+                        accumulate_invoke_from_ws_trade(
+                            &account.order_invoke_hub,
+                            maker_order_id,
+                            size,
+                            price,
+                        )
+                        .await;
                         apply_user_ws_trade_fill(
                             account,
                             maker_order_id,
@@ -523,11 +546,10 @@ pub(crate) async fn apply_sell_fill(
     size: f64,
     price: f64,
     fee_rate_bps: f64,
-    role: OrderRole,
+    _role: OrderRole,
 ) {
     let usd_received = size * price;
     let fee_rate = fee_rate_bps / 10_000.0;
-    let _ = role;
     let net_usdc = usd_received * (1.0 - fee_rate);
 
     let mut to_finalize: Option<crate::history_sim::SharedClosingPosition> = None;

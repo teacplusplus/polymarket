@@ -1,10 +1,11 @@
 //! `RealSimWithSubmit`: CLOB ордеры через [`crate::account_order`], подтверждение прежде всего WS
 //! ([`crate::account_ws`]), дополнительно polling `client.order` ([`spawn_polling_verify`]).
-//!
 //! Таски через `spawn` без долгих локов на `positions`/`closing`; дедуп TP/cancel/closing —
 //! атомики/флаги на позиции до HTTP. После BUY/close/TP — poll до терминального статуса или
 //! `event_end_ms`/`POLL_TIMEOUT_SEC`, затем [`apply_order_status_from_polling`] (как WS).
-
+//!
+//! `event_end_ms` из [`crate::history_sim::OpenPosition`] всегда пробрасывается в
+//! [`crate::account_order::PostOrderRequest::market_end_unix_ms`] для POST здесь (дедлайн invoke/poll).
 use crate::account::SharedAccount;
 use crate::account_order::{
     CancelOrderRequest, OrderAmount, OrderRole, PostOrderRequest, cancel_order_on_clob,
@@ -19,8 +20,8 @@ use polymarket_client_sdk::clob::types::request::TradesRequest;
 use polymarket_client_sdk::clob::types::{OrderStatusType, Side};
 use std::time::Duration;
 
-/// Таймаут одного POST/DELETE в submit-спавнах.
-const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
+/// Один REST/SUBMIT timeout — также для [`crate::account_order_completion`] и invoke-poll (через дубль константы там).
+pub(crate) const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
 
 /// Интервал `client.order` в [`spawn_polling_verify`].
 const POLL_INTERVAL_SEC: u64 = 3;
@@ -50,9 +51,14 @@ pub(crate) fn spawn_open_buy_taker(
     strict_book: Option<StrictBook>,
 ) {
     tokio::spawn(async move {
-        let (pos_id, asset_id, position_size_usd) = {
+        let (pos_id, asset_id, position_size_usd, market_end_unix_ms) = {
             let pos = pos_arc.read().await;
-            (pos.id.clone(), pos.asset_id.clone(), pos.entry_cost)
+            (
+                pos.id.clone(),
+                pos.asset_id.clone(),
+                pos.entry_cost,
+                pos.event_end_ms,
+            )
         };
         let max_slippage_pp = if price.is_some() {
             None
@@ -67,10 +73,11 @@ pub(crate) fn spawn_open_buy_taker(
             price,                                                // worst или None → slip
             max_slippage_pp,                                      // только если price None
             expiration: None,                                     // taker
+            market_end_unix_ms,
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
             strict_book,                                          // L1 для slip без GET
         };
-        match post_order_on_clob(&account, request).await {
+        match post_order_on_clob(&account, request, None).await {
             Ok(result) => {
                 if !result.success {
                     crate::tee_eprintln!(
@@ -103,7 +110,7 @@ pub(crate) fn spawn_open_buy_taker(
 /// Maker TP по цене `buy_price + Y_TRAIN_TAKE_PROFIT_PP`. Идемпотентно через
 /// `tp_placement_attempted` / существующий `tp_order_id`. Успех → `spawn_polling_verify_tp`.
 pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosition) {
-    let (pos_id, asset_id, shares, tp_price, open_order_id) = {
+    let (pos_id, asset_id, shares, tp_price, open_order_id, market_end_unix_ms) = {
         let mut pos = pos_arc.write().await;
         if pos.tp_placement_attempted || pos.tp_order_id.is_some() {
             return;
@@ -121,6 +128,7 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
             pos.shares_held,
             (pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999),
             pos.open_order_id.clone(),
+            pos.event_end_ms,
         )
     };
 
@@ -132,10 +140,11 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
         price: Some(tp_price),                                // limit
         max_slippage_pp: None,                                // не для maker
         expiration: None,                                     // GTC
+        market_end_unix_ms,
         timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
         strict_book: None,                                    // книга не нужна
     };
-    let result = match post_order_on_clob(&account, request).await {
+    let result = match post_order_on_clob(&account, request, None).await {
         Ok(r) => r,
         Err(err) => {
             crate::tee_eprintln!(
@@ -238,13 +247,14 @@ pub fn spawn_cancel_tp_for_hold_zone(account: SharedAccount, pos_arc: SharedOpen
 /// иначе SELL taker с retry; `close_order_id` + polling. Caller взвёл `close_placement_attempted`.
 pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingPosition) {
     tokio::spawn(async move {
-        let (pos_id, asset_id, tp_order_id_to_cancel) = {
+        let (pos_id, asset_id, tp_order_id_to_cancel, market_end_unix_ms) = {
             let pos_arc = closing_arc.read().await.position.clone();
             let pos = pos_arc.read().await;
             (
                 pos.id.clone(),
                 pos.asset_id.clone(),
                 pos.tp_order_id.clone(),
+                pos.event_end_ms,
             )
         };
 
@@ -303,6 +313,7 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
             price: None,                                 // worst из книги
             max_slippage_pp: None,                       // без cap
             expiration: None,                            // taker FAK
+            market_end_unix_ms,
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
             strict_book: None,                           // HTTP book внутри
         };
@@ -315,7 +326,7 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 let mut cw = closing_arc.write().await;
                 cw.close_placement_attempted = true;
             }
-            match post_order_on_clob(&account, request_template.clone()).await {
+            match post_order_on_clob(&account, request_template.clone(), None).await {
                 Ok(r) if r.success => {
                     crate::tee_println!(
                         "[account_submit] SELL taker принят (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, order_id={}, status={:?}",

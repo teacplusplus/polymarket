@@ -5,6 +5,10 @@
 
 use crate::account::{POLY_PRIVATE_KEY_ENV, SharedAccount};
 use crate::history_sim::StrictBook;
+use crate::account_order_completion::{
+    PostOrderHttpOutcome, PostOrderInvokeContext, SingleOrderInvokeCb,
+    after_post_order_maybe_track_invoke, wrap_post_order_cb,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::auth::Normal;
@@ -16,7 +20,9 @@ use polymarket_client_sdk::clob::types::{Amount, OrderStatusType, OrderType, Sid
 use polymarket_client_sdk::data;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::types::{Decimal, U256};
+use serde_json::json;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Маркет (FAK) или лимит post-only (GTC/GTD).
@@ -52,8 +58,10 @@ pub struct PostOrderRequest {
     pub price: Option<f64>,
     /// Cap от best L1 (prob.), только taker без явного `price`.
     pub max_slippage_pp: Option<f64>,
-    /// GTD для maker; у taker `None`.
+    /// GTD на CLOB только у maker; у taker при `Some` задаёт локальный дедлайн финального колбэка POST (не передаётся в `market_order`).
     pub expiration: Option<DateTime<Utc>>,
+    /// Если `Some` — верхний предел времени unix ms для fallback poll после «живого» POST; если `None` — фиксированный запас секунд с момента POST.
+    pub market_end_unix_ms: Option<i64>,
     /// Таймаут HTTP только на `POST /order`.
     pub timeout: Duration,
     /// При slip-cap без `price`: L1 без лишнего GET /book.
@@ -82,13 +90,15 @@ pub struct PostOrderResult {
 }
 
 /// Подписать ордер EOA и отправить на CLOB. Нужны `clob_authed` + `clob_signer`. Account не изменяется.
+/// Переходное: `invoke` — опциональный колбэк один раз после финала (HTTP / WS / `client.order` poll); временно везде можно передавать `None`.
 pub async fn post_order_on_clob(
     account: &SharedAccount,
     request: PostOrderRequest,
+    invoke: Option<SingleOrderInvokeCb>,
 ) -> Result<PostOrderResult> {
     validate_post_order_request(&request)?;
 
-    let auth_client = (**account.clob_authed.load()).clone().ok_or_else(|| {
+    let auth_client: clob::Client<Authenticated<Normal>> = (**account.clob_authed.load()).clone().ok_or_else(|| {
         anyhow!(
             "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
         )
@@ -114,13 +124,76 @@ pub async fn post_order_on_clob(
         .await
         .map_err(|err| anyhow!("post_order_on_clob: подпись ордера упала: {err:#}"))?;
 
+    let invoke_slot = wrap_post_order_cb(invoke);
     let resp = match tokio::time::timeout(request.timeout, auth_client.post_order(signed)).await {
         Ok(Ok(r)) => r,
-        Ok(Err(err)) => bail!("post_order_on_clob: POST /order упал: {err:#}"),
-        Err(_elapsed) => bail!(
-            "post_order_on_clob: POST /order не уложился в {:?}",
-            request.timeout
-        ),
+        Ok(Err(err)) => {
+            crate::tee_eprintln!(
+                "post_order_on_clob: POST /order SDK error after request may have hit network: {err:#}"
+            );
+            let detail = json!({
+                "reason": "post_order_http_sdk_error",
+                "message": err.to_string(),
+            });
+            let http_snap = PostOrderHttpOutcome {
+                order_id: String::new(),
+                success: false,
+                status: OrderStatusType::Delayed,
+                detail: detail.clone(),
+                invoke_ctx: None,
+            };
+            after_post_order_maybe_track_invoke(
+                account,
+                Arc::clone(&account.order_invoke_hub),
+                &http_snap,
+                invoke_slot,
+            )
+            .await;
+            return Ok(PostOrderResult {
+                order_id: String::new(),
+                status: OrderStatusType::Delayed,
+                success: false,
+                making_amount: Decimal::ZERO,
+                taking_amount: Decimal::ZERO,
+                error_msg: Some(err.to_string()),
+                transaction_hashes: vec![],
+                trade_ids: vec![],
+            });
+        }
+        Err(_elapsed) => {
+            crate::tee_eprintln!(
+                "post_order_on_clob: POST /order timed out {:?} (request may have been accepted)",
+                request.timeout,
+            );
+            let detail = json!({
+                "reason": "post_order_http_timeout",
+                "timeout": format!("{:?}", request.timeout),
+            });
+            let http_snap = PostOrderHttpOutcome {
+                order_id: String::new(),
+                success: false,
+                status: OrderStatusType::Delayed,
+                detail: detail.clone(),
+                invoke_ctx: None,
+            };
+            after_post_order_maybe_track_invoke(
+                account,
+                Arc::clone(&account.order_invoke_hub),
+                &http_snap,
+                invoke_slot,
+            )
+            .await;
+            return Ok(PostOrderResult {
+                order_id: String::new(),
+                status: OrderStatusType::Delayed,
+                success: false,
+                making_amount: Decimal::ZERO,
+                taking_amount: Decimal::ZERO,
+                error_msg: Some(format!("HTTP timeout {:?}", request.timeout)),
+                transaction_hashes: vec![],
+                trade_ids: vec![],
+            });
+        }
     };
 
     let PostOrderResponse {
@@ -135,7 +208,7 @@ pub async fn post_order_on_clob(
         ..
     } = resp;
 
-    Ok(PostOrderResult {
+    let out = PostOrderResult {
         order_id,
         status,
         success,
@@ -147,7 +220,39 @@ pub async fn post_order_on_clob(
             .map(|h| format!("{h:#x}"))
             .collect(),
         trade_ids,
-    })
+    };
+
+    let http_detail = json!({
+        "order_id": out.order_id,
+        "success": out.success,
+        "status": format!("{:?}", out.status),
+        "error_msg": out.error_msg,
+        "trade_ids": out.trade_ids,
+        "making_amount": out.making_amount.to_string(),
+        "taking_amount": out.taking_amount.to_string(),
+    });
+    let seed_making = out.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let seed_taking = out.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let http_snap = PostOrderHttpOutcome {
+        order_id: out.order_id.clone(),
+        success: out.success,
+        status: out.status.clone(),
+        detail: http_detail,
+        invoke_ctx: Some(PostOrderInvokeContext {
+            request,
+            seed_making,
+            seed_taking,
+        }),
+    };
+
+    after_post_order_maybe_track_invoke(
+        account,
+        Arc::clone(&account.order_invoke_hub),
+        &http_snap,
+        invoke_slot,
+    )
+    .await;
+    Ok(out)
 }
 
 /// Ошибки комбинаций полей до сети/SDK `build`.
@@ -175,9 +280,6 @@ fn validate_post_order_request(req: &PostOrderRequest) -> Result<()> {
             }
         }
         OrderRole::Taker => {
-            if req.expiration.is_some() {
-                bail!("post_order_on_clob: taker не поддерживает expiration (FAK/FOK)");
-            }
             if matches!(req.side, Side::Sell) && !matches!(req.amount, OrderAmount::Shares(_)) {
                 bail!(
                     "post_order_on_clob: taker SELL требует Shares amount, получили {:?}",
@@ -435,11 +537,13 @@ pub struct CancelOrderResult {
     pub error_msg: Option<String>,
 }
 
-/// `DELETE /order` под API-key; нужен только `clob_authed`. `Ok` не гарантирует снятие — проверьте поля результата.
+/// `DELETE /order` под API-key; нужен только `clob_authed`. При сетевой/SDK-ошибке, таймауте или пустом теле ответа — **`Err`**; если ответ есть, **`Ok`** поля задают результат снятия (в т.ч. `not_canceled` от CLOB).
 pub async fn cancel_order_on_clob(
     account: &SharedAccount,
     request: CancelOrderRequest,
 ) -> Result<CancelOrderResult> {
+    let oid = request.order_id.clone();
+
     if request.timeout.is_zero() {
         bail!("cancel_order_on_clob: timeout=0 — DELETE /order не дождётся ответа");
     }
@@ -458,11 +562,22 @@ pub async fn cancel_order_on_clob(
             .await
         {
             Ok(Ok(r)) => r,
-            Ok(Err(err)) => bail!("cancel_order_on_clob: DELETE /order упал: {err:#}"),
-            Err(_elapsed) => bail!(
-                "cancel_order_on_clob: DELETE /order не уложился в {:?}",
-                request.timeout
-            ),
+            Ok(Err(err)) => {
+                crate::tee_eprintln!(
+                    "cancel_order_on_clob: DELETE /order ошибка после возможной отправки: {err:#}"
+                );
+                bail!(
+                    "cancel_order_on_clob: DELETE /order SDK error после возможной отправки, order_id={oid}: {err:#}"
+                );
+            }
+            Err(_elapsed) => {
+                let msg = format!("HTTP timeout {:?}", request.timeout);
+            
+                bail!(
+                    "cancel_order_on_clob: DELETE /order {}, order_id={oid} — запрос мог уйти в сеть",
+                    msg,
+                );
+            }
         };
 
     let (canceled, error_msg) = if !resp.not_canceled.is_empty() {
@@ -475,18 +590,23 @@ pub async fn cancel_order_on_clob(
     } else if !resp.canceled.is_empty() {
         (true, None)
     } else {
+        crate::tee_eprintln!(
+            "cancel_order_on_clob: DELETE /order пустой ответ (canceled=[], not_canceled={{}}), order_id={}",
+            request.order_id
+        );
         bail!(
-            "cancel_order_on_clob: DELETE /order вернул пустой ответ \
-             (canceled=[], not_canceled={{}}), order_id={}",
+            "cancel_order_on_clob: DELETE /order пустой ответ от CLOB (canceled=[], not_canceled={{}}), order_id={}",
             request.order_id
         );
     };
 
-    Ok(CancelOrderResult {
+    let out = CancelOrderResult {
         order_id: request.order_id,
         canceled,
-        error_msg,
-    })
+        error_msg: error_msg.clone(),
+    };
+
+    Ok(out)
 }
 
 /// HTTP timeout: `DELETE /cancel-all`, Data API, `POST /order` в graceful shutdown.
@@ -595,10 +715,11 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
             price: None,
             max_slippage_pp: None,
             expiration: None,
+            market_end_unix_ms: None,
             timeout: Duration::from_secs(EXIT_HTTP_TIMEOUT_SEC),
             strict_book: None,
         };
-        match post_order_on_clob(account, request).await {
+        match post_order_on_clob(account, request, None).await {
             Ok(r) if r.success => {
                 crate::tee_println!(
                     "[account_exit] SELL ok: asset={asset_id_str}, shares={shares:.4}, \
@@ -619,7 +740,7 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
             }
             Err(err) => {
                 crate::tee_eprintln!(
-                    "[account_exit] SELL HTTP-ошибка: asset={asset_id_str}, \
+                    "[account_exit] SELL ошибка: asset={asset_id_str}, \
                      shares={shares:.4}: {err:#}"
                 );
                 failed += 1;
@@ -741,9 +862,11 @@ mod tests {
                 price: Some(worst_acceptable_buy),         // явный worst-acceptable
                 max_slippage_pp: None,                     // не используем slip от L1
                 expiration: None,                          // taker
+                market_end_unix_ms: None,
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
                 strict_book: None,                         // GET book выше
             },
+            None,
         )
         .await
         .with_context(|| format!("BUY taker slug={slug} asset_id={asset_id}"))?;
@@ -782,9 +905,11 @@ mod tests {
                 price: None,                                               // маркет-продажа в bid
                 max_slippage_pp: None,                                     // без cap
                 expiration: None,                                          // taker
+                market_end_unix_ms: None,
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
                 strict_book: None,                                         // нет локального book
             },
+            None,
         )
         .await
         .with_context(|| format!("SELL taker slug={slug} asset_id={asset_id}"))?;

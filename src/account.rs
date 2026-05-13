@@ -3,6 +3,7 @@
 //! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_resolution` → `closing` → `recently_resolved_markets` → один inner на позицию.
 
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
+use crate::account_order_completion::TrackerEntry;
 use crate::history_sim::{INITIAL_BANKROLL, SharedClosingPosition, SharedOpenPosition};
 use crate::sim_stats::SimStats;
 use crate::real_sim::{RealSimState, interval_label, side_label};
@@ -59,6 +60,8 @@ pub struct Account {
     pub clob_authed: ArcSwapAny<Arc<Option<clob::Client<Authenticated<Normal>>>>>,
     /// EOA-подписант под ордеры; задаётся вместе с `clob_authed`.
     pub clob_signer: ArcSwapAny<Arc<Option<PrivateKeySigner>>>,
+    /// Трекер единоразовых колбэков POST /order (WS + REST fallback).
+    pub order_invoke_hub: Arc<RwLock<HashMap<String, TrackerEntry>>>,
     /// `currency` → [`RealSimState`]; лок отдельно от цепочки `bankroll → …`.
     pub real_sim_state_by_currency: Arc<RwLock<HashMap<String, Arc<RwLock<RealSimState>>>>>,
 }
@@ -79,6 +82,7 @@ impl Account {
             clob,
             clob_authed: ArcSwapAny::new(Arc::new(None)),
             clob_signer: ArcSwapAny::new(Arc::new(None)),
+            order_invoke_hub: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state_by_currency: Arc::new(RwLock::new(HashMap::new())),
         }
     }
