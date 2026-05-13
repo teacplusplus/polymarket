@@ -7,7 +7,7 @@ use crate::account::{POLY_PRIVATE_KEY_ENV, SharedAccount};
 use crate::history_sim::StrictBook;
 use crate::account_order_completion::{
     PostOrderHttpOutcome, PostOrderInvokeContext, after_post_order_maybe_track_invoke,
-    wrap_post_order_cb,
+    fire_failed_invocation_for_side, wrap_post_order_cb,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -16,7 +16,7 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::response::PostOrderResponse;
-use polymarket_client_sdk::clob::types::{Amount, OrderStatusType, OrderType, Side, SignableOrder};
+use polymarket_client_sdk::clob::types::{Amount, OrderType, Side, SignableOrder};
 use polymarket_client_sdk::data;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::types::{Decimal, U256};
@@ -70,65 +70,86 @@ pub struct PostOrderRequest {
 
 pub use crate::account_order_completion::{SingleOrderClobInvocationReport, SingleOrderInvokeCb};
 
-/// Результат `POST /order`: колбэк [`SingleOrderInvokeCb`] один раз после финального отчёта; при ошибках **до** HTTP-ответа колбэк **не** вызывается.
+/// `POST /order`: колбэк [`SingleOrderInvokeCb`] вызывается **ровно один раз** при любом исходе
+/// (валидация, отсутствие auth/signer, ошибка билда/подписи, HTTP/SDK error, timeout,
+/// `success=false`, частичная сделка, полная сделка). Одноразовость обеспечивает
+/// [`crate::account_order_completion::CompletionOnce`] вокруг `invoke`.
+/// При ошибке до HTTP-ответа отчёт несёт `success=false, partial=false, order_id=None` и нули в
+/// корректной типовой раскладке по `side` ([`crate::account_order_completion::SingleOrderClobInvocationReport`]).
 pub async fn post_order_on_clob(
     account: &SharedAccount,
     request: PostOrderRequest,
     invoke: SingleOrderInvokeCb,
 ) -> Result<Option<String>> {
-    validate_post_order_request(&request)?;
+    let invoke_slot = wrap_post_order_cb(invoke);
 
-    let auth_client: clob::Client<Authenticated<Normal>> = (**account.clob_authed.load()).clone().ok_or_else(|| {
-        anyhow!(
-            "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
-        )
-    })?;
-    let signer = (**account.clob_signer.load()).clone().ok_or_else(|| {
-        anyhow!("post_order_on_clob: clob_signer=None — auth-цикл не запускался?")
-    })?;
+    if let Err(err) = validate_post_order_request(&request) {
+        fire_failed_invocation_for_side(&invoke_slot, request.side);
+        return Err(err);
+    }
 
-    let token_id = U256::from_str(&request.asset_id).with_context(|| {
-        format!(
-            "post_order_on_clob: невалидный asset_id={:?} (ожидается десятичный U256)",
-            request.asset_id
-        )
-    })?;
-
-    let signable = match request.role {
-        OrderRole::Maker => build_maker_signable(&auth_client, token_id, &request).await?,
-        OrderRole::Taker => build_taker_signable(&auth_client, token_id, &request).await?,
+    let auth_client: clob::Client<Authenticated<Normal>> = match (**account.clob_authed.load()).clone() {
+        Some(c) => c,
+        None => {
+            fire_failed_invocation_for_side(&invoke_slot, request.side);
+            return Err(anyhow!(
+                "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
+            ));
+        }
+    };
+    let signer = match (**account.clob_signer.load()).clone() {
+        Some(s) => s,
+        None => {
+            fire_failed_invocation_for_side(&invoke_slot, request.side);
+            return Err(anyhow!(
+                "post_order_on_clob: clob_signer=None — auth-цикл не запускался?"
+            ));
+        }
     };
 
-    let signed = auth_client
-        .sign(&signer, signable)
-        .await
-        .map_err(|err| anyhow!("post_order_on_clob: подпись ордера упала: {err:#}"))?;
+    let token_id = match U256::from_str(&request.asset_id) {
+        Ok(t) => t,
+        Err(parse_err) => {
+            fire_failed_invocation_for_side(&invoke_slot, request.side);
+            return Err(anyhow!(
+                "post_order_on_clob: невалидный asset_id={:?} (ожидается десятичный U256): {parse_err}",
+                request.asset_id,
+            ));
+        }
+    };
 
-    let invoke_slot = wrap_post_order_cb(invoke);
+    let signable = match request.role {
+        OrderRole::Maker => match build_maker_signable(&auth_client, token_id, &request).await {
+            Ok(s) => s,
+            Err(err) => {
+                fire_failed_invocation_for_side(&invoke_slot, request.side);
+                return Err(err);
+            }
+        },
+        OrderRole::Taker => match build_taker_signable(&auth_client, token_id, &request).await {
+            Ok(s) => s,
+            Err(err) => {
+                fire_failed_invocation_for_side(&invoke_slot, request.side);
+                return Err(err);
+            }
+        },
+    };
+
+    let signed = match auth_client.sign(&signer, signable).await {
+        Ok(s) => s,
+        Err(err) => {
+            fire_failed_invocation_for_side(&invoke_slot, request.side);
+            return Err(anyhow!("post_order_on_clob: подпись ордера упала: {err:#}"));
+        }
+    };
+
     let resp = match tokio::time::timeout(request.timeout, auth_client.post_order(signed)).await {
         Ok(Ok(r)) => r,
         Ok(Err(err)) => {
             crate::tee_eprintln!(
                 "post_order_on_clob: POST /order SDK error after request may have hit network: {err:#}"
             );
-            let detail = json!({
-                "reason": "post_order_http_sdk_error",
-                "message": err.to_string(),
-            });
-            let http_snap = PostOrderHttpOutcome {
-                order_id: String::new(),
-                success: false,
-                status: OrderStatusType::Delayed,
-                detail: detail.clone(),
-                invoke_ctx: None,
-            };
-            after_post_order_maybe_track_invoke(
-                account,
-                Arc::clone(&account.order_invoke_hub),
-                &http_snap,
-                invoke_slot,
-            )
-            .await;
+            fire_failed_invocation_for_side(&invoke_slot, request.side);
             return Ok(None);
         }
         Err(_elapsed) => {
@@ -136,24 +157,7 @@ pub async fn post_order_on_clob(
                 "post_order_on_clob: POST /order timed out {:?} (request may have been accepted)",
                 request.timeout,
             );
-            let detail = json!({
-                "reason": "post_order_http_timeout",
-                "timeout": format!("{:?}", request.timeout),
-            });
-            let http_snap = PostOrderHttpOutcome {
-                order_id: String::new(),
-                success: false,
-                status: OrderStatusType::Delayed,
-                detail: detail.clone(),
-                invoke_ctx: None,
-            };
-            after_post_order_maybe_track_invoke(
-                account,
-                Arc::clone(&account.order_invoke_hub),
-                &http_snap,
-                invoke_slot,
-            )
-            .await;
+            fire_failed_invocation_for_side(&invoke_slot, request.side);
             return Ok(None);
         }
     };
@@ -181,8 +185,20 @@ pub async fn post_order_on_clob(
         "taking_amount": taking_amount.to_string(),
         "transaction_hashes": transaction_hashes.iter().map(|h| format!("{h:#x}")).collect::<Vec<String>>(),
     });
-    let seed_making = making_amount.to_string().parse::<f64>().unwrap_or(0.0);
-    let seed_taking = taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let making_f64 = making_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let taking_f64 = taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+
+    let (making_amount, taking_amount) = match request.side {
+        Side::Buy => (
+            OrderAmount::UsdNotional(making_f64),
+            OrderAmount::Shares(taking_f64),
+        ),
+        Side::Sell => (
+            OrderAmount::Shares(making_f64),
+            OrderAmount::UsdNotional(taking_f64),
+        ),
+        _ => panic!("post_order_on_clob: side={:?} не поддерживается (ожидается Buy/Sell)", request.side),
+    };
 
     let http_snap = PostOrderHttpOutcome {
         order_id: order_id.clone(),
@@ -191,8 +207,8 @@ pub async fn post_order_on_clob(
         detail: http_detail,
         invoke_ctx: Some(PostOrderInvokeContext {
             request,
-            seed_making,
-            seed_taking,
+            making_amount,
+            taking_amount,
         }),
     };
 
@@ -878,18 +894,18 @@ mod tests {
             "пустой order_id после BUY"
         );
 
-        let shares_to_sell = match buy_result.filled_amount {
+        let shares_to_sell = match buy_result.taking_amount {
             OrderAmount::Shares(s) => s,
             OrderAmount::UsdNotional(_) => {
                 anyhow::bail!(
-                    "BUY taker: ожидались Shares в filled_amount, получили USD notion"
+                    "BUY taker: ожидались Shares в taking_amount, получили USD notion"
                 );
             }
         };
         anyhow::ensure!(
             shares_to_sell > 0.0 && shares_to_sell.is_finite(),
-            "BUY taker не дал shares в filled_amount: {:?}, order_id={:?}",
-            buy_result.filled_amount,
+            "BUY taker не дал shares в taking_amount: {:?}, order_id={:?}",
+            buy_result.taking_amount,
             buy_result.order_id,
         );
 

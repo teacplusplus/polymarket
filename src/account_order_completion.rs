@@ -1,8 +1,10 @@
 //! POST + `invoke`: один колбэк после **тишины** ([`INVOKE_DEBOUNCE_MS`]), если это не **taker** и на этом bump уже `now < market_end`; иначе сразу без паузы и без «волны» debounce.
-//! Финал, если набран целевой объём (**shares / USDC** из [`crate::account_order::PostOrderRequest::amount`]) как **max(HTTP-снимок, накопление WS `trade`)** — снимок с **POST** и при каждом успешном poll [`OpenOrderResponse`] (`size_matched`, для USDC-целей ещё `size_matched × price`) **или** наступил дедлайн
-//! (**`expiration` → иначе `market_end_unix_ms` → короткий fallback**) **или** CLOB дал терминал / отмену.
+//! Финал, если набран целевой объём (**shares / USDC** из [`crate::account_order::PostOrderRequest::amount`]) как **max(HTTP-снимок, накопление user-WS `trade`)** по полям агрегатора [`LegAgg`]: **`making_amount`** (collateral/USDC) и **`taking_amount`** (условный объём матча от `PostOrder` / [`OpenOrderResponse.size_matched`] / [`TradeResponse.size`]).
+//! — последний успешный poll **или** дедлайн (**`expiration` → иначе `market_end_unix_ms` → короткий fallback**) **или** терминал CLOB / отмена.
 //! Нулевое исполнение к дедлайну → `success=false`. Отмены — только HTTP. Агрегаты cancel-all / sell-all.
 //!
+//! Колбёк [`SingleOrderClobInvocationReport`]: те же имена что в **`PostOrderResponse`** — **`making_amount`** (отдано) и **`taking_amount`** (получено), в типах всё равно [`OrderAmount`].
+
 //! Хаб живёт на [`crate::account::Account::order_invoke_hub`].
 
 use crate::account::SharedAccount;
@@ -27,28 +29,183 @@ pub(crate) const INVOKE_FALLBACK_DEADLINE_MS_I64: i64 =
     (INVOKE_FALLBACK_POLL_DEADLINE_SEC as i64).saturating_mul(1000);
 const INVOKE_FALLBACK_POLL_MS: u64 = 500;
 const ORDER_HTTP_POLL_TIMEOUT_SEC: u64 = 10;
-/// Порог «достаточного» накопления outcome-shares при сравнении с целью из заявки.
+/// Порог «достаточного» набранного условного объёма (`LegAgg.taking_amount`) при Shares-цели заявки.
 const SHARE_EPS: f64 = 1e-7;
-/// Порог «достаточной» набранной суммы в USDC при сравнении с целевым notional.
+/// Порог «достаточной» набранной колонки `making_amount` (`LegAgg`) при USDC-цели.
 const USD_EPS: f64 = 1e-5;
 
-fn zero_fill_matching_target_dimension(target_amount: OrderAmount) -> OrderAmount {
-    match target_amount {
-        OrderAmount::Shares(_) => OrderAmount::Shares(0.0),
-        OrderAmount::UsdNotional(_) => OrderAmount::UsdNotional(0.0),
+/// Нули в порядке (`making_amount`, `taking_amount`), как [`polymarket_client_sdk::clob::types::response::PostOrderResponse`].
+/// Используется для отчёта-«пустышки» при любом отказе до накопления исполнения (BUY/SELL, Taker/Maker).
+#[inline]
+pub(crate) fn zero_making_taking_for_side(side: Side) -> (OrderAmount, OrderAmount) {
+    match side {
+        Side::Buy => (
+            OrderAmount::UsdNotional(0.0),
+            OrderAmount::Shares(0.0),
+        ),
+        Side::Sell => (
+            OrderAmount::Shares(0.0),
+            OrderAmount::UsdNotional(0.0),
+        ),
+        _ => (
+            OrderAmount::UsdNotional(0.0),
+            OrderAmount::Shares(0.0),
+        ),
     }
 }
 
-/// Когда после POST ещё нет [`PostOrderRequest`] (SDK error / timeout), размерность «заполнения» неизвестна — отдаём 0 shares как конвенцию.
-fn zero_fill_without_request_context() -> OrderAmount {
-    OrderAmount::Shares(0.0)
+/// Когда после POST ещё нет контекста: конвенция BUY (`making_amount`, `taking_amount`).
+fn zero_fill_without_request_context() -> (OrderAmount, OrderAmount) {
+    zero_making_taking_for_side(Side::Buy)
 }
 
+/// Однократно отправить отчёт-провал (`success=false`, `partial=false`, нулевые суммы по `side`) через [`CompletionOnce`].
+/// Безопасно вызывать после любого live fire — [`CompletionOnce`] гарантирует не более одного срабатывания.
+pub(crate) fn fire_failed_invocation_for_side(
+    slot: &Arc<CompletionOnce<SingleOrderClobInvocationReport>>,
+    side: Side,
+) {
+    let (making_amount, taking_amount) = zero_making_taking_for_side(side);
+    slot.fire(SingleOrderClobInvocationReport {
+        order_id: None,
+        making_amount,
+        taking_amount,
+        success: false,
+        partial: false,
+    });
+}
+
+#[inline]
+fn sanitize_nonneg_f64(x: f64) -> f64 {
+    if !x.is_finite() || x < 0.0 {
+        return 0.0;
+    }
+    x
+}
+
+fn sanitize_order_amount(a: OrderAmount) -> OrderAmount {
+    match a {
+        OrderAmount::Shares(x) => OrderAmount::Shares(sanitize_nonneg_f64(x)),
+        OrderAmount::UsdNotional(x) => OrderAmount::UsdNotional(sanitize_nonneg_f64(x)),
+    }
+}
+
+#[inline]
+fn order_amount_usd_scalar(a: OrderAmount) -> f64 {
+    match a {
+        OrderAmount::UsdNotional(x) => sanitize_nonneg_f64(x),
+        OrderAmount::Shares(_) => 0.0,
+    }
+}
+
+#[inline]
+fn order_amount_shares_scalar(a: OrderAmount) -> f64 {
+    match a {
+        OrderAmount::Shares(x) => sanitize_nonneg_f64(x),
+        OrderAmount::UsdNotional(_) => 0.0,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LegAgg {
+    /// После seed OpenOrder/Poll/WS нормализовано: **`UsdNotional`** — collateral-quote.
+    making_amount: OrderAmount,
+    /// Условный объём (**`Shares`**).
+    taking_amount: OrderAmount,
+}
+
+impl Default for LegAgg {
+    fn default() -> Self {
+        Self {
+            making_amount: OrderAmount::UsdNotional(0.0),
+            taking_amount: OrderAmount::Shares(0.0),
+        }
+    }
+}
+
+impl LegAgg {
+    fn sanitize_mut(&mut self) {
+        self.making_amount = sanitize_order_amount(self.making_amount);
+        self.taking_amount = sanitize_order_amount(self.taking_amount);
+    }
+}
+
+fn leg_agg_add_trade_fill(leg_agg: LegAgg, size: f64, quote: f64) -> LegAgg {
+    if !size.is_finite()
+        || size <= 0.0
+        || !quote.is_finite()
+        || quote < 0.0
+    {
+        return leg_agg;
+    }
+    let mut out_leg_agg = leg_agg;
+    let shares = order_amount_shares_scalar(out_leg_agg.taking_amount) + size;
+    let usd = order_amount_usd_scalar(out_leg_agg.making_amount) + quote;
+    out_leg_agg.taking_amount = OrderAmount::Shares(shares);
+    out_leg_agg.making_amount = OrderAmount::UsdNotional(usd);
+    out_leg_agg.sanitize_mut();
+    out_leg_agg
+}
+
+fn leg_agg_max_normalized(a: LegAgg, b: LegAgg) -> LegAgg {
+    let sh_a = order_amount_shares_scalar(a.taking_amount);
+    let sh_b = order_amount_shares_scalar(b.taking_amount);
+    let usd_a = order_amount_usd_scalar(a.making_amount);
+    let usd_b = order_amount_usd_scalar(b.making_amount);
+    let mut leg = LegAgg {
+        taking_amount: OrderAmount::Shares(sanitize_nonneg_f64(sh_a.max(sh_b))),
+        making_amount: OrderAmount::UsdNotional(sanitize_nonneg_f64(usd_a.max(usd_b))),
+    };
+    leg.sanitize_mut();
+    leg
+}
+
+/// По эффективной паре ног считает объём исполнения **в размерности заявки** ([`InvokeAggInner::target`]).
+fn target_dimension_fill_from_leg(target: OrderAmount, eff: LegAgg) -> OrderAmount {
+    match target {
+        OrderAmount::Shares(_) => OrderAmount::Shares(order_amount_shares_scalar(eff.taking_amount)),
+        OrderAmount::UsdNotional(_) => {
+            OrderAmount::UsdNotional(order_amount_usd_scalar(eff.making_amount))
+        }
+    }
+}
+
+/// Колбёк как в REST: экономические **making**/**taking**, не столбцы [`LegAgg`].
+fn report_making_and_taking_amounts(side: Side, eff: LegAgg) -> (OrderAmount, OrderAmount) {
+    let mk_norm = sanitize_order_amount(eff.making_amount);
+    let tk_norm = sanitize_order_amount(eff.taking_amount);
+    match side {
+        Side::Buy => (mk_norm, tk_norm),
+        Side::Sell => (tk_norm, mk_norm),
+        _ => (mk_norm, tk_norm),
+    }
+}
+
+/// Финальный отчёт по одному CLOB-POST.
+///
+/// Колбэк [`SingleOrderInvokeCb`] вызывается ровно один раз для любого результата POST —
+/// провал (валидация, auth, HTTP/SDK error, timeout, server `success=false`),
+/// частичная сделка или полное достижение цели — независимо от [`OrderRole::Taker`]/[`OrderRole::Maker`].
+///
+/// Конвенция `making_amount`/`taking_amount` идентична `PostOrderResponse` и единая для Taker и Maker:
+/// - **BUY** (любая роль): `making_amount` — отданный USDC ([`OrderAmount::UsdNotional`]),
+///   `taking_amount` — полученные shares ([`OrderAmount::Shares`]).
+/// - **SELL** (любая роль): `making_amount` — отданные shares ([`OrderAmount::Shares`]),
+///   `taking_amount` — полученный USDC ([`OrderAmount::UsdNotional`]).
+///
+/// При провале и при нулевом исполнении возвращаются нули в той же типовой раскладке по `side`,
+/// и `order_id = None`.
 #[derive(Debug, Clone)]
 pub struct SingleOrderClobInvocationReport {
+    /// `Some` только если CLOB принял ордер и было ненулевое исполнение (см. [`Self::success`]).
     pub order_id: Option<String>,
-    pub filled_amount: OrderAmount,
+    /// «Отдано»: BUY → USDC, SELL → shares. Эквивалент `PostOrderResponse.making_amount`.
+    pub making_amount: OrderAmount,
+    /// «Получено»: BUY → shares, SELL → USDC. Эквивалент `PostOrderResponse.taking_amount`.
+    pub taking_amount: OrderAmount,
+    /// `true`, если было хоть какое-то исполнение (полное или частичное).
     pub success: bool,
+    /// `true`, только если `success=true` и цель [`PostOrderRequest::amount`] не достигнута полностью.
     pub partial: bool,
 }
 
@@ -64,8 +221,9 @@ pub type SingleOrderInvokeCb =
 #[derive(Debug, Clone)]
 pub struct PostOrderInvokeContext {
     pub request: PostOrderRequest,
-    pub seed_making: f64,
-    pub seed_taking: f64,
+    /// Колонки wire-ответа POST (`making_amount` / `taking_amount` из тела как `OrderAmount`).
+    pub making_amount: OrderAmount,
+    pub taking_amount: OrderAmount,
 }
 
 pub struct CompletionOnce<T: Send + 'static> {
@@ -99,10 +257,10 @@ impl<T: Send + 'static> CompletionOnce<T> {
 struct InvokeAggInner {
     /// Целевой объём из [`PostOrderRequest::amount`].
     target: OrderAmount,
-    /// Накопленное исполнение только из user-WS `trade` (+=).
-    filled_ws: OrderAmount,
-    /// Последний HTTP-снимок исполнения: POST seed или GET `order()` при poll (**перезапись**).
-    filled_http: OrderAmount,
+    /// Накопление по user-WS `trade` (`LegAgg`: USDC + shares).
+    filled_ws: LegAgg,
+    /// Снимок POST seed или последний GET [`OpenOrderResponse`] (**перезапись**).
+    filled_http: LegAgg,
     /// Unix время (ms): после этого момента finalize допускается даже без полного набора объёма.
     deadline_ms: i64,
     /// [`Side`] ордера (копия из [`crate::account_order::PostOrderRequest::side`]) — трактовка HTTP `making`/`taking` при seed.
@@ -118,30 +276,8 @@ fn decimal_snap_f64(d: &Decimal) -> Option<f64> {
     f.is_finite().then_some(f)
 }
 
-/// Трактует `making`/`taking` как ответ POST — см. [`PostOrderInvokeAggregator::ingest_http_seed`].
-fn invoke_write_filled_http_from_seed_pair(inner: &mut InvokeAggInner, making: f64, taking: f64) {
-    if !making.is_finite() || !taking.is_finite() {
-        return;
-    }
-    match (&inner.target, inner.side) {
-        (OrderAmount::Shares(_), Side::Buy) => {
-            inner.filled_http = OrderAmount::Shares(taking);
-        }
-        (OrderAmount::Shares(_), Side::Sell) => {
-            inner.filled_http = OrderAmount::Shares(making);
-        }
-        (OrderAmount::UsdNotional(_), Side::Buy) => {
-            inner.filled_http = OrderAmount::UsdNotional(making);
-        }
-        (OrderAmount::UsdNotional(_), Side::Sell) => {
-            inner.filled_http = OrderAmount::UsdNotional(taking);
-        }
-        _ => {}
-    }
-}
-
-/// GET `OpenOrderResponse`: перезаписывает [`InvokeAggInner::filled_http`] из `size_matched` (+ `price` для USDC-целей).
-fn invoke_apply_open_order_rest_snapshot(inner: &mut InvokeAggInner, open: &OpenOrderResponse) {
+/// GET [`OpenOrderResponse`]: [`OpenOrderResponse.size_matched`] → [`LegAgg.taking_amount`], `×price` → [`LegAgg.making_amount`].
+fn apply_open_order_response_snapshot(inner: &mut InvokeAggInner, open: &OpenOrderResponse) {
     let Some(size_matched) = decimal_snap_f64(&open.size_matched) else {
         return;
     };
@@ -151,26 +287,15 @@ fn invoke_apply_open_order_rest_snapshot(inner: &mut InvokeAggInner, open: &Open
     if !(size_matched >= 0.0 && price >= 0.0 && price.is_finite()) {
         return;
     }
-    let (making, taking) = match (&inner.target, inner.side) {
-        (OrderAmount::Shares(_), Side::Buy) => (0.0, size_matched),
-        (OrderAmount::Shares(_), Side::Sell) => (size_matched, 0.0),
-        (OrderAmount::UsdNotional(_), Side::Buy) => {
-            let quote = size_matched * price;
-            if !(quote >= 0.0 && quote.is_finite()) {
-                return;
-            }
-            (quote, 0.0)
-        }
-        (OrderAmount::UsdNotional(_), Side::Sell) => {
-            let quote = size_matched * price;
-            if !(quote >= 0.0 && quote.is_finite()) {
-                return;
-            }
-            (0.0, quote)
-        }
-        _ => return,
+    let making_quote = size_matched * price;
+    if !(making_quote >= 0.0 && making_quote.is_finite()) {
+        return;
+    }
+    inner.filled_http = LegAgg {
+        making_amount: OrderAmount::UsdNotional(making_quote),
+        taking_amount: OrderAmount::Shares(size_matched),
     };
-    invoke_write_filled_http_from_seed_pair(inner, making, taking);
+    inner.filled_http.sanitize_mut();
 }
 
 /// Агрегирует исполнение одного POST и один раз дергает `invoke` после тишины.
@@ -217,10 +342,6 @@ impl PostOrderInvokeAggregator {
             .max(timestamp_ms_started)
             .saturating_add(INVOKE_FALLBACK_DEADLINE_MS_I64);
         let target = post_request.amount;
-        let zero_fill_placeholder = match target {
-            OrderAmount::Shares(_) => OrderAmount::Shares(0.0),
-            OrderAmount::UsdNotional(_) => OrderAmount::UsdNotional(0.0),
-        };
 
         Arc::new(Self {
             slot,
@@ -228,8 +349,8 @@ impl PostOrderInvokeAggregator {
             order_id,
             inner: Arc::new(RwLock::new(InvokeAggInner {
                 target,
-                filled_ws: zero_fill_placeholder,
-                filled_http: zero_fill_placeholder,
+                filled_ws: LegAgg::default(),
+                filled_http: LegAgg::default(),
                 deadline_ms,
                 side: post_request.side,
                 success: false,
@@ -276,31 +397,49 @@ impl PostOrderInvokeAggregator {
         });
     }
 
-    async fn ingest_http_seed(self: &Arc<Self>, making: f64, taking: f64) {
+    async fn ingest_post_order_snapshot(
+        self: &Arc<Self>,
+        post_making_amount: OrderAmount,
+        post_taking_amount: OrderAmount,
+    ) {
         {
             let mut state = self.inner.write().await;
-            invoke_write_filled_http_from_seed_pair(&mut state, making, taking);
+            let mut leg = match state.side {
+                Side::Buy => LegAgg {
+                    making_amount: post_making_amount,
+                    taking_amount: post_taking_amount,
+                },
+                Side::Sell => LegAgg {
+                    making_amount: post_taking_amount,
+                    taking_amount: post_making_amount,
+                },
+                _ => LegAgg {
+                    making_amount: post_making_amount,
+                    taking_amount: post_taking_amount,
+                },
+            };
+            leg.sanitize_mut();
+            state.filled_http = leg;
         }
         Self::bump_debounce_finalize(Arc::clone(self));
     }
 
     //[проверено]
-    async fn record_ws_trade_fill(self: &Arc<Self>, outcome_size: f64, quote_usdc: f64) {
-        if !outcome_size.is_finite()
-            || outcome_size <= 0.0
-            || !quote_usdc.is_finite()
-            || quote_usdc < 0.0
+    async fn record_trade_aggregate_from_ws_event(
+        self: &Arc<Self>,
+        size: f64,
+        quote: f64,
+    ) {
+        if !size.is_finite()
+            || size <= 0.0
+            || !quote.is_finite()
+            || quote < 0.0
         {
             return;
         }
         {
             let mut state = self.inner.write().await;
-            match &mut state.filled_ws {
-                OrderAmount::Shares(shares_filled_so_far) => *shares_filled_so_far += outcome_size,
-                OrderAmount::UsdNotional(usdc_filled_so_far) => {
-                    *usdc_filled_so_far += quote_usdc
-                }
-            }
+            state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size, quote);
         }
         Self::bump_debounce_finalize(Arc::clone(self));
     }
@@ -322,7 +461,7 @@ impl PostOrderInvokeAggregator {
     async fn record_poll_http(self: &Arc<Self>, open_order: OpenOrderResponse) {
         {
             let mut state = self.inner.write().await;
-            invoke_apply_open_order_rest_snapshot(&mut state, &open_order);
+            apply_open_order_response_snapshot(&mut state, &open_order);
             if matches!(&open_order.status, OrderStatusType::Canceled) {
                 state.partial = true;
             }
@@ -333,35 +472,23 @@ impl PostOrderInvokeAggregator {
         Self::bump_debounce_finalize(Arc::clone(self));
     }
 
-    fn effective_fill(state: &InvokeAggInner) -> OrderAmount {
-        match (&state.filled_ws, &state.filled_http) {
-            (
-                OrderAmount::Shares(websocket_accumulated_shares),
-                OrderAmount::Shares(http_snapshot_shares),
-            ) => OrderAmount::Shares((*websocket_accumulated_shares).max(*http_snapshot_shares)),
-            (
-                OrderAmount::UsdNotional(websocket_accumulated_usdc),
-                OrderAmount::UsdNotional(http_snapshot_usdc),
-            ) => OrderAmount::UsdNotional((*websocket_accumulated_usdc).max(*http_snapshot_usdc)),
-            (_, _) => state.filled_ws,
-        }
+    fn effective_leg(state: &InvokeAggInner) -> LegAgg {
+        leg_agg_max_normalized(state.filled_ws, state.filled_http)
+    }
+
+    fn target_progress(state: &InvokeAggInner) -> OrderAmount {
+        let effective_leg = Self::effective_leg(state);
+        target_dimension_fill_from_leg(state.target, effective_leg)
     }
 
     fn targets_met(state: &InvokeAggInner) -> bool {
-        let effective_total = Self::effective_fill(state);
-        match (&state.target, &effective_total) {
+        let target_progress = Self::target_progress(state);
+        match (&state.target, &target_progress) {
             (OrderAmount::Shares(target_shares), OrderAmount::Shares(effective_shares)) => {
-                target_shares.is_finite()
-                    && *target_shares > 0.0
-                    && *effective_shares + SHARE_EPS >= *target_shares
+                target_shares.is_finite() && *target_shares > 0.0 && *effective_shares + SHARE_EPS >= *target_shares
             }
-            (
-                OrderAmount::UsdNotional(target_usdc),
-                OrderAmount::UsdNotional(effective_usdc),
-            ) => {
-                target_usdc.is_finite()
-                    && *target_usdc > 0.0
-                    && *effective_usdc + USD_EPS >= *target_usdc
+            (OrderAmount::UsdNotional(target_usdc), OrderAmount::UsdNotional(effective_usdc)) => {
+                target_usdc.is_finite() && *target_usdc > 0.0 && *effective_usdc + USD_EPS >= *target_usdc
             }
             _ => false,
         }
@@ -378,11 +505,12 @@ impl PostOrderInvokeAggregator {
     }
 
     fn build_report(state: &InvokeAggInner, timestamp_ms: i64) -> SingleOrderClobInvocationReport {
-        let effective_fill_amount = Self::effective_fill(state);
-        let has_nonzero_fill = match &effective_fill_amount {
-            OrderAmount::Shares(effective_shares) => *effective_shares > SHARE_EPS,
-            OrderAmount::UsdNotional(effective_usdc) => *effective_usdc > USD_EPS,
-        };
+        let effective_leg = Self::effective_leg(state);
+        let (making_amount, taking_amount) = report_making_and_taking_amounts(state.side, effective_leg);
+
+        let sheres: f64 = order_amount_shares_scalar(effective_leg.taking_amount);
+        let usd = order_amount_usd_scalar(effective_leg.making_amount);
+        let has_nonzero_fill = sheres > SHARE_EPS || usd > USD_EPS;
         let target_reached = Self::targets_met(state);
         let deadline_hit = timestamp_ms >= state.deadline_ms;
 
@@ -395,7 +523,8 @@ impl PostOrderInvokeAggregator {
         if !target_reached && !has_nonzero_fill && (deadline_hit || state.partial) {
             return SingleOrderClobInvocationReport {
                 order_id: None,
-                filled_amount: effective_fill_amount,
+                making_amount,
+                taking_amount,
                 success: false,
                 partial: false,
             };
@@ -403,7 +532,8 @@ impl PostOrderInvokeAggregator {
 
         SingleOrderClobInvocationReport {
             order_id: None,
-            filled_amount: effective_fill_amount,
+            making_amount,
+            taking_amount,
             success: report_success,
             partial: report_partial,
         }
@@ -466,18 +596,18 @@ async fn take_tracker_entry(
     trackers.write().await.remove(order_id)
 }
 
-/// Накапливает объём исполнения по **`order_id`** (WS `trade`): outcome `size`, USDC≈ `size * price`.
+/// Накапливает исполнение по **`order_id`** (WS [`TradeResponse`]: `size`×`price` → `quote` в коллатерале).
 //[проверено]
 pub(crate) async fn accumulate_invoke_from_ws_trade(
     trackers: &Arc<RwLock<HashMap<String, TrackerEntry>>>,
     order_id: &str,
-    outcome_size: f64,
+    size: f64,
     price: f64,
 ) {
     if order_id.is_empty() {
         return;
     }
-    let quote = outcome_size * price;
+    let quote = size * price;
     if !quote.is_finite() {
         return;
     }
@@ -488,7 +618,7 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
     let invoke_aggregator_arc = Arc::clone(&tracker_entry.invoke_aggregator);
     drop(trackers_snapshot);
     invoke_aggregator_arc
-        .record_ws_trade_fill(outcome_size, quote)
+        .record_trade_aggregate_from_ws_event(size, quote)
         .await;
 }
 
@@ -598,11 +728,18 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     slot: Arc<CompletionOnce<SingleOrderClobInvocationReport>>,
 ) {
     let cloned_order_id = http_result.order_id.clone();
+    let side_for_zero_fill = http_result
+        .invoke_ctx
+        .as_ref()
+        .map(|c| c.request.side)
+        .unwrap_or(Side::Buy);
 
     if !http_result.success {
+        let (making_z, taking_z) = zero_making_taking_for_side(side_for_zero_fill);
         slot.fire(SingleOrderClobInvocationReport {
             order_id: nonempty_order_id_str(&cloned_order_id),
-            filled_amount: zero_fill_without_request_context(),
+            making_amount: making_z,
+            taking_amount: taking_z,
             success: false,
             partial: false,
         });
@@ -611,21 +748,25 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     }
 
     let Some(invoke_context) = http_result.invoke_ctx.clone() else {
+        let (making_z, taking_z) = zero_fill_without_request_context();
         slot.fire(SingleOrderClobInvocationReport {
             order_id: nonempty_order_id_str(&cloned_order_id),
-            filled_amount: zero_fill_without_request_context(),
+            making_amount: making_z,
+            taking_amount: taking_z,
             success: false,
             partial: false,
         });
         return;
     };
     let posted_order_request = invoke_context.request;
-    let seed_making = invoke_context.seed_making;
-    let seed_taking = invoke_context.seed_taking;
+    let making_amount = invoke_context.making_amount;
+    let taking_amount = invoke_context.taking_amount;
     if cloned_order_id.is_empty() {
+        let (making_z, taking_z) = zero_making_taking_for_side(posted_order_request.side);
         slot.fire(SingleOrderClobInvocationReport {
             order_id: None,
-            filled_amount: zero_fill_matching_target_dimension(posted_order_request.amount),
+            making_amount: making_z,
+            taking_amount: taking_z,
             success: false,
             partial: false,
         });
@@ -640,7 +781,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     // POST уже Matched: объёмы дублируют WS trades — суммируем только из живого ордера (Live/Delayed/…).
     if !matches!(http_result.status, OrderStatusType::Matched) {
         invoke_aggregator
-            .ingest_http_seed(seed_making, seed_taking)
+            .ingest_post_order_snapshot(making_amount, taking_amount)
             .await;
     }
 

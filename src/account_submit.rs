@@ -43,7 +43,9 @@ const TP_HOLD_ZONE_CANCEL_RETRY_INITIAL_MS: u64 = 500;
 
 /// BUY taker, `UsdNotional = entry_cost`. `price`: worst с decision-L1 (предпочтительно);
 /// если `None` — slip от свежей книги/SDK и опционально `strict_book` без GET.
-/// Успех → `open_order_id` + [`spawn_polling_verify_open`]; ошибка → `OpenFailed`.
+///
+/// После успешного HTTP POST → `PendingOpen` + `open_order_id`; при отказе POST — `OpenFailed`.
+/// Колбэк invoke: успех → `Open` и poll; без успеха → `OpenFailed`.
 pub(crate) fn spawn_open_buy_taker(
     account: SharedAccount,
     pos_arc: SharedOpenPosition,
@@ -89,7 +91,7 @@ pub(crate) fn spawn_open_buy_taker(
                 let pos_arc_i = pos_arc_invoke.clone();
                 let pos_id_log = pos_id.clone();
                 let asset_log = asset_id.clone();
-                tokio::spawn(async move {
+                tokio::spawn(async move {            
                     if !result.success {
                         crate::tee_eprintln!(
                             "[account_submit] BUY taker без успеха (invoke): pos_id={pos_id_log}, asset={asset_log}, order_id={:?}, partial={}",
@@ -108,14 +110,13 @@ pub(crate) fn spawn_open_buy_taker(
                     };
                     {
                         let mut pw = pos_arc_i.write().await;
-                        pw.open_order_id = Some(real_order_id.clone());
                         pw.open_status = OpenPositionStatus::Open;
                     }
                     crate::tee_println!(
                         "[account_submit] BUY размещён (invoke): pos_id={pos_id_log}, order_id={real_order_id}, partial={}",
                         result.partial,
                     );
-                    spawn_polling_verify_open(account_i, pos_arc_i);
+                    spawn_polling_verify_open(account_i, pos_arc_i);                   
                 });
             }),
         )
@@ -143,7 +144,10 @@ pub(crate) fn spawn_open_buy_taker(
 }
 
 /// Maker TP по цене `buy_price + Y_TRAIN_TAKE_PROFIT_PP`. Идемпотентно через
-/// `tp_placement_attempted` / существующий `tp_order_id`. Успех → `spawn_polling_verify_tp`.
+/// `tp_placement_attempted` / существующий `tp_order_id`.
+///
+/// Успешный HTTP POST → `tp_order_id` сразу. Колбэк invoke без успеха сбрасывает `tp_order_id`
+/// и `tp_placement_attempted`; успех → [`spawn_polling_verify_tp`]. Ошибки POST без id → сброс `tp_placement_attempted`.
 pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosition) {
     let (pos_id, asset_id, shares, tp_price, open_order_id, market_end_unix_ms) = {
         let mut pos = pos_arc.write().await;
@@ -187,7 +191,7 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
     let pos_id_cb = pos_id.clone();
     let open_order_id_cb = open_order_id.clone();
 
-    if let Err(err) = post_order_on_clob(
+    match post_order_on_clob(
         &account,
         request,
         Box::new(move |result| {
@@ -198,6 +202,7 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
             let tp_px = tp_price;
             let shr = shares;
             tokio::spawn(async move {
+                
                 if !result.success {
                     crate::tee_eprintln!(
                         "[account_submit] TP maker без успеха (invoke): pos_id={pos_id_log}, open_order_id={open_oid_log:?}, order_id={:?}, partial={}",
@@ -212,7 +217,6 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
                     );
                     return;
                 };
-                pos_arc_i.write().await.tp_order_id = Some(tp_order_id.clone());
                 crate::tee_println!(
                     "[account_submit] TP maker размещён: pos_id={pos_id_log}, tp_order_id={tp_order_id}, open_order_id={open_oid_log:?}, price={tp_px:.4}, shares={shr:.4}",
                 );
@@ -222,10 +226,19 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
     )
     .await
     {
-        crate::tee_eprintln!(
-            "[account_submit] TP maker упал: pos_id={pos_id_fail_log}, open_order_id={open_order_id_fail_log:?}, asset={asset_fail_log}: {err:#}",
-        );
-        return;
+        Err(err) => {
+            crate::tee_eprintln!(
+                "[account_submit] TP maker упал: pos_id={pos_id_fail_log}, open_order_id={open_order_id_fail_log:?}, asset={asset_fail_log}: {err:#}",
+            );            
+        }
+        Ok(None) => {
+            crate::tee_eprintln!(
+                "[account_submit] TP maker без принятого order_id после POST: pos_id={pos_id_fail_log}, open_order_id={open_order_id_fail_log:?}, asset={asset_fail_log}",
+            );            
+        }
+        Ok(Some(oid)) => {
+            pos_arc.write().await.tp_order_id = Some(oid);
+        }
     }
 }
 
@@ -393,6 +406,10 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
             .await
             {
                 Err(err) => {
+                    {
+                        let mut cw = closing_arc.write().await;
+                        cw.close_status = ClosingPositionStatus::CloseFailed;
+                    }
                     crate::tee_eprintln!(
                         "[account_submit] SELL taker HTTP-ошибка (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}: {err:#}"
                     );
@@ -402,6 +419,11 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                         crate::tee_println!(
                             "[account_submit] SELL POST принят CLOB (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, order_id={oid}",
                         );
+                        {
+                            let mut cw = closing_arc.write().await;
+                            cw.close_order_id = Some(oid.clone());
+                            cw.close_status = ClosingPositionStatus::PendingClose;
+                        }
                     } else {
                         crate::tee_eprintln!(
                             "[account_submit] SELL POST без принятого order_id (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}",
@@ -418,7 +440,7 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                                     );
                                     {
                                         let mut cw = closing_arc.write().await;
-                                        cw.close_order_id = Some(oid);
+                                        cw.close_status = ClosingPositionStatus::Closed;
                                     }
                                     spawn_polling_verify_close(account.clone(), closing_arc.clone());
                                     return;
@@ -429,14 +451,14 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                                         r.order_id,
                                         r.success,
                                         r.partial,
-                                    );
+                                    );                               
                                 }
                             }
                         }
                         Err(_) => {
                             crate::tee_eprintln!(
                                 "[account_submit] SELL taker колбёк потерян (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}"
-                            );
+                            );                    
                         }
                     }
                 }
