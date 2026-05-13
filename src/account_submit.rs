@@ -77,31 +77,66 @@ pub(crate) fn spawn_open_buy_taker(
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
             strict_book,                                          // L1 для slip без GET
         };
-        match post_order_on_clob(&account, request, None).await {
-            Ok(result) => {
-                if !result.success {
-                    crate::tee_eprintln!(
-                        "[account_submit] BUY taker отвергнут CLOB: pos_id={pos_id}, error_msg={:?}, status={:?}, order_id={}",
-                        result.error_msg,
-                        result.status,
-                        result.order_id,
+        let pos_id_fail_log = pos_id.clone();
+        let asset_fail_log = asset_id.clone();
+        let account_invoke = account.clone();
+        let pos_arc_invoke = pos_arc.clone();
+        match post_order_on_clob(
+            &account,
+            request,
+            Box::new(move |result| {
+                let account_i = account_invoke.clone();
+                let pos_arc_i = pos_arc_invoke.clone();
+                let pos_id_log = pos_id.clone();
+                let asset_log = asset_id.clone();
+                tokio::spawn(async move {
+                    if !result.success {
+                        crate::tee_eprintln!(
+                            "[account_submit] BUY taker без успеха (invoke): pos_id={pos_id_log}, asset={asset_log}, order_id={:?}, partial={}",
+                            result.order_id,
+                            result.partial,
+                        );
+                        pos_arc_i.write().await.open_status = OpenPositionStatus::OpenFailed;
+                        return;
+                    }
+                    let Some(real_order_id) = result.order_id.clone() else {
+                        crate::tee_eprintln!(
+                            "[account_submit] BUY taker без order_id CLOB при success invoke: pos_id={pos_id_log}, asset={asset_log}"
+                        );
+                        pos_arc_i.write().await.open_status = OpenPositionStatus::OpenFailed;
+                        return;
+                    };
+                    {
+                        let mut pw = pos_arc_i.write().await;
+                        pw.open_order_id = Some(real_order_id.clone());
+                        pw.open_status = OpenPositionStatus::Open;
+                    }
+                    crate::tee_println!(
+                        "[account_submit] BUY размещён (invoke): pos_id={pos_id_log}, order_id={real_order_id}, partial={}",
+                        result.partial,
                     );
-                    pos_arc.write().await.open_status = OpenPositionStatus::OpenFailed;
-                    return;
-                }
-                let real_order_id = result.order_id.clone();
-                pos_arc.write().await.open_order_id = Some(real_order_id.clone());
-                crate::tee_println!(
-                    "[account_submit] BUY taker принят: pos_id={pos_id}, order_id={real_order_id}, status={:?}",
-                    result.status,
-                );
-                spawn_polling_verify_open(account.clone(), pos_arc.clone());
-            }
+                    spawn_polling_verify_open(account_i, pos_arc_i);
+                });
+            }),
+        )
+        .await
+        {
             Err(err) => {
                 crate::tee_eprintln!(
-                    "[account_submit] BUY taker упал: pos_id={pos_id}, asset={asset_id}: {err:#}"
+                    "[account_submit] BUY taker упал: pos_id={pos_id_fail_log}, asset={asset_fail_log}: {err:#}"
                 );
                 pos_arc.write().await.open_status = OpenPositionStatus::OpenFailed;
+            }
+            Ok(None) => {
+                crate::tee_eprintln!(
+                    "[account_submit] BUY taker без принятого order_id после POST: pos_id={pos_id_fail_log}, asset={asset_fail_log}"
+                );
+                pos_arc.write().await.open_status = OpenPositionStatus::OpenFailed;
+            }
+            Ok(Some(oid)) => {
+                let mut pw = pos_arc.write().await;
+                pw.open_order_id = Some(oid);
+                pw.open_status = OpenPositionStatus::PendingOpen;
             }
         }
     });
@@ -144,32 +179,54 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
         timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
         strict_book: None,                                    // книга не нужна
     };
-    let result = match post_order_on_clob(&account, request, None).await {
-        Ok(r) => r,
-        Err(err) => {
-            crate::tee_eprintln!(
-                "[account_submit] TP maker упал: pos_id={pos_id}, open_order_id={open_order_id:?}, asset={asset_id}: {err:#}",
-            );
-            return;
-        }
-    };
-    if !result.success {
+    let pos_id_fail_log = pos_id.clone();
+    let open_order_id_fail_log = open_order_id.clone();
+    let asset_fail_log = asset_id.clone();
+    let account_invoke = account.clone();
+    let pos_arc_invoke = pos_arc.clone();
+    let pos_id_cb = pos_id.clone();
+    let open_order_id_cb = open_order_id.clone();
+
+    if let Err(err) = post_order_on_clob(
+        &account,
+        request,
+        Box::new(move |result| {
+            let account_i = account_invoke.clone();
+            let pos_arc_i = pos_arc_invoke.clone();
+            let pos_id_log = pos_id_cb.clone();
+            let open_oid_log = open_order_id_cb.clone();
+            let tp_px = tp_price;
+            let shr = shares;
+            tokio::spawn(async move {
+                if !result.success {
+                    crate::tee_eprintln!(
+                        "[account_submit] TP maker без успеха (invoke): pos_id={pos_id_log}, open_order_id={open_oid_log:?}, order_id={:?}, partial={}",
+                        result.order_id,
+                        result.partial,
+                    );
+                    return;
+                }
+                let Some(tp_order_id) = result.order_id.clone() else {
+                    crate::tee_eprintln!(
+                        "[account_submit] TP maker без order_id при success invoke: pos_id={pos_id_log}, open_order_id={open_oid_log:?}",
+                    );
+                    return;
+                };
+                pos_arc_i.write().await.tp_order_id = Some(tp_order_id.clone());
+                crate::tee_println!(
+                    "[account_submit] TP maker размещён: pos_id={pos_id_log}, tp_order_id={tp_order_id}, open_order_id={open_oid_log:?}, price={tp_px:.4}, shares={shr:.4}",
+                );
+                spawn_polling_verify_tp(account_i, pos_arc_i);
+            });
+        }),
+    )
+    .await
+    {
         crate::tee_eprintln!(
-            "[account_submit] TP maker отвергнут CLOB: pos_id={pos_id}, error_msg={:?}, status={:?}, order_id={}",
-            result.error_msg,
-            result.status,
-            result.order_id,
+            "[account_submit] TP maker упал: pos_id={pos_id_fail_log}, open_order_id={open_order_id_fail_log:?}, asset={asset_fail_log}: {err:#}",
         );
         return;
     }
-    let tp_order_id = result.order_id.clone();
-
-    pos_arc.write().await.tp_order_id = Some(tp_order_id.clone());
-
-    crate::tee_println!(
-        "[account_submit] TP maker размещён: pos_id={pos_id}, tp_order_id={tp_order_id}, open_order_id={open_order_id:?}, price={tp_price:.4}, shares={shares:.4}",
-    );
-    spawn_polling_verify_tp(account.clone(), pos_arc.clone());
 }
 
 /// Снять TP при `HoldResolution`: caller уже взвёл `tp_cancel_attempted`.
@@ -317,7 +374,6 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
             strict_book: None,                           // HTTP book внутри
         };
-        let mut accepted: Option<crate::account_order::PostOrderResult> = None;
         for attempt in 1..=SELL_TAKER_MAX_ATTEMPTS {
             if bail_if_superseded().await {
                 return;
@@ -326,28 +382,63 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 let mut cw = closing_arc.write().await;
                 cw.close_placement_attempted = true;
             }
-            match post_order_on_clob(&account, request_template.clone(), None).await {
-                Ok(r) if r.success => {
-                    crate::tee_println!(
-                        "[account_submit] SELL taker принят (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, order_id={}, status={:?}",
-                        r.order_id,
-                        r.status,
-                    );
-                    accepted = Some(r);
-                    break;
-                }
-                Ok(r) => {
-                    crate::tee_eprintln!(
-                        "[account_submit] SELL taker отвергнут CLOB (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}, error_msg={:?}, status={:?}, order_id={}",
-                        r.error_msg,
-                        r.status,
-                        r.order_id,
-                    );
-                }
+            let (invoke_tx, invoke_rx) = tokio::sync::oneshot::channel();
+            match post_order_on_clob(
+                &account,
+                request_template.clone(),
+                Box::new(move |rep| {
+                    let _ = invoke_tx.send(rep);
+                }),
+            )
+            .await
+            {
                 Err(err) => {
                     crate::tee_eprintln!(
                         "[account_submit] SELL taker HTTP-ошибка (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}: {err:#}"
                     );
+                }
+                Ok(clob_order_id) => {
+                    if let Some(ref oid) = clob_order_id {
+                        crate::tee_println!(
+                            "[account_submit] SELL POST принят CLOB (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, order_id={oid}",
+                        );
+                    } else {
+                        crate::tee_eprintln!(
+                            "[account_submit] SELL POST без принятого order_id (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}",
+                        );
+                    }
+                    match invoke_rx.await {
+                        Ok(r) => {
+                            let oid_accepted = r.order_id.clone().filter(|s| !s.is_empty());
+                            match (r.success, oid_accepted) {
+                                (true, Some(oid)) => {
+                                    crate::tee_println!(
+                                        "[account_submit] SELL размещён (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, order_id={oid}, partial={}",
+                                        r.partial,
+                                    );
+                                    {
+                                        let mut cw = closing_arc.write().await;
+                                        cw.close_order_id = Some(oid);
+                                    }
+                                    spawn_polling_verify_close(account.clone(), closing_arc.clone());
+                                    return;
+                                }
+                                _ => {
+                                    crate::tee_eprintln!(
+                                        "[account_submit] SELL не принят (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}, asset={asset_id}, order_id={:?}, success={}, partial={}",
+                                        r.order_id,
+                                        r.success,
+                                        r.partial,
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            crate::tee_eprintln!(
+                                "[account_submit] SELL taker колбёк потерян (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}"
+                            );
+                        }
+                    }
                 }
             }
             if attempt < SELL_TAKER_MAX_ATTEMPTS {
@@ -355,21 +446,10 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
-        let Some(result) = accepted else {
-            crate::tee_eprintln!(
-                "[account_submit] SELL taker — все {SELL_TAKER_MAX_ATTEMPTS} попыток исчерпаны, CloseFailed: pos_id={pos_id}, asset={asset_id}; следующий manage_positions-тик попытается снова"
-            );
-            closing_arc.write().await.close_status = ClosingPositionStatus::CloseFailed;
-            return;
-        };
-
-        {
-            let real_sell_id = result.order_id.clone();
-            let mut cw = closing_arc.write().await;
-            cw.close_order_id = Some(real_sell_id.clone());
-        }
-
-        spawn_polling_verify_close(account.clone(), closing_arc.clone());
+        crate::tee_eprintln!(
+            "[account_submit] SELL taker — все {SELL_TAKER_MAX_ATTEMPTS} попыток исчерпаны, CloseFailed: pos_id={pos_id}, asset={asset_id}; следующий manage_positions-тик попытается снова"
+        );
+        closing_arc.write().await.close_status = ClosingPositionStatus::CloseFailed;
     });
 }
 

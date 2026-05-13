@@ -6,8 +6,8 @@
 use crate::account::{POLY_PRIVATE_KEY_ENV, SharedAccount};
 use crate::history_sim::StrictBook;
 use crate::account_order_completion::{
-    PostOrderHttpOutcome, PostOrderInvokeContext, SingleOrderInvokeCb,
-    after_post_order_maybe_track_invoke, wrap_post_order_cb,
+    PostOrderHttpOutcome, PostOrderInvokeContext, after_post_order_maybe_track_invoke,
+    wrap_post_order_cb,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -68,34 +68,14 @@ pub struct PostOrderRequest {
     pub(crate) strict_book: Option<StrictBook>,
 }
 
-/// Распакованный ответ POST /order (поля как у SDK).
-#[derive(Debug, Clone)]
-pub struct PostOrderResult {
-    /// `orderID` для user-WS и `*_order_id`.
-    pub order_id: String,
-    /// Live / Matched / Delayed / …
-    pub status: OrderStatusType,
-    /// HTTP-ответ успешно обработан (ордер мог остаться live).
-    pub success: bool,
-    /// `makingAmount`.
-    pub making_amount: Decimal,
-    /// `takingAmount`.
-    pub taking_amount: Decimal,
-    /// `errorMsg` если success=false или отклонено.
-    pub error_msg: Option<String>,
-    /// `transactionsHashes`, строки `0x…`.
-    pub transaction_hashes: Vec<String>,
-    /// `tradeIDs`.
-    pub trade_ids: Vec<String>,
-}
+pub use crate::account_order_completion::{SingleOrderClobInvocationReport, SingleOrderInvokeCb};
 
-/// Подписать ордер EOA и отправить на CLOB. Нужны `clob_authed` + `clob_signer`. Account не изменяется.
-/// Переходное: `invoke` — опциональный колбэк один раз после финала (HTTP / WS / `client.order` poll); временно везде можно передавать `None`.
+/// Результат `POST /order`: колбэк [`SingleOrderInvokeCb`] один раз после финального отчёта; при ошибках **до** HTTP-ответа колбэк **не** вызывается.
 pub async fn post_order_on_clob(
     account: &SharedAccount,
     request: PostOrderRequest,
-    invoke: Option<SingleOrderInvokeCb>,
-) -> Result<PostOrderResult> {
+    invoke: SingleOrderInvokeCb,
+) -> Result<Option<String>> {
     validate_post_order_request(&request)?;
 
     let auth_client: clob::Client<Authenticated<Normal>> = (**account.clob_authed.load()).clone().ok_or_else(|| {
@@ -149,16 +129,7 @@ pub async fn post_order_on_clob(
                 invoke_slot,
             )
             .await;
-            return Ok(PostOrderResult {
-                order_id: String::new(),
-                status: OrderStatusType::Delayed,
-                success: false,
-                making_amount: Decimal::ZERO,
-                taking_amount: Decimal::ZERO,
-                error_msg: Some(err.to_string()),
-                transaction_hashes: vec![],
-                trade_ids: vec![],
-            });
+            return Ok(None);
         }
         Err(_elapsed) => {
             crate::tee_eprintln!(
@@ -183,16 +154,7 @@ pub async fn post_order_on_clob(
                 invoke_slot,
             )
             .await;
-            return Ok(PostOrderResult {
-                order_id: String::new(),
-                status: OrderStatusType::Delayed,
-                success: false,
-                making_amount: Decimal::ZERO,
-                taking_amount: Decimal::ZERO,
-                error_msg: Some(format!("HTTP timeout {:?}", request.timeout)),
-                transaction_hashes: vec![],
-                trade_ids: vec![],
-            });
+            return Ok(None);
         }
     };
 
@@ -208,35 +170,24 @@ pub async fn post_order_on_clob(
         ..
     } = resp;
 
-    let out = PostOrderResult {
-        order_id,
-        status,
-        success,
-        making_amount,
-        taking_amount,
-        error_msg: error_msg.filter(|s| !s.is_empty()),
-        transaction_hashes: transaction_hashes
-            .into_iter()
-            .map(|h| format!("{h:#x}"))
-            .collect(),
-        trade_ids,
-    };
-
+    let post_error_msg_sdk = error_msg.filter(|s| !s.is_empty());
     let http_detail = json!({
-        "order_id": out.order_id,
-        "success": out.success,
-        "status": format!("{:?}", out.status),
-        "error_msg": out.error_msg,
-        "trade_ids": out.trade_ids,
-        "making_amount": out.making_amount.to_string(),
-        "taking_amount": out.taking_amount.to_string(),
+        "order_id": order_id.clone(),
+        "success": success,
+        "status": format!("{:?}", status),
+        "error_msg": post_error_msg_sdk,
+        "trade_ids": trade_ids,
+        "making_amount": making_amount.to_string(),
+        "taking_amount": taking_amount.to_string(),
+        "transaction_hashes": transaction_hashes.iter().map(|h| format!("{h:#x}")).collect::<Vec<String>>(),
     });
-    let seed_making = out.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
-    let seed_taking = out.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let seed_making = making_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    let seed_taking = taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+
     let http_snap = PostOrderHttpOutcome {
-        order_id: out.order_id.clone(),
-        success: out.success,
-        status: out.status.clone(),
+        order_id: order_id.clone(),
+        success,
+        status: status.clone(),
         detail: http_detail,
         invoke_ctx: Some(PostOrderInvokeContext {
             request,
@@ -252,7 +203,7 @@ pub async fn post_order_on_clob(
         invoke_slot,
     )
     .await;
-    Ok(out)
+    Ok((success && !order_id.is_empty()).then_some(order_id))
 }
 
 /// Ошибки комбинаций полей до сети/SDK `build`.
@@ -520,7 +471,7 @@ fn best_bid_sdk(
 /// Вход в [`cancel_order_on_clob`].
 #[derive(Debug, Clone)]
 pub struct CancelOrderRequest {
-    /// CLOB `orderID` (совпадает с [`PostOrderResult::order_id`]).
+    /// CLOB `orderID`.
     pub order_id: String,
     /// Таймаут HTTP на `DELETE /order`.
     pub timeout: Duration,
@@ -700,6 +651,14 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
     let mut sold = 0_usize;
     let mut skipped_dust = 0_usize;
     let mut failed = 0_usize;
+
+    struct PendingExitSell {
+        invoke_rx: tokio::sync::oneshot::Receiver<SingleOrderClobInvocationReport>,
+        asset_id_str: String,
+        shares: f64,
+    }
+    let mut pending_exit_sells: Vec<PendingExitSell> = Vec::new();
+
     for pos in positions {
         let shares = pos.size.to_string().parse::<f64>().unwrap_or(0.0);
         if !shares.is_finite() || shares < SHARES_DUST_THRESHOLD {
@@ -719,34 +678,66 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
             timeout: Duration::from_secs(EXIT_HTTP_TIMEOUT_SEC),
             strict_book: None,
         };
-        match post_order_on_clob(account, request, None).await {
+        let (invoke_tx, invoke_rx) = tokio::sync::oneshot::channel();
+        match post_order_on_clob(
+            account,
+            request,
+            Box::new(move |rep| {
+                let _ = invoke_tx.send(rep);
+            }),
+        )
+        .await
+        {
+            Err(err) => {
+                crate::tee_eprintln!(
+                    "[account_exit] SELL ошибка до колбека: asset={asset_id_str}, \
+                     shares={shares:.4}: {err:#}"
+                );
+                failed += 1;
+            }
+            Ok(_) => pending_exit_sells.push(PendingExitSell {
+                invoke_rx,
+                asset_id_str,
+                shares,
+            }),
+        }
+        tokio::time::sleep(Duration::from_millis(PER_POSITION_PAUSE_MS)).await;
+    }
+
+    for PendingExitSell {
+        invoke_rx,
+        asset_id_str,
+        shares,
+    } in pending_exit_sells
+    {
+        match invoke_rx.await {
             Ok(r) if r.success => {
                 crate::tee_println!(
                     "[account_exit] SELL ok: asset={asset_id_str}, shares={shares:.4}, \
-                     order_id={}, status={:?}",
+                     order_id={:?}, success={}, partial={}",
                     r.order_id,
-                    r.status,
+                    r.success,
+                    r.partial,
                 );
                 sold += 1;
             }
             Ok(r) => {
                 crate::tee_eprintln!(
-                    "[account_exit] SELL отвергнут CLOB: asset={asset_id_str}, \
-                     shares={shares:.4}, error_msg={:?}, status={:?}",
-                    r.error_msg,
-                    r.status,
+                    "[account_exit] SELL неуспешен (invoke): asset={asset_id_str}, \
+                     shares={shares:.4}, order_id={:?}, success={}, partial={}",
+                    r.order_id,
+                    r.success,
+                    r.partial,
                 );
                 failed += 1;
             }
-            Err(err) => {
+            Err(_) => {
                 crate::tee_eprintln!(
-                    "[account_exit] SELL ошибка: asset={asset_id_str}, \
-                     shares={shares:.4}: {err:#}"
+                    "[account_exit] SELL колбёк потерян: asset={asset_id_str}, shares={shares:.4}"
                 );
                 failed += 1;
             }
         }
-        tokio::time::sleep(Duration::from_millis(PER_POSITION_PAUSE_MS)).await;
     }
     crate::tee_println!(
         "[account_exit] sell-all итог: sold={sold}, failed={failed}, skipped_dust={skipped_dust}"
@@ -759,7 +750,6 @@ mod tests {
     use crate::account::{Account, POLY_PRIVATE_KEY_ENV, try_authenticate_clob_for_heartbeats};
     use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
     use crate::util::{current_timestamp_ms, fetch_gamma_event_data_for_slug};
-    use polymarket_client_sdk::clob::types::OrderStatusType;
     use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
     use polymarket_client_sdk::types::U256;
 
@@ -852,7 +842,8 @@ mod tests {
              worst_acceptable_buy={worst_acceptable_buy:.4}",
         );
 
-        let buy_result = post_order_on_clob(
+        let (buy_invoke_tx, buy_invoke_rx) = tokio::sync::oneshot::channel();
+        post_order_on_clob(
             &account,
             PostOrderRequest {
                 asset_id: asset_id.clone(),                // Gamma outcome token
@@ -866,36 +857,44 @@ mod tests {
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
                 strict_book: None,                         // GET book выше
             },
-            None,
+            Box::new(move |rep| {
+                let _ = buy_invoke_tx.send(rep);
+            }),
         )
         .await
         .with_context(|| format!("BUY taker slug={slug} asset_id={asset_id}"))?;
+        let buy_result = buy_invoke_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("BUY taker колбёк потерян"))?;
+
         anyhow::ensure!(
             buy_result.success,
-            "BUY taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
-            buy_result.status,
-            buy_result.error_msg,
+            "BUY taker финал не успех: order_id={:?}, partial={}",
             buy_result.order_id,
+            buy_result.partial,
         );
         anyhow::ensure!(
-            matches!(
-                buy_result.status,
-                OrderStatusType::Matched | OrderStatusType::Delayed
-            ),
-            "BUY taker не исполнен: status={:?}, order_id={}",
-            buy_result.status,
-            buy_result.order_id,
+            buy_result.order_id.as_deref().is_some_and(|id| !id.is_empty()),
+            "пустой order_id после BUY"
         );
 
-        let shares_to_sell = decimal_to_f64(&buy_result.taking_amount)?;
+        let shares_to_sell = match buy_result.filled_amount {
+            OrderAmount::Shares(s) => s,
+            OrderAmount::UsdNotional(_) => {
+                anyhow::bail!(
+                    "BUY taker: ожидались Shares в filled_amount, получили USD notion"
+                );
+            }
+        };
         anyhow::ensure!(
             shares_to_sell > 0.0 && shares_to_sell.is_finite(),
-            "BUY taker не дал shares: taking_amount={}, order_id={}",
-            buy_result.taking_amount,
+            "BUY taker не дал shares в filled_amount: {:?}, order_id={:?}",
+            buy_result.filled_amount,
             buy_result.order_id,
         );
 
-        let sell_result = post_order_on_clob(
+        let (sell_invoke_tx, sell_invoke_rx) = tokio::sync::oneshot::channel();
+        post_order_on_clob(
             &account,
             PostOrderRequest {
                 asset_id: asset_id.clone(),                                // тот же токен
@@ -909,29 +908,25 @@ mod tests {
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
                 strict_book: None,                                         // нет локального book
             },
-            None,
+            Box::new(move |rep| {
+                let _ = sell_invoke_tx.send(rep);
+            }),
         )
         .await
         .with_context(|| format!("SELL taker slug={slug} asset_id={asset_id}"))?;
+        let sell_result = sell_invoke_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("SELL taker колбёк потерян"))?;
+
         anyhow::ensure!(
             sell_result.success,
-            "SELL taker отвергнут: status={:?}, error_msg={:?}, order_id={}",
-            sell_result.status,
-            sell_result.error_msg,
+            "SELL taker финал не успех: order_id={:?}, partial={}",
             sell_result.order_id,
-        );
-        anyhow::ensure!(
-            matches!(
-                sell_result.status,
-                OrderStatusType::Matched | OrderStatusType::Delayed
-            ),
-            "SELL taker не исполнен: status={:?}, order_id={}",
-            sell_result.status,
-            sell_result.order_id,
+            sell_result.partial,
         );
 
         eprintln!(
-            "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={}, sell_order_id={}, \
+            "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={:?}, sell_order_id={:?}, \
              buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
             buy_result.order_id, sell_result.order_id,
         );

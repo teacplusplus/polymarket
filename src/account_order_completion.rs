@@ -1,4 +1,4 @@
-//! POST + `invoke`: один колбэк после **тишины** ([`INVOKE_DEBOUNCE_MS`]).
+//! POST + `invoke`: один колбэк после **тишины** ([`INVOKE_DEBOUNCE_MS`]), если это не **taker** и на этом bump уже `now < market_end`; иначе сразу без паузы и без «волны» debounce.
 //! Финал, если набран целевой объём (**shares / USDC** из [`crate::account_order::PostOrderRequest::amount`]) как **max(HTTP-снимок, накопление WS `trade`)** — снимок с **POST** и при каждом успешном poll [`OpenOrderResponse`] (`size_matched`, для USDC-целей ещё `size_matched × price`) **или** наступил дедлайн
 //! (**`expiration` → иначе `market_end_unix_ms` → короткий fallback**) **или** CLOB дал терминал / отмену.
 //! Нулевое исполнение к дедлайну → `success=false`. Отмены — только HTTP. Агрегаты cancel-all / sell-all.
@@ -6,7 +6,7 @@
 //! Хаб живёт на [`crate::account::Account::order_invoke_hub`].
 
 use crate::account::SharedAccount;
-use crate::account_order::{OrderAmount, PostOrderRequest};
+use crate::account_order::{OrderAmount, OrderRole, PostOrderRequest};
 use polymarket_client_sdk::clob::types::response::OpenOrderResponse;
 use polymarket_client_sdk::clob::types::{OrderStatusType, Side};
 use polymarket_client_sdk::types::Decimal;
@@ -46,10 +46,15 @@ fn zero_fill_without_request_context() -> OrderAmount {
 
 #[derive(Debug, Clone)]
 pub struct SingleOrderClobInvocationReport {
-    pub order_id: String,
+    pub order_id: Option<String>,
     pub filled_amount: OrderAmount,
     pub success: bool,
     pub partial: bool,
+}
+
+#[inline]
+fn nonempty_order_id_str(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 pub type SingleOrderInvokeCb =
@@ -178,8 +183,10 @@ pub(crate) struct PostOrderInvokeAggregator {
     order_id: String,
     /// Состояние накопления (объём, цели, терминалы): [`tokio::sync::RwLock`] — только асинхронные `.await` локи.
     inner: Arc<RwLock<InvokeAggInner>>,
-    /// Номер «волны» debounce: после паузы финализируют, только если генерация не сменилась.
+    /// Номер «волны» debounce: после паузы финализируют, только если генерация не сменилась (ветка паузы — см. [`Self::bump_debounce_finalize`]).
     debounce_generation: Arc<RwLock<u64>>,
+    role: OrderRole,
+    market_end_unix_ms: Option<i64>,
     /// `true`, когда финальный путь уже взят или колбэк вызван — чтобы не дублировать и остановить poll.
     pub(crate) finished: Arc<RwLock<bool>>,
 }
@@ -229,26 +236,37 @@ impl PostOrderInvokeAggregator {
                 partial: false,
             })),
             debounce_generation: Arc::new(RwLock::new(0)),
+            role: post_request.role,
+            market_end_unix_ms: post_request.market_end_unix_ms,
             finished: Arc::new(RwLock::new(false)),
         })
     }
 
     fn bump_debounce_finalize(aggregator: Arc<Self>) {
         tokio::spawn(async move {
+            let effective_amount_matches_target_goal = {
+                let state = aggregator.inner.read().await;
+                Self::targets_met(&state)
+            };
+            // Если эффективный объём уже покрывает цель заявки — не ждём тишину: finalize сразу.
+            if effective_amount_matches_target_goal {
+                Self::try_finalize_locked(aggregator).await;
+                return;
+            }
+            let timestamp_ms = crate::util::current_timestamp_ms();
+            if matches!(aggregator.role, OrderRole::Taker)
+                || aggregator
+                    .market_end_unix_ms
+                    .is_some_and(|end_ms| end_ms <= timestamp_ms)
+            {
+                Self::try_finalize_locked(aggregator).await;
+                return;
+            }
             let debounce_wave = {
                 let mut wave_counter = aggregator.debounce_generation.write().await;
                 *wave_counter = (*wave_counter).saturating_add(1);
                 *wave_counter
             };
-            // Если эффективный объём уже покрывает цель заявки — не ждём тишину: finalize сразу.
-            let effective_amount_matches_target_goal = {
-                let state = aggregator.inner.read().await;
-                Self::targets_met(&state)
-            };
-            if effective_amount_matches_target_goal {
-                Self::try_finalize_locked(aggregator).await;
-                return;
-            }
             tokio::time::sleep(Duration::from_millis(INVOKE_DEBOUNCE_MS)).await;
             let current_generation = *aggregator.debounce_generation.read().await;
             if current_generation != debounce_wave {
@@ -368,16 +386,15 @@ impl PostOrderInvokeAggregator {
         let target_reached = Self::targets_met(state);
         let deadline_hit = timestamp_ms >= state.deadline_ms;
 
-        let report_success = target_reached
-            || (state.success && has_nonzero_fill)
-            || (deadline_hit && has_nonzero_fill);
+        // Любое ненулевое исполнение (taker/maker, частичное или полное целевое) ⇒ `success`.
+        let report_success = target_reached || has_nonzero_fill;
         let report_partial = report_success
             && !target_reached
             && (has_nonzero_fill || state.success || state.partial);
 
         if !target_reached && !has_nonzero_fill && (deadline_hit || state.partial) {
             return SingleOrderClobInvocationReport {
-                order_id: String::new(),
+                order_id: None,
                 filled_amount: effective_fill_amount,
                 success: false,
                 partial: false,
@@ -385,7 +402,7 @@ impl PostOrderInvokeAggregator {
         }
 
         SingleOrderClobInvocationReport {
-            order_id: String::new(),
+            order_id: None,
             filled_amount: effective_fill_amount,
             success: report_success,
             partial: report_partial,
@@ -432,7 +449,7 @@ impl PostOrderInvokeAggregator {
             }
             let cloned_order_id = self.order_id.clone();
             let mut invocation_report = Self::build_report(&state, timestamp_ms_recheck);
-            invocation_report.order_id.clone_from(&cloned_order_id);
+            invocation_report.order_id = nonempty_order_id_str(&cloned_order_id);
             (invocation_report, cloned_order_id)
         };
 
@@ -578,16 +595,13 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     account: &SharedAccount,
     trackers: Arc<RwLock<HashMap<String, TrackerEntry>>>,
     http_result: &PostOrderHttpOutcome,
-    slot_opt: Option<Arc<CompletionOnce<SingleOrderClobInvocationReport>>>,
+    slot: Arc<CompletionOnce<SingleOrderClobInvocationReport>>,
 ) {
-    let Some(slot) = slot_opt else {
-        return;
-    };
     let cloned_order_id = http_result.order_id.clone();
 
     if !http_result.success {
         slot.fire(SingleOrderClobInvocationReport {
-            order_id: cloned_order_id.clone(),
+            order_id: nonempty_order_id_str(&cloned_order_id),
             filled_amount: zero_fill_without_request_context(),
             success: false,
             partial: false,
@@ -598,7 +612,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
 
     let Some(invoke_context) = http_result.invoke_ctx.clone() else {
         slot.fire(SingleOrderClobInvocationReport {
-            order_id: cloned_order_id.clone(),
+            order_id: nonempty_order_id_str(&cloned_order_id),
             filled_amount: zero_fill_without_request_context(),
             success: false,
             partial: false,
@@ -610,7 +624,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     let seed_taking = invoke_context.seed_taking;
     if cloned_order_id.is_empty() {
         slot.fire(SingleOrderClobInvocationReport {
-            order_id: String::new(),
+            order_id: None,
             filled_amount: zero_fill_matching_target_dimension(posted_order_request.amount),
             success: false,
             partial: false,
@@ -663,7 +677,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
 }
 
 pub(crate) fn wrap_post_order_cb(
-    optional_callback: Option<SingleOrderInvokeCb>,
-) -> Option<Arc<CompletionOnce<SingleOrderClobInvocationReport>>> {
-    optional_callback.map(|on_invoke| Arc::new(CompletionOnce::new(on_invoke)))
+    invoke: SingleOrderInvokeCb,
+) -> Arc<CompletionOnce<SingleOrderClobInvocationReport>> {
+    Arc::new(CompletionOnce::new(invoke))
 }
