@@ -29,6 +29,16 @@ use tokio::time::MissedTickBehavior;
 /// Лимит [`recently_resolved_markets`]; переполнение — `shift_remove_index(0)`.
 pub const RECENTLY_RESOLVED_MARKETS_CAP: usize = 8;
 
+/// Production CLOB V2 host (cutover 2026-04-28; см.
+/// [docs.polymarket.com/v2-migration](https://docs.polymarket.com/v2-migration)).
+///
+/// Старый `clob-v2.polymarket.com` остаётся как pre-cutover testing host и
+/// перестал маршрутизировать `POST /order` — edge отдаёт `405` с пустым телом
+/// (auth/GET-ручки ещё отвечают, поэтому ошибка ловится только на отправке
+/// ордера). Дефолт SDK (`clob::Client::default()`) указывает на тот старый
+/// хост — поэтому мы конструируем клиент явно с production-URL.
+pub const POLYMARKET_CLOB_HOST: &str = "https://clob.polymarket.com";
+
 /// `Arc<Account>`; синхронизация только на полях [`Account`].
 pub type SharedAccount = Arc<Account>;
 
@@ -68,8 +78,13 @@ pub struct Account {
 
 impl Account {
     pub fn new() -> Self {
-        // SDK v2: production CLOB host (старый `clob.polymarket.com` не тот API).
-        let clob = Arc::new(clob::Client::default());
+        // Production CLOB V2 host (см. [`POLYMARKET_CLOB_HOST`]): `clob.polymarket.com`.
+        // `clob::Client::default()` указывает на pre-cutover testing host
+        // `clob-v2.polymarket.com`, где `POST /order` уже не работает.
+        let clob = Arc::new(
+            clob::Client::new(POLYMARKET_CLOB_HOST, clob::Config::default())
+                .expect("CLOB client with production host should construct"),
+        );
         Self {
             bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
             peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
@@ -736,7 +751,7 @@ mod tests {
 
     /// Интеграционный smoke: полный auth + два heartbeat; игнорируется в CI без ключа (см. `#[ignore]`).
     #[tokio::test]
-    #[ignore = "live network: требует POLY_PRIVATE_KEY; делает HTTP к clob-v2.polymarket.com/auth/api-key"]
+    #[ignore = "live network: требует POLY_PRIVATE_KEY; делает HTTP к clob.polymarket.com/auth/api-key"]
     async fn live_try_authenticate_clob_for_heartbeats() -> anyhow::Result<()> {
         let _ = dotenvy::dotenv();
 

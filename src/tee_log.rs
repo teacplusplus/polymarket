@@ -84,3 +84,80 @@ macro_rules! tee_eprintln {
         $crate::tee_log::tee_log_write(&__line);
     }};
 }
+
+// ---------------------------------------------------------------------------
+// Отдельный «test-only» tee-канал для observability-логов теста
+// `live_taker_roundtrip_btc_updown_5m` (или другого test-driver'a).
+//
+// Идея — параллельный писатель, который **не** дублирует вывод в stdout/stderr
+// и **не** шарится с основным [`TEE_LOG`]: подробные `[order_invoke/...]`
+// логи пишутся ТОЛЬКО в файл, заданный [`init_test_tee_log_file`]. Это держит
+// прод-вывод чистым и одновременно даёт полный sequence событий теста для
+// последующего разбора/curl-сверки.
+// ---------------------------------------------------------------------------
+
+/// Параллельный файловый писатель для test-only логов; не пересекается с [`TEE_LOG`].
+/// Семантика идентична: `Mutex<Option<BufWriter<File>>>`, `None` = «не инициализирован,
+/// все записи через [`test_tee_log_write`] становятся no-op».
+pub static TEST_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// Пишет одну строку в [`TEST_TEE_LOG`] (если файл инициализирован) и сразу флашит.
+/// Используется внутри [`test_tee_println!`]/[`test_tee_eprintln!`]; в stdout/stderr
+/// **не** дублирует (в отличие от [`tee_log_write`]) — это test-only канал.
+pub fn test_tee_log_write(line: &str) {
+    if let Ok(mut guard) = TEST_TEE_LOG.lock() {
+        if let Some(w) = guard.as_mut() {
+            let _ = writeln!(w, "{}", line);
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Аналог [`init_tee_log_file`] для [`TEST_TEE_LOG`]: открывает (или
+/// перезаписывает) `path`, кладёт его `BufWriter` в [`TEST_TEE_LOG`] и пишет
+/// первую строку-маркер «[<tag>] test-log пишется в …». Тот же контракт «последний
+/// победил»; на практике вызывается один раз из теста перед размещением ордеров.
+pub fn init_test_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = File::create(path)?;
+    {
+        let mut guard = TEST_TEE_LOG.lock().expect("TEST_TEE_LOG poisoned");
+        *guard = Some(BufWriter::new(file));
+    }
+    crate::test_tee_println!("[{tag}] test-log пишется в {}", path.display());
+    Ok(())
+}
+
+/// Флашит и закрывает писатель в [`TEST_TEE_LOG`], если он был открыт. Полезно в
+/// конце теста, чтобы гарантировать, что хвост лога ушёл на диск до выхода.
+pub fn finish_test_tee_log() {
+    if let Ok(mut guard) = TEST_TEE_LOG.lock() {
+        if let Some(mut w) = guard.take() {
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Записывает форматированную строку **только** в [`TEST_TEE_LOG`] (если открыт);
+/// в stdout не пишет — в отличие от [`tee_println!`]. Если файл не инициализирован,
+/// макрос становится почти no-op (формат строки выполнится, запись будет проглочена).
+#[macro_export]
+macro_rules! test_tee_println {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::test_tee_log_write(&__line);
+    }};
+}
+
+/// Записывает форматированную строку **только** в [`TEST_TEE_LOG`] (если открыт);
+/// в stderr не пишет — в отличие от [`tee_eprintln!`]. Используется для отметки
+/// неуспешных WS/HTTP веток внутри test-only трассы.
+#[macro_export]
+macro_rules! test_tee_eprintln {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::test_tee_log_write(&__line);
+    }};
+}

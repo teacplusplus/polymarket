@@ -74,6 +74,27 @@ pub use crate::account_order_completion::{SingleOrderClobInvocationReport, Singl
 /// (валидация, отсутствие auth/signer, ошибка билда/подписи, HTTP/SDK error, timeout,
 /// `success=false`, частичная сделка, полная сделка). Одноразовость обеспечивает
 /// [`crate::account_order_completion::CompletionOnce`] вокруг `invoke`.
+///
+/// Колбэк **никогда не выполняется синхронно в стэке этой функции**: все пути firing'а проходят через
+/// [`crate::account_order_completion::spawn_fire_invocation_report`] (или через
+/// [`crate::account_order_completion::PostOrderInvokeAggregator`], который уже работает на собственных
+/// [`tokio::spawn`]-тасках — debounce/poll/WS). Это значит, что любое тело `invoke` выполняется
+/// строго **после** возврата `post_order_on_clob` вызывающему — момент планирования таски
+/// определяется тоkio-рантаймом, но не текущим стэком вызовов.
+///
+/// **Гарантия on-chain settlement:** [`crate::account_order_completion::SingleOrderClobInvocationReport::success`]
+/// = `true` фаирится **только после факта зачисления средств on-chain** (как для maker, так и для
+/// taker; для полного и для частичного исполнения). Источник истины — лифсайкл
+/// [`polymarket_client_sdk::clob::types::TradeStatusType`]: трейды учитываются как «settled»
+/// только при `Mined|Confirmed`, а book-level `Matched` короткозамыкания не делает. Сигналы
+/// собираются и из user-WS (`trade.status`), и из REST-poll (`client.order(...)` +
+/// `client.trades(...)`) и комбинируются через `max`-merge — поэтому работает даже при
+/// недоступном WS. См. модуль [`crate::account_order_completion`].
+///
+/// Если book-match произошёл, но settlement не успел до дедлайна
+/// ([`crate::account_order_completion::INVOKE_FALLBACK_POLL_DEADLINE_SEC`]), колбэк отдаёт
+/// `success=false` с диагностикой `error_msg = "settlement_timeout: ..."`.
+///
 /// При ошибке до HTTP-ответа отчёт несёт `success=false, partial=false, order_id=None` и нули в
 /// корректной типовой раскладке по `side` ([`crate::account_order_completion::SingleOrderClobInvocationReport`]).
 pub async fn post_order_on_clob(
@@ -84,37 +105,54 @@ pub async fn post_order_on_clob(
     let invoke_slot = wrap_post_order_cb(invoke);
 
     if let Err(err) = validate_post_order_request(&request) {
-        fire_failed_invocation_for_side(&invoke_slot, request.side);
+        fire_failed_invocation_for_side(
+            &invoke_slot,
+            request.side,
+            Some(format!("validate_post_order_request: {err:#}")),
+        );
         return Err(err);
     }
 
     let auth_client: clob::Client<Authenticated<Normal>> = match (**account.clob_authed.load()).clone() {
         Some(c) => c,
         None => {
-            fire_failed_invocation_for_side(&invoke_slot, request.side);
-            return Err(anyhow!(
-                "post_order_on_clob: clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
-            ));
+            let msg = format!(
+                "clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
+            );
+            fire_failed_invocation_for_side(
+                &invoke_slot,
+                request.side,
+                Some(msg.clone()),
+            );
+            return Err(anyhow!("post_order_on_clob: {msg}"));
         }
     };
     let signer = match (**account.clob_signer.load()).clone() {
         Some(s) => s,
         None => {
-            fire_failed_invocation_for_side(&invoke_slot, request.side);
-            return Err(anyhow!(
-                "post_order_on_clob: clob_signer=None — auth-цикл не запускался?"
-            ));
+            let msg = "clob_signer=None — auth-цикл не запускался?".to_string();
+            fire_failed_invocation_for_side(
+                &invoke_slot,
+                request.side,
+                Some(msg.clone()),
+            );
+            return Err(anyhow!("post_order_on_clob: {msg}"));
         }
     };
 
     let token_id = match U256::from_str(&request.asset_id) {
         Ok(t) => t,
         Err(parse_err) => {
-            fire_failed_invocation_for_side(&invoke_slot, request.side);
-            return Err(anyhow!(
-                "post_order_on_clob: невалидный asset_id={:?} (ожидается десятичный U256): {parse_err}",
+            let msg = format!(
+                "невалидный asset_id={:?} (ожидается десятичный U256): {parse_err}",
                 request.asset_id,
-            ));
+            );
+            fire_failed_invocation_for_side(
+                &invoke_slot,
+                request.side,
+                Some(msg.clone()),
+            );
+            return Err(anyhow!("post_order_on_clob: {msg}"));
         }
     };
 
@@ -122,14 +160,22 @@ pub async fn post_order_on_clob(
         OrderRole::Maker => match build_maker_signable(&auth_client, token_id, &request).await {
             Ok(s) => s,
             Err(err) => {
-                fire_failed_invocation_for_side(&invoke_slot, request.side);
+                fire_failed_invocation_for_side(
+                    &invoke_slot,
+                    request.side,
+                    Some(format!("build_maker_signable: {err:#}")),
+                );
                 return Err(err);
             }
         },
         OrderRole::Taker => match build_taker_signable(&auth_client, token_id, &request).await {
             Ok(s) => s,
             Err(err) => {
-                fire_failed_invocation_for_side(&invoke_slot, request.side);
+                fire_failed_invocation_for_side(
+                    &invoke_slot,
+                    request.side,
+                    Some(format!("build_taker_signable: {err:#}")),
+                );
                 return Err(err);
             }
         },
@@ -138,26 +184,33 @@ pub async fn post_order_on_clob(
     let signed = match auth_client.sign(&signer, signable).await {
         Ok(s) => s,
         Err(err) => {
-            fire_failed_invocation_for_side(&invoke_slot, request.side);
-            return Err(anyhow!("post_order_on_clob: подпись ордера упала: {err:#}"));
+            let msg = format!("подпись ордера упала: {err:#}");
+            fire_failed_invocation_for_side(
+                &invoke_slot,
+                request.side,
+                Some(msg.clone()),
+            );
+            return Err(anyhow!("post_order_on_clob: {msg}"));
         }
     };
 
     let resp = match tokio::time::timeout(request.timeout, auth_client.post_order(signed)).await {
         Ok(Ok(r)) => r,
         Ok(Err(err)) => {
+            let msg = format!("POST /order SDK error: {err:#}");
             crate::tee_eprintln!(
-                "post_order_on_clob: POST /order SDK error after request may have hit network: {err:#}"
+                "post_order_on_clob: {msg} (request may have hit network)"
             );
-            fire_failed_invocation_for_side(&invoke_slot, request.side);
+            fire_failed_invocation_for_side(&invoke_slot, request.side, Some(msg));
             return Ok(None);
         }
         Err(_elapsed) => {
-            crate::tee_eprintln!(
-                "post_order_on_clob: POST /order timed out {:?} (request may have been accepted)",
-                request.timeout,
+            let msg = format!(
+                "POST /order timed out after {:?} (request may have been accepted)",
+                request.timeout
             );
-            fire_failed_invocation_for_side(&invoke_slot, request.side);
+            crate::tee_eprintln!("post_order_on_clob: {msg}");
+            fire_failed_invocation_for_side(&invoke_slot, request.side, Some(msg));
             return Ok(None);
         }
     };
@@ -187,6 +240,7 @@ pub async fn post_order_on_clob(
     });
     let making_f64 = making_amount.to_string().parse::<f64>().unwrap_or(0.0);
     let taking_f64 = taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+    
 
     let (making_amount, taking_amount) = match request.side {
         Side::Buy => (
@@ -210,6 +264,7 @@ pub async fn post_order_on_clob(
             making_amount,
             taking_amount,
         }),
+        error_msg: post_error_msg_sdk.clone(),
     };
 
     after_post_order_maybe_track_invoke(
@@ -740,10 +795,11 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
             Ok(r) => {
                 crate::tee_eprintln!(
                     "[account_exit] SELL неуспешен (invoke): asset={asset_id_str}, \
-                     shares={shares:.4}, order_id={:?}, success={}, partial={}",
+                     shares={shares:.4}, order_id={:?}, success={}, partial={}, error_msg={:?}",
                     r.order_id,
                     r.success,
                     r.partial,
+                    r.error_msg,
                 );
                 failed += 1;
             }
@@ -763,9 +819,10 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{Account, POLY_PRIVATE_KEY_ENV, try_authenticate_clob_for_heartbeats};
+    use crate::account::{Account, POLY_PRIVATE_KEY_ENV, SharedAccount, spawn_heartbeat, try_authenticate_clob_for_heartbeats};
+    use crate::account_ws::spawn_user_ws_listener;
     use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
-    use crate::util::{current_timestamp_ms, fetch_gamma_event_data_for_slug};
+    use crate::util::{current_timestamp_ms, detect_country_and_ip, fetch_gamma_event_data_for_slug};
     use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
     use polymarket_client_sdk::types::U256;
 
@@ -773,6 +830,10 @@ mod tests {
     const BTC_UPDOWN_5M_PERIOD_SEC: i64 = 300;
     /// Общий HTTP timeout в live-сценарии теста.
     const LIVE_ORDER_HTTP_TIMEOUT_SEC: u64 = 20;
+    /// Окно прогрева user-WS: даём `spawn_user_ws_listener` законнектиться и подписаться
+    /// до размещения BUY, чтобы `filled_ws`/`settled_ws` участвовали наравне с HTTP-поллингом
+    /// (в финале берётся `max`-merge — итог корректен и без WS, но смысл теста — проверить и WS).
+    const LIVE_TEST_USER_WS_WARMUP_SECS: u64 = 3;
 
     fn current_btc_updown_5m_slug(now_ms: i64) -> String {
         let poly_sec = now_ms / 1000;
@@ -786,54 +847,22 @@ mod tests {
             .map_err(|err| anyhow::anyhow!("Decimal {d} → f64: {err}"))
     }
 
+    /// Минимально-достаточный notional для taker BUY в долларах (CLOB не пропустит меньше $1
+    /// и меньше `min_order_size × best_ask`).
     fn min_taker_buy_usd_notional(min_order_size: f64, best_ask: f64) -> f64 {
+        // CLOB marketable BUY: не меньше $1 (иначе 400 `min size: $1`).
+        const CLOB_MIN_MARKETABLE_BUY_USD: f64 = 1.0;
         let raw = min_order_size * best_ask;
         let rounded = (raw * 100.0).ceil() / 100.0;
-        rounded.max(0.01)
+        rounded.max(CLOB_MIN_MARKETABLE_BUY_USD)
     }
 
-    /// Live BUY→SELL taker минимального notional по текущему 5m BTC up/down рынку.
-    ///
-    /// ```bash
-    /// POLY_PRIVATE_KEY=0x… \
-    ///     cargo test --bin poly account_order::tests::live_taker_roundtrip_btc_updown_5m -- --ignored --nocapture
-    /// ```
-    #[tokio::test]
-    #[ignore = "live network: требует POLY_PRIVATE_KEY и pUSD на Polymarket Safe; делает реальные CLOB-ордера"]
-    async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
-        let _ = dotenvy::dotenv();
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let private_key_set = std::env::var(POLY_PRIVATE_KEY_ENV)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .is_some();
-        if !private_key_set {
-            eprintln!(
-                "live_taker_roundtrip_btc_updown_5m: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
-            );
-            return Ok(());
-        }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC))
-            .build()?;
-        let slug = current_btc_updown_5m_slug(current_timestamp_ms());
-        let gamma = fetch_gamma_event_data_for_slug(&http, &slug).await?;
-        let asset_id = gamma
-            .currency_up_down_by_asset_id
-            .keys()
-            .next()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Gamma не вернул clobTokenIds для slug={slug}"))?;
-
-        let account = Account::new_shared();
-        try_authenticate_clob_for_heartbeats(&account).await;
-        anyhow::ensure!(
-            account.clob_authed.load().is_some(),
-            "CLOB auth не поднялся — проверьте {POLY_PRIVATE_KEY_ENV} и логи [heartbeat]",
-        );
-
-        let token_id = U256::from_str(&asset_id)
+    async fn live_btc_updown_book_buy_floor(
+        account: &SharedAccount,
+        asset_id: &str,
+        slug: &str,
+    ) -> anyhow::Result<(f64, f64, f64)> {
+        let token_id = U256::from_str(asset_id)
             .with_context(|| format!("невалидный asset_id={asset_id} из Gamma slug={slug}"))?;
         let book_request = OrderBookSummaryRequest::builder()
             .token_id(token_id)
@@ -848,14 +877,164 @@ mod tests {
             anyhow::anyhow!("пустой asks book для asset_id={asset_id} slug={slug}")
         })?;
         let best_ask_f64 = decimal_to_f64(&best_ask)?;
-        let buy_usd = min_taker_buy_usd_notional(min_order_size, best_ask_f64);
+        let market_floor_buy_usd = min_taker_buy_usd_notional(min_order_size, best_ask_f64);
+        Ok((min_order_size, best_ask_f64, market_floor_buy_usd))
+    }
+
+    /// Live BUY→SELL taker по текущему 5m BTC up/down: берётся **минимальный допустимый**
+    /// CLOB notional (`min_order_size × best_ask`, не ниже $1); среди исходов Gamma выбирается
+    /// сторона с меньшим floor (часто обе дороже $1 — тогда тратится меньший из двух минимумов).
+    ///
+    /// ```bash
+    /// POLY_PRIVATE_KEY=0x… \
+    ///     cargo test --bin poly account_order::tests::live_taker_roundtrip_btc_updown_5m -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "live network: требует POLY_PRIVATE_KEY и pUSD на Safe; BUY на CLOB-min notional (может быть > $1)"]
+    async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
+        use std::time::Instant;
+
+        let _ = dotenvy::dotenv();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let t0 = Instant::now();
+        let mut last_evt = t0;
+        macro_rules! evt_ms {
+            ($last:ident, $t0:ident) => {{
+                let now = Instant::now();
+                let prev = std::mem::replace(&mut $last, now);
+                let dt = now.saturating_duration_since(prev).as_millis() as u64;
+                let wall = now.saturating_duration_since($t0).as_millis() as u64;
+                (dt, wall)
+            }};
+        }
+
+        // Открываем отдельный test-only tee-канал: подробные `[order_invoke/...]` логи
+        // (HTTP-запросы, WS-события, агрегация, latency, replay-инструкция) идут **только**
+        // в этот файл и не засоряют stdout/stderr. Файл — на каждый прогон уникальный
+        // (timestamp в имени), кладём в `target/` рядом с артефактами cargo. Сбой
+        // инициализации сам по себе не валит тест — макросы `test_tee_*` без открытого
+        // файла становятся no-op.
+        let log_path = std::path::PathBuf::from(format!(
+            "target/live_taker_roundtrip_btc_updown_5m_{}.log",
+            current_timestamp_ms()
+        ));
+        if let Err(err) =
+            crate::tee_log::init_test_tee_log_file(&log_path, "live_taker_roundtrip_btc_updown_5m")
+        {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            eprintln!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: init_test_tee_log_file({}) failed: {err:#} \
+                 — test продолжит, но детальный `[order_invoke/...]` лог в файл писаться не будет",
+                log_path.display(),
+            );
+        } else {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            eprintln!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: detailed `[order_invoke/...]` log → {}",
+                log_path.display(),
+            );
+        }
+
+        let geo = detect_country_and_ip()
+            .await
+            .ok_or_else(|| {
+                let (dt, wall) = evt_ms!(last_evt, t0);
+                anyhow::anyhow!(
+                    "[от старта {wall} ms | с прошлого {dt} ms] Polymarket geoblock: не удалось GET https://polymarket.com/api/geoblock"
+                )
+            })?;
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        anyhow::ensure!(
+            !geo.blocked,
+            "[от старта {wall} ms | с прошлого {dt} ms] Polymarket geoblock: торговля с этого региона заблокирована \
+             (country={:?}, region={:?}, ip={:?})",
+            geo.country,
+            geo.region,
+            geo.ip,
+        );
+
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        eprintln!("[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: geo:{:?}", geo);
+
+        let private_key_set = std::env::var(POLY_PRIVATE_KEY_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some();
+        if !private_key_set {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            eprintln!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
+            );
+            return Ok(());
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC))
+            .build()?;
+        let slug = current_btc_updown_5m_slug(current_timestamp_ms());
+        let gamma = fetch_gamma_event_data_for_slug(&http, &slug).await?;
+        let cu = &gamma.currency_up_down_by_asset_id;
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        anyhow::ensure!(
+            !cu.is_empty(),
+            "[от старта {wall} ms | с прошлого {dt} ms] Gamma не вернул clobTokenIds для slug={slug}",
+        );
+
+        let account = Account::new_shared();
+        try_authenticate_clob_for_heartbeats(&account).await;
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        anyhow::ensure!(
+            account.clob_authed.load().is_some(),
+            "[от старта {wall} ms | с прошлого {dt} ms] CLOB auth не поднялся — проверьте {POLY_PRIVATE_KEY_ENV} и логи [heartbeat]",
+        );
+
+        // Поднимаем heartbeat (продлевает CLOB auth каждые `CLOB_HEARTBEAT_INTERVAL_SEC`)
+        // и user-WS listener (питает `filled_ws`/`settled_ws` в `PostOrderInvokeAggregator`
+        // параллельно с REST-поллингом). Финал колбэка берётся через `max`-merge обоих
+        // источников — тест поэтому проверяет именно совместную работу WS + HTTP.
+        spawn_heartbeat(account.clone());
+        spawn_user_ws_listener(account.clone());
+
+        tokio::time::sleep(Duration::from_secs(LIVE_TEST_USER_WS_WARMUP_SECS)).await;
+
+
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        eprintln!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: дождался {LIVE_TEST_USER_WS_WARMUP_SECS}s на прогрев user-WS subscribe \
+             (поищите в логе строки `[user_ws] подписан`/`[user_ws] trade`)",
+        );
+
+        let mut best: Option<(String, f64, f64, f64)> = None;
+        for cand_id in cu.keys() {
+            let row = live_btc_updown_book_buy_floor(&account, cand_id, &slug).await?;
+            let take = match &best {
+                None => true,
+                Some((_, _, _, best_floor)) => row.2 < *best_floor - 1e-12,
+            };
+            if take {
+                best = Some((cand_id.clone(), row.0, row.1, row.2));
+            }
+        }
+        let (asset_id, min_order_size, best_ask_f64, market_floor_buy_usd) =
+            best.unwrap_or_else(|| {
+                let (dt, wall) = evt_ms!(last_evt, t0);
+                panic!("[от старта {wall} ms | с прошлого {dt} ms] cu не пустой — выше ensure: best=None")
+            });
+        let buy_usd = market_floor_buy_usd;
         let worst_acceptable_buy =
             (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
 
+        let (dt, wall) = evt_ms!(last_evt, t0);
         eprintln!(
-            "live_taker_roundtrip_btc_updown_5m: slug={slug}, asset_id={asset_id}, \
-             min_order_size={min_order_size:.4}, best_ask={best_ask_f64:.4}, buy_usd={buy_usd:.4}, \
-             worst_acceptable_buy={worst_acceptable_buy:.4}",
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: slug={slug}, asset_id={asset_id}, \
+             min_order_size={min_order_size:.4}, best_ask={best_ask_f64:.4}, \
+             market_floor_buy_usd={market_floor_buy_usd:.4}, buy_usd={buy_usd:.4} \
+             (CLOB-min notional), worst_acceptable_buy={worst_acceptable_buy:.4}",
+        );
+
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        eprintln!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: покупка — цель ≈ {buy_usd:.4} USD notional (taker BUY)"
         );
 
         let (buy_invoke_tx, buy_invoke_rx) = tokio::sync::oneshot::channel();
@@ -878,35 +1057,81 @@ mod tests {
             }),
         )
         .await
-        .with_context(|| format!("BUY taker slug={slug} asset_id={asset_id}"))?;
+        .with_context(|| {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            format!("[от старта {wall} ms | с прошлого {dt} ms] BUY taker slug={slug} asset_id={asset_id}")
+        })?;
         let buy_result = buy_invoke_rx
             .await
-            .map_err(|_| anyhow::anyhow!("BUY taker колбёк потерян"))?;
+            .map_err(|_| {
+                let (dt, wall) = evt_ms!(last_evt, t0);
+                anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] BUY taker колбёк потерян")
+            })?;
 
-        anyhow::ensure!(
-            buy_result.success,
-            "BUY taker финал не успех: order_id={:?}, partial={}",
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        let paid = match buy_result.making_amount {
+            OrderAmount::UsdNotional(u) => format!("{u:.4} USDC"),
+            OrderAmount::Shares(s) => format!("{s:.6} shares (making)"),
+        };
+        let got = match buy_result.taking_amount {
+            OrderAmount::Shares(s) => format!("{s:.6} shares"),
+            OrderAmount::UsdNotional(u) => format!("{u:.4} USDC (taking)"),
+        };
+        eprintln!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: куплено — отдано {paid}, получено {got}, \
+             order_id={:?}, partial={}, целевой notional до ордера ≈{buy_usd:.4} USDC",
             buy_result.order_id,
             buy_result.partial,
         );
+
+        let (dt, wall) = evt_ms!(last_evt, t0);
         anyhow::ensure!(
             buy_result.order_id.as_deref().is_some_and(|id| !id.is_empty()),
-            "пустой order_id после BUY"
+            "[от старта {wall} ms | с прошлого {dt} ms] пустой order_id после BUY"
+        );
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        anyhow::ensure!(
+            buy_result.success,
+            "[от старта {wall} ms | с прошлого {dt} ms] BUY taker финал не успех: order_id={:?}, partial={}, error_msg={:?}",
+            buy_result.order_id,
+            buy_result.partial,
+            buy_result.error_msg,
         );
 
-        let shares_to_sell = match buy_result.taking_amount {
+        let shares_received_net = match buy_result.taking_amount {
             OrderAmount::Shares(s) => s,
             OrderAmount::UsdNotional(_) => {
+                let (dt, wall) = evt_ms!(last_evt, t0);
                 anyhow::bail!(
-                    "BUY taker: ожидались Shares в taking_amount, получили USD notion"
+                    "[от старта {wall} ms | с прошлого {dt} ms] BUY taker: ожидались Shares в taking_amount, получили USD notion"
                 );
             }
         };
+        let (dt, wall) = evt_ms!(last_evt, t0);
         anyhow::ensure!(
-            shares_to_sell > 0.0 && shares_to_sell.is_finite(),
-            "BUY taker не дал shares в taking_amount: {:?}, order_id={:?}",
+            shares_received_net > 0.0 && shares_received_net.is_finite(),
+            "[от старта {wall} ms | с прошлого {dt} ms] BUY taker не дал shares в taking_amount: {:?}, order_id={:?}",
             buy_result.taking_amount,
             buy_result.order_id,
+        );
+
+        // Polymarket V2 SDK валидирует `Amount::shares(...)` максимум на 2 десятичных знака
+        // (лот-сайз = 0.01 shares), иначе `Validation: invalid: Unable to build Amount with N
+        // decimal points, must be <= 2`. BUY-callback дал NET-shares с произвольной точностью
+        // (например `33.333332` от `$1 / $0.03`). Округляем **вниз** до 0.01 — гарантия, что
+        // мы не пытаемся продать больше, чем реально зачислено на чейне.
+        let shares_to_sell = (shares_received_net * 100.0).floor() / 100.0;
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        anyhow::ensure!(
+            shares_to_sell >= min_order_size,
+            "[от старта {wall} ms | с прошлого {dt} ms] после округления вниз до 0.01 shares_to_sell={shares_to_sell:.2} < \
+             min_order_size={min_order_size:.4}; net_from_buy={shares_received_net:.6}",
+        );
+
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        eprintln!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: продажа — цель {shares_to_sell:.2} shares \
+             (net_from_buy={shares_received_net:.6}, rounded down to 0.01 lot) (taker SELL)"
         );
 
         let (sell_invoke_tx, sell_invoke_rx) = tokio::sync::oneshot::channel();
@@ -916,7 +1141,7 @@ mod tests {
                 asset_id: asset_id.clone(),                                // тот же токен
                 side: Side::Sell,                                          // unwind
                 role: OrderRole::Taker,                                    // FAK
-                amount: OrderAmount::Shares(shares_to_sell),               // весь fill с BUY
+                amount: OrderAmount::Shares(shares_to_sell),               // весь fill с BUY (округлён вниз до лот-сайза)
                 price: None,                                               // маркет-продажа в bid
                 max_slippage_pp: None,                                     // без cap
                 expiration: None,                                          // taker
@@ -929,23 +1154,52 @@ mod tests {
             }),
         )
         .await
-        .with_context(|| format!("SELL taker slug={slug} asset_id={asset_id}"))?;
+        .with_context(|| {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            format!("[от старта {wall} ms | с прошлого {dt} ms] SELL taker slug={slug} asset_id={asset_id}")
+        })?;
         let sell_result = sell_invoke_rx
             .await
-            .map_err(|_| anyhow::anyhow!("SELL taker колбёк потерян"))?;
+            .map_err(|_| {
+                let (dt, wall) = evt_ms!(last_evt, t0);
+                anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] SELL taker колбёк потерян")
+            })?;
 
-        anyhow::ensure!(
-            sell_result.success,
-            "SELL taker финал не успех: order_id={:?}, partial={}",
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        let sold = match sell_result.making_amount {
+            OrderAmount::Shares(s) => format!("{s:.2} shares"),
+            OrderAmount::UsdNotional(u) => format!("{u:.4} USDC (making)"),
+        };
+        let proceeds = match sell_result.taking_amount {
+            OrderAmount::UsdNotional(u) => format!("{u:.4} USDC"),
+            OrderAmount::Shares(s) => format!("{s:.6} shares (taking)"),
+        };
+        eprintln!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: продано — отдано {sold}, получено {proceeds}, \
+             order_id={:?}, partial={}",
             sell_result.order_id,
             sell_result.partial,
         );
 
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        anyhow::ensure!(
+            sell_result.success,
+            "[от старта {wall} ms | с прошлого {dt} ms] SELL taker финал не успех: order_id={:?}, partial={}, error_msg={:?}",
+            sell_result.order_id,
+            sell_result.partial,
+            sell_result.error_msg,
+        );
+
+        let (dt, wall) = evt_ms!(last_evt, t0);
         eprintln!(
-            "live_taker_roundtrip_btc_updown_5m OK: buy_order_id={:?}, sell_order_id={:?}, \
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m OK: buy_order_id={:?}, sell_order_id={:?}, \
              buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
             buy_result.order_id, sell_result.order_id,
         );
+        // Гарантируем, что хвост `[order_invoke/...]` ушёл на диск до возврата из теста.
+        // На fail-путях (ранние `?`/`ensure!`) `BufWriter` всё равно сфлашится в Drop
+        // статика при штатном завершении процесса.
+        crate::tee_log::finish_test_tee_log();
         Ok(())
     }
 }

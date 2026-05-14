@@ -66,8 +66,9 @@ const ERC1967_CONST1: B256 =
 const ERC1967_CONST2: B256 =
     b256!("5155f3363d3d373d3d363d7f360894a13ba1a3210667c828492db98dca3e2076");
 
-/// Дефолтный Polymarket relayer endpoint. Можно переопределить через
-/// `POLY_RELAYER_URL` (актуально для staging-а). Без trailing slash.
+/// Polymarket Relayer API (`POST /submit`). Сервер из официальной OpenAPI:
+/// <https://docs.polymarket.com/api-reference/relayer/submit-a-transaction>
+/// Без trailing slash.
 const RELAYER_URL: &str = "https://relayer-v2.polymarket.com";
 
 sol! {
@@ -122,13 +123,8 @@ fn read_config() -> Option<Config> {
     if relayer_api_key_address.trim().is_empty() {
         return None;
     }
-    let relayer_url = std::env::var("POLY_RELAYER_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim_end_matches('/').to_string())
-        .unwrap_or_else(|| RELAYER_URL.to_string());
     Some(Config {
-        relayer_url,
+        relayer_url: RELAYER_URL.to_string(),
         relayer_api_key,
         relayer_api_key_address,
     })

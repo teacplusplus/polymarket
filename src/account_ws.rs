@@ -4,9 +4,8 @@
 use crate::account::SharedAccount;
 use crate::account_order_completion::{
     accumulate_invoke_from_ws_trade, notify_terminal_ws_order_snapshot,
+    ws_trade_status_settled_on_chain,
 };
-use crate::account_order::OrderRole;
-use crate::history_sim::{CloseReason, ClosingPosition, ClosingPositionStatus, OpenPositionStatus};
 use crate::util::current_timestamp_ms;
 use futures_util::{SinkExt, StreamExt};
 use polymarket_client_sdk::auth::Credentials;
@@ -237,29 +236,12 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                 order_status,
             )
             .await;
-            let new_open = order_status_to_open_position_status(order_kind, order_status);
-            let new_close = order_status_to_closing_position_status(order_kind, order_status);
-            // После перехода в Open триггерим TP (идемпотентно внутри позиции).
-            let trigger_tp_arcs =
-                update_position_statuses(account, order_id, new_open, new_close).await;
-            for pos_arc in trigger_tp_arcs {
-                let acc = account.clone();
-                tokio::spawn(async move {
-                    crate::account_submit::try_place_tp_maker(acc, pos_arc).await;
-                });
-            }
         }
         "trade" => {
             let trade_id = value.get("id").and_then(Value::as_str).unwrap_or("");
-            let taker_order_id = value
-                .get("taker_order_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let taker_order_id = value.get("taker_order_id").and_then(Value::as_str).unwrap_or("");
             let trade_status = value.get("status").and_then(Value::as_str).unwrap_or("?");
-            let trader_side = value
-                .get("trader_side")
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let trader_side = value.get("trader_side").and_then(Value::as_str).unwrap_or("?");
             let side = value.get("side").and_then(Value::as_str).unwrap_or("?");
             crate::tee_println!(
                 "[user_ws] trade: id={trade_id} taker={taker_order_id} side={side} status={trade_status} trader_side={trader_side}",
@@ -267,31 +249,27 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             // Сначала taker-статусы (чтобы SELL уже `Closed` к fill); затем partial/full fill; maker_orders — возможный наш TP.
             let trade_size = parse_decimal_str(value.get("size"));
             let trade_price = parse_decimal_str(value.get("price"));
-            let fee_rate_bps = parse_decimal_str(value.get("fee_rate_bps")).unwrap_or(0.0);
-            let new_open = trade_status_to_open_position_status(trade_status);
-            let new_close = trade_status_to_closing_position_status(trade_status);
-            let is_terminal = matches!(trade_status, "MATCHED" | "MINED" | "CONFIRMED");
-            let mut trigger_tp_arcs_for_taker: Vec<crate::history_sim::SharedOpenPosition> =
-                Vec::new();
-            if !taker_order_id.is_empty() {
-                trigger_tp_arcs_for_taker =
-                    update_position_statuses(account, taker_order_id, new_open, new_close).await;
-                if is_terminal && let (Some(size), Some(price)) = (trade_size, trade_price) {
+            // `fee_rate_bps` per-trade — пробрасываем в invoke-агрегатор, чтобы
+            // `making_amount`/`taking_amount` в финальном колбэке были **net of fee**.
+            // Отсутствует → 0 bps (для большинства маркетов Polymarket V2 сейчас так).
+            let trade_fee_rate_bps =
+                parse_decimal_str(value.get("fee_rate_bps")).unwrap_or(0.0);
+            // `is_book_terminal`: трейд имеет смысл учитывать в book-match агрегате
+            // (`MATCHED|MINED|CONFIRMED`); `RETRYING|FAILED` и пр. — пропускаем.
+            // `is_settled_on_chain`: настоящий on-chain факт (`MINED|CONFIRMED`) —
+            // только этот сигнал гейтит финальный `success=true` колбэка.
+            let is_book_terminal = matches!(trade_status, "MATCHED" | "MINED" | "CONFIRMED");
+            let is_settled_on_chain = ws_trade_status_settled_on_chain(trade_status);
+            if !taker_order_id.is_empty() {                
+                if is_book_terminal && let (Some(size), Some(price)) = (trade_size, trade_price) {
                     accumulate_invoke_from_ws_trade(
                         &account.order_invoke_hub,
                         taker_order_id,
+                        trade_id,
                         size,
                         price,
-                    )
-                    .await;
-                    apply_user_ws_trade_fill(
-                        account,
-                        taker_order_id,
-                        side,
-                        size,
-                        price,
-                        fee_rate_bps,
-                        OrderRole::Taker,
+                        trade_fee_rate_bps,
+                        is_settled_on_chain,
                     )
                     .await;
                 }
@@ -305,43 +283,23 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                     }
                     let maker_size = parse_decimal_str(maker.get("matched_amount"));
                     let maker_price = parse_decimal_str(maker.get("price"));
-                    let maker_fee_bps =
-                        parse_decimal_str(maker.get("fee_rate_bps")).unwrap_or(fee_rate_bps);
-                    let maker_side = maker.get("side").and_then(Value::as_str).unwrap_or(side);
+                    // Maker fee_rate_bps может отличаться от taker'a — берём maker'ское, иначе общий fallback.
+                    let maker_fee_rate_bps =
+                        parse_decimal_str(maker.get("fee_rate_bps")).unwrap_or(trade_fee_rate_bps);
                     // TP по maker: open-ветку не триггерим; см. debug_assert ниже.
-                    let ret =
-                        update_position_statuses(account, maker_order_id, new_open, new_close)
-                            .await;
-                    debug_assert!(
-                        ret.is_empty(),
-                        "maker_order_id не должен матчиться по open_order_id"
-                    );
-                    if is_terminal && let (Some(size), Some(price)) = (maker_size, maker_price) {
+                    if is_book_terminal && let (Some(size), Some(price)) = (maker_size, maker_price) {
                         accumulate_invoke_from_ws_trade(
                             &account.order_invoke_hub,
                             maker_order_id,
+                            trade_id,
                             size,
                             price,
-                        )
-                        .await;
-                        apply_user_ws_trade_fill(
-                            account,
-                            maker_order_id,
-                            maker_side,
-                            size,
-                            price,
-                            maker_fee_bps,
-                            OrderRole::Maker,
+                            maker_fee_rate_bps,
+                            is_settled_on_chain,
                         )
                         .await;
                     }
                 }
-            }
-            for pos_arc in trigger_tp_arcs_for_taker {
-                let acc = account.clone();
-                tokio::spawn(async move {
-                    crate::account_submit::try_place_tp_maker(acc, pos_arc).await;
-                });
             }
         }
         _ => {
@@ -357,420 +315,6 @@ fn parse_decimal_str(v: Option<&Value>) -> Option<f64> {
         return None;
     }
     s.parse::<f64>().ok().filter(|x| x.is_finite())
-}
-
-/// `(order.type, order.status)` → новый BUY-статус; `None` = не трогаем.
-fn order_status_to_open_position_status(
-    order_type: &str,
-    order_status: &str,
-) -> Option<OpenPositionStatus> {
-    match (order_type, order_status) {
-        ("UPDATE" | "PLACEMENT", "MATCHED") => Some(OpenPositionStatus::Open),
-        ("CANCELLATION", _) | (_, "CANCELED") => Some(OpenPositionStatus::OpenFailed),
-        _ => None,
-    }
-}
-
-/// Аналог для SELL ([`ClosingPositionStatus`]).
-fn order_status_to_closing_position_status(
-    order_type: &str,
-    order_status: &str,
-) -> Option<ClosingPositionStatus> {
-    match (order_type, order_status) {
-        ("UPDATE" | "PLACEMENT", "MATCHED") => Some(ClosingPositionStatus::Closed),
-        ("CANCELLATION", _) | (_, "CANCELED") => Some(ClosingPositionStatus::CloseFailed),
-        _ => None,
-    }
-}
-
-/// Идемпотентно к паре с `order`-событием.
-fn trade_status_to_open_position_status(trade_status: &str) -> Option<OpenPositionStatus> {
-    match trade_status {
-        "MATCHED" | "MINED" | "CONFIRMED" => Some(OpenPositionStatus::Open),
-        "FAILED" => Some(OpenPositionStatus::OpenFailed),
-        _ => None,
-    }
-}
-
-/// Аналог закрытия по `trade.status`.
-fn trade_status_to_closing_position_status(trade_status: &str) -> Option<ClosingPositionStatus> {
-    match trade_status {
-        "MATCHED" | "MINED" | "CONFIRMED" => Some(ClosingPositionStatus::Closed),
-        "FAILED" => Some(ClosingPositionStatus::CloseFailed),
-        _ => None,
-    }
-}
-
-/// Обновляет `open_order_id` / `close_order_id`; возвращает позиции с только что произошедшим `PendingOpen → Open` для TP.
-///
-/// См. локи: не держать два inner-lock на одной позиции одновременно.
-async fn update_position_statuses(
-    account: &SharedAccount,
-    order_id: &str,
-    new_open: Option<OpenPositionStatus>,
-    new_close: Option<ClosingPositionStatus>,
-) -> Vec<crate::history_sim::SharedOpenPosition> {
-    let mut to_trigger_tp: Vec<crate::history_sim::SharedOpenPosition> = Vec::new();
-    if new_open.is_none() && new_close.is_none() {
-        return to_trigger_tp;
-    }
-
-    if let Some(status) = new_open {
-        let positions = account.positions.read().await;
-        let mut hit_pos_ids: Vec<String> = Vec::new();
-        for vec in positions.values() {
-            for pos_arc in vec.iter() {
-                let mut pos = pos_arc.write().await;
-                if pos.open_order_id.as_deref() == Some(order_id) {
-                    let was_pending = matches!(pos.open_status, OpenPositionStatus::PendingOpen);
-                    pos.open_status = status;
-                    if was_pending && matches!(status, OpenPositionStatus::Open) {
-                        to_trigger_tp.push(pos_arc.clone());
-                    }
-                    hit_pos_ids.push(pos.id.clone());
-                }
-            }
-        }
-        if !hit_pos_ids.is_empty() {
-            crate::tee_println!(
-                "[user_ws] open_status({order_id}) → {status:?} (pos_id={hit_pos_ids:?})",
-            );
-        }
-    }
-
-    if let Some(status) = new_close {
-        let closing = account.closing.read().await;
-        let mut hit_pairs: Vec<(String, String)> = Vec::new();
-        for vec in closing.values() {
-            for c_arc in vec.iter() {
-                let mut c = c_arc.write().await;
-                if c.close_order_id.as_deref() == Some(order_id) {
-                    c.close_status = status;
-                    let oid_clone = c.close_order_id.clone().unwrap_or_default();
-                    let pos_id = c.position.read().await.id.clone();
-                    hit_pairs.push((oid_clone, pos_id));
-                }
-            }
-        }
-        // Только лог: inner read позиции — после отпускания c.write.
-        for (oid, pos_id) in hit_pairs {
-            crate::tee_println!("[user_ws] close_status({oid}) → {status:?} (pos_id={pos_id})",);
-        }
-    }
-
-    to_trigger_tp
-}
-
-/// Один BUY/SELL fill по WS: аккумулирует позицию или закрытие; терминально — bankroll через finalize.
-async fn apply_user_ws_trade_fill(
-    account: &SharedAccount,
-    order_id: &str,
-    side: &str,
-    size: f64,
-    price: f64,
-    fee_rate_bps: f64,
-    role: OrderRole,
-) {
-    if size <= 0.0 || !size.is_finite() || price <= 0.0 || !price.is_finite() {
-        return;
-    }
-    match side {
-        "BUY" => {
-            apply_buy_fill(account, order_id, size, price, fee_rate_bps, role).await;
-        }
-        "SELL" => {
-            apply_sell_fill(account, order_id, size, price, fee_rate_bps, role).await;
-        }
-        _ => {
-            crate::tee_eprintln!(
-                "[user_ws] неизвестный side={side} в trade fill (order_id={order_id})"
-            );
-        }
-    }
-}
-
-/// BUY: аккумулирует `shares_held`/`entry_cost`/`buy_price` по `fee_rate_bps`; первый fill сбрасывает оптимист (`optimistic_fill_replaced`).
-async fn apply_buy_fill(
-    account: &SharedAccount,
-    order_id: &str,
-    size: f64,
-    price: f64,
-    fee_rate_bps: f64,
-    _role: OrderRole,
-) {
-    let positions = account.positions.read().await;
-    let mut hit = false;
-    for vec in positions.values() {
-        for pos_arc in vec.iter() {
-            let mut pos = pos_arc.write().await;
-            if pos.open_order_id.as_deref() != Some(order_id) {
-                continue;
-            }
-            if !pos.optimistic_fill_replaced {
-                pos.shares_held = 0.0;
-                pos.entry_cost = 0.0;
-                pos.optimistic_fill_replaced = true;
-            }
-            let usd_paid = size * price;
-            let fee_rate = fee_rate_bps / 10_000.0;
-            let net_shares = size * (1.0 - fee_rate);
-            pos.shares_held += net_shares;
-            pos.entry_cost += usd_paid;
-            if pos.shares_held > 0.0 {
-                pos.buy_price = (pos.entry_cost / pos.shares_held).clamp(0.001, 0.999);
-            }
-            hit = true;
-            crate::tee_println!(
-                "[user_ws] BUY fill: pos_id={}, order_id={order_id}, size={size:.4}, price={price:.4}, fee_rate_bps={fee_rate_bps:.2} → shares_held={:.4} (plan {:.4}), entry_cost={:.4} (plan {:.4}), buy_price={:.4} (plan {:.4})",
-                pos.id,
-                pos.shares_held,
-                pos.planned_shares_held,
-                pos.entry_cost,
-                pos.planned_entry_cost,
-                pos.buy_price,
-                pos.planned_buy_price,
-            );
-        }
-    }
-    if !hit {
-        crate::tee_eprintln!(
-            "[user_ws] BUY fill: order_id={order_id} не найден ни в одной OpenPosition"
-        );
-    }
-}
-
-/// SELL: `close_order_id` (taker) или TP по `tp_order_id` (maker); при отсутствии записи — создаём [`ClosingPosition`] TP и финализируем.
-pub(crate) async fn apply_sell_fill(
-    account: &SharedAccount,
-    order_id: &str,
-    size: f64,
-    price: f64,
-    fee_rate_bps: f64,
-    _role: OrderRole,
-) {
-    let usd_received = size * price;
-    let fee_rate = fee_rate_bps / 10_000.0;
-    let net_usdc = usd_received * (1.0 - fee_rate);
-
-    let mut to_finalize: Option<crate::history_sim::SharedClosingPosition> = None;
-    let mut hit_pos_arcs: Vec<(crate::history_sim::SharedOpenPosition, f64)> = Vec::new();
-    {
-        let closing = account.closing.read().await;
-        let mut hit = false;
-        for vec in closing.values() {
-            for c_arc in vec.iter() {
-                let mut c = c_arc.write().await;
-                if c.close_order_id.as_deref() != Some(order_id) {
-                    continue;
-                }
-                let prev = c.pnl.unwrap_or(0.0);
-                // Аккумулируем net USDC; вычитаем вход на finalize при `Closed`.
-                c.pnl = Some(prev + net_usdc);
-                hit = true;
-                hit_pos_arcs.push((c.position.clone(), prev + net_usdc));
-                if matches!(c.close_status, ClosingPositionStatus::Closed) {
-                    to_finalize = Some(c_arc.clone());
-                }
-            }
-        }
-        if hit {
-            drop(closing);
-            for (pos_arc, acc_proceeds) in hit_pos_arcs {
-                let pid = pos_arc.read().await.id.clone();
-                crate::tee_println!(
-                    "[user_ws] SELL fill (close): pos_id={pid}, order_id={order_id}, size={size:.4}, price={price:.4} → accumulated_proceeds={acc_proceeds:.4}",
-                );
-            }
-            if let Some(c_arc) = to_finalize {
-                finalize_close_pnl_in_place(account, c_arc, "Ws").await;
-            }
-            return;
-        }
-    }
-
-    // TP maker: ищем позицию по `tp_order_id`, убираем из `positions`, пушим в `closing`.
-    let mut maybe_pos: Option<(
-        crate::account::LaneKey,
-        crate::history_sim::SharedOpenPosition,
-    )> = None;
-    {
-        let mut positions = account.positions.write().await;
-        for (key, vec) in positions.iter_mut() {
-            let mut idx = 0;
-            while idx < vec.len() {
-                let is_tp = vec[idx].read().await.tp_order_id.as_deref() == Some(order_id);
-                if is_tp {
-                    let pos_arc = vec.swap_remove(idx);
-                    maybe_pos = Some((key.clone(), pos_arc));
-                    break;
-                }
-                idx += 1;
-            }
-            if maybe_pos.is_some() {
-                break;
-            }
-        }
-    }
-    let Some((lane_key, pos_arc)) = maybe_pos else {
-        crate::tee_eprintln!(
-            "[user_ws] SELL fill: order_id={order_id} не найден ни в ClosingPosition, ни как tp_order_id (возможно, дубль / уже обработан)"
-        );
-        return;
-    };
-    let (pos_id, entry_cost, shares_held, existing_closing) = {
-        let p = pos_arc.read().await;
-        (
-            p.id.clone(),
-            p.entry_cost,
-            p.shares_held,
-            p.closing_position
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade),
-        )
-    };
-    let exit_price = if shares_held > 0.0 {
-        net_usdc / shares_held
-    } else {
-        price
-    };
-    let pnl = net_usdc - entry_cost;
-
-    if let Some(c_arc) = existing_closing {
-        // Гонка с taker-close: подменяем id и reason на TP, finalize найдёт ту же запись.
-        {
-            let mut c = c_arc.write().await;
-            let prev_close_order_id = c.close_order_id.clone();
-            let prev_reason = c.reason.clone();
-            let prev_status = c.close_status;
-            c.close_status = ClosingPositionStatus::Closed;
-            c.reason = CloseReason::TakeProfit;
-            c.pnl = Some(pnl);
-            c.close_order_id = Some(order_id.to_string());
-            c.exit_price = exit_price;
-            crate::tee_println!(
-                "[user_ws] TP maker fill (raced SELL-taker close): pos_id={pos_id}, order_id={order_id}, size={size:.4}, price={price:.4}, net_usdc={net_usdc:.4}, entry_cost={entry_cost:.4}, pnl={pnl:.4} \
-                 — morphed existing ClosingPosition: status {prev_status:?} → Closed, reason {prev_reason:?} → TakeProfit, close_order_id {prev_close_order_id:?} → Some({order_id})"
-            );
-        }
-        let _ = lane_key; // уже в `closing`
-        finalize_tp_close_after_creation(account, order_id, "Ws").await;
-        return;
-    }
-
-    crate::tee_println!(
-        "[user_ws] TP maker fill: pos_id={pos_id}, order_id={order_id}, size={size:.4}, price={price:.4}, net_usdc={net_usdc:.4}, entry_cost={entry_cost:.4}, pnl={pnl:.4}"
-    );
-    let c_arc: crate::history_sim::SharedClosingPosition =
-        std::sync::Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-            position: pos_arc.clone(),       // тот же Arc, что был в positions
-            exit_price,                      // VWAP выхода из net/shares
-            reason: CloseReason::TakeProfit, // причина — TP
-            pnl: Some(pnl),                  // net_usdc − entry_cost (один fill)
-            close_status: ClosingPositionStatus::Closed, // сразу финал
-            close_order_id: Some(order_id.to_string()), // id ордера TP в CLOB
-            close_placement_attempted: true, // submit: не ставить второй SELL
-            created_unix_ms: current_timestamp_ms(), // wall ms создания записи
-        }));
-    // Weak в OpenPosition для polling в submit.
-    {
-        let mut p = pos_arc.write().await;
-        p.set_closing_position(std::sync::Arc::downgrade(&c_arc));
-    }
-    {
-        let mut closing = account.closing.write().await;
-        closing.entry(lane_key).or_default().push(c_arc);
-    }
-    finalize_tp_close_after_creation(account, order_id, "Ws").await;
-}
-
-/// `pnl` − `entry_cost`, затем bankroll, drawdown, stats и CSV; идемпотентно через `pnl_finalized` на [`crate::history_sim::OpenPosition`]. Не смешивать два inner-write на одной позиции.
-pub(crate) async fn finalize_close_pnl_in_place(
-    account: &SharedAccount,
-    c_arc: crate::history_sim::SharedClosingPosition,
-    finalized_via: &'static str,
-) {
-    let (pos_arc, raw_pnl) = {
-        let c = c_arc.read().await;
-        (c.position.clone(), c.pnl.unwrap_or(0.0))
-    };
-    let (entry_cost, already_finalized, pos_id) = {
-        let p = pos_arc.read().await;
-        (p.entry_cost, p.pnl_finalized, p.id.clone())
-    };
-    if already_finalized {
-        return;
-    }
-    let pnl = raw_pnl - entry_cost;
-    {
-        let mut c = c_arc.write().await;
-        c.pnl = Some(pnl);
-    }
-    {
-        let mut p = pos_arc.write().await;
-        p.pnl_finalized = true;
-    }
-
-    let new_bankroll = {
-        let mut bankroll = account.bankroll.write().await;
-        *bankroll += pnl;
-        *bankroll
-    };
-    crate::tee_println!(
-        "[user_ws] finalize SELL: pos_id={pos_id}, pnl={pnl:.4} → bankroll={new_bankroll:.4}",
-    );
-    account.update_drawdown(new_bankroll).await;
-    record_submit_close_to_csv_and_stats(account, &pos_arc, &c_arc, pnl, finalized_via).await;
-}
-
-/// После TP-ветки [`apply_sell_fill`]: bankroll, drawdown, stats, CSV; идемпотентно тем же маркером.
-pub(crate) async fn finalize_tp_close_after_creation(
-    account: &SharedAccount,
-    order_id: &str,
-    finalized_via: &'static str,
-) {
-    let target: Option<(
-        crate::history_sim::SharedOpenPosition,
-        crate::history_sim::SharedClosingPosition,
-        f64,
-    )> = {
-        let closing = account.closing.read().await;
-        let mut found: Option<(
-            crate::history_sim::SharedOpenPosition,
-            crate::history_sim::SharedClosingPosition,
-            f64,
-        )> = None;
-        'outer: for vec in closing.values() {
-            for c_arc in vec.iter() {
-                let c = c_arc.read().await;
-                if c.close_order_id.as_deref() == Some(order_id) {
-                    found = Some((c.position.clone(), c_arc.clone(), c.pnl.unwrap_or(0.0)));
-                    break 'outer;
-                }
-            }
-        }
-        found
-    };
-    let Some((pos_arc, c_arc, pnl)) = target else {
-        return;
-    };
-    let pos_id = {
-        let mut p = pos_arc.write().await;
-        if p.pnl_finalized {
-            return;
-        }
-        p.pnl_finalized = true;
-        p.id.clone()
-    };
-    let new_bankroll = {
-        let mut bankroll = account.bankroll.write().await;
-        *bankroll += pnl;
-        *bankroll
-    };
-    crate::tee_println!(
-        "[user_ws] finalize TP: pos_id={pos_id}, pnl={pnl:.4} → bankroll={new_bankroll:.4}",
-    );
-    account.update_drawdown(new_bankroll).await;
-    record_submit_close_to_csv_and_stats(account, &pos_arc, &c_arc, pnl, finalized_via).await;
 }
 
 /// Бамп stats по сторонам и одна строка submit-CSV; короткие read, без write-локов `Account`. No-op без `real_sim_state` или при `unknown` interval/side.

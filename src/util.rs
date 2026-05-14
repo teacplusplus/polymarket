@@ -255,21 +255,26 @@ fn parse_clob_token_ids_from_gamma_market(v: &Value) -> anyhow::Result<Vec<Strin
     }
 }
 
+#[derive(Debug)]
 pub struct CountryAndIp {
-    /// Код страны из ifconfig.co (если есть).
+    /// `blocked` из [`detect_country_and_ip`] (`GET /api/geoblock` Polymarket).
+    pub blocked: bool,
+    /// Код страны (если есть).
     pub country: Option<String>,
+    /// Регион/штат (если есть).
+    pub region: Option<String>,
     /// Внешний IP (если есть).
     pub ip: Option<String>,
 }
 
-/// Страна и IP для стартового лога (`ifconfig.co/json`); сбой → `None`, без паники.
+/// Страна, IP и флаг геоблока Polymarket (`GET https://polymarket.com/api/geoblock`); сбой → `None`.
 pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
     let resp = client
-        .get("https://ifconfig.co/json")
+        .get("https://polymarket.com/api/geoblock")
         .header(reqwest::header::USER_AGENT, "curl/8.9.1")
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
@@ -279,6 +284,7 @@ pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
         return None;
     }
     let body: Value = resp.json().await.ok()?;
+    let blocked = body.get("blocked")?.as_bool()?;
     let pick = |k: &str| -> Option<String> {
         body.get(k)
             .and_then(|v| v.as_str())
@@ -286,7 +292,9 @@ pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
             .filter(|s| !s.is_empty())
     };
     Some(CountryAndIp {
+        blocked,
         country: pick("country"),
+        region: pick("region"),
         ip: pick("ip"),
     })
 }

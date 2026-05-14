@@ -81,9 +81,18 @@ async fn main() -> Result<()> {
         Some(info) => {
             let country = info.country.as_deref().unwrap_or("?");
             let ip = info.ip.as_deref().unwrap_or("?");
-            println!("Страна: {country}, IP: {ip}");
+            let region = info.region.as_deref().unwrap_or("");
+            let region_suffix = if region.is_empty() {
+                String::new()
+            } else {
+                format!(", регион: {region}")
+            };
+            println!(
+                "Polymarket geoblock: blocked={}, страна: {country}, IP: {ip}{region_suffix}",
+                info.blocked
+            );
         }
-        None => println!("Страна: не удалось определить (ifconfig.co/json)"),
+        None => println!("Polymarket geoblock: не удалось определить (api/geoblock)"),
     }
 
     let mode = AppMode::from_env();
