@@ -1,7 +1,7 @@
-pub mod account_order_completion;
 pub mod account;
 pub mod account_exit;
 pub mod account_order;
+pub mod account_order_completion;
 pub mod account_submit;
 pub mod account_ws;
 pub mod constants;

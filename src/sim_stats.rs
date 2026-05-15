@@ -1,6 +1,6 @@
 //! Агрегаты симуляции по стороне и версии: [`SideStats`], [`SimStats`], лог-печать.
 
-use crate::{tee_println};
+use crate::tee_println;
 
 /// Статистика по одной стороне (UP/DOWN).
 #[derive(Debug, Default)]
@@ -319,7 +319,9 @@ pub fn print_sim_stats(
     }
     tee_println!(
         "[sim]   bankroll: {:.2}$ (start={initial_bankroll}$) ROI={:+.2}% max_drawdown={:.2}%",
-        bankroll_now, roi_pct, max_drawdown_pct_now,
+        bankroll_now,
+        roi_pct,
+        max_drawdown_pct_now,
     );
 
     print_side_stats(tag, "UP", &sim_stats.up, is_kelly);

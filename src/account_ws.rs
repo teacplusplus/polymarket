@@ -230,18 +230,20 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             if order_id.is_empty() {
                 return;
             }
-            notify_terminal_ws_order_snapshot(
-                &account.order_invoke_hub,
-                order_id,
-                order_status,
-            )
-            .await;
+            notify_terminal_ws_order_snapshot(&account.order_invoke_hub, order_id, order_status)
+                .await;
         }
         "trade" => {
             let trade_id = value.get("id").and_then(Value::as_str).unwrap_or("");
-            let taker_order_id = value.get("taker_order_id").and_then(Value::as_str).unwrap_or("");
+            let taker_order_id = value
+                .get("taker_order_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let trade_status = value.get("status").and_then(Value::as_str).unwrap_or("?");
-            let trader_side = value.get("trader_side").and_then(Value::as_str).unwrap_or("?");
+            let trader_side = value
+                .get("trader_side")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             let side = value.get("side").and_then(Value::as_str).unwrap_or("?");
             crate::tee_println!(
                 "[user_ws] trade: id={trade_id} taker={taker_order_id} side={side} status={trade_status} trader_side={trader_side}",
@@ -252,15 +254,14 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             // `fee_rate_bps` per-trade — пробрасываем в invoke-агрегатор, чтобы
             // `making_amount`/`taking_amount` в финальном колбэке были **net of fee**.
             // Отсутствует → 0 bps (для большинства маркетов Polymarket V2 сейчас так).
-            let trade_fee_rate_bps =
-                parse_decimal_str(value.get("fee_rate_bps")).unwrap_or(0.0);
+            let trade_fee_rate_bps = parse_decimal_str(value.get("fee_rate_bps")).unwrap_or(0.0);
             // `is_book_terminal`: трейд имеет смысл учитывать в book-match агрегате
             // (`MATCHED|MINED|CONFIRMED`); `RETRYING|FAILED` и пр. — пропускаем.
             // `is_settled_on_chain`: настоящий on-chain факт (`MINED|CONFIRMED`) —
             // только этот сигнал гейтит финальный `success=true` колбэка.
             let is_book_terminal = matches!(trade_status, "MATCHED" | "MINED" | "CONFIRMED");
             let is_settled_on_chain = ws_trade_status_settled_on_chain(trade_status);
-            if !taker_order_id.is_empty() {                
+            if !taker_order_id.is_empty() {
                 if is_book_terminal && let (Some(size), Some(price)) = (trade_size, trade_price) {
                     accumulate_invoke_from_ws_trade(
                         &account.order_invoke_hub,
@@ -287,7 +288,8 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                     let maker_fee_rate_bps =
                         parse_decimal_str(maker.get("fee_rate_bps")).unwrap_or(trade_fee_rate_bps);
                     // TP по maker: open-ветку не триггерим; см. debug_assert ниже.
-                    if is_book_terminal && let (Some(size), Some(price)) = (maker_size, maker_price) {
+                    if is_book_terminal && let (Some(size), Some(price)) = (maker_size, maker_price)
+                    {
                         accumulate_invoke_from_ws_trade(
                             &account.order_invoke_hub,
                             maker_order_id,

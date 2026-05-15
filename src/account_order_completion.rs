@@ -75,18 +75,9 @@ const USD_EPS: f64 = 1e-5;
 #[inline]
 pub(crate) fn zero_making_taking_for_side(side: Side) -> (OrderAmount, OrderAmount) {
     match side {
-        Side::Buy => (
-            OrderAmount::UsdNotional(0.0),
-            OrderAmount::Shares(0.0),
-        ),
-        Side::Sell => (
-            OrderAmount::Shares(0.0),
-            OrderAmount::UsdNotional(0.0),
-        ),
-        _ => (
-            OrderAmount::UsdNotional(0.0),
-            OrderAmount::Shares(0.0),
-        ),
+        Side::Buy => (OrderAmount::UsdNotional(0.0), OrderAmount::Shares(0.0)),
+        Side::Sell => (OrderAmount::Shares(0.0), OrderAmount::UsdNotional(0.0)),
+        _ => (OrderAmount::UsdNotional(0.0), OrderAmount::Shares(0.0)),
     }
 }
 
@@ -188,11 +179,7 @@ impl LegAgg {
 }
 
 fn leg_agg_add_trade_fill(leg_agg: LegAgg, size: f64, quote: f64) -> LegAgg {
-    if !size.is_finite()
-        || size <= 0.0
-        || !quote.is_finite()
-        || quote < 0.0
-    {
+    if !size.is_finite() || size <= 0.0 || !quote.is_finite() || quote < 0.0 {
         return leg_agg;
     }
     let mut out_leg_agg = leg_agg;
@@ -220,7 +207,9 @@ fn leg_agg_max_normalized(a: LegAgg, b: LegAgg) -> LegAgg {
 /// По эффективной паре ног считает объём исполнения **в размерности заявки** ([`InvokeAggInner::target`]).
 fn target_dimension_fill_from_leg(target: OrderAmount, eff: LegAgg) -> OrderAmount {
     match target {
-        OrderAmount::Shares(_) => OrderAmount::Shares(order_amount_shares_scalar(eff.taking_amount)),
+        OrderAmount::Shares(_) => {
+            OrderAmount::Shares(order_amount_shares_scalar(eff.taking_amount))
+        }
         OrderAmount::UsdNotional(_) => {
             OrderAmount::UsdNotional(order_amount_usd_scalar(eff.making_amount))
         }
@@ -294,8 +283,7 @@ fn nonempty_order_id_str(s: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-pub type SingleOrderInvokeCb =
-    Box<dyn FnOnce(SingleOrderClobInvocationReport) + Send + 'static>;
+pub type SingleOrderInvokeCb = Box<dyn FnOnce(SingleOrderClobInvocationReport) + Send + 'static>;
 
 /// Контекст после успешного HTTP POST для агрегатора invoke.
 #[derive(Debug, Clone)]
@@ -388,14 +376,18 @@ fn decimal_snap_f64(d: &Decimal) -> Option<f64> {
 /// Компактная строка для observability: shares/USDC по обеим ногам и флаги терминала.
 /// Используется в `[order_invoke/ws]`, `[order_invoke/poll]`, `[order_invoke/final]`.
 fn leg_summary_for_log(state: &InvokeAggInner) -> String {
-    let book_shares =
-        order_amount_shares_scalar(leg_agg_max_normalized(state.filled_ws, state.filled_http).taking_amount);
-    let book_usd =
-        order_amount_usd_scalar(leg_agg_max_normalized(state.filled_ws, state.filled_http).making_amount);
-    let settled_shares =
-        order_amount_shares_scalar(leg_agg_max_normalized(state.settled_ws, state.settled_http).taking_amount);
-    let settled_usd =
-        order_amount_usd_scalar(leg_agg_max_normalized(state.settled_ws, state.settled_http).making_amount);
+    let book_shares = order_amount_shares_scalar(
+        leg_agg_max_normalized(state.filled_ws, state.filled_http).taking_amount,
+    );
+    let book_usd = order_amount_usd_scalar(
+        leg_agg_max_normalized(state.filled_ws, state.filled_http).making_amount,
+    );
+    let settled_shares = order_amount_shares_scalar(
+        leg_agg_max_normalized(state.settled_ws, state.settled_http).taking_amount,
+    );
+    let settled_usd = order_amount_usd_scalar(
+        leg_agg_max_normalized(state.settled_ws, state.settled_http).making_amount,
+    );
     let f_ws_sh = order_amount_shares_scalar(state.filled_ws.taking_amount);
     let f_ws_us = order_amount_usd_scalar(state.filled_ws.making_amount);
     let f_ht_sh = order_amount_shares_scalar(state.filled_http.taking_amount);
@@ -466,14 +458,16 @@ fn aggregate_trades_into_leg<'a>(
     let mut total_shares = 0.0_f64;
     let mut total_usdc = 0.0_f64;
     for trade in trades {
-        let Some(size) = decimal_snap_f64(&trade.size) else { continue };
-        let Some(price) = decimal_snap_f64(&trade.price) else { continue };
+        let Some(size) = decimal_snap_f64(&trade.size) else {
+            continue;
+        };
+        let Some(price) = decimal_snap_f64(&trade.price) else {
+            continue;
+        };
         if !(size >= 0.0 && price >= 0.0 && price.is_finite()) {
             continue;
         }
-        let fee_factor = fee_factor_from_bps(
-            decimal_snap_f64(&trade.fee_rate_bps).unwrap_or(0.0),
-        );
+        let fee_factor = fee_factor_from_bps(decimal_snap_f64(&trade.fee_rate_bps).unwrap_or(0.0));
         let quote = size * price;
         if !quote.is_finite() {
             continue;
@@ -762,16 +756,14 @@ impl PostOrderInvokeAggregator {
                 // лифсайклу — игнорируем не-settled и считаем settled только если он есть.
                 // Это безопасный no-op для аномальных событий.
                 if is_settled_on_chain {
-                    state.filled_ws =
-                        leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
+                    state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
                     state.settled_ws =
                         leg_agg_add_trade_fill(state.settled_ws, size_net, quote_net);
                     state_changed = true;
                 }
             } else {
                 if state.seen_ws_trade_ids.insert(trade_id.clone()) {
-                    state.filled_ws =
-                        leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
+                    state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
                     state_changed = true;
                 }
                 if is_settled_on_chain && state.settled_seen_ws_trade_ids.insert(trade_id) {
@@ -815,7 +807,8 @@ impl PostOrderInvokeAggregator {
         trades: Option<Vec<TradeResponse>>,
     ) {
         {
-            let mut state: tokio::sync::RwLockWriteGuard<'_, InvokeAggInner> = self.inner.write().await;
+            let mut state: tokio::sync::RwLockWriteGuard<'_, InvokeAggInner> =
+                self.inner.write().await;
             // `apply_polled_snapshot` сам выставит `book_terminal_reached` для
             // `Matched|Canceled|Unmatched` — дублируем здесь только информационные флаги.
             apply_polled_snapshot(&mut state, &open_order, trades.as_deref());
@@ -900,7 +893,8 @@ impl PostOrderInvokeAggregator {
         // Book-matched (`effective_leg`) используем только для диагностики `settlement_timeout`.
         let settled_leg = Self::effective_settled_leg(state);
         let book_leg = Self::effective_leg(state);
-        let (making_amount, taking_amount) = report_making_and_taking_amounts(state.side, settled_leg);
+        let (making_amount, taking_amount) =
+            report_making_and_taking_amounts(state.side, settled_leg);
 
         let settled_shares = order_amount_shares_scalar(settled_leg.taking_amount);
         let settled_usd = order_amount_usd_scalar(settled_leg.making_amount);
@@ -919,8 +913,8 @@ impl PostOrderInvokeAggregator {
             // Что-то реально зачислено on-chain.
             if settled_target_reached {
                 None
-            } else if has_book_fill && (book_shares > settled_shares + SHARE_EPS
-                || book_usd > settled_usd + USD_EPS)
+            } else if has_book_fill
+                && (book_shares > settled_shares + SHARE_EPS || book_usd > settled_usd + USD_EPS)
                 && deadline_hit
             {
                 Some(format!(
@@ -1243,8 +1237,8 @@ fn spawn_invoke_poll_fallback(
 
             // Дёргаем trades только когда есть что фетчить (`size_matched > 0`); до первого матча
             // taker-Delayed остаётся одним запросом на тик — не плодим лишний трафик.
-            let size_matched_positive = decimal_snap_f64(&polled_order.size_matched)
-                .is_some_and(|s| s > 0.0);
+            let size_matched_positive =
+                decimal_snap_f64(&polled_order.size_matched).is_some_and(|s| s > 0.0);
             let trades_t0 = std::time::Instant::now();
             let polled_trades: Option<Vec<TradeResponse>> = if size_matched_positive {
                 let trades_request = TradesRequest::builder().id(order_id.clone()).build();
@@ -1308,9 +1302,16 @@ fn spawn_invoke_poll_fallback(
                         buf.push_str(&format!(
                             "    - id={} status={:?} size={:.6} price={:.6} fee_bps={:.3} \
                              tx_hash={} match_time={} last_update={} maker={} taker_order_id={}\n",
-                            t.id, t.status, size, price, fee_bps, tx_hash,
-                            t.match_time.timestamp(), t.last_update.timestamp(),
-                            t.maker_address, t.taker_order_id,
+                            t.id,
+                            t.status,
+                            size,
+                            price,
+                            fee_bps,
+                            tx_hash,
+                            t.match_time.timestamp(),
+                            t.last_update.timestamp(),
+                            t.maker_address,
+                            t.taker_order_id,
                         ));
                     }
                     buf.trim_end().to_string()
@@ -1336,7 +1337,9 @@ fn spawn_invoke_poll_fallback(
                 let state = aggregator.inner.read().await;
                 leg_summary_for_log(&state)
             };
-            aggregator.record_poll_http(polled_order, polled_trades).await;
+            aggregator
+                .record_poll_http(polled_order, polled_trades)
+                .await;
             let snapshot_after = {
                 let state = aggregator.inner.read().await;
                 leg_summary_for_log(&state)
@@ -1377,10 +1380,12 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
         .unwrap_or(Side::Buy);
 
     if !http_result.success {
-        let server_error = http_result
-            .error_msg
-            .clone()
-            .or_else(|| Some(format!("server returned success=false, status={:?}", http_result.status)));
+        let server_error = http_result.error_msg.clone().or_else(|| {
+            Some(format!(
+                "server returned success=false, status={:?}",
+                http_result.status
+            ))
+        });
         crate::test_tee_println!(
             "[order_invoke/early-fail] order_id={cloned_order_id} status={:?} side={:?} \
              server_success=false → fire `success=false` immediately (no tracker registered) | \
@@ -1435,9 +1440,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                 taking_amount: taking_z,
                 success: false,
                 partial: false,
-                error_msg: Some(
-                    "CLOB вернул пустой order_id при success=true".to_string(),
-                ),
+                error_msg: Some("CLOB вернул пустой order_id при success=true".to_string()),
             },
         );
         return;

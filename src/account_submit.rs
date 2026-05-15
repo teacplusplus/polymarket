@@ -16,7 +16,7 @@ use crate::history_sim::{
     SharedOpenPosition, StrictBook,
 };
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
-use polymarket_client_sdk::clob::types::{Side};
+use polymarket_client_sdk::clob::types::Side;
 use std::time::Duration;
 
 /// Один REST/SUBMIT timeout — также для [`crate::account_order_completion`] и invoke-poll (через дубль константы там).
@@ -61,20 +61,21 @@ pub(crate) fn spawn_open_buy_taker(
             Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
         };
         let request = PostOrderRequest {
-            asset_id: asset_id.clone(),                           // CLOB tokenId
-            side: Side::Buy,                                      // вход
-            role: OrderRole::Taker,                               // FAK BUY
-            amount: OrderAmount::UsdNotional(position_size_usd),  // notional
-            price,                                                // worst или None → slip
-            max_slippage_pp,                                      // только если price None
-            expiration: None,                                     // taker
+            asset_id: asset_id.clone(),                          // CLOB tokenId
+            side: Side::Buy,                                     // вход
+            role: OrderRole::Taker,                              // FAK BUY
+            amount: OrderAmount::UsdNotional(position_size_usd), // notional
+            price,                                               // worst или None → slip
+            max_slippage_pp,                                     // только если price None
+            expiration: None,                                    // taker
             market_end_unix_ms,
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
             strict_book,                                          // L1 для slip без GET
         };
         let pos_id_fail_log = pos_id.clone();
         let asset_fail_log = asset_id.clone();
-        let (invoke_tx, invoke_rx) = tokio::sync::oneshot::channel::<SingleOrderClobInvocationReport>();
+        let (invoke_tx, invoke_rx) =
+            tokio::sync::oneshot::channel::<SingleOrderClobInvocationReport>();
         let post_result = post_order_on_clob(
             &account,
             request,
@@ -168,13 +169,13 @@ pub async fn try_place_tp_maker(account: SharedAccount, pos_arc: SharedOpenPosit
     };
 
     let request = PostOrderRequest {
-        asset_id: asset_id.clone(),                           // outcome token
-        side: Side::Sell,                                     // TP short
-        role: OrderRole::Maker,                               // post-only в SDK
-        amount: OrderAmount::Shares(shares),                  // размер TP
-        price: Some(tp_price),                                // limit
-        max_slippage_pp: None,                                // не для maker
-        expiration: None,                                     // GTC
+        asset_id: asset_id.clone(),          // outcome token
+        side: Side::Sell,                    // TP short
+        role: OrderRole::Maker,              // post-only в SDK
+        amount: OrderAmount::Shares(shares), // размер TP
+        price: Some(tp_price),               // limit
+        max_slippage_pp: None,               // не для maker
+        expiration: None,                    // GTC
         market_end_unix_ms,
         timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
         strict_book: None,                                    // книга не нужна
@@ -377,7 +378,7 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
             expiration: None,                            // taker FAK
             market_end_unix_ms,
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC), // post_order timeout
-            strict_book: None,                           // HTTP book внутри
+            strict_book: None,                                    // HTTP book внутри
         };
         for attempt in 1..=SELL_TAKER_MAX_ATTEMPTS {
             if bail_if_superseded().await {
@@ -443,14 +444,14 @@ pub fn spawn_close_via_taker(account: SharedAccount, closing_arc: SharedClosingP
                                         r.success,
                                         r.partial,
                                         r.error_msg,
-                                    );                               
+                                    );
                                 }
                             }
                         }
                         Err(_) => {
                             crate::tee_eprintln!(
                                 "[account_submit] SELL taker колбёк потерян (attempt {attempt}/{SELL_TAKER_MAX_ATTEMPTS}): pos_id={pos_id}"
-                            );                    
+                            );
                         }
                     }
                 }

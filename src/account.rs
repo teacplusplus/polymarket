@@ -2,11 +2,11 @@
 //! Один [`SharedAccount`] на процесс: поля под отдельными `RwLock`, auth в [`ArcSwapAny`] (read-mostly).
 //! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_resolution` → `closing` → `recently_resolved_markets` → один inner на позицию.
 
-use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::account_order_completion::TrackerEntry;
+use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{INITIAL_BANKROLL, SharedClosingPosition, SharedOpenPosition};
-use crate::sim_stats::SimStats;
 use crate::real_sim::{RealSimState, interval_label, side_label};
+use crate::sim_stats::SimStats;
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use arc_swap::ArcSwapAny;

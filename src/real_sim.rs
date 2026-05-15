@@ -9,9 +9,9 @@ use crate::history_sim::{
     buy_gate, compute_p_win_now, compute_pnl_inference, load_booster, manage_positions,
     try_open_position,
 };
-use crate::sim_stats::{print_sim_stats, SimStats};
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
+use crate::sim_stats::{SimStats, print_sim_stats};
 use crate::train_mode::{Calibration, load_calibration};
 use crate::util::current_timestamp_ms;
 use crate::xframe::BookLevel;
@@ -72,7 +72,8 @@ const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
 #[derive(Debug)]
 pub struct LaneFrameChannels {
     /// [`LaneFrame`] на `(interval, side)`.
-    pub channels: Arc<RwLock<HashMap<(XFrameIntervalKind, CurrencyUpDownOutcome), mpsc::Sender<LaneFrame>>>>,
+    pub channels:
+        Arc<RwLock<HashMap<(XFrameIntervalKind, CurrencyUpDownOutcome), mpsc::Sender<LaneFrame>>>>,
 }
 
 impl LaneFrameChannels {
@@ -725,7 +726,14 @@ async fn tick_once(
             "[real_sim] {tag}: {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
             current_timestamp_ms(),
         );
-        print_sim_stats(tag, stats, bankroll_now, max_drawdown_pct_now, true, INITIAL_BANKROLL);
+        print_sim_stats(
+            tag,
+            stats,
+            bankroll_now,
+            max_drawdown_pct_now,
+            true,
+            INITIAL_BANKROLL,
+        );
     }
 
     *last_market_id = Some(market_id);
