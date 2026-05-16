@@ -17,7 +17,6 @@ use polymarket_client_sdk::clob;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::response::PostOrderResponse;
 use polymarket_client_sdk::clob::types::{Amount, OrderType, Side, SignableOrder};
-use polymarket_client_sdk::data;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::types::{Decimal, U256};
 use serde_json::json;
@@ -68,7 +67,9 @@ pub struct PostOrderRequest {
     pub(crate) strict_book: Option<StrictBook>,
 }
 
-pub use crate::account_order_completion::{SingleOrderClobInvocationReport, SingleOrderInvokeCb};
+pub use crate::account_order_completion::{
+    SingleOrderClobInvocationReport, SingleOrderInvokeCb,
+};
 
 /// `POST /order`: колбэк [`SingleOrderInvokeCb`] вызывается **ровно один раз** при любом исходе
 /// (валидация, отсутствие auth/signer, ошибка билда/подписи, HTTP/SDK error, timeout,
@@ -701,11 +702,10 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
         "[account_exit] data/positions: user=safe={safe:#x} (derived from eoa={eoa:#x})"
     );
 
-    let data_client = data::Client::default();
     let positions_req = PositionsRequest::builder().user(safe).build();
     let positions = match tokio::time::timeout(
         Duration::from_secs(EXIT_HTTP_TIMEOUT_SEC),
-        data_client.positions(&positions_req),
+        account.data.as_ref().positions(&positions_req),
     )
     .await
     {

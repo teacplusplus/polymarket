@@ -1,9 +1,11 @@
 use anyhow::Context;
-use chrono::DateTime;
 use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::constants::CurrencyUpDownOutcome;
+use polymarket_client_sdk::gamma;
+use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
+use polymarket_client_sdk::gamma::types::response::Market;
 
 /// Макс. длина имени в [`sanitized_filename_from_gamma_question`] до обрезки с `...`.
 const MAX_SANITIZED_FILENAME_LEN: usize = 180;
@@ -128,65 +130,52 @@ fn vatic_slug_window_sec_and_market_type(
     Some((window_sec, market_type))
 }
 
-pub async fn fetch_gamma_event_data_for_slug(
-    http: &reqwest::Client,
-    slug: &str,
-) -> anyhow::Result<CurrencyEventSlugData> {
-    let url = format!("https://gamma-api.polymarket.com/markets/slug/{slug}");
-    let response = http
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("Gamma GET {url}"))?;
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("Gamma HTTP error slug={slug}"))?;
-    let v: Value = response
-        .json()
-        .await
-        .with_context(|| format!("Gamma JSON slug={slug}"))?;
+#[inline]
+fn gamma_datetime_to_epoch_ms(dt: Option<chrono::DateTime<chrono::Utc>>) -> Option<i64> {
+    dt.map(|d| d.timestamp_millis())
+}
 
-    let clob_token_ids = parse_clob_token_ids_from_gamma_market(&v)
-        .with_context(|| format!("clobTokenIds slug={slug}"))?;
-    let outcomes =
-        parse_outcomes_from_gamma_market(&v).with_context(|| format!("outcomes slug={slug}"))?;
+/// Собирает [`CurrencyEventSlugData`] из ответа Gamma SDK [`Market`].
+/// Цепочка fallback для старта окна близка к прежнему разбору JSON:
+/// `event_start_time` маркета → `events[0].start_time` → `start_date` маркета → `events[0].start_date`;
+/// конец: `end_date` маркета → `events[0].end_date`.
+pub fn currency_event_slug_data_from_gamma_market(m: &Market) -> anyhow::Result<CurrencyEventSlugData> {
+    let outcomes = m.outcomes.clone().unwrap_or_default();
     if outcomes.is_empty() {
-        anyhow::bail!("пустой outcomes в ответе Gamma для slug={slug:?}");
+        anyhow::bail!("пустой outcomes в ответе Gamma для маркета");
     }
-    let currency_up_down_by_asset_id = zip_outcomes_clob_to_up_code(&outcomes, &clob_token_ids)
-        .with_context(|| format!("outcomes vs clobTokenIds slug={slug}"))?;
 
-    let gamma_question = v
-        .get("question")
-        .and_then(|x| x.as_str())
-        .map(str::to_string);
+    let clob_token_ids: Vec<String> = m
+        .clob_token_ids
+        .as_ref()
+        .map(|ids| ids.iter().map(std::string::ToString::to_string).collect())
+        .unwrap_or_default();
+    if clob_token_ids.is_empty() {
+        anyhow::bail!("ни одного clobTokenId в ответе Gamma для маркета");
+    }
+
+    let currency_up_down_by_asset_id =
+        zip_outcomes_clob_to_up_code(&outcomes, &clob_token_ids).context("outcomes vs clobTokenIds")?;
+
+    let gamma_question = m.question.clone();
 
     let mut market_event_start_ms = HashMap::new();
     let mut market_event_end_ms = HashMap::new();
 
-    if let Some(cid) = v
-        .get("conditionId")
-        .and_then(|x| x.as_str())
-        .map(str::to_string)
-    {
-        let event0 = v
-            .get("events")
-            .and_then(Value::as_array)
-            .and_then(|a| a.first());
-        let start_ms = gamma_json_date_ms(v.get("eventStartTime"))
-            .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("eventStartTime"))))
-            .or_else(|| gamma_json_date_ms(v.get("startTime")))
-            .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("startTime"))))
-            .or_else(|| gamma_json_date_ms(v.get("startDate")))
-            .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("startDate"))));
-        market_event_start_ms.insert(cid.clone(), start_ms);
-        let end_ms = gamma_json_date_ms(v.get("endDate"))
-            .or_else(|| event0.and_then(|e| gamma_json_date_ms(e.get("endDate"))));
-        market_event_end_ms.insert(cid, end_ms);
-    }
+    if let Some(cid_b256) = m.condition_id {
+        let cid = format!("{cid_b256:#x}");
+        let event0 = m.events.as_ref().and_then(|ev| ev.first());
 
-    if clob_token_ids.is_empty() {
-        anyhow::bail!("ни одного clobTokenId в ответе Gamma для slug={slug:?}");
+        let start_ms = gamma_datetime_to_epoch_ms(m.event_start_time)
+            .or_else(|| event0.and_then(|e| gamma_datetime_to_epoch_ms(e.start_time)))
+            .or_else(|| gamma_datetime_to_epoch_ms(m.start_date))
+            .or_else(|| event0.and_then(|e| gamma_datetime_to_epoch_ms(e.start_date)));
+
+        market_event_start_ms.insert(cid.clone(), start_ms);
+
+        let end_ms = gamma_datetime_to_epoch_ms(m.end_date)
+            .or_else(|| event0.and_then(|e| gamma_datetime_to_epoch_ms(e.end_date)));
+        market_event_end_ms.insert(cid, end_ms);
     }
 
     Ok(CurrencyEventSlugData {
@@ -195,6 +184,20 @@ pub async fn fetch_gamma_event_data_for_slug(
         market_event_end_ms,
         gamma_question,
     })
+}
+
+/// `GET /markets/slug/{slug}` через [`gamma::Client`] и разбор в [`CurrencyEventSlugData`].
+pub async fn fetch_gamma_event_data_for_gamma_client(
+    client: &gamma::Client,
+    slug: &str,
+) -> anyhow::Result<CurrencyEventSlugData> {
+    let request = MarketBySlugRequest::builder().slug(slug.to_string()).build();
+    let market = client
+        .market_by_slug(&request)
+        .await
+        .with_context(|| format!("Gamma market_by_slug slug={slug:?}"))?;
+    currency_event_slug_data_from_gamma_market(&market)
+        .with_context(|| format!("разбор ответа Gamma slug={slug:?}"))
 }
 
 fn gamma_outcome_label_to_currency_kind(label: &str) -> Option<CurrencyUpDownOutcome> {
@@ -225,36 +228,6 @@ fn zip_outcomes_clob_to_up_code(
     Ok(map)
 }
 
-fn parse_outcomes_from_gamma_market(v: &Value) -> anyhow::Result<Vec<String>> {
-    match v.get("outcomes") {
-        Some(Value::String(encoded)) => Ok(serde_json::from_str(encoded)?),
-        Some(Value::Array(items)) => Ok(items
-            .iter()
-            .filter_map(|x| x.as_str().map(String::from))
-            .collect()),
-        _ => Ok(Vec::new()),
-    }
-}
-
-/// RFC3339 из Gamma JSON → Unix ms UTC.
-fn gamma_json_date_ms(v: Option<&Value>) -> Option<i64> {
-    let s = v?.as_str()?;
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|dt| dt.timestamp_millis())
-}
-
-fn parse_clob_token_ids_from_gamma_market(v: &Value) -> anyhow::Result<Vec<String>> {
-    match v.get("clobTokenIds") {
-        Some(Value::String(encoded)) => Ok(serde_json::from_str(encoded)?),
-        Some(Value::Array(items)) => Ok(items
-            .iter()
-            .filter_map(|x| x.as_str().map(String::from))
-            .collect()),
-        _ => Ok(Vec::new()),
-    }
-}
-
 #[derive(Debug)]
 pub struct CountryAndIp {
     /// `blocked` из [`detect_country_and_ip`] (`GET /api/geoblock` Polymarket).
@@ -268,13 +241,11 @@ pub struct CountryAndIp {
 }
 
 /// Страна, IP и флаг геоблока Polymarket (`GET https://polymarket.com/api/geoblock`); сбой → `None`.
-pub async fn detect_country_and_ip() -> Option<CountryAndIp> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
-    let resp = client
+/// `http` — обычно [`Account::http`](crate::account::Account::http).
+pub async fn detect_country_and_ip(http: &reqwest::Client) -> Option<CountryAndIp> {
+    let resp = http
         .get("https://polymarket.com/api/geoblock")
+        .timeout(std::time::Duration::from_secs(5))
         .header(reqwest::header::USER_AGENT, "curl/8.9.1")
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
@@ -309,12 +280,10 @@ mod tests {
     async fn live_fetch_price_to_beat_from_vatic_btc_updown_5m_1778267400() -> anyhow::Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?;
+        let account = crate::account::Account::new_shared();
 
         let slug = "btc-updown-5m-1778267400";
-        let price = fetch_price_to_beat_from_vatic_api(&http, slug, "btc").await?;
+        let price = fetch_price_to_beat_from_vatic_api(account.http.as_ref(), slug, "btc").await?;
 
         let price_2dp = (price * 100.0).round() / 100.0;
         anyhow::ensure!(

@@ -64,14 +64,8 @@ const HTTP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 /// Точка входа миграции (`STATUS=migrate_price_to_beat`).
 ///
 /// Async — потому что HTTP-запросы за `priceToBeat` идут через тот же
-/// [`fetch_price_to_beat_from_vatic_api`], что и в основном цикле,
-/// и оперируют `reqwest::Client` (`tokio`-async).
-pub async fn run_price_to_beat_migration() -> Result<()> {
-    let http = reqwest::Client::builder()
-        .use_rustls_tls()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-
+/// [`fetch_price_to_beat_from_vatic_api`], что и в основном цикле.
+pub async fn run_price_to_beat_migration(http: &reqwest::Client) -> Result<()> {
     let current_size = crate::migration::current_schema_size();
     println!("[migration_ptb] current schema_size={current_size}");
 

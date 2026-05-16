@@ -77,7 +77,8 @@ impl AppMode {
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    match util::detect_country_and_ip().await {
+    let account = Account::new_shared();
+    match util::detect_country_and_ip(account.http.as_ref()).await {
         Some(info) => {
             let country = info.country.as_deref().unwrap_or("?");
             let ip = info.ip.as_deref().unwrap_or("?");
@@ -117,7 +118,7 @@ async fn main() -> Result<()> {
             rustls::crypto::ring::default_provider()
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for HTTPS)");
-            migration_price_to_beat::run_price_to_beat_migration().await?;
+            migration_price_to_beat::run_price_to_beat_migration(account.http.as_ref()).await?;
         }
         AppMode::MigrateGraphHtml => {
             migration_graph_html::run_graph_html_migration()?;
@@ -131,8 +132,6 @@ async fn main() -> Result<()> {
                 std::path::Path::new("xframes/last_default.txt"),
                 "default",
             )?;
-
-            let account = Account::new_shared();
 
             for currency in CURRENCIES {
                 let _ = ProjectManager::new((*currency).to_string(), account.clone());
@@ -155,8 +154,6 @@ async fn main() -> Result<()> {
             ))?;
             trade_csv_log::set_current_regime("real_sim");
 
-            let account = Account::new_shared();
-
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
                 real_sim::run_real_sim(project_manager, false).await?;
@@ -173,12 +170,14 @@ async fn main() -> Result<()> {
                 std::path::Path::new("xframes/last_real_sim_with_submit.txt"),
                 "real_sim_with_submit",
             )?;
+            tee_log::init_stream_tee_log_file(
+                std::path::Path::new("xframes/last_stream.txt"),
+                "real_sim_with_submit",
+            )?;
             trade_csv_log::init_submit_trade_csv_log_file(std::path::Path::new(
                 "xframes/last_real_sim_with_submit_trades.csv",
             ))?;
             trade_csv_log::set_current_regime("real_sim_with_submit");
-
-            let account = Account::new_shared();
 
             account::try_authenticate_clob_for_heartbeats(&account).await;
             assert!(

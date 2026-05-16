@@ -17,6 +17,8 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::clob::types::request::UpdateBalanceAllowanceRequest;
 use polymarket_client_sdk::clob::types::{AssetType, SignatureType};
+use polymarket_client_sdk::data;
+use polymarket_client_sdk::gamma;
 use polymarket_client_sdk::types::Address;
 use polymarket_client_sdk::{POLYGON, derive_proxy_wallet};
 use std::collections::HashMap;
@@ -64,8 +66,17 @@ pub struct Account {
     pub closing: Arc<RwLock<HashMap<LaneKey, Vec<SharedClosingPosition>>>>,
     /// Недавно зарезолвленные `market_id`; анти-повтор открытия ([`RECENTLY_RESOLVED_MARKETS_CAP`]).
     pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
+    /// HTTP с rustls; тот же `Arc`, что у [`ProjectManager::http`](crate::project_manager::ProjectManager::http).
+    pub http: Arc<reqwest::Client>,
     /// Общий unauth CLOB SDK-клиент (клоны в PM и др.).
     pub clob: Arc<clob::Client>,
+    /// Отдельный unauth CLOB только для цепочки SDK `authenticate()` ([`try_authenticate_clob_for_heartbeats_with_force`]);
+    /// не шарит inner с [`Self::clob`].
+    pub clob_auth_client: Arc<clob::Client>,
+    /// Gamma API SDK-клиент; тот же `Arc`, что у [`ProjectManager::gamma`](crate::project_manager::ProjectManager::gamma).
+    pub gamma: Arc<gamma::Client>,
+    /// Polymarket Data API (`/positions` и др.).
+    pub data: Arc<data::Client>,
     /// Authed-сессия: heartbeat и ордеры ([`crate::account_order`]).
     pub clob_authed: ArcSwapAny<Arc<Option<clob::Client<Authenticated<Normal>>>>>,
     /// EOA-подписант под ордеры; задаётся вместе с `clob_authed`.
@@ -85,6 +96,18 @@ impl Account {
             clob::Client::new(POLYMARKET_CLOB_HOST, clob::Config::default())
                 .expect("CLOB client with production host should construct"),
         );
+        let clob_auth_client = Arc::new(
+            clob::Client::new(POLYMARKET_CLOB_HOST, clob::Config::default())
+                .expect("CLOB auth-handshake client should construct"),
+        );
+        let http = Arc::new(
+            reqwest::Client::builder()
+                .use_rustls_tls()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        );
+        let gamma = Arc::new(gamma::Client::default());
+        let data = Arc::new(data::Client::default());
         Self {
             bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
             peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
@@ -94,7 +117,11 @@ impl Account {
             pending_resolution: Arc::new(RwLock::new(HashMap::new())),
             closing: Arc::new(RwLock::new(HashMap::new())),
             recently_resolved_markets: Arc::new(RwLock::new(IndexSet::new())),
+            http,
             clob,
+            clob_auth_client,
+            gamma,
+            data,
             clob_authed: ArcSwapAny::new(Arc::new(None)),
             clob_signer: ArcSwapAny::new(Arc::new(None)),
             order_invoke_hub: Arc::new(RwLock::new(HashMap::new())),
@@ -646,29 +673,15 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
         return;
     };
     if matches!(&profile, ClobAuthProfile::Poly1271 { .. }) {
-        match reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .build()
+        if let Err(err) =
+            crate::poly_chain::ensure_deposit_wallet_deployed(account.http.as_ref(), eoa).await
         {
-            Ok(http) => {
-                if let Err(err) =
-                    crate::poly_chain::ensure_deposit_wallet_deployed(&http, eoa).await
-                {
-                    crate::tee_eprintln!(
-                        "[heartbeat] deposit wallet WALLET-CREATE провалился: {err:#}",
-                    );
-                }
-            }
-            Err(err) => {
-                crate::tee_eprintln!(
-                    "[heartbeat] HTTP-клиент для WALLET-CREATE не создан: {err:#}",
-                );
-            }
+            crate::tee_eprintln!(
+                "[heartbeat] deposit wallet WALLET-CREATE провалился: {err:#}",
+            );
         }
     }
-    // Отдельный ephemeral unauth клиент — `authenticate` в SDK требует unique inner.
-    let unauth = clob::Client::new(account.clob.host().as_str(), clob::Config::default())
-        .expect("failed to create Polymarket CLOB client for auth");
+    let unauth = account.clob_auth_client.as_ref().clone();
 
     let auth_result = match profile {
         ClobAuthProfile::GnosisSafe { safe } => {

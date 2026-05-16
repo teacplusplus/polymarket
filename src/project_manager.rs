@@ -12,7 +12,7 @@ use crate::data_ws::{
 use crate::market_snapshot::aggregate_events;
 use crate::run_log;
 use crate::util::{
-    CurrencyEventSlugData, current_timestamp_ms, fetch_gamma_event_data_for_slug,
+    CurrencyEventSlugData, current_timestamp_ms, fetch_gamma_event_data_for_gamma_client,
     fetch_price_to_beat_from_vatic_api,
 };
 use crate::xframe::{
@@ -123,19 +123,17 @@ impl ProjectManager {
 
     /// WS, сборщик XFrame, циклы 5m/15m. Карта каналов [`LaneFrameChannels`](crate::real_sim::LaneFrameChannels) пуста до регистрации воркерами `real_sim`.
     ///
+    /// `http` — [`SharedAccount::http`](crate::account::Account::http);
+    /// `gamma` — [`SharedAccount::gamma`](crate::account::Account::gamma).
+    ///
     /// CLOB-клиент создаётся ровно в [`crate::account::Account::new`] и
     /// переиспользуется: один пул соединений / DNS-кэш на все валюты плюс
     /// [`crate::account::spawn_heartbeat`].
     pub fn new(currency: String, account: SharedAccount) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 
-        let http = Arc::new(
-            reqwest::Client::builder()
-                .use_rustls_tls()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        );
-        let gamma = Arc::new(gamma::Client::default());
+        let http = account.http.clone();
+        let gamma = account.gamma.clone();
         // CLOB-клиент берём из `Account` (single source of truth, см.
         // `Account::clob` doc). `clone` ⇒ клон `Arc` без `await` под
         // локом — тот же `ClientInner` внутри SDK.
@@ -266,7 +264,7 @@ impl ProjectManager {
         }
     }
 
-    /// Как [`fetch_gamma_event_data_for_slug`](crate::util::fetch_gamma_event_data_for_slug), но из кэшей PM.
+    /// Как [`fetch_gamma_event_data_for_gamma_client`](crate::util::fetch_gamma_event_data_for_gamma_client), но из кэшей PM.
     async fn try_restore_currency_event_from_slug_cache(
         &self,
         slug: &str,
@@ -443,7 +441,7 @@ impl ProjectManager {
             market_event_start_ms,
             market_event_end_ms,
             gamma_question,
-        } = match fetch_gamma_event_data_for_slug(self.http.as_ref(), slug).await {
+        } = match fetch_gamma_event_data_for_gamma_client(self.gamma.as_ref(), slug).await {
             Ok(d) => d,
             Err(e) => {
                 run_log::gamma_fetch_err(period, slug, &e);

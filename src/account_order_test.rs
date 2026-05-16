@@ -8,7 +8,9 @@ use crate::account_order_completion::SingleOrderClobInvocationReport;
 use crate::account_ws::spawn_user_ws_listener;
 use crate::constants::CurrencyUpDownOutcome;
 use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
-use crate::util::{current_timestamp_ms, detect_country_and_ip, fetch_gamma_event_data_for_slug};
+use crate::util::{
+    current_timestamp_ms, detect_country_and_ip, fetch_gamma_event_data_for_gamma_client,
+};
 use anyhow::Context;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::Side;
@@ -158,6 +160,13 @@ struct DuelHarness {
     prep_up: LegPrep,
     prep_down: LegPrep,
     done: Notify,
+    /// On-chain settled shares **отданные** maker'ом по каждой ноге (NET, кумулятив).
+    /// Пишется из финального `invoke` (single) на POST maker'a — источник правды о
+    /// том, сколько из изначального `buy_floor` уже выкуплено через resting maker. Используется
+    /// в [`duel_on_full_maker_winner_flow`] вместо обращения к Data API `/positions` для
+    /// решения «нужно ли SELL'ить opp-инвентарь» при double-winner-гонке.
+    maker_settled_shares_up: Mutex<f64>,
+    maker_settled_shares_down: Mutex<f64>,
 }
 
 impl DuelHarness {
@@ -167,6 +176,8 @@ impl DuelHarness {
             prep_up,
             prep_down,
             done: Notify::new(),
+            maker_settled_shares_up: Mutex::new(0.0),
+            maker_settled_shares_down: Mutex::new(0.0),
         })
     }
 
@@ -191,6 +202,33 @@ impl DuelHarness {
             CurrencyUpDownOutcome::Up => g.up_buy_floor = Some(shares),
             CurrencyUpDownOutcome::Down => g.down_buy_floor = Some(shares),
         }
+    }
+
+    /// Multi-progress snapshot из агрегатора maker'a: `shares_settled_cum` — кумулятивные
+    /// **отданные** shares on-chain (NET of fee) с момента POST maker'a. Сохраняем как
+    /// `max(prev, новое)` для устойчивости к возможным регрессиям из аномальных событий
+    /// (`max(settled_ws, settled_http)` на стороне агрегатора уже монотонен, но дополнительный
+    /// `max` на нашей стороне — копеечная страховка).
+    fn record_maker_settled_shares(&self, o: CurrencyUpDownOutcome, shares_settled_cum: f64) {
+        if !shares_settled_cum.is_finite() || shares_settled_cum < 0.0 {
+            return;
+        }
+        let cell = match o {
+            CurrencyUpDownOutcome::Up => &self.maker_settled_shares_up,
+            CurrencyUpDownOutcome::Down => &self.maker_settled_shares_down,
+        };
+        let mut guard = cell.lock().unwrap();
+        if shares_settled_cum > *guard {
+            *guard = shares_settled_cum;
+        }
+    }
+
+    fn get_maker_settled_shares(&self, o: CurrencyUpDownOutcome) -> f64 {
+        let cell = match o {
+            CurrencyUpDownOutcome::Up => &self.maker_settled_shares_up,
+            CurrencyUpDownOutcome::Down => &self.maker_settled_shares_down,
+        };
+        *cell.lock().unwrap()
     }
 
     /// Если maker полностью набрал объём первым — противоположный maker id (если известен) и shares «лузера».
@@ -373,7 +411,7 @@ async fn duel_unwind_inventory_when_other_leg_buy_failed(
         "duel early-exit: пустой order_id после SELL {:?}", successful,
     );
 
-    duel.done.notify_waiters();
+    duel.done.notify_one();
     Ok(())
 }
 
@@ -413,6 +451,27 @@ async fn duel_on_full_maker_winner_flow(
     };
 
     let other_outcome = maker_outcome.opposite();
+    let opp_prep = harness.prep_ref(other_outcome);
+
+    // Double-winner защита: оба maker могли сматчиться почти одновременно. Источник правды
+    // об «уже зачисленных on-chain shares opp maker'a» — промежуточные/финальные обновления
+    // `harness.maker_settled_shares_*` из `invoke` maker'a (см. `DuelHarness::record_maker_settled_shares`).
+    // Финальный `SingleOrderInvokeCb` для opp maker'a мог ещё не вызваться; для main maker'а
+    // single-invoke несёт settled-итог после on-chain.
+    //
+    // Если opp maker'у успело уйти ≥ `opp_sh_floor - lot`, цели «продать остаток» нет:
+    // купленные в BUY-ноге shares уже выкупил opp maker через свой собственный fill, и
+    // SELL на эти же shares падает на CLOB-balance/allowance check (баланс уже сменился).
+    let opp_maker_settled = harness.get_maker_settled_shares(other_outcome);
+    let remaining_inventory = (opp_sh_floor - opp_maker_settled).max(0.0);
+    // Floor до CLOB-lot (0.01) — sub-lot хвост биржа всё равно не примет в новый ордер.
+    let sell_shares = (remaining_inventory * 100.0).floor() / 100.0;
+    eprintln!(
+        "[от старта {wall_ms} ms] duel: opp {:?} maker settled (saved)={:.4} sh (saved_floor={:.4}); \
+         remaining_inventory={:.4} → SELL={:.4}",
+        other_outcome, opp_maker_settled, opp_sh_floor, remaining_inventory, sell_shares,
+    );
+
     duel_cancel_if_some(
         &account,
         &format!("отмен противоположного maker ({other_outcome:?})"),
@@ -421,13 +480,23 @@ async fn duel_on_full_maker_winner_flow(
     )
     .await;
 
-    let opp_prep = harness.prep_ref(other_outcome);
+    if sell_shares < opp_prep.min_order_size {
+        eprintln!(
+            "[от старта {wall_ms} ms] duel: opp {:?} SELL пропущен — sell_shares={:.4} < min_order_size={:.4} \
+             (opp maker уже выкупил инвентарь через свой fill, либо остался sub-lot хвост); \
+             считаем gracefully unwound — double-winner",
+            other_outcome, sell_shares, opp_prep.min_order_size,
+        );
+        harness.done.notify_one();
+        return;
+    }
+
     let flatten_res = duel_taker_flatten_floor(
         &account,
         &slug,
         other_outcome,
         &opp_prep.asset_id,
-        opp_sh_floor,
+        sell_shares,
         opp_prep.min_order_size,
         &format!("unwind loser taker {:?}", other_outcome),
     )
@@ -438,7 +507,7 @@ async fn duel_on_full_maker_winner_flow(
             eprintln!(
                 "[от старта {wall_ms} ms] duel: unwind противоположного {:?}: sold floor={:.4}, maker/taking {:?}/{:?}, order_id={:?}, success={}, partial={}, err={:?}",
                 other_outcome,
-                opp_sh_floor,
+                sell_shares,
                 sell_rep.making_amount,
                 sell_rep.taking_amount,
                 sell_rep.order_id,
@@ -461,7 +530,7 @@ async fn duel_on_full_maker_winner_flow(
         }
     }
 
-    harness.done.notify_waiters();
+    harness.done.notify_one();
 }
 
 /// Сигнал в `rx`, когда BUY-колбэк выставил maker и завершился весь `spawn` цикл (ошибочный BUY тоже).
@@ -590,6 +659,10 @@ async fn duel_post_buy_then_maker_in_callback(
                     });
 
                 let (mk_invoke_tx, mk_invoke_rx) = oneshot::channel();
+                // `record_maker_settled_shares` из финального отчёта maker SELL (NET shares в
+                // making_amount). Раньше дублировали из progress-колбэка; теперь только финал.
+                let duel_for_invoke = Arc::clone(&duel);
+                let outcome_for_invoke = outcome_t;
                 let post_res = post_order_on_clob(
                     &account,
                     PostOrderRequest {
@@ -605,6 +678,9 @@ async fn duel_post_buy_then_maker_in_callback(
                         strict_book: None,
                     },
                     Box::new(move |rep| {
+                        if let OrderAmount::Shares(s) = rep.making_amount {
+                            duel_for_invoke.record_maker_settled_shares(outcome_for_invoke, s);
+                        }
                         eprintln!(
                             "[maker POST {:?}] ВХОД в invoke финала лимита: success={}, partial={}, order_id={:?}, making={:?}, taking={:?}, err={:?}",
                             outcome_t,
@@ -774,7 +850,7 @@ async fn duel_abort_race_cancel_any_makers_then_flatten_both_fills(
         "abort-race DOWN unwind: {:?}", dn_sell,
     );
 
-    duel.done.notify_waiters();
+    duel.done.notify_one();
     eprintln!(
         "[от старта {wall_ms} ms] duel early-exit завершён: cancel (если были) + оба taker SELL",
     );
@@ -860,7 +936,7 @@ async fn duel_emergency_flatten_and_cancel_all(
         }
     }
 
-    duel.done.notify_waiters();
+    duel.done.notify_one();
 }
 
 /// Live BUY→SELL taker по текущему 5m BTC up/down: берётся **минимальный допустимый**
@@ -891,22 +967,18 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         }};
     }
 
-    // Открываем отдельный test-only tee-канал: подробные `[order_invoke/...]` логи
+    // Открываем отдельный stream tee-канал: подробные `[order_invoke/...]` логи
     // (HTTP-запросы, WS-события, агрегация, latency, replay-инструкция) идут **только**
-    // в этот файл и не засоряют stdout/stderr. Файл — на каждый прогон уникальный
-    // (timestamp в имени), кладём в `target/` рядом с артефактами cargo. Сбой
-    // инициализации сам по себе не валит тест — макросы `test_tee_*` без открытого
-    // файла становятся no-op.
-    let log_path = std::path::PathBuf::from(format!(
-        "target/live_taker_roundtrip_btc_updown_5m_{}.log",
-        current_timestamp_ms()
-    ));
+    // в этот файл и не засоряют stdout/stderr. Фиксированный путь — `xframes/last_stream.txt`
+    // (относительно cwd прогона, как `init_tee_log_file` в main). Сбой инициализации сам по себе не валит
+    // тест — макросы `stream_tee_*` без открытого файла становятся no-op.
+    let log_path = std::path::Path::new("xframes/last_stream.txt");
     if let Err(err) =
-        crate::tee_log::init_test_tee_log_file(&log_path, "live_taker_roundtrip_btc_updown_5m")
+        crate::tee_log::init_stream_tee_log_file(&log_path, "live_taker_roundtrip_btc_updown_5m")
     {
         let (dt, wall) = evt_ms!(last_evt, t0);
         eprintln!(
-            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: init_test_tee_log_file({}) failed: {err:#} \
+            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: init_stream_tee_log_file({}) failed: {err:#} \
              — test продолжит, но детальный `[order_invoke/...]` лог в файл писаться не будет",
             log_path.display(),
         );
@@ -918,7 +990,8 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         );
     }
 
-    let geo = detect_country_and_ip()
+    let account = Account::new_shared();
+    let geo = detect_country_and_ip(account.http.as_ref())
         .await
         .ok_or_else(|| {
             let (dt, wall) = evt_ms!(last_evt, t0);
@@ -953,11 +1026,8 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC))
-        .build()?;
     let slug = current_btc_updown_5m_slug(current_timestamp_ms());
-    let gamma = fetch_gamma_event_data_for_slug(&http, &slug).await?;
+    let gamma = fetch_gamma_event_data_for_gamma_client(account.gamma.as_ref(), &slug).await?;
     let cu = &gamma.currency_up_down_by_asset_id;
     let (dt, wall) = evt_ms!(last_evt, t0);
     anyhow::ensure!(
@@ -965,7 +1035,6 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         "[от старта {wall} ms | с прошлого {dt} ms] Gamma не вернул clobTokenIds для slug={slug}",
     );
 
-    let account = Account::new_shared();
     try_authenticate_clob_for_heartbeats(&account).await;
     let (dt, wall) = evt_ms!(last_evt, t0);
     anyhow::ensure!(
@@ -996,7 +1065,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
             Some((_, _, _, best_floor)) => row.2 < *best_floor - 1e-12,
         };
         if take {
-            best = Some((cand_id.clone(), row.0, row.1, row.2));
+            best = Some((cand_id.to_string(), row.0, row.1, row.2));
         }
     }
     let (asset_id, min_order_size, best_ask_f64, market_floor_buy_usd) =
@@ -1185,7 +1254,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
     // Гарантируем, что хвост `[order_invoke/...]` ушёл на диск до возврата из теста.
     // На fail-путях (ранние `?`/`ensure!`) `BufWriter` всё равно сфлашится в Drop
     // статика при штатном завершении процесса.
-    crate::tee_log::finish_test_tee_log();
+    crate::tee_log::finish_stream_tee_log();
     Ok(())
 }
 
@@ -1234,16 +1303,13 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
 
     let wall_anchor = Arc::new(t0);
 
-    let log_path = std::path::PathBuf::from(format!(
-        "target/live_duel_up_down_maker_race_tp10_{}.log",
-        current_timestamp_ms()
-    ));
+    let log_path = std::path::Path::new("xframes/last_stream.txt");
     if let Err(err) =
-        crate::tee_log::init_test_tee_log_file(&log_path, "live_duel_up_down_maker_race_tp10")
+        crate::tee_log::init_stream_tee_log_file(&log_path, "live_duel_up_down_maker_race_tp10")
     {
         let (dt, wall) = evt_ms!(last_evt, t0);
         eprintln!(
-            "[от старта {wall} ms | с прошлого {dt} ms] live_duel: init_test_tee_log_file({}) failed: {err:#}",
+            "[от старта {wall} ms | с прошлого {dt} ms] live_duel: init_stream_tee_log_file({}) failed: {err:#}",
             log_path.display(),
         );
     } else {
@@ -1254,7 +1320,8 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         );
     }
 
-    let geo = detect_country_and_ip()
+    let account = Account::new_shared();
+    let geo = detect_country_and_ip(account.http.as_ref())
         .await
         .ok_or_else(|| {
             let (dt, wall) = evt_ms!(last_evt, t0);
@@ -1283,11 +1350,8 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC))
-        .build()?;
     let slug = current_btc_updown_5m_slug(current_timestamp_ms());
-    let gamma = fetch_gamma_event_data_for_slug(&http, &slug).await?;
+    let gamma = fetch_gamma_event_data_for_gamma_client(account.gamma.as_ref(), &slug).await?;
     let cu = &gamma.currency_up_down_by_asset_id;
     let (dt, wall) = evt_ms!(last_evt, t0);
     anyhow::ensure!(
@@ -1295,7 +1359,6 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         "[от старта {wall} ms | с прошлого {dt} ms] Gamma: пусто для slug={slug}",
     );
 
-    let account = Account::new_shared();
     try_authenticate_clob_for_heartbeats(&account).await;
     let (dt, wall) = evt_ms!(last_evt, t0);
     anyhow::ensure!(
@@ -1377,7 +1440,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 up_sh,
             )
             .await?;
-            crate::tee_log::finish_test_tee_log();
+            crate::tee_log::finish_stream_tee_log();
             return Ok(());
         }
         (None, Some(dn_sh)) => {
@@ -1395,7 +1458,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 dn_sh,
             )
             .await?;
-            crate::tee_log::finish_test_tee_log();
+            crate::tee_log::finish_stream_tee_log();
             return Ok(());
         }
         (Some(up_sh), Some(dn_sh)) => {
@@ -1430,7 +1493,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                     reason,
                 )
                 .await?;
-                crate::tee_log::finish_test_tee_log();
+                crate::tee_log::finish_stream_tee_log();
                 return Ok(());
             }
 
@@ -1443,6 +1506,21 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 LIVE_DUAL_MAKER_RACE_DEADLINE_SEC,
             );
         }
+    }
+
+    // Защита от race с `notify_one`: maker-callback может вызвать `done.notify_one()` ДО того,
+    // как мы дойдём до `notified().await` (kейс double-winner: оба maker matched в ранней WS-пачке
+    // ещё до того, как `tokio::join!` BUY-ног отдал нам управление). С `notify_one` permit
+    // накапливается, поэтому следующий `notified().await` всё равно получит сигнал моментально;
+    // но если winner уже set'нут — пройдём OK без лишней асинхронной сериализации и быстрее.
+    if let Some(winner) = duel_h.snapshot_state_unlocked_clone().winner {
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        eprintln!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_duel OK (winner-already): победила сторона {winner:?} \
+             до того, как главный поток дошёл до `done.notified()` — нет смысла ждать таймаут",
+        );
+        crate::tee_log::finish_stream_tee_log();
+        return Ok(());
     }
 
     match tokio::time::timeout(
@@ -1483,6 +1561,6 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         }
     }
 
-    crate::tee_log::finish_test_tee_log();
+    crate::tee_log::finish_stream_tee_log();
     Ok(())
 }

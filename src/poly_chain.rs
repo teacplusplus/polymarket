@@ -45,6 +45,7 @@ use alloy::sol;
 use alloy::sol_types::SolValue;
 use anyhow::Context as _;
 use serde::Serialize;
+use std::time::Duration;
 
 /// Polymarket Safe Factory (deployer-адрес для CREATE2 деривации Safe-адреса
 /// по EOA). Источник: `builder-relayer-client/src/config/index.ts`,
@@ -211,6 +212,7 @@ pub(crate) async fn ensure_deposit_wallet_deployed(
         .header("RELAYER_API_KEY", &cfg.relayer_api_key)
         .header("RELAYER_API_KEY_ADDRESS", &cfg.relayer_api_key_address)
         .json(&body)
+        .timeout(Duration::from_secs(20))
         .send()
         .await
         .context("POST /submit WALLET-CREATE")?;

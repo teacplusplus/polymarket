@@ -848,7 +848,7 @@ impl PostOrderInvokeAggregator {
             finished: Arc::new(RwLock::new(false)),
         });
 
-        crate::test_tee_println!(
+        crate::stream_tee_println!(
             "[order_invoke/start] order_id={order_id} side={side:?} role={role:?} \
              asset_id={asset_id} target={target:?} expiration_unix_ms={expiration_unix_ms:?} \
              market_end_unix_ms={market_end_unix_ms:?} started_at_ms={timestamp_ms_started}",
@@ -1091,9 +1091,22 @@ impl PostOrderInvokeAggregator {
         }
     }
 
-    /// `true` если **терминальный** объём (settled + failed) догнал book-matched leg
-    /// (по обеим осям). Используется для finalize cancel-сценариев: после `Canceled` делать
+    /// `true` если **терминальный** объём (settled + failed) **по shares-оси** догнал
+    /// book-matched leg. Используется для finalize cancel-сценариев: после `Canceled` делать
     /// вид, что больше fills не будет, но ждать settlement уже состоявшегося book-match'а.
+    ///
+    /// **Только shares-ось** — единственный источник правды о том, "что было сматчено".
+    /// USD-ось book'a — это **переоценка** на основе цены из POST-ответа (`size_matched ×
+    /// post.price`), которая часто не равна цене реального on-chain трейда:
+    /// - Taker BUY с лимитом выше топ-аска получает фактический fill по **лучшей** цене
+    ///   → `settled_usd < book_usd` (заплатили меньше) → проверка `terminal_usd ≥ book_usd`
+    ///   была бы навсегда false, и агрегатор зависал бы.
+    /// - Taker SELL аналогично — settled_usd может быть больше book_usd при «лучшей» цене.
+    ///
+    /// Поэтому USD-ось из этой проверки **исключена**: shares-баланс — однозначный (CLOB
+    /// сматчил столько-то лотов, on-chain учли столько-то/failed столько-то), а USD —
+    /// производная от цены трейда; финальный отчёт всё равно строится из реальных
+    /// `settled_*` сумм (см. [`Self::build_report`]).
     ///
     /// **Failed-трейды** учитываются здесь как terminal-объём, потому что для них релайер
     /// сдался — больше изменений по этим `trade_id` не будет ни on-chain, ни в книге. Без этого
@@ -1118,9 +1131,6 @@ impl PostOrderInvokeAggregator {
         let book_shares = order_amount_shares_scalar(book_leg.taking_amount);
         let settled_shares = order_amount_shares_scalar(settled_leg.taking_amount);
         let failed_shares = order_amount_shares_scalar(failed_leg.taking_amount);
-        let book_usd = order_amount_usd_scalar(book_leg.making_amount);
-        let settled_usd = order_amount_usd_scalar(settled_leg.making_amount);
-        let failed_usd = order_amount_usd_scalar(failed_leg.making_amount);
 
         if state.size_matched_observed > book_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE
         {
@@ -1128,14 +1138,13 @@ impl PostOrderInvokeAggregator {
         }
 
         let terminal_shares = settled_shares + failed_shares;
-        let terminal_usd = settled_usd + failed_usd;
-        terminal_shares + SHARE_EPS >= book_shares && terminal_usd + USD_EPS >= book_usd
+        terminal_shares + SHARE_EPS >= book_shares
     }
 
     /// Ready-to-finalize **строго** по событиям от CLOB — никаких timestamp-фоллбэков:
     /// 1. settlement покрыл целевой объём (`success=true` в отчёте), **или**
     /// 2. book-level терминал заявки достигнут ([`InvokeAggInner::book_terminal_reached`])
-    ///    **и** terminal-объём (`settled + failed`) догнал book-match по обеим осям — больше
+    ///    **и** terminal-объём (`settled + failed`) по **shares** догнал book-match — больше
     ///    изменений не будет:
     ///    - Taker — сразу после settlement (FAK не остаётся в книге).
     ///    - Maker `CANCELED`/`UNMATCHED` — безусловно (ордер ушёл из книги; для GTD это и есть
@@ -1304,7 +1313,7 @@ impl PostOrderInvokeAggregator {
         let http_polls = *self.http_poll_count.read().await;
         let ws_trades = *self.ws_trade_count.read().await;
 
-        crate::test_tee_println!(
+        crate::stream_tee_println!(
             "[order_invoke/final] order_id={committed_order_id} elapsed_ms={elapsed_ms} \
              http_polls={http_polls} ws_trades={ws_trades} side={side:?} role={role:?} \
              target={target:?} | success={success} partial={partial} making={making:?} \
@@ -1323,7 +1332,7 @@ impl PostOrderInvokeAggregator {
         // CLOB `/trades` требует L2-auth (`POLY-API-KEY/PASSPHRASE/SIGNATURE/TIMESTAMP`),
         // поэтому простой curl без подписи не сработает — даём минимум для SDK-replay'a
         // и публичные ссылки на explorer для уже эмитнутых трейдов (`tx_hash` поля).
-        crate::test_tee_println!(
+        crate::stream_tee_println!(
             "[order_invoke/replay] order_id={committed_order_id} asset_id={asset_id} \
              side={side:?} | для ручной сверки повторите `auth_client.trades(\
              TradesRequest::builder().id(\"{committed_order_id}\").build(), None)` \
@@ -1333,7 +1342,7 @@ impl PostOrderInvokeAggregator {
             side = self.side,
         );
 
-        self.slot.fire(report);
+        spawn_fire_invocation_report(&self.slot, report);
     }
 }
 
@@ -1373,7 +1382,7 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
     let Some(tracker_entry) = trackers_snapshot.get(order_id) else {
         // Observability: WS прилетел до регистрации трекера или после finalize — это норма для
         // чужих ордеров, но при разборе кейса полезно знать, что событие отброшено.
-        crate::test_tee_println!(
+        crate::stream_tee_println!(
             "[order_invoke/ws] dropped (no tracker): order_id={order_id} trade_id={trade_id} \
              size={size} price={price} fee_bps={fee_rate_bps} settled={is_settled_on_chain} \
              failed={is_terminal_failed}",
@@ -1413,7 +1422,7 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
         let state = invoke_aggregator_arc.inner.read().await;
         leg_summary_for_log(&state)
     };
-    crate::test_tee_println!(
+    crate::stream_tee_println!(
         "[order_invoke/ws] order_id={order_id} trade_id={trade_id} size={size:.6} \
          price={price:.6} fee_bps={fee_rate_bps:.3} settled={is_settled_on_chain} \
          failed={is_terminal_failed} → ws_count={ws_count_after} | {snapshot_before} → {snapshot_after}",
@@ -1458,7 +1467,7 @@ fn spawn_invoke_poll_fallback(
     aggregator: Arc<PostOrderInvokeAggregator>,
 ) {
     tokio::spawn(async move {
-        crate::test_tee_println!(
+        crate::stream_tee_println!(
             "[order_invoke/poll/spawn] order_id={order_id} interval_ms={INVOKE_FALLBACK_POLL_MS} \
              trades_pages_max={TRADES_MAX_PAGES_PER_POLL} \
              http_timeout_s={ORDER_HTTP_POLL_TIMEOUT_SEC} \
@@ -1478,7 +1487,7 @@ fn spawn_invoke_poll_fallback(
             let auth_client = match (**account.clob_authed.load()).clone() {
                 Some(client) => client,
                 None => {
-                    crate::test_tee_eprintln!(
+                    crate::stream_tee_eprintln!(
                         "[order_invoke/poll/skip] order_id={order_id} clob_authed=None — \
                          пропуск итерации, ждём heartbeat re-auth",
                     );
@@ -1501,14 +1510,14 @@ fn spawn_invoke_poll_fallback(
             {
                 Ok(Ok(response)) => response,
                 Ok(Err(error)) => {
-                    crate::test_tee_eprintln!(
+                    crate::stream_tee_eprintln!(
                         "[order_invoke/poll/{iter_idx}] GET /order order_id={order_id} \
                          error: {error:#}",
                     );
                     continue;
                 }
                 Err(_) => {
-                    crate::test_tee_eprintln!(
+                    crate::stream_tee_eprintln!(
                         "[order_invoke/poll/{iter_idx}] GET /order order_id={order_id} \
                          timeout > {ORDER_HTTP_POLL_TIMEOUT_SEC}s",
                     );
@@ -1549,7 +1558,7 @@ fn spawn_invoke_poll_fallback(
                             cursor = Some(page.next_cursor);
                         }
                         Ok(Err(error)) => {
-                            crate::test_tee_eprintln!(
+                            crate::stream_tee_eprintln!(
                                 "[order_invoke/poll/{iter_idx}] GET /trades?id={order_id} \
                                  page={pages_fetched} error: {error:#}",
                             );
@@ -1557,7 +1566,7 @@ fn spawn_invoke_poll_fallback(
                             break;
                         }
                         Err(_) => {
-                            crate::test_tee_eprintln!(
+                            crate::stream_tee_eprintln!(
                                 "[order_invoke/poll/{iter_idx}] GET /trades?id={order_id} \
                                  page={pages_fetched} timeout > {ORDER_HTTP_POLL_TIMEOUT_SEC}s",
                             );
@@ -1610,7 +1619,7 @@ fn spawn_invoke_poll_fallback(
                 }
             };
 
-            crate::test_tee_println!(
+            crate::stream_tee_println!(
                 "[order_invoke/poll/{iter_idx}] order_id={order_id} \
                  GET /order → status={order_status_str} size_matched={size_matched_log:.6} \
                  price={price_log:.6} ({order_elapsed_ms}ms); GET /trades → \
@@ -1629,7 +1638,7 @@ fn spawn_invoke_poll_fallback(
                 let state = aggregator.inner.read().await;
                 leg_summary_for_log(&state)
             };
-            crate::test_tee_println!(
+            crate::stream_tee_println!(
                 "[order_invoke/poll/{iter_idx}/agg] order_id={order_id} | {snapshot_before} → {snapshot_after}",
             );
 
@@ -1671,7 +1680,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                 http_result.status
             ))
         });
-        crate::test_tee_println!(
+        crate::stream_tee_println!(
             "[order_invoke/early-fail] order_id={cloned_order_id} status={:?} side={:?} \
              server_success=false → fire `success=false` immediately (no tracker registered) | \
              error_msg={server_error:?}",
