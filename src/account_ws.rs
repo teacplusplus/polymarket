@@ -4,7 +4,8 @@
 use crate::account::SharedAccount;
 use crate::account_order_completion::{
     accumulate_invoke_from_ws_trade, notify_terminal_ws_order_snapshot,
-    ws_trade_status_settled_on_chain,
+    ws_trade_status_for_invoke_book_match, ws_trade_status_settled_on_chain,
+    ws_trade_status_terminal_failed,
 };
 use crate::util::current_timestamp_ms;
 use futures_util::{SinkExt, StreamExt};
@@ -224,14 +225,28 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             let side = value.get("side").and_then(Value::as_str).unwrap_or("?");
             let order_status = value.get("status").and_then(Value::as_str).unwrap_or("?");
             let order_kind = value.get("type").and_then(Value::as_str).unwrap_or("?");
+            // `original_size`/`size_matched` приходят строками-десятичными в `OrderMessage`
+            // user-канала. Парсим их и пробрасываем в invoke-агрегатор: его гейт
+            // book-fully-matched (см. `is_book_fully_matched_observed` в
+            // `account_order_completion.rs`) использует именно их, чтобы `MATCHED` от
+            // Polymarket не выстрелил колбэк прематурно для partial maker'а.
+            let original_size = parse_decimal_str(value.get("original_size"));
+            let size_matched = parse_decimal_str(value.get("size_matched"));
             crate::tee_println!(
-                "[user_ws] order: id={order_id} side={side} type={order_kind} status={order_status}",
+                "[user_ws] order: id={order_id} side={side} type={order_kind} status={order_status} \
+                 original_size={original_size:?} size_matched={size_matched:?}",
             );
             if order_id.is_empty() {
                 return;
             }
-            notify_terminal_ws_order_snapshot(&account.order_invoke_hub, order_id, order_status)
-                .await;
+            notify_terminal_ws_order_snapshot(
+                &account.order_invoke_hub,
+                order_id,
+                order_status,
+                original_size,
+                size_matched,
+            )
+            .await;
         }
         "trade" => {
             let trade_id = value.get("id").and_then(Value::as_str).unwrap_or("");
@@ -255,12 +270,18 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             // `making_amount`/`taking_amount` в финальном колбэке были **net of fee**.
             // Отсутствует → 0 bps (для большинства маркетов Polymarket V2 сейчас так).
             let trade_fee_rate_bps = parse_decimal_str(value.get("fee_rate_bps")).unwrap_or(0.0);
-            // `is_book_terminal`: трейд имеет смысл учитывать в book-match агрегате
-            // (`MATCHED|MINED|CONFIRMED`); `RETRYING|FAILED` и пр. — пропускаем.
+            // `is_book_terminal`: трейд достоин учёта в book-match агрегате — это любой статус
+            // его жизненного цикла, включая terminal-failed (`MATCHED|RETRYING|MINED|
+            // CONFIRMED|FAILED`). Дедуп по `trade_id` в `record_trade_aggregate_from_ws_event`
+            // гарантирует, что повторные события одного `trade_id` не дают двойного счёта.
             // `is_settled_on_chain`: настоящий on-chain факт (`MINED|CONFIRMED`) —
             // только этот сигнал гейтит финальный `success=true` колбэка.
-            let is_book_terminal = matches!(trade_status, "MATCHED" | "MINED" | "CONFIRMED");
+            // `is_terminal_failed`: релайер сдался (`FAILED`) — on-chain ничего не зачислится;
+            // учитывается как terminal-объём в `settlement_caught_up_with_match`, иначе при
+            // race «CANCELED + один трейд завис на чейне как Failed» агрегатор бы зависал.
+            let is_book_terminal = ws_trade_status_for_invoke_book_match(trade_status);
             let is_settled_on_chain = ws_trade_status_settled_on_chain(trade_status);
+            let is_terminal_failed = ws_trade_status_terminal_failed(trade_status);
             if !taker_order_id.is_empty() {
                 if is_book_terminal && let (Some(size), Some(price)) = (trade_size, trade_price) {
                     accumulate_invoke_from_ws_trade(
@@ -271,6 +292,7 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                         price,
                         trade_fee_rate_bps,
                         is_settled_on_chain,
+                        is_terminal_failed,
                     )
                     .await;
                 }
@@ -298,6 +320,7 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                             price,
                             maker_fee_rate_bps,
                             is_settled_on_chain,
+                            is_terminal_failed,
                         )
                         .await;
                     }

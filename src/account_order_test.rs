@@ -138,8 +138,8 @@ async fn duel_leg_prep_for_outcome(
 /// Ждём финала duel: один maker полностью исполнился (success, не partial),
 /// противоположный maker сняли, противоположные shares — в taker.
 const LIVE_DUAL_MAKER_RACE_DEADLINE_SEC: u64 = 180;
-/// Лимит-продажа maker на +20% к средней цене taker BUY.
-const LIVE_MAKER_TP_MULT: f64 = 1.2;
+/// Лимит-продажа maker на **+10%** к средней цене taker BUY.
+const LIVE_MAKER_TP_MULT: f64 = 1.1;
 
 #[derive(Clone, Debug, Default)]
 struct DuelState {
@@ -265,6 +265,8 @@ async fn duel_taker_flatten_floor(
             "duel flatten {invoke_label}: shares_floor={shares_floor:.4} < min_order_size={min_sz:.6} slug={slug} outcome={outcome:?}",
         );
     }
+    let invoke_label_static = invoke_label.to_string();
+    let invoke_lost = invoke_label_static.clone();
     let (tx, rx) = oneshot::channel();
     post_order_on_clob(
         account,
@@ -281,13 +283,98 @@ async fn duel_taker_flatten_floor(
             strict_book: None,
         },
         Box::new(move |rep| {
+            eprintln!(
+                "[flatten {invoke_label_static}] taker SELL finalize: outcome={:?} success={}, partial={}, \
+                 order_id={:?}, making={:?}, taking={:?}, error_msg={:?}",
+                outcome,
+                rep.success,
+                rep.partial,
+                rep.order_id,
+                rep.making_amount,
+                rep.taking_amount,
+                rep.error_msg,
+            );
             let _ = tx.send(rep);
         }),
     )
     .await
     .with_context(|| format!("duel flatten POST taker slug={slug} invoke={invoke_label}"))?;
     rx.await
-        .map_err(|_| anyhow::anyhow!("duel flatten: invoke-колбёк потерян ({invoke_label})"))
+        .map_err(|_| anyhow::anyhow!("duel flatten: invoke-колбёк потерян ({invoke_lost})"))
+}
+
+/// Противоположная нога **не купила** (нет `buy_floor`), на этой — есть инвентарь и (возможно) maker.
+/// Снимаем maker, продаём все купленные shares taker-ом, выходим из сценария без ожидания гонки.
+async fn duel_unwind_inventory_when_other_leg_buy_failed(
+    account: &SharedAccount,
+    duel: Arc<DuelHarness>,
+    slug: &str,
+    wall_ms: u64,
+    successful: CurrencyUpDownOutcome,
+    failed_peer: CurrencyUpDownOutcome,
+    bought_floor_shares: f64,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit: нога {:?} не получила успешный taker BUY; \
+         успешная нога {:?}: снимаем maker (если был) → taker SELL всех {:.2} shares (floor)",
+        failed_peer, successful, bought_floor_shares,
+    );
+
+    let snap = duel.snapshot_state_unlocked_clone();
+    let maker_oid_to_cancel = match successful {
+        CurrencyUpDownOutcome::Up => snap.maker_id_up.clone(),
+        CurrencyUpDownOutcome::Down => snap.maker_id_down.clone(),
+    };
+
+    duel_cancel_if_some(
+        account,
+        &format!("ранний выход: снять maker {:?} перед market-SELL всей позиции", successful),
+        maker_oid_to_cancel.as_ref(),
+        wall_ms,
+    )
+    .await;
+
+    let prep = duel.prep_ref(successful);
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit: taker SELL всего набранного {:?} slug={slug} asset_id={} shares={:.2}",
+        successful, prep.asset_id, bought_floor_shares,
+    );
+
+    let sell_rep = duel_taker_flatten_floor(
+        account,
+        slug,
+        successful,
+        &prep.asset_id,
+        bought_floor_shares,
+        prep.min_order_size,
+        "early_exit_other_leg_buy_failed_flatten_all",
+    )
+    .await?;
+
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit: продажа успешной ноги {:?} завершена — \
+         отдано (making) {:?}, получено (taking) {:?}, order_id={:?}, partial={}, ok={}",
+        successful,
+        sell_rep.making_amount,
+        sell_rep.taking_amount,
+        sell_rep.order_id,
+        sell_rep.partial,
+        sell_rep.success,
+    );
+
+    anyhow::ensure!(
+        sell_rep.success,
+        "duel early-exit: SELL успешной ноги {:?} финал без success slug={slug}, err={:?}",
+        successful,
+        sell_rep.error_msg,
+    );
+    anyhow::ensure!(
+        sell_rep.order_id.as_deref().is_some_and(|id| !id.is_empty()),
+        "duel early-exit: пустой order_id после SELL {:?}", successful,
+    );
+
+    duel.done.notify_waiters();
+    Ok(())
 }
 
 async fn duel_on_full_maker_winner_flow(
@@ -299,11 +386,13 @@ async fn duel_on_full_maker_winner_flow(
     maker_rep: SingleOrderClobInvocationReport,
 ) {
     eprintln!(
-        "[от старта {wall_ms} ms] duel: maker финал {:?}: success={}, partial={}, order_id={:?}, error_msg={:?}",
+        "[от старта {wall_ms} ms] duel: ВХОД maker finalize {:?} колбёк после settle: БЫЛИ поставлены продажи-maker; финал rep: success={}, partial={}, order_id={:?}, making={:?}, taking={:?}, err={:?}",
         maker_outcome,
         maker_rep.success,
         maker_rep.partial,
         maker_rep.order_id,
+        maker_rep.making_amount,
+        maker_rep.taking_amount,
         maker_rep.error_msg,
     );
 
@@ -426,9 +515,13 @@ async fn duel_post_buy_then_maker_in_callback(
                 let _ack = AckDrop(Some(chain_done_tx));
                 let wall_ms = wall_spawn.elapsed().as_millis() as u64;
                 eprintln!(
-                    "[от старта {wall_ms} ms] duel: BUY taker финал {:?} asset={}: success={}, partial={}, order_id={:?}, making/taking {:?}/{:?}, err={:?}",
+                    "[от старта {wall_ms} ms] duel: ВХОД в invoke-колбёк taker BUY {:?} slug={} asset_id={} (целевой notion ≈{buy_usd:.4} USDC worst={worst:.5})",
+                    outcome_t, slug_buy, aid,
+                );
+                eprintln!(
+                    "[от старта {wall_ms} ms] duel: taker BUY {:?} итог после settle: успех={} частичн.={} order_id={:?}; \
+                     КУПИЛИ/потратили making={:?}, taking={:?}, err={:?}",
                     outcome_t,
-                    aid,
                     buy_rep.success,
                     buy_rep.partial,
                     buy_rep.order_id,
@@ -437,34 +530,55 @@ async fn duel_post_buy_then_maker_in_callback(
                     buy_rep.error_msg,
                 );
                 if !buy_rep.success {
+                    eprintln!(
+                        "[от старта {wall_ms} ms] duel: taker BUY {:?} ПРОВАЛ — maker не выставляется, вторая нога может разгрузить сценарий",
+                        outcome_t,
+                    );
                     return;
                 }
                 let shares_net = match buy_rep.taking_amount {
                     OrderAmount::Shares(s) => s,
                     OrderAmount::UsdNotional(_) => {
-                        eprintln!("duel: BUY {:?}: ожидались Shares в taking_amount", outcome_t);
+                        eprintln!(
+                            "[от старта {wall_ms} ms] duel: BUY {:?}: ожидались Shares в taking_amount — без maker",
+                            outcome_t,
+                        );
                         return;
                     }
                 };
                 if !(shares_net > 0.0 && shares_net.is_finite()) {
-                    eprintln!("duel: BUY {:?}: плохой shares_net={}", outcome_t, shares_net);
+                    eprintln!(
+                        "[от старта {wall_ms} ms] duel: BUY {:?}: невалидный shares_net={} — maker не ставится",
+                        outcome_t, shares_net,
+                    );
                     return;
                 }
                 let shares_floor = (shares_net * 100.0).floor() / 100.0;
                 if shares_floor < min_sz_buy {
                     eprintln!(
-                        "duel: BUY {:?}: после floor до 0.01 shares {:.4} < min_order {:.4}",
+                        "[от старта {wall_ms} ms] duel: BUY {:?}: после floor до 0.01 shares {:.4} < min_order {:.4} — maker не ставится",
                         outcome_t, shares_floor, min_sz_buy
                     );
                     return;
                 }
-                duel.record_buy_floor(outcome_t, shares_floor);
-
                 let Some(implied_px) = implied_buy_px_per_share(&buy_rep) else {
-                    eprintln!("duel: BUY {:?}: не удалось восстановить среднюю цену BUY", outcome_t);
+                    eprintln!(
+                        "[от старта {wall_ms} ms] duel: BUY {:?}: не смогли восстановить USD/share — без maker",
+                        outcome_t,
+                    );
                     return;
                 };
-                let maker_price = (implied_px * LIVE_MAKER_TP_MULT).clamp(0.001, 0.999);
+                let maker_price_raw = implied_px * LIVE_MAKER_TP_MULT;
+
+                eprintln!(
+                    "[от старта {wall_ms} ms] duel: BUY {:?} зачтено для maker: NET shares {:.6} → floor {:.2}; \
+                     сырая TP-цена до тика на CLOB (`post_order_on_clob`) ≈ {:.6}",
+                    outcome_t,
+                    shares_net,
+                    shares_floor,
+                    maker_price_raw,
+                );
+                duel.record_buy_floor(outcome_t, shares_floor);
 
                 let market_end_unix_ms =
                     btc_updown_5m_window_end_unix_ms_from_slug(slug_buy.as_str()).or_else(|| {
@@ -483,7 +597,7 @@ async fn duel_post_buy_then_maker_in_callback(
                         side: Side::Sell,
                         role: OrderRole::Maker,
                         amount: OrderAmount::Shares(shares_floor),
-                        price: Some(maker_price),
+                        price: Some(maker_price_raw),
                         max_slippage_pp: None,
                         expiration: None,
                         market_end_unix_ms,
@@ -491,33 +605,72 @@ async fn duel_post_buy_then_maker_in_callback(
                         strict_book: None,
                     },
                     Box::new(move |rep| {
+                        eprintln!(
+                            "[maker POST {:?}] ВХОД в invoke финала лимита: success={}, partial={}, order_id={:?}, making={:?}, taking={:?}, err={:?}",
+                            outcome_t,
+                            rep.success,
+                            rep.partial,
+                            rep.order_id,
+                            rep.making_amount,
+                            rep.taking_amount,
+                            rep.error_msg,
+                        );
                         let _ = mk_invoke_tx.send(rep);
                     }),
                 )
                 .await;
 
-                match &post_res {
-                    Ok(Some(oid)) => {
-                        duel.set_maker_order_id(outcome_t, Some(oid.clone()));
-                        let wall_oid = wall_ms;
+                let resting_oid = match &post_res {
+                    Ok(Some(oid)) if !oid.trim().is_empty() => Some(oid.clone()),
+                    Ok(Some(_)) => {
                         eprintln!(
-                            "[от старта {wall_oid} ms] duel: maker SELL resting POST {:?} order_id={oid} price={maker_price:.5} shares={shares_floor:.2} market_end_unix_ms={market_end_unix_ms:?}",
-                            outcome_t
+                            "[от старта {wall_ms} ms] duel: maker POST {:?} вернул пустой order_id",
+                            outcome_t,
                         );
+                        None
                     }
-                    Ok(None) => eprintln!(
-                        "duel: maker POST {:?} без order_id (success=false телом?)",
-                        outcome_t
-                    ),
+                    Ok(None) => {
+                        eprintln!(
+                            "[от старта {wall_ms} ms] duel: maker POST {:?} Ok(None) — resting нет до invoke",
+                            outcome_t,
+                        );
+                        None
+                    }
                     Err(err) => {
-                        eprintln!("duel: maker POST {:?} err: {err:#}", outcome_t);
-                        return;
+                        eprintln!(
+                            "[от старта {wall_ms} ms] duel: maker POST {:?} упал до/на REST: {err:#}",
+                            outcome_t,
+                        );
+                        None
                     }
+                };
+
+                if let Some(oid) = resting_oid.clone() {
+                    duel.set_maker_order_id(outcome_t, Some(oid.clone()));
+                    eprintln!(
+                        "[от старта {wall_ms} ms] duel: maker {:?} принят книгой order_id={oid} \
+                         сырая лимит-цена ≈{maker_price_raw:.6} (нормализация тика 0.01 в `post_order_on_clob`) \
+                         shares={shares_floor:.2} market_end_unix_ms={market_end_unix_ms:?}",
+                        outcome_t,
+                    );
                 }
 
-                let maker_evt = mk_invoke_rx.await;
-                match maker_evt {
+                let maker_fin = mk_invoke_rx.await;
+                match maker_fin {
                     Ok(maker_rep) => {
+                        if resting_oid.is_none() {
+                            eprintln!(
+                                "[от старта {wall_ms} ms] duel: maker {:?} не на книге — получен только отчёт агрегатора (success={}, err={:?}); гонку не ждём с этой ноги",
+                                outcome_t,
+                                maker_rep.success,
+                                maker_rep.error_msg,
+                            );
+                            return;
+                        }
+                        eprintln!(
+                            "[от старта {wall_ms} ms] duel: финальный invoke resting maker {:?} (гонка take-profit)",
+                            outcome_t,
+                        );
                         duel_on_full_maker_winner_flow(
                             duel,
                             account,
@@ -530,7 +683,7 @@ async fn duel_post_buy_then_maker_in_callback(
                     }
                     Err(_) => eprintln!(
                         "duel: {:?} maker invoke-колбёк потерян до финала агрегатора",
-                        outcome_t
+                        outcome_t,
                     ),
                 };
             });
@@ -541,6 +694,90 @@ async fn duel_post_buy_then_maker_in_callback(
     chain_done_rx
         .await
         .map_err(|_| anyhow::anyhow!("duel BUY→maker spawn завершился без Ack ({outcome_t:?})"))?;
+    Ok(())
+}
+
+/// Обе BUY-ноги зафлоорены, но для сценария гонки по тексту нужны **два** resting maker.
+/// Если на книге меньше двух (`order_id`): **немедленно** — cancel всех висимых maker (если есть), затем
+/// два **taker SELL** всего floor (не ждём дедлайн гонки).
+async fn duel_abort_race_cancel_any_makers_then_flatten_both_fills(
+    account: &SharedAccount,
+    duel: Arc<DuelHarness>,
+    slug: &str,
+    wall_ms: u64,
+    snap: &DuelState,
+    reason_human: &str,
+) -> anyhow::Result<()> {
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit: {reason_human} slug={slug} \
+         resting maker_id up={:?} down={:?} snap полный {:?}",
+        snap.maker_id_up, snap.maker_id_down, snap,
+    );
+
+    duel_cancel_if_some(
+        account,
+        "early-exit cancel maker UP",
+        snap.maker_id_up.as_ref(),
+        wall_ms,
+    )
+    .await;
+    duel_cancel_if_some(
+        account,
+        "early-exit cancel maker DOWN",
+        snap.maker_id_down.as_ref(),
+        wall_ms,
+    )
+    .await;
+
+    let u = snap
+        .up_buy_floor
+        .with_context(|| "duel early-exit internal: отсутствует up_buy_floor")?;
+    let d = snap
+        .down_buy_floor
+        .with_context(|| "duel early-exit internal: отсутствует down_buy_floor")?;
+    let up_prep = duel.prep_ref(CurrencyUpDownOutcome::Up);
+    let dn_prep = duel.prep_ref(CurrencyUpDownOutcome::Down);
+
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit: taker SELL всего набранного UP — {u:.2} shares",
+    );
+    let up_sell = duel_taker_flatten_floor(
+        account,
+        slug,
+        CurrencyUpDownOutcome::Up,
+        &up_prep.asset_id,
+        u,
+        up_prep.min_order_size,
+        "abort_race_flatten_up",
+    )
+    .await?;
+    anyhow::ensure!(
+        up_sell.success && up_sell.order_id.as_deref().is_some_and(|s| !s.is_empty()),
+        "abort-race UP unwind: {:?}", up_sell,
+    );
+
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit: taker SELL всего набранного DOWN — {d:.2} shares",
+    );
+    let dn_sell = duel_taker_flatten_floor(
+        account,
+        slug,
+        CurrencyUpDownOutcome::Down,
+        &dn_prep.asset_id,
+        d,
+        dn_prep.min_order_size,
+        "abort_race_flatten_down",
+    )
+    .await?;
+    anyhow::ensure!(
+        dn_sell.success && dn_sell.order_id.as_deref().is_some_and(|s| !s.is_empty()),
+        "abort-race DOWN unwind: {:?}", dn_sell,
+    );
+
+    duel.done.notify_waiters();
+    eprintln!(
+        "[от старта {wall_ms} ms] duel early-exit завершён: cancel (если были) + оба taker SELL",
+    );
     Ok(())
 }
 
@@ -952,22 +1189,32 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Duel: параллельные **taker BUY** по **Up** и **Down** (`tokio::try_join`), в каждом BUY-invoke —
-/// `tokio::spawn` и из него **maker SELL** всей набранной позиции (+20% к среднему BUY `USD/shares`).
-/// Первый maker с полным исполнением (`success && !partial`) бьёт `claim`: **cancel** maker другой стороны,
-/// противоположные shares разгружаются **taker SELL**.
-
+/// Duel: параллельные **taker BUY** (**Up** и **Down**) — две таски **`tokio::spawn`**, ожидание через **`tokio::join!`**.
+/// В каждом **BUY-invoke** (`SingleOrderInvokeCb`) вызывается **`tokio::spawn`**: там же выставляется **maker SELL**
+/// всей набранной позиции (**+10%** к среднему BUY `USD/shares`).
 ///
-/// Если за [`LIVE_DUAL_MAKER_RACE_DEADLINE_SEC`] никто из maker не финализирует победную ветку — emergency:
-/// отменить обоих maker (если известны `order_id`), затем два **taker SELL** всего сохранённого floor.
+/// Если **ровно одна** нога **не получила успешный taker BUY** (`record_buy_floor` не вызван) — без ожидания гонки maker:
+/// на **успешной** стороне **cancel maker** (если известен `order_id`) и **taker SELL всех** накопленных shares по floor → **`Ok`**.
+///
+/// Если **обе купили**, но **нет ровно двух** resting maker (0 или 1 `order_id`) — **немедленно**:
+/// **cancel** всех висимых maker, затем два **taker SELL** всего floor (гонку не ждём; по смыслу нужны **оба** maker).
+///
+/// Если **обе купили** и **обоих maker** на книге: первый **полностью исполнившийся** maker (`success && !partial`) делает **claim** —
+/// **cancel** maker другой стороны, противоположные shares снимаются **taker SELL**.
+///
+/// В лог (**`stderr`**) пишется **`ВХОД`** и **итог** на ключевых invoke: taker BUY, колбёк финала resting maker после POST,
+/// колбёк финала maker из агрегатора (гонка/takeprofit), каждый taker flatten.
+///
+/// Если за [`LIVE_DUAL_MAKER_RACE_DEADLINE_SEC`] никто из maker не дал победную нотификацию — **emergency**:
+/// отменить обоих maker при необходимости, затем два **taker SELL** сохранённого floor.
 ///
 /// ```bash
 /// POLY_PRIVATE_KEY=0x… \
-///     cargo test --bin poly account_order::tests::live_duel_up_down_maker_race_tp20 -- --ignored --nocapture
+///     cargo test --bin poly account_order::tests::live_duel_up_down_maker_race_tp10 -- --ignored --nocapture
 /// ```
 #[tokio::test]
-#[ignore = "live duel: требует POLY_PRIVATE_KEY + pUSD; две покупки, maker TP 20%, гонка, cancel + taker flat"]
-async fn live_duel_up_down_maker_race_tp20() -> anyhow::Result<()> {
+#[ignore = "live duel: требует POLY_PRIVATE_KEY + pUSD; две покупки, maker TP 10%, гонка, cancel + taker flat"]
+async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     use std::time::Instant;
 
     let _ = dotenvy::dotenv();
@@ -988,11 +1235,11 @@ async fn live_duel_up_down_maker_race_tp20() -> anyhow::Result<()> {
     let wall_anchor = Arc::new(t0);
 
     let log_path = std::path::PathBuf::from(format!(
-        "target/live_duel_up_down_maker_race_tp20_{}.log",
+        "target/live_duel_up_down_maker_race_tp10_{}.log",
         current_timestamp_ms()
     ));
     if let Err(err) =
-        crate::tee_log::init_test_tee_log_file(&log_path, "live_duel_up_down_maker_race_tp20")
+        crate::tee_log::init_test_tee_log_file(&log_path, "live_duel_up_down_maker_race_tp10")
     {
         let (dt, wall) = evt_ms!(last_evt, t0);
         eprintln!(
@@ -1105,11 +1352,98 @@ async fn live_duel_up_down_maker_race_tp20() -> anyhow::Result<()> {
     j_dn.map_err(|e| anyhow::anyhow!("live_duel tokio::spawn DOWN JoinError: {e}"))?
         .with_context(|| format!("live_duel BUY→maker нога DOWN slug={slug}"))?;
 
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel: обе ноги BUY→maker ACK; жду гонку maker или дедлайн {}s…",
-        LIVE_DUAL_MAKER_RACE_DEADLINE_SEC,
-    );
+    let wall_ms_post_legs = wall_anchor.elapsed().as_millis() as u64;
+    let snap_two = duel_h.snapshot_state_unlocked_clone();
+
+    match (snap_two.up_buy_floor, snap_two.down_buy_floor) {
+        (None, None) => {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            anyhow::bail!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_duel: обе BUY ноги без fill — см. «ВХОД/итог» в invoke taker BUY; slug={slug}",
+            );
+        }
+        (Some(up_sh), None) => {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            eprintln!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_duel: DOWN не купила — снимаем maker UP (если есть) и taker SELL всех {up_sh:.2} shares UP",
+            );
+            duel_unwind_inventory_when_other_leg_buy_failed(
+                &account,
+                Arc::clone(&duel_h),
+                &slug,
+                wall_ms_post_legs,
+                CurrencyUpDownOutcome::Up,
+                CurrencyUpDownOutcome::Down,
+                up_sh,
+            )
+            .await?;
+            crate::tee_log::finish_test_tee_log();
+            return Ok(());
+        }
+        (None, Some(dn_sh)) => {
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            eprintln!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_duel: UP не купила — снимаем maker DOWN (если есть) и taker SELL всех {dn_sh:.2} shares DOWN",
+            );
+            duel_unwind_inventory_when_other_leg_buy_failed(
+                &account,
+                Arc::clone(&duel_h),
+                &slug,
+                wall_ms_post_legs,
+                CurrencyUpDownOutcome::Down,
+                CurrencyUpDownOutcome::Up,
+                dn_sh,
+            )
+            .await?;
+            crate::tee_log::finish_test_tee_log();
+            return Ok(());
+        }
+        (Some(up_sh), Some(dn_sh)) => {
+            let snap_race = duel_h.snapshot_state_unlocked_clone();
+            let up_has_maker = snap_race
+                .maker_id_up
+                .as_deref()
+                .map_or(false, |s| !s.trim().is_empty());
+            let dn_has_maker = snap_race
+                .maker_id_down
+                .as_deref()
+                .map_or(false, |s| !s.trim().is_empty());
+
+            if !(up_has_maker && dn_has_maker) {
+                let (dt, wall) = evt_ms!(last_evt, t0);
+                let reason = if !up_has_maker && !dn_has_maker {
+                    "обе BUY ok, но **ни один** maker не на книге"
+                } else {
+                    "обе BUY ok, но на книге **только один** maker — по сценарию нужны **два**"
+                };
+                eprintln!(
+                    "[от старта {wall} ms | с прошлого {dt} ms] live_duel: {reason}; \
+                     cancel висящих maker (если есть) → два taker SELL всего floor; без ожидания {}s гонки",
+                    LIVE_DUAL_MAKER_RACE_DEADLINE_SEC,
+                );
+                duel_abort_race_cancel_any_makers_then_flatten_both_fills(
+                    &account,
+                    Arc::clone(&duel_h),
+                    &slug,
+                    wall_anchor.elapsed().as_millis() as u64,
+                    &snap_race,
+                    reason,
+                )
+                .await?;
+                crate::tee_log::finish_test_tee_log();
+                return Ok(());
+            }
+
+            let (dt, wall) = evt_ms!(last_evt, t0);
+            eprintln!(
+                "[от старта {wall} ms | с прошлого {dt} ms] live_duel: обе BUY ok (floor up={up_sh:.2}, down={dn_sh:.2}); \
+                 **оба** maker на книге (up_id={:?} down_id={:?}) — жду полный maker на одной стороне или дедлайн {}s…",
+                snap_race.maker_id_up,
+                snap_race.maker_id_down,
+                LIVE_DUAL_MAKER_RACE_DEADLINE_SEC,
+            );
+        }
+    }
 
     match tokio::time::timeout(
         Duration::from_secs(LIVE_DUAL_MAKER_RACE_DEADLINE_SEC),

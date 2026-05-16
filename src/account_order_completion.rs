@@ -1,29 +1,32 @@
-//! POST + `invoke`: один колбэк один раз — но **только после on-chain settlement** (debit + credit средств).
+//! POST + `invoke`: один колбэк один раз — **только после явного терминала от CLOB** (HTTP/WS).
+//! Никаких timestamp-фоллбэков: агрегатор ждёт сигналов столько, сколько нужно.
 //!
 //! Источник истины — [`polymarket_client_sdk::clob::types::TradeStatusType`] лифсайкла трейда:
 //! `Matched` (только в книге CLOB) → `Mined` (включён в блок) → `Confirmed` (после финализации).
 //! Зачислением считаем `Mined|Confirmed` (см. [`PostOrderInvokeAggregator`]). Состояния
-//! `Retrying|Failed` контрибьютят в book-match агрегат (`filled_*`), но **не** в settlement-агрегат
-//! (`settled_*`); если они так и не перейдут в `Mined|Confirmed` к дедлайну —
-//! [`SingleOrderClobInvocationReport::success`] = `false` с диагностикой `error_msg = "settlement_timeout: ..."`.
+//! `Retrying` контрибьютят в book-match агрегат (`filled_*`), но **не** в settlement-агрегат
+//! (`settled_*`); ждём, пока CLOB пере-эмитит этот трейд как `Mined|Confirmed` либо `Failed`.
+//! Терминальный `Failed` (релайер сдался) ведёт отдельный учёт (`failed_*`): он **не** прибавляется
+//! к зачисленным средствам (on-chain ничего не произошло), но засчитывается как «терминальный
+//! объём» в гейте finalize — иначе при race «book CANCELED + 1 трейд застрял на чейне как
+//! Failed» агрегатор бы ждал вечно (см. [`PostOrderInvokeAggregator::settlement_caught_up_with_match`]).
 //!
 //! Финал = `success=true` фаирится, как только выполнено хотя бы одно из:
 //! 1. **`max(settled_ws, settled_http)`** покрывает целевой объём заявки
 //!    [`crate::account_order::PostOrderRequest::amount`] (full target reached);
 //! 2. достигнут book-level терминал ([`InvokeAggInner::book_terminal_reached`]) — для Taker
 //!    это всегда сразу после `POST /order`, для Maker — статус `Matched|Canceled|Unmatched`
-//!    из POST/REST/WS — **и** settlement догнал book-match по обеим осям (нечего больше ждать);
-//! 3. дедлайн ([`INVOKE_FALLBACK_POLL_DEADLINE_SEC`]) — best-effort с диагностикой в `error_msg`.
+//!    из POST/REST/WS — **и** settlement догнал book-match по обеим осям (нечего больше ждать).
 //!
-//! Поэтому Taker FAK с partial fill финализируется через settlement-задержку (~1–3s),
-//! а не через 30s дедлайн.
+//! Никакого «timestamp-deadline» finalize нет: maker-`expiration` (GTD) обрабатывает сам CLOB и
+//! пришлёт нам `Canceled|Unmatched` через WS/HTTP — этот сигнал и есть наш терминал. Если CLOB
+//! не отвечает (сеть/баг), агрегатор ждёт; вызывающий код должен таймаутить сам, если нужно.
 //!
 //! Источники сигнала:
 //! - **HTTP**: REST-poll каждые [`INVOKE_FALLBACK_POLL_MS`] дёргает `client.order(order_id)` +
 //!   (если `size_matched > 0`) `client.trades(order_id)` и партиционирует трейды на
-//!   book-matched (всё) и settled (`status ∈ {Mined, Confirmed}`). Поллинг **не** прерывается на
-//!   `OrderStatusType::Matched` — он живёт до finalize или дедлайна
-//!   ([`INVOKE_FALLBACK_POLL_DEADLINE_SEC`]).
+//!   book-matched (всё) и settled (`status ∈ {Mined, Confirmed}`). Поллинг крутится до тех пор,
+//!   пока [`PostOrderInvokeAggregator::finished`] не станет `true`.
 //! - **WS**: user-channel `trade`-события несут `status` по тому же лифсайклу. Дедуплицируется
 //!   по `trade_id` ([`InvokeAggInner::seen_ws_trade_ids`]) — каждый трейд учитывается в
 //!   `filled_ws` ровно один раз и в `settled_ws` ровно один раз (при первом `MINED|CONFIRMED`).
@@ -52,13 +55,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Пауза без новых событий (мс): после неё считается, что можно финализировать и вызвать invoke один раз.
-const INVOKE_DEBOUNCE_MS: u64 = 450;
-/// Запас по времени (сек), если ни `expiration`, ни `market_end_unix_ms` не заданы — верхняя граница опроса/финала.
-pub(crate) const INVOKE_FALLBACK_POLL_DEADLINE_SEC: u64 = 5;
-/// То же окно fallback в миллисекундах как `i64` для [`crate::util::current_timestamp_ms`].
-pub(crate) const INVOKE_FALLBACK_DEADLINE_MS_I64: i64 =
-    (INVOKE_FALLBACK_POLL_DEADLINE_SEC as i64).saturating_mul(1000);
 const INVOKE_FALLBACK_POLL_MS: u64 = 500;
 const ORDER_HTTP_POLL_TIMEOUT_SEC: u64 = 10;
 /// SDK-маркер «страниц больше нет» в [`polymarket_client_sdk::clob::types::response::Page::next_cursor`] (base64 `-1`).
@@ -69,6 +65,20 @@ const TRADES_MAX_PAGES_PER_POLL: usize = 8;
 const SHARE_EPS: f64 = 1e-7;
 /// Порог «достаточной» набранной колонки `making_amount` (`LegAgg`) при USDC-цели.
 const USD_EPS: f64 = 1e-5;
+/// Дастр-толерантность по shares **только** для финального
+/// [`SingleOrderClobInvocationReport::partial`] (и связанной `error_msg`-диагностики):
+/// 0.01 = один CLOB-lot. На уровне CLOB Polymarket помечает ордер `OrderStatusType::Matched`
+/// и снимает с книги остаток ниже лота (например, при `original_size=5.0`
+/// и `size_matched=4.995078` оставшиеся 0.004922 sh уже не сматчатся — биржа их обнуляет).
+/// Без этого допуска такие «полные» исполнения на уровне книги попадали бы в `partial=true`
+/// из-за строгого [`SHARE_EPS`]; пользователь же видит «вся нога продана». На гейт finalize
+/// ([`PostOrderInvokeAggregator::should_invoke`] / [`PostOrderInvokeAggregator::settled_targets_met`])
+/// он не влияет — там по-прежнему [`SHARE_EPS`], чтобы taker FAK с настоящим partial-fill
+/// дождался on-chain settlement и сообщил честную цифру через terminal-ветку.
+const SHARES_REPORT_FULL_FILL_DUST_TOLERANCE: f64 = 0.01;
+/// USDC-аналог [`SHARES_REPORT_FULL_FILL_DUST_TOLERANCE`]: 1 цент. Используется ТОЛЬКО для
+/// `partial`/`error_msg` в финальном отчёте, не для гейта finalize.
+const USDC_REPORT_FULL_FILL_DUST_TOLERANCE: f64 = 0.01;
 
 /// Нули в порядке (`making_amount`, `taking_amount`), как [`polymarket_client_sdk::clob::types::response::PostOrderResponse`].
 /// Используется для отчёта-«пустышки» при любом отказе до накопления исполнения (BUY/SELL, Taker/Maker).
@@ -240,11 +250,13 @@ fn report_making_and_taking_amounts(side: Side, eff: LegAgg) -> (OrderAmount, Or
 /// 1. settlement покрыл целевой объём (фул-филл с зачислением on-chain), либо
 /// 2. достигнут book-level терминал заявки (POST `Matched|Canceled|Unmatched` для Taker всегда;
 ///    для Maker — Matched/Canceled/Unmatched по POST/REST/WS) **И** settlement догнал
-///    book-match по обеим осям (нечего больше ждать), либо
-/// 3. дедлайн (best-effort, см. [`SingleOrderClobInvocationReport::error_msg`]).
+///    book-match по обеим осям (нечего больше ждать).
 ///
-/// Поэтому для Taker FAK колбэк выстреливает в течение settlement-задержки релайера
-/// (~1–3s в норме), а не по дедлайну.
+/// Никаких timestamp-фоллбэков нет: агрегатор ждёт явных HTTP/WS сигналов сколько нужно. Для
+/// Taker FAK это даёт колбэк в пределах settlement-задержки релайера (~1–3s в норме). Для
+/// Maker GTD `expiration` обрабатывает CLOB и эмитит `Canceled` через WS/HTTP — это и есть
+/// наш терминал. Если CLOB по какой-то причине не отвечает (сеть/баг), вызывающий код
+/// должен таймаутить сам.
 ///
 /// **Гарантии чисел:** `making_amount`/`taking_amount` — **net of fee** (то, что реально
 /// списано/зачислено на чейне), не gross-нотасчик подписанного ордера. Источник истины —
@@ -270,7 +282,13 @@ pub struct SingleOrderClobInvocationReport {
     pub taking_amount: OrderAmount,
     /// `true`, если было хоть какое-то исполнение (полное или частичное).
     pub success: bool,
-    /// `true`, только если `success=true` и цель [`PostOrderRequest::amount`] не достигнута полностью.
+    /// `true`, только если `success=true` и цель [`PostOrderRequest::amount`] не достигнута
+    /// полностью **с учётом дастр-допуска в один CLOB-lot**: при `target=Shares(N)` нужно
+    /// `settled_shares + 0.01 < N`, при `target=UsdNotional(U)` — `settled_usdc + 0.01 < U`.
+    /// Без этого допуска полностью исполнённый maker, у которого Polymarket снял sub-lot
+    /// остаток ниже `min_order_size` и пометил книгу `OrderStatusType::Matched` (типичный кейс
+    /// `Shares(5.0) → settled Shares(4.995078)`), ошибочно попадал бы в `partial=true`,
+    /// тогда как пользователь видит «вся нога продана».
     pub partial: bool,
     /// Текст ошибки для диагностики при `success=false` (HTTP/SDK error и его тело, server `error_msg`,
     /// валидация, отсутствие auth/signer, build/sign-сбой, дедлайн без исполнения, отмена до исполнения).
@@ -338,22 +356,41 @@ struct InvokeAggInner {
     /// `Mined|Confirmed`). POST seed **не** контрибьютит сюда — POST-ответ говорит только о
     /// book-match, релайер ещё не отработал.
     settled_http: LegAgg,
+    /// Terminal-failed накопление по user-WS `trade` (только `FAILED` — релайер сдался,
+    /// on-chain ничего не зачислилось). Дедуплицируется по `trade_id`
+    /// ([`Self::failed_seen_ws_trade_ids`]). **Не** прибавляется к `success`-цифрам в отчёте,
+    /// но засчитывается как «терминальный объём» в [`PostOrderInvokeAggregator::settlement_caught_up_with_match`],
+    /// чтобы `filled = settled + failed` гарантированно покрывалось — иначе при race
+    /// «book CANCELED + один трейд застрял в `Failed`» агрегатор зависнет.
+    failed_ws: LegAgg,
+    /// Terminal-failed HTTP-снимок (max-merge с агрегатом REST-`trades` со статусом `Failed`).
+    /// Аналогично [`Self::failed_ws`]: «релайер сдался, on-chain ничего не зачислилось» —
+    /// контрибьютит только в гейт finalize и в диагностику `error_msg`, не в `success`.
+    failed_http: LegAgg,
     /// `trade_id` уже учтённые в `filled_ws` — защита от тройного счёта при WS-лифсайкле
     /// одного трейда (`MATCHED`→`MINED`→`CONFIRMED` могут прийти как 1..3 события).
     seen_ws_trade_ids: HashSet<String>,
     /// `trade_id` уже учтённые в `settled_ws` — отдельный сет, потому что settle-первая
     /// контрибьюция — это первый `MINED|CONFIRMED` после возможного предыдущего `MATCHED`.
     settled_seen_ws_trade_ids: HashSet<String>,
-    /// Unix время (ms): после этого момента finalize допускается даже без полного набора объёма.
-    deadline_ms: i64,
+    /// `trade_id` уже учтённые в `failed_ws` — гарантирует ровно один учёт `FAILED`-перехода
+    /// для одного трейда (лифсайкл `MATCHED → RETRYING → FAILED` присылает несколько событий).
+    failed_seen_ws_trade_ids: HashSet<String>,
     /// [`Side`] ордера (копия из [`crate::account_order::PostOrderRequest::side`]) — управляет
     /// трактовкой HTTP `making`/`taking` при seed и применением fee к нужной стороне (taking).
     side: Side,
     /// Book-level терминал заявки: больше fill'ов не ожидается. Ставится:
     /// - **сразу** в [`after_post_order_maybe_track_invoke`] для любого Taker (taker не остаётся
-    ///   в книге) — отсюда taker FAK с partial fill финализируется на settlement, а не по дедлайну;
+    ///   в книге) — отсюда taker FAK с partial fill финализируется на settlement;
     /// - в [`Self::record_poll_http`] / [`Self::record_ws_order_status`] для статусов CLOB
-    ///   `Matched|Canceled|Unmatched` (POST/REST) либо `MATCHED|FILLED|CANCELED` (WS) у Maker.
+    ///   `Canceled|Unmatched` (POST/REST) либо `CANCELED|UNMATCHED` (WS) — безусловно (ордер
+    ///   ушёл из книги, новых матчей не будет; для maker GTD это ровно то, что приходит после
+    ///   `expiration` — CLOB сам снимает ордер и эмитит `Canceled`);
+    /// - для CLOB `Matched`/`MATCHED|FILLED` (Maker) — **только** когда
+    ///   [`is_book_fully_matched_observed`] = `true`, т.е. наблюдаемый `size_matched` покрыл
+    ///   `original_size` с дастр-допуском. Polymarket шлёт `MATCHED` после **каждого** трейда
+    ///   maker'а, поэтому без этой проверки колбэк мог бы выстрелить прематурно (settlement
+    ///   догнал book по первому трейду — а матч ещё мог продолжаться).
     ///
     /// Главный гейт `success=true` в [`PostOrderInvokeAggregator::should_invoke`]: terminal +
     /// `settlement_caught_up_with_match` ⇒ финализируем (выстреливаем колбэк), потому что
@@ -366,11 +403,68 @@ struct InvokeAggInner {
     /// От CLOB поступила терминальная отмена (WS `CANCELED`, POST/poll `Canceled`). Информационный
     /// флаг для диагностики `error_msg`; book-level терминал отдельно — [`Self::book_terminal_reached`].
     partial: bool,
+    /// Наблюдаемый `original_size` ордера на стороне CLOB. Сидится в [`PostOrderInvokeAggregator::new`]
+    /// из `target` (`OrderAmount::Shares` — иначе `None`; такие заявки — только Taker, и для
+    /// них book-terminal выставляется по другому каналу — Taker FAK не остаётся в книге).
+    /// Дальше max-merge'ится из [`OpenOrderResponse::original_size`] (poll) и из
+    /// `OrderMessage.original_size` (WS user-channel). Используется как делитель в
+    /// [`is_book_fully_matched_observed`].
+    original_size_observed: Option<f64>,
+    /// Максимум наблюдаемого `size_matched` ордера на стороне CLOB: max-merge из
+    /// [`OpenOrderResponse::size_matched`] (poll), `OrderMessage.size_matched` (WS user-channel)
+    /// и making/taking-сидов POST-ответа (см. [`after_post_order_maybe_track_invoke`]).
+    /// Монотонно растёт. В паре с [`Self::original_size_observed`] определяет
+    /// [`is_book_fully_matched_observed`].
+    size_matched_observed: f64,
 }
 
 fn decimal_snap_f64(d: &Decimal) -> Option<f64> {
     let f = d.to_string().parse::<f64>().ok()?;
     f.is_finite().then_some(f)
+}
+
+/// `true` если по наблюдаемым `(original_size, size_matched)` ордер сматчен на book-уровне
+/// «целиком» (с дастр-допуском в один CLOB-lot — Polymarket сам снимает sub-lot остаток ниже
+/// `min_order_size`). Используется как обязательный гейт перевода CLOB-статуса `MATCHED`/`FILLED`
+/// в [`InvokeAggInner::book_terminal_reached`]: Polymarket шлёт `MATCHED` после каждого трейда
+/// maker'а, и без этой проверки колбэк мог бы выстрелить ПРЕМАТУРНО — например, после первого
+/// `MATCHED` event'а у maker'а 100 sh, когда сматчено лишь 30 sh, а оставшиеся 70 sh ещё могли
+/// бы дальше матчиться при движении цены к нашему лимиту.
+fn is_book_fully_matched_observed(
+    original_size_observed: Option<f64>,
+    size_matched_observed: f64,
+) -> bool {
+    match original_size_observed {
+        Some(orig) if orig.is_finite() && orig > 0.0 => {
+            size_matched_observed.is_finite()
+                && size_matched_observed + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE >= orig
+        }
+        _ => false,
+    }
+}
+
+/// Max-merge для [`InvokeAggInner::original_size_observed`]. Защищает от случайных
+/// нулей/мусора в `original_size` поле WS/poll-event'а и обеспечивает монотонность.
+fn update_original_size_observed(state: &mut InvokeAggInner, observed: f64) {
+    if !observed.is_finite() || observed <= 0.0 {
+        return;
+    }
+    state.original_size_observed = Some(
+        state
+            .original_size_observed
+            .map(|prev| prev.max(observed))
+            .unwrap_or(observed),
+    );
+}
+
+/// Max-merge для [`InvokeAggInner::size_matched_observed`]. Монотонно растёт.
+fn update_size_matched_observed(state: &mut InvokeAggInner, observed: f64) {
+    if !observed.is_finite() || observed < 0.0 {
+        return;
+    }
+    if observed > state.size_matched_observed {
+        state.size_matched_observed = observed;
+    }
 }
 
 /// Компактная строка для observability: shares/USDC по обеим ногам и флаги терминала.
@@ -388,6 +482,12 @@ fn leg_summary_for_log(state: &InvokeAggInner) -> String {
     let settled_usd = order_amount_usd_scalar(
         leg_agg_max_normalized(state.settled_ws, state.settled_http).making_amount,
     );
+    let failed_shares = order_amount_shares_scalar(
+        leg_agg_max_normalized(state.failed_ws, state.failed_http).taking_amount,
+    );
+    let failed_usd = order_amount_usd_scalar(
+        leg_agg_max_normalized(state.failed_ws, state.failed_http).making_amount,
+    );
     let f_ws_sh = order_amount_shares_scalar(state.filled_ws.taking_amount);
     let f_ws_us = order_amount_usd_scalar(state.filled_ws.making_amount);
     let f_ht_sh = order_amount_shares_scalar(state.filled_http.taking_amount);
@@ -396,12 +496,26 @@ fn leg_summary_for_log(state: &InvokeAggInner) -> String {
     let s_ws_us = order_amount_usd_scalar(state.settled_ws.making_amount);
     let s_ht_sh = order_amount_shares_scalar(state.settled_http.taking_amount);
     let s_ht_us = order_amount_usd_scalar(state.settled_http.making_amount);
+    let fa_ws_sh = order_amount_shares_scalar(state.failed_ws.taking_amount);
+    let fa_ws_us = order_amount_usd_scalar(state.failed_ws.making_amount);
+    let fa_ht_sh = order_amount_shares_scalar(state.failed_http.taking_amount);
+    let fa_ht_us = order_amount_usd_scalar(state.failed_http.making_amount);
     format!(
         "book={book_shares:.6}sh/{book_usd:.6}$ (ws={f_ws_sh:.6}/{f_ws_us:.6}, \
          http={f_ht_sh:.6}/{f_ht_us:.6}) settled={settled_shares:.6}sh/{settled_usd:.6}$ \
          (ws={s_ws_sh:.6}/{s_ws_us:.6}, http={s_ht_sh:.6}/{s_ht_us:.6}) \
-         term={} part={} succ={}",
-        state.book_terminal_reached, state.partial, state.success,
+         failed={failed_shares:.6}sh/{failed_usd:.6}$ \
+         (ws={fa_ws_sh:.6}/{fa_ws_us:.6}, http={fa_ht_sh:.6}/{fa_ht_us:.6}) \
+         orig={:?} matched={:.6} fully={} term={} part={} succ={}",
+        state.original_size_observed,
+        state.size_matched_observed,
+        is_book_fully_matched_observed(
+            state.original_size_observed,
+            state.size_matched_observed,
+        ),
+        state.book_terminal_reached,
+        state.partial,
+        state.success,
     )
 }
 
@@ -420,6 +534,32 @@ pub(crate) fn ws_trade_status_settled_on_chain(status_raw: &str) -> bool {
         status_raw.to_ascii_uppercase().as_str(),
         "MINED" | "CONFIRMED"
     )
+}
+
+/// Сырой WS `trade.status` — нужно ли прокидывать событие в invoke-агрегатор для учёта в
+/// book-match ноге (`filled_*`): любой этап лифсайкла, по которому Polymarket шлёт trade-event
+/// (`MATCHED` … `FAILED`). Дедуп по `trade_id` в [`PostOrderInvokeAggregator`] гарантирует один
+/// счёт на трейд; см. [`ws_trade_status_settled_on_chain`], [`ws_trade_status_terminal_failed`].
+#[inline]
+pub(crate) fn ws_trade_status_for_invoke_book_match(status_raw: &str) -> bool {
+    matches!(
+        status_raw.to_ascii_uppercase().as_str(),
+        "MATCHED" | "MINED" | "CONFIRMED" | "RETRYING" | "FAILED"
+    )
+}
+
+/// `true` если трейд **терминально провалился** на чейне: релайер сдался, on-chain ничего не
+/// зачислилось и больше попыток не будет. См. [`TradeStatusType::Failed`]. `Retrying` — это
+/// **не** terminal: релайер ещё пробует, переход может быть в `Mined` либо `Failed`.
+#[inline]
+pub(crate) fn trade_status_terminal_failed(status: &TradeStatusType) -> bool {
+    matches!(status, TradeStatusType::Failed)
+}
+
+/// То же по сырой строке статуса WS user-channel `trade.status`.
+#[inline]
+pub(crate) fn ws_trade_status_terminal_failed(status_raw: &str) -> bool {
+    status_raw.eq_ignore_ascii_case("FAILED")
 }
 
 /// Per-trade fee_factor: `(1 - fee_rate_bps/10_000)`, защищён от мусорных значений.
@@ -495,9 +635,15 @@ fn aggregate_trades_into_leg<'a>(
 /// - `settled_http` (on-chain, `status ∈ {Mined, Confirmed}`): max-merge с агрегатом
 ///   отфильтрованных трейдов (монотонно растёт по определению — max-merge безопасен).
 ///
-/// Также выставляет [`InvokeAggInner::book_terminal_reached`] для `OrderStatusType` ∈
-/// {`Matched`, `Canceled`, `Unmatched`} — это «больше fill'ов не будет» сигнал, по которому
-/// finalize может выстрелить сразу после catch-up settlement.
+/// Также обновляет [`InvokeAggInner::original_size_observed`] и
+/// [`InvokeAggInner::size_matched_observed`] (max-merge) и выставляет
+/// [`InvokeAggInner::book_terminal_reached`] по правилу:
+/// - `Canceled` / `Unmatched` — безусловно (ордер ушёл из книги, новых матчей не будет).
+/// - `Matched` — **только** если [`is_book_fully_matched_observed`] = `true`, т.е. наблюдаемый
+///   `size_matched` покрыл `original_size` с дастр-допуском. Polymarket помечает книгу
+///   `Matched` после каждого трейда (см. `OrderStatusType::Matched` в SDK — это «order has
+///   been matched», не «fully matched»), поэтому без этой проверки колбэк мог бы выстрелить
+///   прематурно для partial maker'а, ещё способного матчиться дальше.
 fn apply_polled_snapshot(
     inner: &mut InvokeAggInner,
     open: &OpenOrderResponse,
@@ -513,6 +659,13 @@ fn apply_polled_snapshot(
     if !(size_matched >= 0.0 && order_price >= 0.0 && order_price.is_finite()) {
         return;
     }
+
+    // Observed-поля для book-fully-matched гейта. `original_size` — поле `OpenOrderResponse`,
+    // должно быть стабильным; max-merge просто страхует от случайных нулей при сетевых сбоях.
+    if let Some(orig) = decimal_snap_f64(&open.original_size) {
+        update_original_size_observed(inner, orig);
+    }
+    update_size_matched_observed(inner, size_matched);
 
     match trades {
         Some(ts) => {
@@ -548,6 +701,17 @@ fn apply_polled_snapshot(
                 .filter(|trade| trade_status_settled_on_chain(&trade.status));
             let settled_leg = aggregate_trades_into_leg(side, settled_iter);
             inner.settled_http = leg_agg_max_normalized(inner.settled_http, settled_leg);
+
+            // Failed-only ветка: трейды, по которым релайер сдался — on-chain пусто, но они
+            // занимают «слот» в book-match'е, поэтому без их учёта `settled_caught_up_with_match`
+            // навсегда `false` и агрегатор зависает. Fee применяется идентично (gross→net через
+            // `apply_fee_to_taking_side`), чтобы сравнение `settled + failed >= filled` оставалось
+            // консистентным в одной размерности с `filled_*` (BUY=NET shares, SELL=NET USDC).
+            let failed_iter = ts
+                .iter()
+                .filter(|trade| trade_status_terminal_failed(&trade.status));
+            let failed_leg = aggregate_trades_into_leg(side, failed_iter);
+            inner.failed_http = leg_agg_max_normalized(inner.failed_http, failed_leg);
         }
         None => {
             // Trades request упал/таймаут — пользуемся только `size_matched × order.price`
@@ -565,11 +729,24 @@ fn apply_polled_snapshot(
         }
     }
 
-    if matches!(
-        &open.status,
-        OrderStatusType::Matched | OrderStatusType::Canceled | OrderStatusType::Unmatched
-    ) {
-        inner.book_terminal_reached = true;
+    match &open.status {
+        // Ордер ушёл из книги — гарантированно больше не сматчится.
+        OrderStatusType::Canceled | OrderStatusType::Unmatched => {
+            inner.book_terminal_reached = true;
+        }
+        // `Matched` в Polymarket — «по ордеру был хотя бы один матч», НЕ «сматчен полностью».
+        // Терминал ставим, только когда `size_matched` действительно покрыл `original_size`
+        // (с дастр-допуском в один CLOB-lot — sub-lot остаток биржа снимает сама). Иначе ждём
+        // дальнейших трейдов или явного `Canceled`/`Unmatched`.
+        OrderStatusType::Matched => {
+            if is_book_fully_matched_observed(
+                inner.original_size_observed,
+                inner.size_matched_observed,
+            ) {
+                inner.book_terminal_reached = true;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -583,10 +760,7 @@ pub(crate) struct PostOrderInvokeAggregator {
     order_id: String,
     /// Состояние накопления (объём, цели, терминалы): [`tokio::sync::RwLock`] — только асинхронные `.await` локи.
     inner: Arc<RwLock<InvokeAggInner>>,
-    /// Номер «волны» debounce: после паузы финализируют, только если генерация не сменилась (ветка паузы — см. [`Self::bump_debounce_finalize`]).
-    debounce_generation: Arc<RwLock<u64>>,
     role: OrderRole,
-    market_end_unix_ms: Option<i64>,
     /// Целевой объём (копия из [`PostOrderRequest::amount`]) — для observability в логах.
     target: OrderAmount,
     /// Side ордера (копия) — для observability и в replay-cmd.
@@ -624,19 +798,23 @@ impl PostOrderInvokeAggregator {
         post_request: PostOrderRequest,
     ) -> Arc<Self> {
         let timestamp_ms_started = crate::util::current_timestamp_ms();
-        let deadline_ms = post_request
-            .expiration
-            .map(|expiration| expiration.timestamp_millis())
-            .or(post_request.market_end_unix_ms)
-            .unwrap_or_else(|| timestamp_ms_started)
-            .max(timestamp_ms_started)
-            .saturating_add(INVOKE_FALLBACK_DEADLINE_MS_I64);
         let target = post_request.amount;
         let side = post_request.side;
         let role = post_request.role;
         let asset_id = post_request.asset_id.clone();
-        let market_end_unix_ms = post_request.market_end_unix_ms;
+        // Поля только для observability — никакой timestamp-фоллбэк finalize не использует:
+        // maker GTD `expiration` обрабатывает CLOB и пришлёт `Canceled|Unmatched` через
+        // WS/HTTP — это и есть наш терминал.
         let expiration_unix_ms = post_request.expiration.map(|e| e.timestamp_millis());
+        let market_end_unix_ms = post_request.market_end_unix_ms;
+        // Сид `original_size_observed` из target'a: для Shares-target (всегда у Maker и часто
+        // у Taker SELL) знаем сразу. Для UsdNotional-target (Taker BUY) `original_size` в shares
+        // на CLOB определяется post-factum через `taking_amount` POST-ответа — для таких заявок
+        // book-terminal проставляется по другому каналу (Taker FAK не остаётся в книге).
+        let original_size_observed = match target {
+            OrderAmount::Shares(s) if s.is_finite() && s > 0.0 => Some(s),
+            _ => None,
+        };
 
         let aggregator = Arc::new(Self {
             slot,
@@ -648,17 +826,19 @@ impl PostOrderInvokeAggregator {
                 settled_ws: LegAgg::default(),
                 filled_http: LegAgg::default(),
                 settled_http: LegAgg::default(),
+                failed_ws: LegAgg::default(),
+                failed_http: LegAgg::default(),
                 seen_ws_trade_ids: HashSet::new(),
                 settled_seen_ws_trade_ids: HashSet::new(),
-                deadline_ms,
+                failed_seen_ws_trade_ids: HashSet::new(),
                 side,
                 book_terminal_reached: false,
                 success: false,
                 partial: false,
+                original_size_observed,
+                size_matched_observed: 0.0,
             })),
-            debounce_generation: Arc::new(RwLock::new(0)),
             role,
-            market_end_unix_ms,
             target,
             side,
             asset_id: asset_id.clone(),
@@ -668,68 +848,46 @@ impl PostOrderInvokeAggregator {
             finished: Arc::new(RwLock::new(false)),
         });
 
-        // Observability: старт трекера со всеми параметрами заявки. Полезно для трассировки
-        // «один POST → один колбэк», особенно при параллельных ордерах и реплее по логу.
         crate::test_tee_println!(
             "[order_invoke/start] order_id={order_id} side={side:?} role={role:?} \
              asset_id={asset_id} target={target:?} expiration_unix_ms={expiration_unix_ms:?} \
-             market_end_unix_ms={market_end_unix_ms:?} deadline_ms={deadline_ms} \
-             started_at_ms={timestamp_ms_started}",
+             market_end_unix_ms={market_end_unix_ms:?} started_at_ms={timestamp_ms_started}",
         );
 
         aggregator
     }
 
-    fn bump_debounce_finalize(aggregator: Arc<Self>) {
+    /// Спаунит попытку финализации на отдельной таске (чтобы не выполнять `try_finalize_locked` /
+    /// и тем более callback в стэке вызывающего, в т.ч. внутри `post_order_on_clob`).
+    /// `try_finalize_locked` сам проверит [`Self::should_invoke`] и фаирнет колбэк ровно один
+    /// раз через `finished` flag — параллельные вызовы из разных событий безопасны.
+    ///
+    /// Раньше тут было debounce-окно `INVOKE_DEBOUNCE_MS` для накопления близких событий до
+    /// единого finalize-attempt'а; теперь, когда `should_invoke` детерминирован и срабатывает
+    /// только на явных монотонных терминалах от CLOB, окно бессмысленно — финал и так
+    /// выстреливает на первом ready-событии.
+    fn schedule_finalize_attempt(aggregator: Arc<Self>) {
         tokio::spawn(async move {
-            // Settlement-aware fast-path: фаирим без debounce только если условие гейта уже
-            // выполнено (settled покрывает таргет, либо cancel + settled догнал book-match,
-            // либо дедлайн). Никакого «быстрого» finalize по book-match без on-chain settlement —
-            // см. [`Self::should_invoke`].
-            let timestamp_ms_initial = crate::util::current_timestamp_ms();
-            let ready_now = {
-                let state = aggregator.inner.read().await;
-                Self::should_invoke(&state, timestamp_ms_initial)
-            };
-            if ready_now {
-                Self::try_finalize_locked(aggregator).await;
-                return;
-            }
-            // Taker / market-end → пытаемся finalize, но `try_finalize_locked` всё равно не
-            // выстрелит без settlement (или дедлайна). Это полезно как «опросная точка», когда
-            // должен сработать deadline-branch.
-            if matches!(aggregator.role, OrderRole::Taker)
-                || aggregator
-                    .market_end_unix_ms
-                    .is_some_and(|end_ms| end_ms <= timestamp_ms_initial)
-            {
-                Self::try_finalize_locked(aggregator).await;
-                return;
-            }
-            let debounce_wave = {
-                let mut wave_counter = aggregator.debounce_generation.write().await;
-                *wave_counter = (*wave_counter).saturating_add(1);
-                *wave_counter
-            };
-            tokio::time::sleep(Duration::from_millis(INVOKE_DEBOUNCE_MS)).await;
-            let current_generation = *aggregator.debounce_generation.read().await;
-            if current_generation != debounce_wave {
-                return;
-            }
             Self::try_finalize_locked(aggregator).await;
         });
     }
 
     /// Учёт одного user-WS `trade`-события. Дедуплицирует по `trade_id`:
     /// - первый раз: добавляет в `filled_ws` (book-match);
-    /// - первый раз с `is_settled_on_chain=true`: добавляет в `settled_ws`.
+    /// - первый раз с `is_settled_on_chain=true`: добавляет в `settled_ws`;
+    /// - первый раз с `is_terminal_failed=true`: добавляет в `failed_ws`.
+    ///
+    /// `is_settled_on_chain` и `is_terminal_failed` — взаимоисключающие исходы (`Mined|Confirmed`
+    /// vs `Failed`); защитимся проверкой xor, но даже при «обоих true» дедуп-сеты не пересекаются.
     ///
     /// Значения **NET of fee** (см. [`apply_fee_to_taking_side`]): fee_rate_bps удерживается с
     /// taking-стороны (BUY → меньше shares; SELL → меньше USDC) — это то, что реально движется
-    /// на чейне и попадает в [`SingleOrderClobInvocationReport`].
+    /// на чейне и попадает в [`SingleOrderClobInvocationReport`]. Для `Failed` on-chain ничего
+    /// не движется (fee нулевая де-факто), но мы применяем тот же fee_factor, чтобы failed_leg
+    /// шёл в той же размерности, что filled_leg (важно для `settlement_caught_up_with_match`).
     ///
-    /// Дедуп безопасен для лифсайкла одного трейда: `MATCHED → MINED → CONFIRMED` приходят как
-    /// отдельные сообщения и без дедупа дали бы x2/x3 счёт.
+    /// Дедуп безопасен для лифсайкла одного трейда: `MATCHED → RETRYING → MINED → CONFIRMED`
+    /// (или `… → FAILED`) приходят как отдельные сообщения и без дедупа дали бы x2/x3 счёт.
     async fn record_trade_aggregate_from_ws_event(
         self: &Arc<Self>,
         trade_id: &str,
@@ -737,6 +895,7 @@ impl PostOrderInvokeAggregator {
         quote: f64,
         fee_rate_bps: f64,
         is_settled_on_chain: bool,
+        is_terminal_failed: bool,
     ) {
         if !size.is_finite() || size <= 0.0 || !quote.is_finite() || quote < 0.0 {
             return;
@@ -753,12 +912,17 @@ impl PostOrderInvokeAggregator {
             }
             if trade_id.is_empty() {
                 // Без trade_id дедуплицировать не можем. Чтобы не плодить тройной счёт по
-                // лифсайклу — игнорируем не-settled и считаем settled только если он есть.
+                // лифсайклу — игнорируем не-терминальные статусы; для терминальных (settled или
+                // failed) контрибьютим в book + соответствующую settlement-ось ровно один раз.
                 // Это безопасный no-op для аномальных событий.
                 if is_settled_on_chain {
                     state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
                     state.settled_ws =
                         leg_agg_add_trade_fill(state.settled_ws, size_net, quote_net);
+                    state_changed = true;
+                } else if is_terminal_failed {
+                    state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
+                    state.failed_ws = leg_agg_add_trade_fill(state.failed_ws, size_net, quote_net);
                     state_changed = true;
                 }
             } else {
@@ -766,39 +930,71 @@ impl PostOrderInvokeAggregator {
                     state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
                     state_changed = true;
                 }
-                if is_settled_on_chain && state.settled_seen_ws_trade_ids.insert(trade_id) {
+                if is_settled_on_chain
+                    && state.settled_seen_ws_trade_ids.insert(trade_id.clone())
+                {
                     state.settled_ws =
                         leg_agg_add_trade_fill(state.settled_ws, size_net, quote_net);
+                    state_changed = true;
+                }
+                if is_terminal_failed && state.failed_seen_ws_trade_ids.insert(trade_id) {
+                    state.failed_ws = leg_agg_add_trade_fill(state.failed_ws, size_net, quote_net);
                     state_changed = true;
                 }
             }
         }
         if state_changed {
-            Self::bump_debounce_finalize(Arc::clone(self));
+            Self::schedule_finalize_attempt(Arc::clone(self));
         }
     }
 
-    async fn record_ws_order_status(self: &Arc<Self>, status_raw: &str) {
+    /// Применяет WS user-channel `order`-event: подтягивает `original_size`/`size_matched`
+    /// (если есть) в observed-поля и выставляет terminal-флаги по правилу:
+    /// - `CANCELED` — book-terminal безусловно, плюс `partial=true`.
+    /// - `UNMATCHED` — book-terminal безусловно (FAK без ликвидности / expired GTD).
+    /// - `MATCHED`/`FILLED` — `success=true` всегда (информационно), book-terminal **только**
+    ///   когда [`is_book_fully_matched_observed`] = `true`, т.к. Polymarket шлёт `MATCHED` после
+    ///   каждого трейда maker'а, и без этой проверки колбэк мог бы выстрелить прематурно для
+    ///   partial maker'а, ещё способного матчиться дальше.
+    /// - Прочие (`LIVE`, `INVALID`, etc) — только обновление observed-полей, terminal не ставим;
+    ///   ждём дальнейших WS/HTTP-событий (timestamp-фоллбэка нет).
+    async fn record_ws_order_status(
+        self: &Arc<Self>,
+        status_raw: &str,
+        original_size_hint: Option<f64>,
+        size_matched_hint: Option<f64>,
+    ) {
         let normalized_status = status_raw.to_ascii_uppercase();
         {
             let mut state = self.inner.write().await;
-            // Любой book-level терминал — снимает «ждать ещё fill'ов» от gate'a finalize.
-            // Maker `MATCHED` тут — это полностью съеденный лимит-ордер; `CANCELED` — отмена;
-            // `FILLED` — синоним полностью сматченного на стороне CLOB.
-            if matches!(
-                normalized_status.as_str(),
-                "MATCHED" | "FILLED" | "CANCELED"
-            ) {
-                state.book_terminal_reached = true;
+            if let Some(orig) = original_size_hint {
+                update_original_size_observed(&mut state, orig);
             }
-            if normalized_status == "CANCELED" {
-                state.partial = true;
+            if let Some(matched) = size_matched_hint {
+                update_size_matched_observed(&mut state, matched);
             }
-            if matches!(normalized_status.as_str(), "MATCHED" | "FILLED") {
-                state.success = true;
+            let book_fully_matched = is_book_fully_matched_observed(
+                state.original_size_observed,
+                state.size_matched_observed,
+            );
+            match normalized_status.as_str() {
+                "CANCELED" => {
+                    state.book_terminal_reached = true;
+                    state.partial = true;
+                }
+                "UNMATCHED" => {
+                    state.book_terminal_reached = true;
+                }
+                "MATCHED" | "FILLED" => {
+                    state.success = true;
+                    if book_fully_matched {
+                        state.book_terminal_reached = true;
+                    }
+                }
+                _ => {}
             }
         }
-        Self::bump_debounce_finalize(Arc::clone(self));
+        Self::schedule_finalize_attempt(Arc::clone(self));
     }
 
     async fn record_poll_http(
@@ -809,8 +1005,9 @@ impl PostOrderInvokeAggregator {
         {
             let mut state: tokio::sync::RwLockWriteGuard<'_, InvokeAggInner> =
                 self.inner.write().await;
-            // `apply_polled_snapshot` сам выставит `book_terminal_reached` для
-            // `Matched|Canceled|Unmatched` — дублируем здесь только информационные флаги.
+            // `apply_polled_snapshot` сам обновит observed-поля и выставит
+            // `book_terminal_reached` (для `Canceled|Unmatched` — безусловно, для `Matched` —
+            // только при `is_book_fully_matched_observed`); здесь дублируем информационные флаги.
             apply_polled_snapshot(&mut state, &open_order, trades.as_deref());
             if matches!(&open_order.status, OrderStatusType::Canceled) {
                 state.partial = true;
@@ -819,7 +1016,7 @@ impl PostOrderInvokeAggregator {
                 state.success = true;
             }
         }
-        Self::bump_debounce_finalize(Arc::clone(self));
+        Self::schedule_finalize_attempt(Arc::clone(self));
     }
 
     /// Book-matched эффективный leg — `max(filled_ws, filled_http)`. **Информационный**:
@@ -832,6 +1029,16 @@ impl PostOrderInvokeAggregator {
     /// зачисленных средствах: только эту цифру сообщает [`SingleOrderClobInvocationReport`].
     fn effective_settled_leg(state: &InvokeAggInner) -> LegAgg {
         leg_agg_max_normalized(state.settled_ws, state.settled_http)
+    }
+
+    /// Terminal-failed эффективный leg — `max(failed_ws, failed_http)`. Это объём book-match'а,
+    /// по которому релайер сдался: on-chain ничего не зачислилось и **не зачислится**. В
+    /// [`Self::build_report`] **не** прибавляется к `success`-цифрам (`making_amount`/
+    /// `taking_amount`), но засчитывается в [`Self::settlement_caught_up_with_match`] как
+    /// «терминальный объём» — иначе при race «book CANCELED + один трейд застрял `Failed`»
+    /// агрегатор бы ждал вечно (settled навсегда меньше filled).
+    fn effective_failed_leg(state: &InvokeAggInner) -> LegAgg {
+        leg_agg_max_normalized(state.failed_ws, state.failed_http)
     }
 
     fn settled_target_progress(state: &InvokeAggInner) -> OrderAmount {
@@ -859,40 +1066,107 @@ impl PostOrderInvokeAggregator {
         Self::target_amount_meets(&state.target, &Self::settled_target_progress(state))
     }
 
-    /// `true` если settled-leg догнал book-matched leg (по обеим осям). Используется для
-    /// finalize cancel-сценариев: после `Canceled` делать вид, что больше fills не будет, но
-    /// ждать settlement уже состоявшегося book-match'а.
+    /// Тоже самое, что [`Self::target_amount_meets`], но с допуском «дастр» в один CLOB-lot
+    /// ([`SHARES_REPORT_FULL_FILL_DUST_TOLERANCE`] / [`USDC_REPORT_FULL_FILL_DUST_TOLERANCE`]).
+    /// Применяется **только** для решения `partial`/`error_msg` в [`Self::build_report`] —
+    /// гейт finalize ([`Self::should_invoke`] / [`Self::settled_targets_met`]) остаётся строгим.
+    /// Цель: не помечать ордер как `partial=true`, когда CLOB **сам** маркирует исполнение
+    /// `Matched` и обнуляет sub-lot остаток (типичный случай: `target=Shares(5.0)`,
+    /// `settled=Shares(4.995078)` — пользователь видит «вся нога продана»).
+    fn settled_meets_target_with_report_dust(state: &InvokeAggInner) -> bool {
+        let progress = Self::settled_target_progress(state);
+        match (&state.target, &progress) {
+            (OrderAmount::Shares(target_shares), OrderAmount::Shares(effective_shares)) => {
+                target_shares.is_finite()
+                    && *target_shares > 0.0
+                    && *effective_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE
+                        >= *target_shares
+            }
+            (OrderAmount::UsdNotional(target_usdc), OrderAmount::UsdNotional(effective_usdc)) => {
+                target_usdc.is_finite()
+                    && *target_usdc > 0.0
+                    && *effective_usdc + USDC_REPORT_FULL_FILL_DUST_TOLERANCE >= *target_usdc
+            }
+            _ => false,
+        }
+    }
+
+    /// `true` если **терминальный** объём (settled + failed) догнал book-matched leg
+    /// (по обеим осям). Используется для finalize cancel-сценариев: после `Canceled` делать
+    /// вид, что больше fills не будет, но ждать settlement уже состоявшегося book-match'а.
+    ///
+    /// **Failed-трейды** учитываются здесь как terminal-объём, потому что для них релайер
+    /// сдался — больше изменений по этим `trade_id` не будет ни on-chain, ни в книге. Без этого
+    /// при race «`Canceled` пришёл, последний из N трейдов застрял в `Failed`» условие
+    /// `settled ≥ filled` оставалось бы навсегда `false`, и агрегатор зависал бы (мы убрали
+    /// timestamp-дедлайны, см. модульный комментарий). `success` от учёта Failed не растёт:
+    /// в [`Self::build_report`] он считается строго по `effective_settled_leg`.
+    ///
+    /// Дополнительно защищает от race «WS `order` с `size_matched` пришёл раньше
+    /// соответствующих WS `trade` event'ов»: если CLOB утверждает, что сматчено больше, чем
+    /// мы успели накопить в `book_leg` через trade-event'ы (или REST `trades`-агрегат), —
+    /// settlement по определению ещё не догнал. Без этой проверки finalize выстрелил бы с
+    /// пустыми сидами и `success=false`, хотя on-chain трейды на подходе. Допуск — один
+    /// CLOB-lot ([`SHARES_REPORT_FULL_FILL_DUST_TOLERANCE`]): для SELL shares-сторона у нас
+    /// gross (fee удерживается с USDC), сравнение прямое; для BUY fee на shares-стороне даёт
+    /// малое shrinkage, но у Polymarket в большинстве маркетов 0 bps, и lot-допуск его
+    /// покрывает.
     fn settlement_caught_up_with_match(state: &InvokeAggInner) -> bool {
         let book_leg = Self::effective_leg(state);
         let settled_leg = Self::effective_settled_leg(state);
+        let failed_leg = Self::effective_failed_leg(state);
         let book_shares = order_amount_shares_scalar(book_leg.taking_amount);
         let settled_shares = order_amount_shares_scalar(settled_leg.taking_amount);
+        let failed_shares = order_amount_shares_scalar(failed_leg.taking_amount);
         let book_usd = order_amount_usd_scalar(book_leg.making_amount);
         let settled_usd = order_amount_usd_scalar(settled_leg.making_amount);
-        settled_shares + SHARE_EPS >= book_shares && settled_usd + USD_EPS >= book_usd
+        let failed_usd = order_amount_usd_scalar(failed_leg.making_amount);
+
+        if state.size_matched_observed > book_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE
+        {
+            return false;
+        }
+
+        let terminal_shares = settled_shares + failed_shares;
+        let terminal_usd = settled_usd + failed_usd;
+        terminal_shares + SHARE_EPS >= book_shares && terminal_usd + USD_EPS >= book_usd
     }
 
-    /// Ready-to-finalize, если выполнено **строгое** settlement-условие:
+    /// Ready-to-finalize **строго** по событиям от CLOB — никаких timestamp-фоллбэков:
     /// 1. settlement покрыл целевой объём (`success=true` в отчёте), **или**
     /// 2. book-level терминал заявки достигнут ([`InvokeAggInner::book_terminal_reached`])
-    ///    **и** settlement догнал book-match по обеим осям — больше fill'ов не будет
-    ///    (Taker FAK сразу после settlement, Maker — после `MATCHED|CANCELED|UNMATCHED`), **или**
-    /// 3. дедлайн (best-effort: отчёт по факту settled, диагностика в `error_msg`).
-    fn should_invoke(state: &InvokeAggInner, timestamp_ms: i64) -> bool {
+    ///    **и** terminal-объём (`settled + failed`) догнал book-match по обеим осям — больше
+    ///    изменений не будет:
+    ///    - Taker — сразу после settlement (FAK не остаётся в книге).
+    ///    - Maker `CANCELED`/`UNMATCHED` — безусловно (ордер ушёл из книги; для GTD это и есть
+    ///      событие после `expiration` — CLOB сам снимает ордер).
+    ///    - Maker `MATCHED`/`FILLED` — **только** если
+    ///      [`is_book_fully_matched_observed`] = `true` (т.е. наблюдаемый `size_matched`
+    ///      покрыл `original_size` с дастр-допуском). Это защищает partial maker'а от
+    ///      прематурного finalize, когда Polymarket уже прислал `MATCHED` после первого
+    ///      трейда, а матч ещё может продолжаться (см. [`InvokeAggInner::book_terminal_reached`]).
+    ///
+    /// `Failed`-трейды (релайер сдался) считаются терминальным объёмом наравне с `Mined|Confirmed`
+    /// в гейте `(2)` — см. [`Self::settlement_caught_up_with_match`] — иначе при race
+    /// «`CANCELED` пришёл, последний из N трейдов застрял в `Failed`» агрегатор бы зависал.
+    /// При этом `Failed` **не** прибавляется к `success`-цифрам отчёта (там только реально
+    /// зачисленное on-chain).
+    fn should_invoke(state: &InvokeAggInner) -> bool {
         if Self::settled_targets_met(state) {
             return true;
         }
-        if state.book_terminal_reached && Self::settlement_caught_up_with_match(state) {
-            return true;
-        }
-        timestamp_ms >= state.deadline_ms
+        state.book_terminal_reached && Self::settlement_caught_up_with_match(state)
     }
 
-    fn build_report(state: &InvokeAggInner, timestamp_ms: i64) -> SingleOrderClobInvocationReport {
+    fn build_report(state: &InvokeAggInner) -> SingleOrderClobInvocationReport {
         // Отчёт всегда по settled-leg — это правда о зачисленных средствах (NET of fee).
-        // Book-matched (`effective_leg`) используем только для диагностики `settlement_timeout`.
+        // Book-matched (`effective_leg`) и failed-leg (`effective_failed_leg`) используем
+        // только для диагностики (`partial_settlement` / `relayer_failed`); в numerical
+        // `making_amount`/`taking_amount` они **не** входят: пользователь видит ровно то,
+        // что реально упало в его кошелёк on-chain.
         let settled_leg = Self::effective_settled_leg(state);
         let book_leg = Self::effective_leg(state);
+        let failed_leg = Self::effective_failed_leg(state);
         let (making_amount, taking_amount) =
             report_making_and_taking_amounts(state.side, settled_leg);
 
@@ -900,54 +1174,74 @@ impl PostOrderInvokeAggregator {
         let settled_usd = order_amount_usd_scalar(settled_leg.making_amount);
         let book_shares = order_amount_shares_scalar(book_leg.taking_amount);
         let book_usd = order_amount_usd_scalar(book_leg.making_amount);
+        let failed_shares = order_amount_shares_scalar(failed_leg.taking_amount);
+        let failed_usd = order_amount_usd_scalar(failed_leg.making_amount);
 
         let has_settled_fill = settled_shares > SHARE_EPS || settled_usd > USD_EPS;
         let has_book_fill = book_shares > SHARE_EPS || book_usd > USD_EPS;
-        let settled_target_reached = Self::settled_targets_met(state);
-        let deadline_hit = timestamp_ms >= state.deadline_ms;
+        let has_failed_terminal = failed_shares > SHARE_EPS || failed_usd > USD_EPS;
+        // Для решения `partial` используем **дастр**-допуск: Polymarket снимает sub-lot остаток
+        // при `OrderStatusType::Matched` (book-terminal), и пользовательски это «вся нога
+        // продана». Гейт finalize этим не затрагиваем — там по-прежнему строгий
+        // [`Self::settled_targets_met`] (см. [`Self::should_invoke`]).
+        let settled_target_reached_with_dust = Self::settled_meets_target_with_report_dust(state);
 
         let report_success = has_settled_fill;
-        let report_partial = report_success && !settled_target_reached;
+        let report_partial = report_success && !settled_target_reached_with_dust;
 
         let error_msg = if has_settled_fill {
-            // Что-то реально зачислено on-chain.
-            if settled_target_reached {
+            // Что-то реально зачислено on-chain. Сначала чекаем terminal-failed — это самый
+            // громкий диагностический сигнал: были book-match'и, по которым релайер сдался.
+            if has_failed_terminal {
+                Some(format!(
+                    "relayer_failed: settled shares={settled_shares:.6} usdc={settled_usd:.6}, \
+                     failed_on_relayer shares={failed_shares:.6} usdc={failed_usd:.6} \
+                     (book_matched shares={book_shares:.6} usdc={book_usd:.6})"
+                ))
+            } else if settled_target_reached_with_dust {
                 None
             } else if has_book_fill
+                && state.book_terminal_reached
                 && (book_shares > settled_shares + SHARE_EPS || book_usd > settled_usd + USD_EPS)
-                && deadline_hit
             {
+                // Книга закрыта, но on-chain зачислилось меньше, чем сматчилось, и failed
+                // ничего не объясняет — значит часть трейдов ещё `Retrying` (не terminal).
+                // Гейт `should_invoke` сюда привести не должен; диагностика на случай гонок.
                 Some(format!(
                     "partial_settlement: book matched shares={book_shares:.6} usdc={book_usd:.6}, \
-                     settled shares={settled_shares:.6} usdc={settled_usd:.6} within \
-                     {INVOKE_FALLBACK_POLL_DEADLINE_SEC}s deadline"
+                     settled shares={settled_shares:.6} usdc={settled_usd:.6}"
                 ))
             } else {
                 None
             }
-        } else if has_book_fill {
-            // Сматчили в книге, но settlement не дошёл (Mined/Confirmed не пришли) —
-            // либо дедлайн, либо Retrying/Failed на чейне.
-            Some(format!(
-                "settlement_timeout: matched book shares={book_shares:.6} usdc={book_usd:.6} \
-                 but 0 settled on-chain (deadline_hit={deadline_hit}, \
-                 book_terminal={}, canceled={}) within {INVOKE_FALLBACK_POLL_DEADLINE_SEC}s",
-                state.book_terminal_reached, state.partial
-            ))
         } else if state.book_terminal_reached {
-            // Book-уровень закрыт (Unmatched/Canceled без fill'а) — ждать больше нечего.
-            Some(format!(
-                "book_terminal_no_fill: order reached terminal book status with 0 matches \
-                 (canceled={})",
-                state.partial
-            ))
-        } else if deadline_hit {
-            Some(format!(
-                "no_fill_no_settlement: order neither matched nor settled within \
-                 {INVOKE_FALLBACK_POLL_DEADLINE_SEC}s deadline"
-            ))
+            // Book-уровень закрыт, on-chain settle = 0. Если has_failed_terminal — все трейды
+            // (или единственные имевшиеся) провалились на релайере. Иначе — либо book-fill
+            // ещё `Retrying|Matched`, либо `Unmatched|Canceled` вовсе без fill'ов.
+            if has_failed_terminal {
+                Some(format!(
+                    "relayer_failed_all: book matched shares={book_shares:.6} usdc={book_usd:.6}, \
+                     all failed_on_relayer shares={failed_shares:.6} usdc={failed_usd:.6} \
+                     (canceled={})",
+                    state.partial
+                ))
+            } else if has_book_fill {
+                Some(format!(
+                    "book_terminal_no_settle: book matched shares={book_shares:.6} \
+                     usdc={book_usd:.6} but 0 settled on-chain (book_terminal=true, \
+                     canceled={})",
+                    state.partial
+                ))
+            } else {
+                Some(format!(
+                    "book_terminal_no_fill: order reached terminal book status with 0 matches \
+                     (canceled={})",
+                    state.partial
+                ))
+            }
         } else {
-            // Сюда теоретически не должны приходить: `should_invoke` бы вернул false.
+            // Сюда теоретически не должны приходить: `should_invoke` бы вернул false без
+            // settled fill'а и без book-terminal'а.
             None
         };
 
@@ -966,10 +1260,9 @@ impl PostOrderInvokeAggregator {
             return;
         }
 
-        let timestamp_ms = crate::util::current_timestamp_ms();
         let ready_to_invoke = {
             let state = self.inner.read().await;
-            Self::should_invoke(&state, timestamp_ms)
+            Self::should_invoke(&state)
         };
         if !ready_to_invoke {
             return;
@@ -988,23 +1281,21 @@ impl PostOrderInvokeAggregator {
             return;
         }
 
-        let (report, committed_order_id, summary_at_fire, deadline_ms_for_log) = {
+        let (report, committed_order_id, summary_at_fire) = {
             let state = self.inner.read().await;
-            let timestamp_ms_recheck = crate::util::current_timestamp_ms();
-            if !Self::should_invoke(&state, timestamp_ms_recheck) {
+            if !Self::should_invoke(&state) {
                 {
                     let mut finished_guard = self.finished.write().await;
                     *finished_guard = false;
                 }
-                Self::bump_debounce_finalize(Arc::clone(&self));
+                Self::schedule_finalize_attempt(Arc::clone(&self));
                 return;
             }
             let cloned_order_id = self.order_id.clone();
-            let mut invocation_report = Self::build_report(&state, timestamp_ms_recheck);
+            let mut invocation_report = Self::build_report(&state);
             invocation_report.order_id = nonempty_order_id_str(&cloned_order_id);
             let summary = leg_summary_for_log(&state);
-            let deadline = state.deadline_ms;
-            (invocation_report, cloned_order_id, summary, deadline)
+            (invocation_report, cloned_order_id, summary)
         };
 
         let _ = self.trackers.write().await.remove(&committed_order_id);
@@ -1013,14 +1304,11 @@ impl PostOrderInvokeAggregator {
         let http_polls = *self.http_poll_count.read().await;
         let ws_trades = *self.ws_trade_count.read().await;
 
-        // Финальный лог: всё, что вызывающий и аудит увидят в `SingleOrderClobInvocationReport`,
-        // плюс счётчики событий и итоговые агрегаты обеих ног.
         crate::test_tee_println!(
             "[order_invoke/final] order_id={committed_order_id} elapsed_ms={elapsed_ms} \
              http_polls={http_polls} ws_trades={ws_trades} side={side:?} role={role:?} \
-             target={target:?} deadline_ms={deadline_ms_for_log} | \
-             success={success} partial={partial} making={making:?} taking={taking:?} \
-             error_msg={error_msg:?} | {summary_at_fire}",
+             target={target:?} | success={success} partial={partial} making={making:?} \
+             taking={taking:?} error_msg={error_msg:?} | {summary_at_fire}",
             side = self.side,
             role = self.role,
             target = self.target,
@@ -1057,11 +1345,13 @@ async fn take_tracker_entry(
 }
 
 /// Накапливает исполнение по **`order_id`** из user-WS `trade`-события.
-/// `trade_id` — уникальный id трейда (для дедупа лифсайкла `MATCHED → MINED → CONFIRMED`,
-/// которые могут прийти как несколько событий с одним `id`). `fee_rate_bps` — per-trade
-/// fee из user-WS (`trade.fee_rate_bps`); удерживается с **taking-стороны** заявки
-/// (BUY → меньше shares; SELL → меньше USDC). `is_settled_on_chain` —
-/// `true` для `MINED|CONFIRMED` (см. [`ws_trade_status_settled_on_chain`]).
+/// `trade_id` — уникальный id трейда (для дедупа лифсайкла
+/// `MATCHED → RETRYING → MINED → CONFIRMED` или `… → FAILED`, которые могут прийти
+/// как несколько событий с одним `id`). `fee_rate_bps` — per-trade fee из user-WS
+/// (`trade.fee_rate_bps`); удерживается с **taking-стороны** заявки (BUY → меньше shares;
+/// SELL → меньше USDC). `is_settled_on_chain` — `true` для `MINED|CONFIRMED`
+/// (см. [`ws_trade_status_settled_on_chain`]). `is_terminal_failed` — `true` для `FAILED`
+/// (см. [`ws_trade_status_terminal_failed`]): релайер сдался, on-chain ничего не зачислится.
 pub(crate) async fn accumulate_invoke_from_ws_trade(
     trackers: &Arc<RwLock<HashMap<String, TrackerEntry>>>,
     order_id: &str,
@@ -1070,6 +1360,7 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
     price: f64,
     fee_rate_bps: f64,
     is_settled_on_chain: bool,
+    is_terminal_failed: bool,
 ) {
     if order_id.is_empty() {
         return;
@@ -1084,7 +1375,8 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
         // чужих ордеров, но при разборе кейса полезно знать, что событие отброшено.
         crate::test_tee_println!(
             "[order_invoke/ws] dropped (no tracker): order_id={order_id} trade_id={trade_id} \
-             size={size} price={price} fee_bps={fee_rate_bps} settled={is_settled_on_chain}",
+             size={size} price={price} fee_bps={fee_rate_bps} settled={is_settled_on_chain} \
+             failed={is_terminal_failed}",
         );
         return;
     };
@@ -1104,6 +1396,7 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
             quote,
             fee_rate_bps,
             is_settled_on_chain,
+            is_terminal_failed,
         )
         .await;
 
@@ -1123,7 +1416,7 @@ pub(crate) async fn accumulate_invoke_from_ws_trade(
     crate::test_tee_println!(
         "[order_invoke/ws] order_id={order_id} trade_id={trade_id} size={size:.6} \
          price={price:.6} fee_bps={fee_rate_bps:.3} settled={is_settled_on_chain} \
-         → ws_count={ws_count_after} | {snapshot_before} → {snapshot_after}",
+         failed={is_terminal_failed} → ws_count={ws_count_after} | {snapshot_before} → {snapshot_after}",
     );
 }
 
@@ -1132,6 +1425,8 @@ pub(crate) async fn notify_terminal_ws_order_snapshot(
     trackers: &Arc<RwLock<HashMap<String, TrackerEntry>>>,
     order_id: &str,
     order_status: &str,
+    original_size: Option<f64>,
+    size_matched: Option<f64>,
 ) {
     if order_id.is_empty() {
         return;
@@ -1143,7 +1438,7 @@ pub(crate) async fn notify_terminal_ws_order_snapshot(
     let invoke_aggregator_arc = Arc::clone(&tracker_entry.invoke_aggregator);
     drop(trackers_snapshot);
     invoke_aggregator_arc
-        .record_ws_order_status(order_status)
+        .record_ws_order_status(order_status, original_size, size_matched)
         .await;
 }
 
@@ -1167,20 +1462,10 @@ fn spawn_invoke_poll_fallback(
             "[order_invoke/poll/spawn] order_id={order_id} interval_ms={INVOKE_FALLBACK_POLL_MS} \
              trades_pages_max={TRADES_MAX_PAGES_PER_POLL} \
              http_timeout_s={ORDER_HTTP_POLL_TIMEOUT_SEC} \
-             deadline_s={INVOKE_FALLBACK_POLL_DEADLINE_SEC}",
+             (no timestamp deadline; loop until terminal CLOB event)",
         );
         loop {
             if *aggregator.finished.read().await {
-                return;
-            }
-            let timestamp_ms = crate::util::current_timestamp_ms();
-            let deadline_ms = aggregator.inner.read().await.deadline_ms;
-            if timestamp_ms >= deadline_ms {
-                crate::test_tee_println!(
-                    "[order_invoke/poll/deadline] order_id={order_id} \
-                     ts={timestamp_ms} deadline_ms={deadline_ms} → bump finalize",
-                );
-                PostOrderInvokeAggregator::bump_debounce_finalize(Arc::clone(&aggregator));
                 return;
             }
 
@@ -1471,8 +1756,12 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     // Также выставляем `book_terminal_reached`:
     // - **Taker** — всегда сразу: taker не остаётся в книге, любой POST-ответ — это финальное
     //   состояние book-уровня (Matched/Unmatched/Canceled — больше fill'ов не будет).
-    // - **Maker** — только для терминальных POST-статусов (`Matched|Canceled|Unmatched`);
-    //   `Live|Delayed` оставляем без флага — ордер живёт в книге, ждём fill'ы.
+    // - **Maker** `Canceled|Unmatched` — безусловный терминал (ордер ушёл из книги).
+    // - **Maker** `Matched` — терминал **только** если book-match по POST покрыл `original_size`
+    //   (с дастр-допуском в один CLOB-lot). Polymarket помечает книгу `Matched` после **каждого**
+    //   матча, поэтому без этой проверки колбэк мог бы выстрелить прематурно у partial maker'а,
+    //   ещё способного матчиться дальше. Если PostOrderResponse-сид показывает неполный матч,
+    //   ждём дальнейших трейдов через poll/WS, либо явного `Canceled`/`Unmatched`.
     let order_role = invoke_aggregator.role;
     {
         let mut invoke_state = invoke_aggregator.inner.write().await;
@@ -1492,11 +1781,28 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
         };
         leg.sanitize_mut();
         invoke_state.filled_http = leg_agg_max_normalized(invoke_state.filled_http, leg);
-        let post_status_is_book_terminal = matches!(
+
+        // Сидим `size_matched_observed` из gross-shares в POST-ответе: после `LegAgg`-свопа
+        // `leg.taking_amount` всегда лежит в `OrderAmount::Shares` (`making`=USDC, `taking`=Shares
+        // по нашей внутренней конвенции). Это позволяет диагностировать полный мгновенный
+        // maker-матч уже на POST-ответе без ожидания первого poll'а (~500ms экономии latency).
+        if let OrderAmount::Shares(s) = leg.taking_amount {
+            update_size_matched_observed(&mut invoke_state, s);
+        }
+
+        let post_status_is_sure_terminal = matches!(
             http_result.status,
-            OrderStatusType::Matched | OrderStatusType::Canceled | OrderStatusType::Unmatched
+            OrderStatusType::Canceled | OrderStatusType::Unmatched
         );
-        if matches!(order_role, OrderRole::Taker) || post_status_is_book_terminal {
+        let post_status_matched_fully = matches!(http_result.status, OrderStatusType::Matched)
+            && is_book_fully_matched_observed(
+                invoke_state.original_size_observed,
+                invoke_state.size_matched_observed,
+            );
+        if matches!(order_role, OrderRole::Taker)
+            || post_status_is_sure_terminal
+            || post_status_matched_fully
+        {
             invoke_state.book_terminal_reached = true;
         }
         if matches!(http_result.status, OrderStatusType::Canceled) {
@@ -1513,7 +1819,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     // - `Canceled`: ждём settlement уже произошедших до отмены fill'ов; на
     //   `book_terminal_reached + settled догнал book-match` finalize (см.
     //   [`PostOrderInvokeAggregator::should_invoke`]).
-    PostOrderInvokeAggregator::bump_debounce_finalize(Arc::clone(&invoke_aggregator));
+    PostOrderInvokeAggregator::schedule_finalize_attempt(Arc::clone(&invoke_aggregator));
     spawn_invoke_poll_fallback(Arc::clone(account), cloned_order_id, invoke_aggregator);
 }
 

@@ -78,7 +78,7 @@ pub use crate::account_order_completion::{SingleOrderClobInvocationReport, Singl
 /// Колбэк **никогда не выполняется синхронно в стэке этой функции**: все пути firing'а проходят через
 /// [`crate::account_order_completion::spawn_fire_invocation_report`] (или через
 /// [`crate::account_order_completion::PostOrderInvokeAggregator`], который уже работает на собственных
-/// [`tokio::spawn`]-тасках — debounce/poll/WS). Это значит, что любое тело `invoke` выполняется
+/// [`tokio::spawn`]-тасках — finalize-attempt/poll/WS). Это значит, что любое тело `invoke` выполняется
 /// строго **после** возврата `post_order_on_clob` вызывающему — момент планирования таски
 /// определяется тоkio-рантаймом, но не текущим стэком вызовов.
 ///
@@ -91,9 +91,12 @@ pub use crate::account_order_completion::{SingleOrderClobInvocationReport, Singl
 /// `client.trades(...)`) и комбинируются через `max`-merge — поэтому работает даже при
 /// недоступном WS. См. модуль [`crate::account_order_completion`].
 ///
-/// Если book-match произошёл, но settlement не успел до дедлайна
-/// ([`crate::account_order_completion::INVOKE_FALLBACK_POLL_DEADLINE_SEC`]), колбэк отдаёт
-/// `success=false` с диагностикой `error_msg = "settlement_timeout: ..."`.
+/// Никаких timestamp-фоллбэков нет: агрегатор ждёт явных HTTP/WS терминалов от CLOB сколько
+/// нужно. Если book-match состоялся, а on-chain settlement зависает (`Retrying|Failed`),
+/// CLOB-сторона рано или поздно эмитит `Canceled|Unmatched` или сам ордер дойдёт до book-terminal
+/// при очередном poll — и колбэк выстрелит с `success=false`/`partial=true` и диагностикой
+/// `error_msg = "book_terminal_no_settle: ..."`. Если CLOB не отвечает (сеть/баг), вызывающий
+/// код сам должен таймаутить — этот контракт не таймаутит ничего.
 ///
 /// При ошибке до HTTP-ответа отчёт несёт `success=false, partial=false, order_id=None` и нули в
 /// корректной типовой раскладке по `side` ([`crate::account_order_completion::SingleOrderClobInvocationReport`]).
@@ -329,18 +332,34 @@ fn f64_to_decimal(f: f64, ctx: &str) -> Result<Decimal> {
         .with_context(|| format!("post_order_on_clob: {ctx}: f64 {f} → Decimal не сконвертился"))
 }
 
+/// Минимальный тик Polymarket по цене исхода — **0.01** ⇒ в `f64` не более двух знаков после запятой.
+/// Принимаем любой конечный `price` уже прошедший [`validate_post_order_request`] и округляем к «центу»,
+/// затем режем диапазон, чтобы/SDK не падали на лишней точности `f64`.
+fn normalize_probability_price_to_cent_tick(price: f64, ctx: &str) -> Result<f64> {
+    if !price.is_finite() {
+        bail!("post_order_on_clob: {ctx}: цена не finite ({price})");
+    }
+    if !(0.0..=1.0).contains(&price) {
+        bail!("post_order_on_clob: {ctx}: цена {price} вне допустимого [0,1]");
+    }
+    let rounded = (price * 100.0).round() / 100.0;
+    // Согласовано с фильтром лимита в `validate_post_order_request` после округления.
+    Ok(rounded.clamp(0.001, 0.999))
+}
+
 /// `limit_order` post_only, GTC или GTD если есть `expiration`.
 async fn build_maker_signable(
     client: &clob::Client<Authenticated<Normal>>,
     token_id: U256,
     req: &PostOrderRequest,
 ) -> Result<SignableOrder> {
-    let price = req.price.expect("validated in validate_post_order_request");
+    let price_raw = req.price.expect("validated in validate_post_order_request");
+    let price = normalize_probability_price_to_cent_tick(price_raw, "maker price input")?;
     let shares = match req.amount {
         OrderAmount::Shares(s) => s,
         OrderAmount::UsdNotional(_) => unreachable!("validated"),
     };
-    let price_dec = f64_to_decimal(price, "maker price")?;
+    let price_dec = f64_to_decimal(price, "maker price (tick-normalized)")?;
     let size_dec = f64_to_decimal(shares, "maker shares")?;
 
     let order_type = if req.expiration.is_some() {
@@ -412,7 +431,8 @@ async fn compute_taker_cap_price(
     req: &PostOrderRequest,
 ) -> Result<Option<Decimal>> {
     if let Some(p) = req.price {
-        return Ok(Some(f64_to_decimal(p, "taker price")?));
+        let p_norm = normalize_probability_price_to_cent_tick(p, "taker explicit cap price")?;
+        return Ok(Some(f64_to_decimal(p_norm, "taker price (tick-normalized)")?));
     }
     let Some(slip) = req.max_slippage_pp else {
         return Ok(None);
