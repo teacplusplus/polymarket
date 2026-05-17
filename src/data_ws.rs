@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::ws_connect::{connect_async_maybe_proxy, ws_proxy_from_env};
 
 pub use crate::market_snapshot::{
     CurrencyUpDownDelayClass, CurrencyUpDownOutcome, MarketSnapshot, TradeSide, XFrameIntervalKind,
@@ -135,15 +137,16 @@ async fn run_persistent_interval_market_ws_inner(
     let mut had_prior_successful_market_subscription = false;
 
     loop {
-        let (websocket_stream, _http_response) = match connect_async(POLYMARKET_MARKET_WS_URL).await
-        {
-            Ok(stream_and_response) => stream_and_response,
-            Err(connect_err) => {
-                run_log::market_ws_session_err(&connect_err);
-                sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
-                continue;
-            }
-        };
+        let proxy = ws_proxy_from_env();
+        let (websocket_stream, _http_response) =
+            match connect_async_maybe_proxy(POLYMARKET_MARKET_WS_URL, proxy.as_ref()).await {
+                Ok(stream_and_response) => stream_and_response,
+                Err(connect_err) => {
+                    run_log::market_ws_session_err(&connect_err);
+                    sleep(Duration::from_secs(WS_RECONNECT_DELAY_SECS)).await;
+                    continue;
+                }
+            };
         let (mut write, mut read) = websocket_stream.split();
 
         let subscribe = json!({

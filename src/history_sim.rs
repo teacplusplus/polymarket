@@ -6,8 +6,8 @@ use crate::account::{Account, SharedAccount};
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
 use crate::train_mode::{
-    Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION, collect_bin_paths,
-    load_calibration, split_counts,
+    collect_bin_paths, load_calibration, split_counts,
+    Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
 };
 use crate::xframe::{
     BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN_NO_TRADE_PROB_LOW,
@@ -17,7 +17,7 @@ use crate::xframe::{
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println};
 
-pub use crate::sim_stats::{SideStats, SimStats, print_side_stats, print_sim_stats};
+pub use crate::sim_stats::{print_side_stats, print_sim_stats, SideStats, SimStats};
 use std::fs;
 use std::path::Path;
 use xgb::{Booster, DMatrix};
@@ -75,7 +75,7 @@ pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
 
 /// HTTP стакан для strict fill в `real_sim`: `None` в history (WS [`book_fill_*`]).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct StrictBook {
+pub struct StrictBook {
     /// Bids, лучший первый.
     pub(crate) bids: Vec<BookLevel>,
     /// Asks, лучший первый.
@@ -389,15 +389,11 @@ pub async fn run_sim_mode() -> anyhow::Result<()> {
     )?;
 
     crate::trade_csv_log::set_current_regime("kelly");
-    tee_println!(
-        "[sim] === regime=kelly (Kelly + calibration, min(MAX_BET_FRACTION × bankroll, MAX_POSITION_USD)) ==="
-    );
+    tee_println!("[sim] === regime=kelly (Kelly + calibration, min(MAX_BET_FRACTION × bankroll, MAX_POSITION_USD)) ===");
     run_sim_mode_inner(true).await?;
 
     crate::trade_csv_log::set_current_regime("raw");
-    tee_println!(
-        "[sim] === regime=raw (no Kelly, no calibration, ${NO_KELLY_POSITION_SIZE_USD} entry) ==="
-    );
+    tee_println!("[sim] === regime=raw (no Kelly, no calibration, ${NO_KELLY_POSITION_SIZE_USD} entry) ===");
     run_sim_mode_inner(false).await?;
 
     crate::trade_csv_log::set_current_regime("");
@@ -430,13 +426,10 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     continue;
                 }
 
-                let model_up_path = version_path.join(format!("model_{interval}_1s_pnl_up.ubj"));
-                let model_down_path =
-                    version_path.join(format!("model_{interval}_1s_pnl_down.ubj"));
-                let model_resolution_up_path =
-                    version_path.join(format!("model_{interval}_1s_resolution_up.ubj"));
-                let model_resolution_down_path =
-                    version_path.join(format!("model_{interval}_1s_resolution_down.ubj"));
+                let model_up_path   = version_path.join(format!("model_{interval}_1s_pnl_up.ubj"));
+                let model_down_path = version_path.join(format!("model_{interval}_1s_pnl_down.ubj"));
+                let model_resolution_up_path   = version_path.join(format!("model_{interval}_1s_resolution_up.ubj"));
+                let model_resolution_down_path = version_path.join(format!("model_{interval}_1s_resolution_down.ubj"));
 
                 let tag = format!("{currency}/{version}/{interval}/{regime_label}");
 
@@ -460,9 +453,8 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
 
                 let booster_resolution_up = load_booster(&model_resolution_up_path);
                 let booster_resolution_down = load_booster(&model_resolution_down_path);
-                let calibration_resolution_up = load_calibration(&model_resolution_up_path).ok();
-                let calibration_resolution_down =
-                    load_calibration(&model_resolution_down_path).ok();
+                let calibration_resolution_up   = load_calibration(&model_resolution_up_path).ok();
+                let calibration_resolution_down = load_calibration(&model_resolution_down_path).ok();
 
                 let cal_info = |cal: &Option<Calibration>, label: &str| -> String {
                     match cal {
@@ -495,16 +487,8 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                          | {test_period_str}",
                         cal_info(&calibration_up, "cal_up"),
                         cal_info(&calibration_down, "cal_down"),
-                        if booster_resolution_up.is_some() {
-                            "✓"
-                        } else {
-                            "✗"
-                        },
-                        if booster_resolution_down.is_some() {
-                            "✓"
-                        } else {
-                            "✗"
-                        },
+                        if booster_resolution_up.is_some()   { "✓" } else { "✗" },
+                        if booster_resolution_down.is_some() { "✓" } else { "✗" },
                     );
                 } else {
                     tee_println!(
@@ -514,16 +498,8 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                          | no_trade_zone=({Y_TRAIN_NO_TRADE_PROB_LOW}..{Y_TRAIN_NO_TRADE_PROB_HIGH}) \
                          | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE} \
                          | {test_period_str}",
-                        if booster_resolution_up.is_some() {
-                            "✓"
-                        } else {
-                            "✗"
-                        },
-                        if booster_resolution_down.is_some() {
-                            "✓"
-                        } else {
-                            "✗"
-                        },
+                        if booster_resolution_up.is_some()   { "✓" } else { "✗" },
+                        if booster_resolution_down.is_some() { "✓" } else { "✗" },
                     );
                 }
 
@@ -537,15 +513,11 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 for file_path in test_paths {
                     match load_market_xframes(file_path) {
                         Ok(market_xframes) => {
-                            let polymarket_url = polymarket_event_url_from_dump_path(
-                                file_path,
-                                &currency,
-                                interval_kind,
-                            )
-                            .unwrap_or_default();
-                            let event_end_ms =
-                                window_bounds_from_dump_path(file_path, interval_kind)
-                                    .map(|b| b.event_end_ms);
+                            let polymarket_url =
+                                polymarket_event_url_from_dump_path(file_path, &currency, interval_kind)
+                                    .unwrap_or_default();
+                            let event_end_ms = window_bounds_from_dump_path(file_path, interval_kind)
+                                .map(|b| b.event_end_ms);
                             simulate_event(
                                 &market_xframes,
                                 &currency,
@@ -613,17 +585,9 @@ async fn simulate_event(
     let graph_dump_bin_path = bin_dump_path.to_string_lossy().into_owned();
     let price_to_beat = Some(market_xframes.price_to_beat);
     let final_price = Some(market_xframes.final_price);
-    let lane_key_up = (
-        currency.to_string(),
-        interval_kind,
-        CurrencyUpDownOutcome::Up,
-    );
-    let lane_key_down = (
-        currency.to_string(),
-        interval_kind,
-        CurrencyUpDownOutcome::Down,
-    );
-    let frames_up: Vec<&XFrame<SIZE>> = market_xframes.frames_up.iter().collect();
+    let lane_key_up = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Up);
+    let lane_key_down = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Down);
+    let frames_up: Vec<&XFrame<SIZE>>   = market_xframes.frames_up.iter().collect();
     let frames_down: Vec<&XFrame<SIZE>> = market_xframes.frames_down.iter().collect();
 
     let up_won = market_xframes.up_won();
@@ -933,12 +897,7 @@ pub enum BuyGate {
     /// После порога нет edge или размер < [`MIN_POSITION_USD`] (`kelly_skips`).
     KellySkip { raw: f32, pred: f32, kelly_f: f64 },
     /// Открыть на `size` USDC.
-    Proceed {
-        raw: f32,
-        pred: f32,
-        kelly_f: f64,
-        size: f64,
-    },
+    Proceed { raw: f32, pred: f32, kelly_f: f64, size: f64 },
 }
 
 /// Дерево решений входа без побочных эффектов ([`BuyGate`]). Инференс снаружи — [`compute_pnl_inference`].
@@ -985,12 +944,7 @@ pub(crate) fn buy_gate(
             // KellySkip → в no-kelly печати как bankroll_too_small ([`print_side_stats`]).
             return BuyGate::KellySkip { raw, pred, kelly_f };
         }
-        return BuyGate::Proceed {
-            raw,
-            pred,
-            kelly_f,
-            size,
-        };
+        return BuyGate::Proceed { raw, pred, kelly_f, size };
     }
 
     let kelly_f_adj = kelly_f * KELLY_MULTIPLIER;
@@ -1002,12 +956,7 @@ pub(crate) fn buy_gate(
     if size < MIN_POSITION_USD {
         return BuyGate::KellySkip { raw, pred, kelly_f };
     }
-    BuyGate::Proceed {
-        raw,
-        pred,
-        kelly_f,
-        size,
-    }
+    BuyGate::Proceed { raw, pred, kelly_f, size }
 }
 
 /// `true` если позиция открыта и добавлена в `positions`; иначе skip-счётчики ([`buy_gate`], same-asset).
@@ -1068,12 +1017,7 @@ pub(crate) async fn try_open_position(
             stats.kelly_skips += 1;
             false
         }
-        BuyGate::Proceed {
-            raw,
-            pred,
-            kelly_f,
-            size,
-        } => {
+        BuyGate::Proceed { raw, pred, kelly_f, size } => {
             if BLOCK_SAME_ASSET_OPEN {
                 let mut same_asset_open = false;
                 for p in positions.iter() {
@@ -1167,10 +1111,7 @@ pub(crate) enum SellGate {
     /// Hold-zone: SL + EV; caller записывает `new_p_win_ema` в позицию.
     HoldResolution { new_p_win_ema: Option<f64> },
     /// Закрыть по VWAP `exit_price` и причине (maker vs taker fee в [`close_position`]).
-    Close {
-        exit_price: f64,
-        reason: CloseReason,
-    },
+    Close { exit_price: f64, reason: CloseReason },
 }
 
 /// Один bid-walk для гейта. `net_usdc`: при `exit_as_maker == true` — gross без комиссии на выход;
@@ -1203,8 +1144,7 @@ fn capped_sell_fill_for_gate(
     let net_usdc = if exit_as_maker {
         gross_usdc
     } else {
-        let fee_usdc =
-            shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_vwap * (1.0 - sell_vwap);
+        let fee_usdc = shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_vwap * (1.0 - sell_vwap);
         gross_usdc - fee_usdc
     };
     Some(CappedSellFill {
@@ -1251,8 +1191,7 @@ pub(crate) fn sell_gate(
         }
     }
 
-    let in_hold_zone = frame.event_remaining_ms > 0
-        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
+    let in_hold_zone = frame.event_remaining_ms > 0 && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
 
     if in_hold_zone {
         let Some(fill) = capped_sell_fill_for_gate(
@@ -1269,16 +1208,12 @@ pub(crate) fn sell_gate(
         let delta = fill.sell_vwap - pos.buy_price;
 
         let new_p_win_ema: Option<f64> = match (p_win_now, pos.p_win_ema) {
-            (Some(p), Some(prev)) => {
-                Some(EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev)
-            }
+            (Some(p), Some(prev)) => Some(EV_EXIT_P_WIN_EMA_ALPHA * p + (1.0 - EV_EXIT_P_WIN_EMA_ALPHA) * prev),
             (Some(p), None) => Some(p),
             (None, existing) => existing,
         };
 
-        if delta <= Y_TRAIN_STOP_LOSS_PP
-            && stop_loss_sell_deteriorated_vs_entry_ref(pos, fill.sell_vwap)
-        {
+        if delta <= Y_TRAIN_STOP_LOSS_PP && stop_loss_sell_deteriorated_vs_entry_ref(pos, fill.sell_vwap) {
             return SellGate::Close {
                 exit_price: fill.sell_vwap,
                 reason: CloseReason::StopLoss,
@@ -1793,8 +1728,7 @@ fn open_position(
     }
     let buy_price = buy_price.clamp(0.001, 0.999);
 
-    let fee_usdc =
-        nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
+    let fee_usdc = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
     let fee_shares = fee_usdc / buy_price;
     let actual_shares = nominal_shares - fee_shares;
 
@@ -1916,9 +1850,7 @@ pub(crate) fn apply_close_to_side_stats(
     } else {
         stats.losses += 1;
     }
-    stats
-        .closed_trade_entries
-        .push((raw_pred_at_open, pnl > 0.0));
+    stats.closed_trade_entries.push((raw_pred_at_open, pnl > 0.0));
     match reason {
         CloseReason::TakeProfit => {
             stats.tp_count += 1;
@@ -2089,9 +2021,7 @@ pub(crate) fn book_fill_buy(
     let mut remaining_usdc = position_size;
     let mut total_shares = 0.0_f64;
     for level in asks {
-        if level.price <= 0.0 || level.size <= 0.0 {
-            continue;
-        }
+        if level.price <= 0.0 || level.size <= 0.0 { continue }
         let affordable = remaining_usdc / level.price;
         if affordable <= level.size {
             total_shares += affordable;
@@ -2143,9 +2073,7 @@ pub(crate) fn book_fill_sell(
     let mut remaining = shares_to_sell;
     let mut total_usdc = 0.0_f64;
     for level in bids {
-        if level.price <= 0.0 || level.size <= 0.0 {
-            continue;
-        }
+        if level.price <= 0.0 || level.size <= 0.0 { continue }
         if remaining <= level.size {
             total_usdc += remaining * level.price;
             remaining = 0.0;
@@ -2235,9 +2163,7 @@ pub(crate) fn top_pnl_shap_features_csv_cell(
         })
         .collect();
     contributions.sort_by(|(_, _, pct_a), (_, _, pct_b)| {
-        pct_b
-            .partial_cmp(pct_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        pct_b.partial_cmp(pct_a).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     contributions
@@ -2255,10 +2181,7 @@ pub(crate) fn load_booster(path: &Path) -> Option<Booster> {
     match Booster::load(path) {
         Ok(b) => Some(b),
         Err(err) => {
-            tee_eprintln!(
-                "[sim] не удалось загрузить модель {}: {err}",
-                path.display()
-            );
+            tee_eprintln!("[sim] не удалось загрузить модель {}: {err}", path.display());
             None
         }
     }
@@ -2277,7 +2200,7 @@ fn polymarket_event_url_from_dump_path(
 ) -> Option<String> {
     let bounds = window_bounds_from_dump_path(dump_file_path, interval_kind)?;
     let interval_label_str = match interval_kind {
-        XFrameIntervalKind::FiveMin => "5m",
+        XFrameIntervalKind::FiveMin    => "5m",
         XFrameIntervalKind::FifteenMin => "15m",
     };
     Some(format!(

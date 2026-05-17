@@ -14,7 +14,9 @@ use polymarket_client_sdk::auth::ExposeSecret as _;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::{MissedTickBehavior, interval, sleep};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::ws_connect::{connect_async_maybe_proxy, ws_proxy_from_env};
 
 /// URL user-канала (<https://docs.polymarket.com/api-reference/wss/user>).
 const POLYMARKET_USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
@@ -95,7 +97,9 @@ async fn run_user_ws_session(
     account: &SharedAccount,
     credentials: &Credentials,
 ) -> anyhow::Result<()> {
-    let (ws_stream, _http_response) = connect_async(POLYMARKET_USER_WS_URL).await?;
+    let proxy = ws_proxy_from_env();
+    let (ws_stream, _http_response) =
+        connect_async_maybe_proxy(POLYMARKET_USER_WS_URL, proxy.as_ref()).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Без фильтра маркетов; отбор по нашим order_id в apply.

@@ -1,22 +1,27 @@
-use super::*;
-use crate::account::{
+//! Live duel (dual taker BUY + maker TP race) integration test.
+
+use anyhow::Context;
+use poly::account::{
     Account, POLY_PRIVATE_KEY_ENV, SharedAccount, spawn_heartbeat,
     try_authenticate_clob_for_heartbeats,
 };
-use crate::account_order::{cancel_order_on_clob, CancelOrderRequest};
-use crate::account_order_completion::SingleOrderClobInvocationReport;
-use crate::account_ws::spawn_user_ws_listener;
-use crate::constants::CurrencyUpDownOutcome;
-use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
-use crate::util::{
+use poly::account_order::{
+    best_ask_sdk, cancel_order_on_clob, post_order_on_clob, CancelOrderRequest, OrderAmount,
+    OrderRole, PostOrderRequest, SingleOrderClobInvocationReport,
+};
+use poly::account_ws::spawn_user_ws_listener;
+use poly::constants::CurrencyUpDownOutcome;
+use poly::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
+use poly::util::{
     current_timestamp_ms, detect_country_and_ip, fetch_gamma_event_data_for_gamma_client,
 };
-use anyhow::Context;
 use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::Side;
 use polymarket_client_sdk::types::U256;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{Notify, oneshot};
 
 /// Период в секундах у slug `btc-updown-5m-{ts}`.
@@ -84,7 +89,6 @@ async fn live_btc_updown_book_buy_floor(
     let market_floor_buy_usd = min_taker_buy_usd_notional(min_order_size, best_ask_f64);
     Ok((min_order_size, best_ask_f64, market_floor_buy_usd))
 }
-
 /// Комиссия уже в [`SingleOrderClobInvocationReport`]; цена BUY ≈ USD spent / NET shares.
 fn implied_buy_px_per_share(rep: &SingleOrderClobInvocationReport) -> Option<f64> {
     let usd = match rep.making_amount {
@@ -265,7 +269,7 @@ async fn duel_cancel_if_some(
     wall_ms: u64,
 ) {
     let Some(id) = oid else {
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: {label}: cancel skipped — maker order_id unknown"
         );
         return;
@@ -279,11 +283,11 @@ async fn duel_cancel_if_some(
     )
     .await
     {
-        Ok(r) => eprintln!(
+        Ok(r) => poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: {label}: cancel order_id={id} canceled={}",
             r.canceled
         ),
-        Err(err) => eprintln!(
+        Err(err) => poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: {label}: cancel order_id={id} err: {err:#}"
         ),
     }
@@ -321,7 +325,7 @@ async fn duel_taker_flatten_floor(
             strict_book: None,
         },
         Box::new(move |rep| {
-            eprintln!(
+            poly::test_tee_println!(
                 "[flatten {invoke_label_static}] taker SELL finalize: outcome={:?} success={}, partial={}, \
                  order_id={:?}, making={:?}, taking={:?}, error_msg={:?}",
                 outcome,
@@ -352,7 +356,7 @@ async fn duel_unwind_inventory_when_other_leg_buy_failed(
     failed_peer: CurrencyUpDownOutcome,
     bought_floor_shares: f64,
 ) -> anyhow::Result<()> {
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit: нога {:?} не получила успешный taker BUY; \
          успешная нога {:?}: снимаем maker (если был) → taker SELL всех {:.2} shares (floor)",
         failed_peer, successful, bought_floor_shares,
@@ -373,7 +377,7 @@ async fn duel_unwind_inventory_when_other_leg_buy_failed(
     .await;
 
     let prep = duel.prep_ref(successful);
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit: taker SELL всего набранного {:?} slug={slug} asset_id={} shares={:.2}",
         successful, prep.asset_id, bought_floor_shares,
     );
@@ -389,7 +393,7 @@ async fn duel_unwind_inventory_when_other_leg_buy_failed(
     )
     .await?;
 
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit: продажа успешной ноги {:?} завершена — \
          отдано (making) {:?}, получено (taking) {:?}, order_id={:?}, partial={}, ok={}",
         successful,
@@ -423,7 +427,7 @@ async fn duel_on_full_maker_winner_flow(
     maker_outcome: CurrencyUpDownOutcome,
     maker_rep: SingleOrderClobInvocationReport,
 ) {
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel: ВХОД maker finalize {:?} колбёк после settle: БЫЛИ поставлены продажи-maker; финал rep: success={}, partial={}, order_id={:?}, making={:?}, taking={:?}, err={:?}",
         maker_outcome,
         maker_rep.success,
@@ -443,7 +447,7 @@ async fn duel_on_full_maker_winner_flow(
 
     let Some((cancel_other_oid, opp_sh_floor)) = harness.claim_first_full_maker_hit(maker_outcome)
     else {
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: второй/full maker финал после победителя или гонка — {:?} игнор",
             maker_outcome
         );
@@ -466,7 +470,7 @@ async fn duel_on_full_maker_winner_flow(
     let remaining_inventory = (opp_sh_floor - opp_maker_settled).max(0.0);
     // Floor до CLOB-lot (0.01) — sub-lot хвост биржа всё равно не примет в новый ордер.
     let sell_shares = (remaining_inventory * 100.0).floor() / 100.0;
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel: opp {:?} maker settled (saved)={:.4} sh (saved_floor={:.4}); \
          remaining_inventory={:.4} → SELL={:.4}",
         other_outcome, opp_maker_settled, opp_sh_floor, remaining_inventory, sell_shares,
@@ -481,7 +485,7 @@ async fn duel_on_full_maker_winner_flow(
     .await;
 
     if sell_shares < opp_prep.min_order_size {
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: opp {:?} SELL пропущен — sell_shares={:.4} < min_order_size={:.4} \
              (opp maker уже выкупил инвентарь через свой fill, либо остался sub-lot хвост); \
              считаем gracefully unwound — double-winner",
@@ -504,7 +508,7 @@ async fn duel_on_full_maker_winner_flow(
 
     match flatten_res {
         Ok(sell_rep) => {
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wall_ms} ms] duel: unwind противоположного {:?}: sold floor={:.4}, maker/taking {:?}/{:?}, order_id={:?}, success={}, partial={}, err={:?}",
                 other_outcome,
                 sell_shares,
@@ -517,13 +521,13 @@ async fn duel_on_full_maker_winner_flow(
             );
             if !(sell_rep.success && sell_rep.order_id.as_deref().is_some_and(|s| !s.is_empty()))
             {
-                eprintln!(
+                poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: WARNING unwind taker финал без полного успеха"
                 );
             }
         }
         Err(err) => {
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wall_ms} ms] duel: unwind противоположного {:?} упал: {err:#}",
                 other_outcome
             );
@@ -583,11 +587,11 @@ async fn duel_post_buy_then_maker_in_callback(
             tokio::spawn(async move {
                 let _ack = AckDrop(Some(chain_done_tx));
                 let wall_ms = wall_spawn.elapsed().as_millis() as u64;
-                eprintln!(
+                poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: ВХОД в invoke-колбёк taker BUY {:?} slug={} asset_id={} (целевой notion ≈{buy_usd:.4} USDC worst={worst:.5})",
                     outcome_t, slug_buy, aid,
                 );
-                eprintln!(
+                poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: taker BUY {:?} итог после settle: успех={} частичн.={} order_id={:?}; \
                      КУПИЛИ/потратили making={:?}, taking={:?}, err={:?}",
                     outcome_t,
@@ -599,7 +603,7 @@ async fn duel_post_buy_then_maker_in_callback(
                     buy_rep.error_msg,
                 );
                 if !buy_rep.success {
-                    eprintln!(
+                    poly::test_tee_println!(
                         "[от старта {wall_ms} ms] duel: taker BUY {:?} ПРОВАЛ — maker не выставляется, вторая нога может разгрузить сценарий",
                         outcome_t,
                     );
@@ -608,7 +612,7 @@ async fn duel_post_buy_then_maker_in_callback(
                 let shares_net = match buy_rep.taking_amount {
                     OrderAmount::Shares(s) => s,
                     OrderAmount::UsdNotional(_) => {
-                        eprintln!(
+                        poly::test_tee_println!(
                             "[от старта {wall_ms} ms] duel: BUY {:?}: ожидались Shares в taking_amount — без maker",
                             outcome_t,
                         );
@@ -616,7 +620,7 @@ async fn duel_post_buy_then_maker_in_callback(
                     }
                 };
                 if !(shares_net > 0.0 && shares_net.is_finite()) {
-                    eprintln!(
+                    poly::test_tee_println!(
                         "[от старта {wall_ms} ms] duel: BUY {:?}: невалидный shares_net={} — maker не ставится",
                         outcome_t, shares_net,
                     );
@@ -624,14 +628,14 @@ async fn duel_post_buy_then_maker_in_callback(
                 }
                 let shares_floor = (shares_net * 100.0).floor() / 100.0;
                 if shares_floor < min_sz_buy {
-                    eprintln!(
+                    poly::test_tee_println!(
                         "[от старта {wall_ms} ms] duel: BUY {:?}: после floor до 0.01 shares {:.4} < min_order {:.4} — maker не ставится",
                         outcome_t, shares_floor, min_sz_buy
                     );
                     return;
                 }
                 let Some(implied_px) = implied_buy_px_per_share(&buy_rep) else {
-                    eprintln!(
+                    poly::test_tee_println!(
                         "[от старта {wall_ms} ms] duel: BUY {:?}: не смогли восстановить USD/share — без maker",
                         outcome_t,
                     );
@@ -639,7 +643,7 @@ async fn duel_post_buy_then_maker_in_callback(
                 };
                 let maker_price_raw = implied_px * LIVE_MAKER_TP_MULT;
 
-                eprintln!(
+                poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: BUY {:?} зачтено для maker: NET shares {:.6} → floor {:.2}; \
                      сырая TP-цена до тика на CLOB (`post_order_on_clob`) ≈ {:.6}",
                     outcome_t,
@@ -681,7 +685,7 @@ async fn duel_post_buy_then_maker_in_callback(
                         if let OrderAmount::Shares(s) = rep.making_amount {
                             duel_for_invoke.record_maker_settled_shares(outcome_for_invoke, s);
                         }
-                        eprintln!(
+                        poly::test_tee_println!(
                             "[maker POST {:?}] ВХОД в invoke финала лимита: success={}, partial={}, order_id={:?}, making={:?}, taking={:?}, err={:?}",
                             outcome_t,
                             rep.success,
@@ -699,21 +703,21 @@ async fn duel_post_buy_then_maker_in_callback(
                 let resting_oid = match &post_res {
                     Ok(Some(oid)) if !oid.trim().is_empty() => Some(oid.clone()),
                     Ok(Some(_)) => {
-                        eprintln!(
+                        poly::test_tee_println!(
                             "[от старта {wall_ms} ms] duel: maker POST {:?} вернул пустой order_id",
                             outcome_t,
                         );
                         None
                     }
                     Ok(None) => {
-                        eprintln!(
+                        poly::test_tee_println!(
                             "[от старта {wall_ms} ms] duel: maker POST {:?} Ok(None) — resting нет до invoke",
                             outcome_t,
                         );
                         None
                     }
                     Err(err) => {
-                        eprintln!(
+                        poly::test_tee_println!(
                             "[от старта {wall_ms} ms] duel: maker POST {:?} упал до/на REST: {err:#}",
                             outcome_t,
                         );
@@ -723,7 +727,7 @@ async fn duel_post_buy_then_maker_in_callback(
 
                 if let Some(oid) = resting_oid.clone() {
                     duel.set_maker_order_id(outcome_t, Some(oid.clone()));
-                    eprintln!(
+                    poly::test_tee_println!(
                         "[от старта {wall_ms} ms] duel: maker {:?} принят книгой order_id={oid} \
                          сырая лимит-цена ≈{maker_price_raw:.6} (нормализация тика 0.01 в `post_order_on_clob`) \
                          shares={shares_floor:.2} market_end_unix_ms={market_end_unix_ms:?}",
@@ -735,7 +739,7 @@ async fn duel_post_buy_then_maker_in_callback(
                 match maker_fin {
                     Ok(maker_rep) => {
                         if resting_oid.is_none() {
-                            eprintln!(
+                            poly::test_tee_println!(
                                 "[от старта {wall_ms} ms] duel: maker {:?} не на книге — получен только отчёт агрегатора (success={}, err={:?}); гонку не ждём с этой ноги",
                                 outcome_t,
                                 maker_rep.success,
@@ -743,7 +747,7 @@ async fn duel_post_buy_then_maker_in_callback(
                             );
                             return;
                         }
-                        eprintln!(
+                        poly::test_tee_println!(
                             "[от старта {wall_ms} ms] duel: финальный invoke resting maker {:?} (гонка take-profit)",
                             outcome_t,
                         );
@@ -757,7 +761,7 @@ async fn duel_post_buy_then_maker_in_callback(
                         )
                         .await;
                     }
-                    Err(_) => eprintln!(
+                    Err(_) => poly::test_tee_println!(
                         "duel: {:?} maker invoke-колбёк потерян до финала агрегатора",
                         outcome_t,
                     ),
@@ -784,7 +788,7 @@ async fn duel_abort_race_cancel_any_makers_then_flatten_both_fills(
     snap: &DuelState,
     reason_human: &str,
 ) -> anyhow::Result<()> {
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit: {reason_human} slug={slug} \
          resting maker_id up={:?} down={:?} snap полный {:?}",
         snap.maker_id_up, snap.maker_id_down, snap,
@@ -814,7 +818,7 @@ async fn duel_abort_race_cancel_any_makers_then_flatten_both_fills(
     let up_prep = duel.prep_ref(CurrencyUpDownOutcome::Up);
     let dn_prep = duel.prep_ref(CurrencyUpDownOutcome::Down);
 
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit: taker SELL всего набранного UP — {u:.2} shares",
     );
     let up_sell = duel_taker_flatten_floor(
@@ -832,7 +836,7 @@ async fn duel_abort_race_cancel_any_makers_then_flatten_both_fills(
         "abort-race UP unwind: {:?}", up_sell,
     );
 
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit: taker SELL всего набранного DOWN — {d:.2} shares",
     );
     let dn_sell = duel_taker_flatten_floor(
@@ -851,7 +855,7 @@ async fn duel_abort_race_cancel_any_makers_then_flatten_both_fills(
     );
 
     duel.done.notify_one();
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel early-exit завершён: cancel (если были) + оба taker SELL",
     );
     Ok(())
@@ -864,7 +868,7 @@ async fn duel_emergency_flatten_and_cancel_all(
     wall_ms: u64,
     snap: &DuelState,
 ) {
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel: EMERGENCY timeout/cleanup slug={slug} snapshot winner={:?} up_buy={:?} down_buy={:?}",
         snap.winner,
         snap.up_buy_floor,
@@ -900,11 +904,11 @@ async fn duel_emergency_flatten_and_cancel_all(
             )
             .await
             {
-                Ok(r) => eprintln!(
+                Ok(r) => poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: emergency flatten UP ok success={}",
                     r.success
                 ),
-                Err(err) => eprintln!(
+                Err(err) => poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: emergency flatten UP failed: {err:#}"
                 ),
             }
@@ -925,11 +929,11 @@ async fn duel_emergency_flatten_and_cancel_all(
             )
             .await
             {
-                Ok(r) => eprintln!(
+                Ok(r) => poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: emergency flatten DOWN ok success={}",
                     r.success
                 ),
-                Err(err) => eprintln!(
+                Err(err) => poly::test_tee_println!(
                     "[от старта {wall_ms} ms] duel: emergency flatten DOWN failed: {err:#}"
                 ),
             }
@@ -937,325 +941,6 @@ async fn duel_emergency_flatten_and_cancel_all(
     }
 
     duel.done.notify_one();
-}
-
-/// Live BUY→SELL taker по текущему 5m BTC up/down: берётся **минимальный допустимый**
-/// CLOB notional (`min_order_size × best_ask`, не ниже $1); среди исходов Gamma выбирается
-/// сторона с меньшим floor (часто обе дороже $1 — тогда тратится меньший из двух минимумов).
-///
-/// ```bash
-/// POLY_PRIVATE_KEY=0x… \
-///     cargo test --bin poly account_order::tests::live_taker_roundtrip_btc_updown_5m -- --ignored --nocapture
-/// ```
-#[tokio::test]
-#[ignore = "live network: требует POLY_PRIVATE_KEY и pUSD на Safe; BUY на CLOB-min notional (может быть > $1)"]
-async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
-    use std::time::Instant;
-
-    let _ = dotenvy::dotenv();
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let t0 = Instant::now();
-    let mut last_evt = t0;
-    macro_rules! evt_ms {
-        ($last:ident, $t0:ident) => {{
-            let now = Instant::now();
-            let prev = std::mem::replace(&mut $last, now);
-            let dt = now.saturating_duration_since(prev).as_millis() as u64;
-            let wall = now.saturating_duration_since($t0).as_millis() as u64;
-            (dt, wall)
-        }};
-    }
-
-    // Открываем отдельный stream tee-канал: подробные `[order_invoke/...]` логи
-    // (HTTP-запросы, WS-события, агрегация, latency, replay-инструкция) идут **только**
-    // в этот файл и не засоряют stdout/stderr. Фиксированный путь — `xframes/last_stream.txt`
-    // (относительно cwd прогона, как `init_tee_log_file` в main). Сбой инициализации сам по себе не валит
-    // тест — макросы `stream_tee_*` без открытого файла становятся no-op.
-    let log_path = std::path::Path::new("xframes/last_stream.txt");
-    if let Err(err) =
-        crate::tee_log::init_stream_tee_log_file(&log_path, "live_taker_roundtrip_btc_updown_5m")
-    {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
-            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: init_stream_tee_log_file({}) failed: {err:#} \
-             — test продолжит, но детальный `[order_invoke/...]` лог в файл писаться не будет",
-            log_path.display(),
-        );
-    } else {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
-            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: detailed `[order_invoke/...]` log → {}",
-            log_path.display(),
-        );
-    }
-
-    let account = Account::new_shared();
-    let geo = detect_country_and_ip(account.http.as_ref())
-        .await
-        .ok_or_else(|| {
-            let (dt, wall) = evt_ms!(last_evt, t0);
-            anyhow::anyhow!(
-                "[от старта {wall} ms | с прошлого {dt} ms] Polymarket geoblock: не удалось GET https://polymarket.com/api/geoblock"
-            )
-        })?;
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        !geo.blocked,
-        "[от старта {wall} ms | с прошлого {dt} ms] Polymarket geoblock: торговля с этого региона заблокирована \
-         (country={:?}, region={:?}, ip={:?})",
-        geo.country,
-        geo.region,
-        geo.ip,
-    );
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: geo:{:?}",
-        geo
-    );
-
-    let private_key_set = std::env::var(POLY_PRIVATE_KEY_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .is_some();
-    if !private_key_set {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
-            "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
-        );
-        return Ok(());
-    }
-    let slug = current_btc_updown_5m_slug(current_timestamp_ms());
-    let gamma = fetch_gamma_event_data_for_gamma_client(account.gamma.as_ref(), &slug).await?;
-    let cu = &gamma.currency_up_down_by_asset_id;
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        !cu.is_empty(),
-        "[от старта {wall} ms | с прошлого {dt} ms] Gamma не вернул clobTokenIds для slug={slug}",
-    );
-
-    try_authenticate_clob_for_heartbeats(&account).await;
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        account.clob_authed.load().is_some(),
-        "[от старта {wall} ms | с прошлого {dt} ms] CLOB auth не поднялся — проверьте {POLY_PRIVATE_KEY_ENV} и логи [heartbeat]",
-    );
-
-    // Поднимаем heartbeat (продлевает CLOB auth каждые `CLOB_HEARTBEAT_INTERVAL_SEC`)
-    // и user-WS listener (питает `filled_ws`/`settled_ws` в `PostOrderInvokeAggregator`
-    // параллельно с REST-поллингом). Финал колбэка берётся через `max`-merge обоих
-    // источников — тест поэтому проверяет именно совместную работу WS + HTTP.
-    spawn_heartbeat(account.clone());
-    spawn_user_ws_listener(account.clone());
-
-    tokio::time::sleep(Duration::from_secs(LIVE_TEST_USER_WS_WARMUP_SECS)).await;
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: дождался {LIVE_TEST_USER_WS_WARMUP_SECS}s на прогрев user-WS subscribe \
-         (поищите в логе строки `[user_ws] подписан`/`[user_ws] trade`)",
-    );
-
-    let mut best: Option<(String, f64, f64, f64)> = None;
-    for cand_id in cu.keys() {
-        let row = live_btc_updown_book_buy_floor(&account, cand_id, &slug).await?;
-        let take = match &best {
-            None => true,
-            Some((_, _, _, best_floor)) => row.2 < *best_floor - 1e-12,
-        };
-        if take {
-            best = Some((cand_id.to_string(), row.0, row.1, row.2));
-        }
-    }
-    let (asset_id, min_order_size, best_ask_f64, market_floor_buy_usd) =
-        best.unwrap_or_else(|| {
-            let (dt, wall) = evt_ms!(last_evt, t0);
-            panic!(
-                "[от старта {wall} ms | с прошлого {dt} ms] cu не пустой — выше ensure: best=None"
-            )
-        });
-    let buy_usd = market_floor_buy_usd;
-    let worst_acceptable_buy = (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: slug={slug}, asset_id={asset_id}, \
-         min_order_size={min_order_size:.4}, best_ask={best_ask_f64:.4}, \
-         market_floor_buy_usd={market_floor_buy_usd:.4}, buy_usd={buy_usd:.4} \
-         (CLOB-min notional), worst_acceptable_buy={worst_acceptable_buy:.4}",
-    );
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: покупка — цель ≈ {buy_usd:.4} USD notional (taker BUY)"
-    );
-
-    let (buy_invoke_tx, buy_invoke_rx) = tokio::sync::oneshot::channel();
-    post_order_on_clob(
-        &account,
-        PostOrderRequest {
-            asset_id: asset_id.clone(),                // Gamma outcome token
-            side: Side::Buy,                           // вход long
-            role: OrderRole::Taker,                    // FAK
-            amount: OrderAmount::UsdNotional(buy_usd), // мин. допустимый notional
-            price: Some(worst_acceptable_buy),         // явный worst-acceptable
-            max_slippage_pp: None,                     // не используем slip от L1
-            expiration: None,                          // taker
-            market_end_unix_ms: None,
-            timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
-            strict_book: None,                                         // GET book выше
-        },
-        Box::new(move |rep| {
-            let _ = buy_invoke_tx.send(rep);
-        }),
-    )
-    .await
-    .with_context(|| {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        format!(
-            "[от старта {wall} ms | с прошлого {dt} ms] BUY taker slug={slug} asset_id={asset_id}"
-        )
-    })?;
-    let buy_result = buy_invoke_rx.await.map_err(|_| {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] BUY taker колбёк потерян")
-    })?;
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    let paid = match buy_result.making_amount {
-        OrderAmount::UsdNotional(u) => format!("{u:.4} USDC"),
-        OrderAmount::Shares(s) => format!("{s:.6} shares (making)"),
-    };
-    let got = match buy_result.taking_amount {
-        OrderAmount::Shares(s) => format!("{s:.6} shares"),
-        OrderAmount::UsdNotional(u) => format!("{u:.4} USDC (taking)"),
-    };
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: куплено — отдано {paid}, получено {got}, \
-         order_id={:?}, partial={}, целевой notional до ордера ≈{buy_usd:.4} USDC",
-        buy_result.order_id, buy_result.partial,
-    );
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        buy_result
-            .order_id
-            .as_deref()
-            .is_some_and(|id| !id.is_empty()),
-        "[от старта {wall} ms | с прошлого {dt} ms] пустой order_id после BUY"
-    );
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        buy_result.success,
-        "[от старта {wall} ms | с прошлого {dt} ms] BUY taker финал не успех: order_id={:?}, partial={}, error_msg={:?}",
-        buy_result.order_id,
-        buy_result.partial,
-        buy_result.error_msg,
-    );
-
-    let shares_received_net = match buy_result.taking_amount {
-        OrderAmount::Shares(s) => s,
-        OrderAmount::UsdNotional(_) => {
-            let (dt, wall) = evt_ms!(last_evt, t0);
-            anyhow::bail!(
-                "[от старта {wall} ms | с прошлого {dt} ms] BUY taker: ожидались Shares в taking_amount, получили USD notion"
-            );
-        }
-    };
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        shares_received_net > 0.0 && shares_received_net.is_finite(),
-        "[от старта {wall} ms | с прошлого {dt} ms] BUY taker не дал shares в taking_amount: {:?}, order_id={:?}",
-        buy_result.taking_amount,
-        buy_result.order_id,
-    );
-
-    // Polymarket V2 SDK валидирует `Amount::shares(...)` максимум на 2 десятичных знака
-    // (лот-сайз = 0.01 shares), иначе `Validation: invalid: Unable to build Amount with N
-    // decimal points, must be <= 2`. BUY-callback дал NET-shares с произвольной точностью
-    // (например `33.333332` от `$1 / $0.03`). Округляем **вниз** до 0.01 — гарантия, что
-    // мы не пытаемся продать больше, чем реально зачислено на чейне.
-    let shares_to_sell = (shares_received_net * 100.0).floor() / 100.0;
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        shares_to_sell >= min_order_size,
-        "[от старта {wall} ms | с прошлого {dt} ms] после округления вниз до 0.01 shares_to_sell={shares_to_sell:.2} < \
-         min_order_size={min_order_size:.4}; net_from_buy={shares_received_net:.6}",
-    );
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: продажа — цель {shares_to_sell:.2} shares \
-         (net_from_buy={shares_received_net:.6}, rounded down to 0.01 lot) (taker SELL)"
-    );
-
-    let (sell_invoke_tx, sell_invoke_rx) = tokio::sync::oneshot::channel();
-    post_order_on_clob(
-        &account,
-        PostOrderRequest {
-            asset_id: asset_id.clone(),                  // тот же токен
-            side: Side::Sell,                            // unwind
-            role: OrderRole::Taker,                      // FAK
-            amount: OrderAmount::Shares(shares_to_sell), // весь fill с BUY (округлён вниз до лот-сайза)
-            price: None,                                 // маркет-продажа в bid
-            max_slippage_pp: None,                       // без cap
-            expiration: None,                            // taker
-            market_end_unix_ms: None,
-            timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC), // POST /order
-            strict_book: None,                                         // нет локального book
-        },
-        Box::new(move |rep| {
-            let _ = sell_invoke_tx.send(rep);
-        }),
-    )
-    .await
-    .with_context(|| {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        format!(
-            "[от старта {wall} ms | с прошлого {dt} ms] SELL taker slug={slug} asset_id={asset_id}"
-        )
-    })?;
-    let sell_result = sell_invoke_rx.await.map_err(|_| {
-        let (dt, wall) = evt_ms!(last_evt, t0);
-        anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] SELL taker колбёк потерян")
-    })?;
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    let sold = match sell_result.making_amount {
-        OrderAmount::Shares(s) => format!("{s:.2} shares"),
-        OrderAmount::UsdNotional(u) => format!("{u:.4} USDC (making)"),
-    };
-    let proceeds = match sell_result.taking_amount {
-        OrderAmount::UsdNotional(u) => format!("{u:.4} USDC"),
-        OrderAmount::Shares(s) => format!("{s:.6} shares (taking)"),
-    };
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: продано — отдано {sold}, получено {proceeds}, \
-         order_id={:?}, partial={}",
-        sell_result.order_id, sell_result.partial,
-    );
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    anyhow::ensure!(
-        sell_result.success,
-        "[от старта {wall} ms | с прошлого {dt} ms] SELL taker финал не успех: order_id={:?}, partial={}, error_msg={:?}",
-        sell_result.order_id,
-        sell_result.partial,
-        sell_result.error_msg,
-    );
-
-    let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m OK: buy_order_id={:?}, sell_order_id={:?}, \
-         buy_usd={buy_usd:.4}, shares_sold={shares_to_sell:.4}",
-        buy_result.order_id, sell_result.order_id,
-    );
-    // Гарантируем, что хвост `[order_invoke/...]` ушёл на диск до возврата из теста.
-    // На fail-путях (ранние `?`/`ensure!`) `BufWriter` всё равно сфлашится в Drop
-    // статика при штатном завершении процесса.
-    crate::tee_log::finish_stream_tee_log();
-    Ok(())
 }
 
 /// Duel: параллельные **taker BUY** (**Up** и **Down**) — две таски **`tokio::spawn`**, ожидание через **`tokio::join!`**.
@@ -1279,7 +964,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
 ///
 /// ```bash
 /// POLY_PRIVATE_KEY=0x… \
-///     cargo test --bin poly account_order::tests::live_duel_up_down_maker_race_tp10 -- --ignored --nocapture
+///     cargo test --test live_duel_up_down_maker_race_tp10 -- --ignored --nocapture
 /// ```
 #[tokio::test]
 #[ignore = "live duel: требует POLY_PRIVATE_KEY + pUSD; две покупки, maker TP 10%, гонка, cancel + taker flat"]
@@ -1305,16 +990,16 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
 
     let log_path = std::path::Path::new("xframes/last_stream.txt");
     if let Err(err) =
-        crate::tee_log::init_stream_tee_log_file(&log_path, "live_duel_up_down_maker_race_tp10")
+        poly::tee_log::init_stream_tee_log_file(&log_path, "live_duel_up_down_maker_race_tp10")
     {
         let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall} ms | с прошлого {dt} ms] live_duel: init_stream_tee_log_file({}) failed: {err:#}",
             log_path.display(),
         );
     } else {
         let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall} ms | с прошлого {dt} ms] live_duel: `[order_invoke/...]` tee → {}",
             log_path.display(),
         );
@@ -1344,7 +1029,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         .is_some();
     if !private_key_set {
         let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall} ms | с прошлого {dt} ms] live_duel: {POLY_PRIVATE_KEY_ENV} не задан — skip",
         );
         return Ok(());
@@ -1370,7 +1055,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     spawn_user_ws_listener(account.clone());
     tokio::time::sleep(Duration::from_secs(LIVE_TEST_USER_WS_WARMUP_SECS)).await;
     let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall} ms | с прошлого {dt} ms] live_duel: slug={slug} прогрет user-WS {}s",
         LIVE_TEST_USER_WS_WARMUP_SECS,
     );
@@ -1381,7 +1066,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         duel_leg_prep_for_outcome(&account, &slug, cu, CurrencyUpDownOutcome::Down).await?;
 
     let (dt, wall) = evt_ms!(last_evt, t0);
-    eprintln!(
+    poly::test_tee_println!(
         "[от старта {wall} ms | с прошлого {dt} ms] live_duel: UP buy_usd={:.4} asset={} ; DOWN buy_usd={:.4} asset={}",
         prep_up.buy_usd,
         prep_up.asset_id,
@@ -1427,7 +1112,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         }
         (Some(up_sh), None) => {
             let (dt, wall) = evt_ms!(last_evt, t0);
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wall} ms | с прошлого {dt} ms] live_duel: DOWN не купила — снимаем maker UP (если есть) и taker SELL всех {up_sh:.2} shares UP",
             );
             duel_unwind_inventory_when_other_leg_buy_failed(
@@ -1440,12 +1125,12 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 up_sh,
             )
             .await?;
-            crate::tee_log::finish_stream_tee_log();
+            poly::tee_log::finish_stream_tee_log();
             return Ok(());
         }
         (None, Some(dn_sh)) => {
             let (dt, wall) = evt_ms!(last_evt, t0);
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wall} ms | с прошлого {dt} ms] live_duel: UP не купила — снимаем maker DOWN (если есть) и taker SELL всех {dn_sh:.2} shares DOWN",
             );
             duel_unwind_inventory_when_other_leg_buy_failed(
@@ -1458,7 +1143,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 dn_sh,
             )
             .await?;
-            crate::tee_log::finish_stream_tee_log();
+            poly::tee_log::finish_stream_tee_log();
             return Ok(());
         }
         (Some(up_sh), Some(dn_sh)) => {
@@ -1479,7 +1164,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 } else {
                     "обе BUY ok, но на книге **только один** maker — по сценарию нужны **два**"
                 };
-                eprintln!(
+                poly::test_tee_println!(
                     "[от старта {wall} ms | с прошлого {dt} ms] live_duel: {reason}; \
                      cancel висящих maker (если есть) → два taker SELL всего floor; без ожидания {}s гонки",
                     LIVE_DUAL_MAKER_RACE_DEADLINE_SEC,
@@ -1493,12 +1178,12 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                     reason,
                 )
                 .await?;
-                crate::tee_log::finish_stream_tee_log();
+                poly::tee_log::finish_stream_tee_log();
                 return Ok(());
             }
 
             let (dt, wall) = evt_ms!(last_evt, t0);
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wall} ms | с прошлого {dt} ms] live_duel: обе BUY ok (floor up={up_sh:.2}, down={dn_sh:.2}); \
                  **оба** maker на книге (up_id={:?} down_id={:?}) — жду полный maker на одной стороне или дедлайн {}s…",
                 snap_race.maker_id_up,
@@ -1515,11 +1200,11 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     // но если winner уже set'нут — пройдём OK без лишней асинхронной сериализации и быстрее.
     if let Some(winner) = duel_h.snapshot_state_unlocked_clone().winner {
         let (dt, wall) = evt_ms!(last_evt, t0);
-        eprintln!(
+        poly::test_tee_println!(
             "[от старта {wall} ms | с прошлого {dt} ms] live_duel OK (winner-already): победила сторона {winner:?} \
              до того, как главный поток дошёл до `done.notified()` — нет смысла ждать таймаут",
         );
-        crate::tee_log::finish_stream_tee_log();
+        poly::tee_log::finish_stream_tee_log();
         return Ok(());
     }
 
@@ -1537,7 +1222,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 "[от старта {wall} ms | с прошлого {dt} ms] live_duel: notify без победителя state={:?} — вероятно emergency path",
                 st,
             );
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wall} ms | с прошлого {dt} ms] live_duel OK: победила сторона {:?}; \
                  сохранённые floor up={:?} down={:?}",
                 st.winner, st.up_buy_floor, st.down_buy_floor,
@@ -1546,7 +1231,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         Err(_elapsed) => {
             let wm = wall_anchor.elapsed().as_millis() as u64;
             let snap = duel_h.snapshot_state_unlocked_clone();
-            eprintln!(
+            poly::test_tee_println!(
                 "[от старта {wm} ms] live_duel: дедлайн {}s без победной нотификации winner={:?}",
                 LIVE_DUAL_MAKER_RACE_DEADLINE_SEC,
                 snap.winner,
@@ -1561,6 +1246,6 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         }
     }
 
-    crate::tee_log::finish_stream_tee_log();
+    poly::tee_log::finish_stream_tee_log();
     Ok(())
 }

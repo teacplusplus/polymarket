@@ -3,6 +3,7 @@
 //! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_resolution` → `closing` → `recently_resolved_markets` → один inner на позицию.
 
 use crate::account_order_completion::TrackerEntry;
+use crate::account_proxy::PolyProxyEnvGuard;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{INITIAL_BANKROLL, SharedClosingPosition, SharedOpenPosition};
 use crate::real_sim::{RealSimState, interval_label, side_label};
@@ -70,9 +71,6 @@ pub struct Account {
     pub http: Arc<reqwest::Client>,
     /// Общий unauth CLOB SDK-клиент (клоны в PM и др.).
     pub clob: Arc<clob::Client>,
-    /// Отдельный unauth CLOB только для цепочки SDK `authenticate()` ([`try_authenticate_clob_for_heartbeats_with_force`]);
-    /// не шарит inner с [`Self::clob`].
-    pub clob_auth_client: Arc<clob::Client>,
     /// Gamma API SDK-клиент; тот же `Arc`, что у [`ProjectManager::gamma`](crate::project_manager::ProjectManager::gamma).
     pub gamma: Arc<gamma::Client>,
     /// Polymarket Data API (`/positions` и др.).
@@ -89,16 +87,16 @@ pub struct Account {
 
 impl Account {
     pub fn new() -> Self {
+        // Если в `.env` заданы `POLY_PROXY_IP` + `POLY_PROXY_PORT` (и опционально пароль / логин), временно
+        // выставляем `HTTP_PROXY`/`HTTPS_PROXY` для сборки клиентов (reqwest подхватывает их по умолчанию).
+        let poly_proxy_env = PolyProxyEnvGuard::install_from_env();
+
         // Production CLOB V2 host (см. [`POLYMARKET_CLOB_HOST`]): `clob.polymarket.com`.
         // `clob::Client::default()` указывает на pre-cutover testing host
         // `clob-v2.polymarket.com`, где `POST /order` уже не работает.
         let clob = Arc::new(
             clob::Client::new(POLYMARKET_CLOB_HOST, clob::Config::default())
                 .expect("CLOB client with production host should construct"),
-        );
-        let clob_auth_client = Arc::new(
-            clob::Client::new(POLYMARKET_CLOB_HOST, clob::Config::default())
-                .expect("CLOB auth-handshake client should construct"),
         );
         let http = Arc::new(
             reqwest::Client::builder()
@@ -108,6 +106,7 @@ impl Account {
         );
         let gamma = Arc::new(gamma::Client::default());
         let data = Arc::new(data::Client::default());
+        PolyProxyEnvGuard::uninstall_from_env(poly_proxy_env);
         Self {
             bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
             peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
@@ -119,7 +118,6 @@ impl Account {
             recently_resolved_markets: Arc::new(RwLock::new(IndexSet::new())),
             http,
             clob,
-            clob_auth_client,
             gamma,
             data,
             clob_authed: ArcSwapAny::new(Arc::new(None)),
@@ -520,7 +518,7 @@ impl Default for Account {
 const CLOB_HEARTBEAT_INTERVAL_SEC: u64 = 5;
 
 /// Env: EOA hex для CLOB-auth и split; пусто → [`try_authenticate_clob_for_heartbeats`] noop.
-pub(crate) const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
+pub const POLY_PRIVATE_KEY_ENV: &str = "POLY_PRIVATE_KEY";
 
 /// Env: funder deposit для `POLY_1271`; совпадение с Safe или proxy → тот профиль, не deposit.
 pub(crate) const POLY_DEPOSIT_WALLET_ENV: &str = "POLY_DEPOSIT_WALLET";
@@ -642,7 +640,7 @@ pub fn spawn_heartbeat(account: SharedAccount) {
 }
 
 /// CLOB-auth по env EOA (`POLY_PRIVATE_KEY`); кладёт authed клиент и signer в [`Account`]. Идемпотентно; при ошибках клиент `None`, heartbeat без POST.
-pub(crate) async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount) {
+pub async fn try_authenticate_clob_for_heartbeats(account: &SharedAccount) {
     try_authenticate_clob_for_heartbeats_with_force(account, false).await
 }
 
@@ -681,7 +679,21 @@ pub(crate) async fn try_authenticate_clob_for_heartbeats_with_force(
             );
         }
     }
-    let unauth = account.clob_auth_client.as_ref().clone();
+    // Свежий unauth-клиент: SDK `authenticate()` делает `Arc::into_inner(self.client.inner)` и требует
+    // refcount == 1. Если бы мы хранили один экземпляр и клонировали его, inner-Arc был бы у двух владельцев,
+    // и SDK возвращал бы `Synchronization: multiple threads are attempting to log in or log out`.
+    let proxy_env = PolyProxyEnvGuard::install_from_env();
+    let unauth = match clob::Client::new(POLYMARKET_CLOB_HOST, clob::Config::default()) {
+        Ok(c) => c,
+        Err(err) => {
+            PolyProxyEnvGuard::uninstall_from_env(proxy_env);
+            crate::tee_eprintln!(
+                "[heartbeat] построить unauth CLOB-клиент не удалось: {err:#}; CLOB heartbeat отключён",
+            );
+            return;
+        }
+    };
+    PolyProxyEnvGuard::uninstall_from_env(proxy_env);
 
     let auth_result = match profile {
         ClobAuthProfile::GnosisSafe { safe } => {

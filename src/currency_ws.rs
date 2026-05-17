@@ -6,7 +6,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::ws_connect::{connect_async_maybe_proxy, ws_proxy_from_env};
 
 /// Аналог market CLOB WS — endpoint RTDS.
 const POLYMARKET_RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
@@ -79,9 +81,11 @@ async fn run_rtds_spot_ws_loop(project_manager: Arc<ProjectManager>) {
 }
 
 async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<()> {
-    let (ws_stream, _http_response) = connect_async(POLYMARKET_RTDS_WS_URL)
-        .await
-        .context("rtds connect_async")?;
+    let proxy = ws_proxy_from_env();
+    let (ws_stream, _http_response) =
+        connect_async_maybe_proxy(POLYMARKET_RTDS_WS_URL, proxy.as_ref())
+            .await
+            .context("rtds connect_async_maybe_proxy")?;
     let (mut write, mut read) = ws_stream.split();
 
     let pair_symbol = rtds_spot_pair_symbol(project_manager.currency.as_str());

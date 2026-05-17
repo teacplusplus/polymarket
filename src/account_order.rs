@@ -64,12 +64,10 @@ pub struct PostOrderRequest {
     /// Таймаут HTTP только на `POST /order`.
     pub timeout: Duration,
     /// При slip-cap без `price`: L1 без лишнего GET /book.
-    pub(crate) strict_book: Option<StrictBook>,
+    pub strict_book: Option<StrictBook>,
 }
 
-pub use crate::account_order_completion::{
-    SingleOrderClobInvocationReport, SingleOrderInvokeCb,
-};
+pub use crate::account_order_completion::{SingleOrderClobInvocationReport, SingleOrderInvokeCb};
 
 /// `POST /order`: колбэк [`SingleOrderInvokeCb`] вызывается **ровно один раз** при любом исходе
 /// (валидация, отсутствие auth/signer, ошибка билда/подписи, HTTP/SDK error, timeout,
@@ -433,7 +431,10 @@ async fn compute_taker_cap_price(
 ) -> Result<Option<Decimal>> {
     if let Some(p) = req.price {
         let p_norm = normalize_probability_price_to_cent_tick(p, "taker explicit cap price")?;
-        return Ok(Some(f64_to_decimal(p_norm, "taker price (tick-normalized)")?));
+        return Ok(Some(f64_to_decimal(
+            p_norm,
+            "taker price (tick-normalized)",
+        )?));
     }
     let Some(slip) = req.max_slippage_pp else {
         return Ok(None);
@@ -534,7 +535,7 @@ pub(crate) fn best_bid_strict(book: &StrictBook) -> Option<f64> {
         .map(|l| l.price)
 }
 
-fn best_ask_sdk(
+pub fn best_ask_sdk(
     book: &polymarket_client_sdk::clob::types::response::OrderBookSummaryResponse,
 ) -> Option<Decimal> {
     book.asks.iter().map(|l| l.price).min()
@@ -823,7 +824,3 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
         "[account_exit] sell-all итог: sold={sold}, failed={failed}, skipped_dust={skipped_dust}"
     );
 }
-
-#[cfg(test)]
-#[path = "account_order_test.rs"]
-mod tests;

@@ -1,38 +1,10 @@
-pub mod account;
-pub mod account_exit;
-pub mod account_order;
-pub mod account_order_completion;
-pub mod account_submit;
-pub mod account_ws;
-pub mod constants;
-pub mod currency_updown_sibling;
-pub mod currency_ws;
-pub mod data_ws;
-pub mod gamma_question;
-pub mod history_sim;
-pub mod market_snapshot;
-pub mod migration;
-pub mod migration_graph_html;
-pub mod migration_price_to_beat;
-pub mod poly_chain;
-pub mod project_manager;
-pub mod real_sim;
-pub mod run_log;
-pub mod sim_stats;
-pub mod tee_log;
-pub mod trade_csv_log;
-pub mod train_mode;
-pub mod util;
-pub mod xframe;
-pub mod xframe_dump;
-pub mod xframe_graph_dump;
-
-use account::Account;
 use anyhow::Result;
-use project_manager::ProjectManager;
-
-/// Валюты процесса: по одному [`ProjectManager`] на элемент (Default/RealSim/миграции).
-pub const CURRENCIES: &[&str] = &["btc"];
+use poly::account::Account;
+use poly::project_manager::ProjectManager;
+use poly::{
+    account, account_exit, account_ws, history_sim, migration, migration_graph_html,
+    migration_price_to_beat, real_sim, tee_log, trade_csv_log, train_mode, util, CURRENCIES,
+};
 
 /// Режим из переменной окружения `STATUS` (`.env`).
 #[derive(Debug)]
@@ -49,7 +21,7 @@ enum AppMode {
     RealSim,
     /// Живой WS + ордера на CLOB (heartbeat, user-WS, auth).
     RealSimWithSubmit,
-    /// Миграция полей [`crate::xframe::XFrame`] в дампах.
+    /// Миграция полей [`poly::xframe::XFrame`] в дампах.
     Migrate,
     /// Backfill `price_to_beat` (Vatic API).
     MigratePriceToBeat,
@@ -197,7 +169,7 @@ async fn main() -> Result<()> {
             }
 
             wait_for_shutdown_signal().await;
-            crate::tee_println!("[main] получен shutdown-сигнал → graceful exit");
+            poly::tee_println!("[main] получен shutdown-сигнал → graceful exit");
             account_exit::graceful_exit(account.clone()).await;
             std::process::exit(0);
         }
@@ -213,7 +185,7 @@ async fn wait_for_shutdown_signal() {
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(err) => {
-            crate::tee_eprintln!(
+            poly::tee_eprintln!(
                 "[main] не удалось зарегистрировать SIGTERM-хэндлер: {err:#}; \
                  ждём только SIGINT (Ctrl+C)"
             );
@@ -223,10 +195,10 @@ async fn wait_for_shutdown_signal() {
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            crate::tee_println!("[main] SIGINT (Ctrl+C)");
+            poly::tee_println!("[main] SIGINT (Ctrl+C)");
         }
         _ = sigterm.recv() => {
-            crate::tee_println!("[main] SIGTERM");
+            poly::tee_println!("[main] SIGTERM");
         }
     }
 }
@@ -235,5 +207,5 @@ async fn wait_for_shutdown_signal() {
 #[cfg(not(unix))]
 async fn wait_for_shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    crate::tee_println!("[main] SIGINT (Ctrl+C)");
+    poly::tee_println!("[main] SIGINT (Ctrl+C)");
 }

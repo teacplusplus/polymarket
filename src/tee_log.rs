@@ -5,8 +5,11 @@
 //! указывает [`TEE_LOG`]. Инициализация и закрытие файла — ответственность
 //! вызывающего кода (обычно в точке входа режима).
 //!
-//! Если [`TEE_LOG`] ещё не инициализирован (`None`) — макросы работают как
-//! обычный `println!`/`eprintln!`, просто без файловой копии.
+//! Если [`TEE_LOG`] ещё не инициализирован (`None`) — [`tee_println!`]/[`tee_eprintln!`]
+//! работают как обычный `println!`/`eprintln!`, просто без файловой копии.
+//!
+//! Если [`STREAM_TEE_LOG`] или [`TEST_TEE_LOG`] не открыты через `init_*` — соответствующие
+//! макросы не пишут в файл (форматирование строки всё равно выполняется).
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -157,5 +160,64 @@ macro_rules! stream_tee_eprintln {
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
         $crate::tee_log::stream_tee_log_write(&__line);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Отдельный «test» tee-канал (unit / интеграционные сценарии): только файл,
+// без stdout/stderr — как [`STREAM_TEE_LOG`], но с собственным файлом и маркером.
+// ---------------------------------------------------------------------------
+
+/// Файловый писатель для test-only логов; не пересекается с [`TEE_LOG`] и [`STREAM_TEE_LOG`].
+pub static TEST_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// Пишет одну строку в [`TEST_TEE_LOG`] (если файл инициализирован) и сразу флашит.
+pub fn test_tee_log_write(line: &str) {
+    if let Ok(mut guard) = TEST_TEE_LOG.lock() {
+        if let Some(w) = guard.as_mut() {
+            let _ = writeln!(w, "{}", line);
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Аналог [`init_stream_tee_log_file`] для [`TEST_TEE_LOG`]: маркер «[<tag>] test-log пишется в …».
+pub fn init_test_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = File::create(path)?;
+    {
+        let mut guard = TEST_TEE_LOG.lock().expect("TEST_TEE_LOG poisoned");
+        *guard = Some(BufWriter::new(file));
+    }
+    crate::test_tee_println!("[{tag}] test-log пишется в {}", path.display());
+    Ok(())
+}
+
+/// Закрывает писатель [`TEST_TEE_LOG`], флаш перед снятием.
+pub fn finish_test_tee_log() {
+    if let Ok(mut guard) = TEST_TEE_LOG.lock() {
+        if let Some(mut w) = guard.take() {
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Записывает строку **только** в [`TEST_TEE_LOG`] (если открыт); в stdout не пишет.
+#[macro_export]
+macro_rules! test_tee_println {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::test_tee_log_write(&__line);
+    }};
+}
+
+/// Записывает строку **только** в [`TEST_TEE_LOG`] (если открыт); в stderr не пишет.
+#[macro_export]
+macro_rules! test_tee_eprintln {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::test_tee_log_write(&__line);
     }};
 }

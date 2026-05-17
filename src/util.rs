@@ -139,7 +139,9 @@ fn gamma_datetime_to_epoch_ms(dt: Option<chrono::DateTime<chrono::Utc>>) -> Opti
 /// Цепочка fallback для старта окна близка к прежнему разбору JSON:
 /// `event_start_time` маркета → `events[0].start_time` → `start_date` маркета → `events[0].start_date`;
 /// конец: `end_date` маркета → `events[0].end_date`.
-pub fn currency_event_slug_data_from_gamma_market(m: &Market) -> anyhow::Result<CurrencyEventSlugData> {
+pub fn currency_event_slug_data_from_gamma_market(
+    m: &Market,
+) -> anyhow::Result<CurrencyEventSlugData> {
     let outcomes = m.outcomes.clone().unwrap_or_default();
     if outcomes.is_empty() {
         anyhow::bail!("пустой outcomes в ответе Gamma для маркета");
@@ -154,8 +156,8 @@ pub fn currency_event_slug_data_from_gamma_market(m: &Market) -> anyhow::Result<
         anyhow::bail!("ни одного clobTokenId в ответе Gamma для маркета");
     }
 
-    let currency_up_down_by_asset_id =
-        zip_outcomes_clob_to_up_code(&outcomes, &clob_token_ids).context("outcomes vs clobTokenIds")?;
+    let currency_up_down_by_asset_id = zip_outcomes_clob_to_up_code(&outcomes, &clob_token_ids)
+        .context("outcomes vs clobTokenIds")?;
 
     let gamma_question = m.question.clone();
 
@@ -191,7 +193,9 @@ pub async fn fetch_gamma_event_data_for_gamma_client(
     client: &gamma::Client,
     slug: &str,
 ) -> anyhow::Result<CurrencyEventSlugData> {
-    let request = MarketBySlugRequest::builder().slug(slug.to_string()).build();
+    let request = MarketBySlugRequest::builder()
+        .slug(slug.to_string())
+        .build();
     let market = client
         .market_by_slug(&request)
         .await

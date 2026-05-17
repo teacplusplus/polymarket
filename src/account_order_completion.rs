@@ -509,10 +509,7 @@ fn leg_summary_for_log(state: &InvokeAggInner) -> String {
          orig={:?} matched={:.6} fully={} term={} part={} succ={}",
         state.original_size_observed,
         state.size_matched_observed,
-        is_book_fully_matched_observed(
-            state.original_size_observed,
-            state.size_matched_observed,
-        ),
+        is_book_fully_matched_observed(state.original_size_observed, state.size_matched_observed,),
         state.book_terminal_reached,
         state.partial,
         state.success,
@@ -930,9 +927,7 @@ impl PostOrderInvokeAggregator {
                     state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
                     state_changed = true;
                 }
-                if is_settled_on_chain
-                    && state.settled_seen_ws_trade_ids.insert(trade_id.clone())
-                {
+                if is_settled_on_chain && state.settled_seen_ws_trade_ids.insert(trade_id.clone()) {
                     state.settled_ws =
                         leg_agg_add_trade_fill(state.settled_ws, size_net, quote_net);
                     state_changed = true;
@@ -1079,8 +1074,7 @@ impl PostOrderInvokeAggregator {
             (OrderAmount::Shares(target_shares), OrderAmount::Shares(effective_shares)) => {
                 target_shares.is_finite()
                     && *target_shares > 0.0
-                    && *effective_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE
-                        >= *target_shares
+                    && *effective_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE >= *target_shares
             }
             (OrderAmount::UsdNotional(target_usdc), OrderAmount::UsdNotional(effective_usdc)) => {
                 target_usdc.is_finite()
@@ -1132,8 +1126,7 @@ impl PostOrderInvokeAggregator {
         let settled_shares = order_amount_shares_scalar(settled_leg.taking_amount);
         let failed_shares = order_amount_shares_scalar(failed_leg.taking_amount);
 
-        if state.size_matched_observed > book_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE
-        {
+        if state.size_matched_observed > book_shares + SHARES_REPORT_FULL_FILL_DUST_TOLERANCE {
             return false;
         }
 
