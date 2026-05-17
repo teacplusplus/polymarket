@@ -55,11 +55,19 @@ fn decimal_to_f64(d: &polymarket_client_sdk::types::Decimal) -> anyhow::Result<f
         .map_err(|err| anyhow::anyhow!("Decimal {d} → f64: {err}"))
 }
 
+/// Возвращает `(best_ask, recommended_buy_usd, min_order_size_shares)`.
+///
+/// Nominal BUY в USDC выбираем так: при худшем случае **`amount / price_cap`**, где
+/// `price_cap = (best_ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp( … )`, тот же самый,
+/// что в [`duel_leg_prep_for_outcome`], не оказывается **ниже `min_order_size`**.
+///
+/// Раньше брали `min_order_size * best_ask` без slippage cap — из-за этого
+/// гард «ожидаемые shares ниже min» триггерил ранний выход без BUY (≈ `4.79` vs `5.0`).
 async fn live_btc_updown_book_buy_floor(
     account: &SharedAccount,
     asset_id: &str,
     slug: &str,
-) -> anyhow::Result<(f64, f64)> {
+) -> anyhow::Result<(f64, f64, f64)> {
     let token_id = U256::from_str(asset_id)
         .with_context(|| format!("невалидный asset_id={asset_id} из Gamma slug={slug}"))?;
     let book_request = OrderBookSummaryRequest::builder()
@@ -74,11 +82,13 @@ async fn live_btc_updown_book_buy_floor(
     let best_ask = best_ask_sdk(&book)
         .ok_or_else(|| anyhow::anyhow!("пустой asks book для asset_id={asset_id} slug={slug}"))?;
     let best_ask_f64 = decimal_to_f64(&best_ask)?;
+    let buy_price_cap =
+        (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
     const CLOB_MIN_MARKETABLE_BUY_USD: f64 = 1.0;
-    let raw = min_order_size * best_ask_f64;
-    let rounded = (raw * 100.0).ceil() / 100.0;
+    let raw_usd_floor = min_order_size * buy_price_cap + LIVE_DUEL_BUY_USD_HEADROOM;
+    let rounded = (raw_usd_floor * 100.0).ceil() / 100.0;
     let amount = rounded.max(CLOB_MIN_MARKETABLE_BUY_USD);
-    Ok((best_ask_f64, amount))
+    Ok((best_ask_f64, amount, min_order_size))
 }
 /// Комиссия уже в [`SingleOrderClobInvocationReport`]; цена BUY ≈ USD spent / NET shares.
 fn implied_buy_price_per_share(rep: &SingleOrderClobInvocationReport) -> Option<f64> {
@@ -103,6 +113,7 @@ struct LegPrep {
     asset_id: String,
     amount: f64,
     price: f64,
+    min_order_size_shares: f64,
 }
 
 async fn duel_leg_prep_for_outcome(
@@ -116,7 +127,7 @@ async fn duel_leg_prep_for_outcome(
         .find(|(_, o)| **o == outcome)
         .map(|(aid, _)| aid.clone())
         .with_context(|| format!("нет outcome={outcome:?} в Gamma currency_up_down_by_asset_id для slug={slug}"))?;
-    let (best_ask, amount) =
+    let (best_ask, amount, min_order_size_shares) =
         live_btc_updown_book_buy_floor(account, &asset_id, slug).await?;
     let price = (best_ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
     Ok(LegPrep {
@@ -124,11 +135,15 @@ async fn duel_leg_prep_for_outcome(
         asset_id,
         amount,
         price,
+        min_order_size_shares,
     })
 }
 
 /// Лимит-продажа maker на **+10%** к средней цене taker BUY.
 const LIVE_MAKER_TP_MULT: f64 = 1.1;
+/// Дополнительный USDC после `ceil` к центам над `min_order_size * price_cap`, чтобы гард
+/// `amount / price_cap` надёжно не падал ниже `min_order_size_shares`.
+const LIVE_DUEL_BUY_USD_HEADROOM: f64 = 0.03;
 /// Повторы taker SELL при unwind противоположной ноги (FAK без матча и т.п.), подряд без пауз.
 const UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS: u32 = 3;
 
@@ -218,7 +233,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
         {
             Ok(res) => {
                 poly::test_tee_println!(
-                    "[от старта {wall_ms} ms] duel: unwind — cancel противоположного {:?} maker slug={slug} order_id={} canceled={} err={:?}",
+                    "[от старта {wall_ms} ms] duel: нога {this_outcome:?}: unwind — cancel противоположного {:?} maker slug={slug} order_id={} canceled={} err={:?}",
                     opposite,
                     res.order_id,
                     res.canceled,
@@ -231,7 +246,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 }
             }
             Err(err) => poly::test_tee_println!(
-                "[от старта {wall_ms} ms] duel: unwind — cancel противоположного {:?} slug={slug} order_id={oid}: {err:#}",
+                "[от старта {wall_ms} ms] duel: нога {this_outcome:?}: unwind — cancel противоположного {:?} slug={slug} order_id={oid}: {err:#}",
                 opposite,
             ),
         }
@@ -245,13 +260,19 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 CurrencyUpDownOutcome::Down => g.down_shares_remaining,
             }
         };
-        let shares_floor = (opp_shares * 100.0).floor() / 100.0;
-        if !(shares_floor > 0.0 && shares_floor.is_finite()) {
+        // SDK `polymarket-client-sdk-v2 v0.6.0-canary.1` валидирует `Amount::shares(...)`
+        // ровно на 2 знака после запятой (`Unable to build Amount with 6 decimal points,
+        // must be <= 2`), хотя on-chain ERC-1155 у Polymarket — 6 знаков. Поэтому
+        // округляем **вниз** к 0.01 sh — `round` к 2 знакам недопустим: результат
+        // может оказаться больше реального остатка и контракт реверт-нет с
+        // `insufficient balance`. ~0.006 sh теряется по этой причине, не по нашей.
+        let shares_to_sell = (opp_shares * 100.0).floor() / 100.0;
+        if !(shares_to_sell > 0.0 && shares_to_sell.is_finite()) {
             break;
         }
 
         poly::test_tee_println!(
-            "[от старта {wall_ms} ms] duel: unwind — taker SELL противоположного {:?} slug={slug} asset_id={} shares={shares_floor:.2} попытка {attempt}/{}",
+            "[от старта {wall_ms} ms] duel: нога {this_outcome:?}: unwind — taker SELL противоположного {:?} slug={slug} asset_id={} shares={shares_to_sell:.2} (raw remaining={opp_shares:.6}) попытка {attempt}/{}",
             opposite,
             opposite_prep.asset_id,
             UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
@@ -263,7 +284,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 asset_id: opposite_prep.asset_id.clone(),
                 side: Side::Sell,
                 role: OrderRole::Taker,
-                amount: OrderAmount::Shares(shares_floor),
+                amount: OrderAmount::Shares(shares_to_sell),
                 price: None,
                 max_slippage_pp: None,
                 expiration: None,
@@ -305,7 +326,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 .await
                 .apply_maker_sell_settled(opposite, sold_shares);
             poly::test_tee_println!(
-                "[от старта {wall_ms} ms] duel: unwind — taker SELL противоположного {:?} итог попытка {attempt}/{}: success={} partial={} making={:?} taking={:?} err={:?}",
+                "[от старта {wall_ms} ms] duel: нога {this_outcome:?}: unwind — taker SELL противоположного {:?} итог попытка {attempt}/{}: success={} partial={} making={:?} taking={:?} err={:?}",
                 opposite,
                 UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
                 sell_rep.success,
@@ -315,6 +336,93 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 sell_rep.error_msg,
             );
             break;        
+        }
+    }
+}
+
+/// Продаёт свою ногу `outcome_t` через **taker FAK** (повтор до
+/// [`UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS`] — как unwind противоположной ноги).
+/// Остаток читается из `duel` на каждой итерации; SDK ≤2 знаков → floor к 0.01 sh.
+async fn duel_self_taker_sell_flush(
+    account: &SharedAccount,
+    duel: &Arc<RwLock<DuelHarness>>,
+    outcome_t: CurrencyUpDownOutcome,
+    asset_id: &str,
+    wall_ms: u64,
+    slug: &str,
+) {
+    for attempt in 1..=UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS {
+        let my_shares = {
+            let g = duel.read().await;
+            match outcome_t {
+                CurrencyUpDownOutcome::Up => g.up_shares_remaining,
+                CurrencyUpDownOutcome::Down => g.down_shares_remaining,
+            }
+        };
+        let shares_to_sell = (my_shares * 100.0).floor() / 100.0;
+        if !(shares_to_sell > 0.0 && shares_to_sell.is_finite()) {
+            break;
+        }
+
+        poly::test_tee_println!(
+            "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush — taker FAK SELL slug={slug} asset_id={asset_id} shares={shares_to_sell:.2} (raw remaining={my_shares:.6}) попытка {attempt}/{}",
+            UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
+        );
+        let (sell_tx, sell_rx) = oneshot::channel();
+        if let Err(err) = post_order_on_clob(
+            account,
+            PostOrderRequest {
+                asset_id: asset_id.to_string(),
+                side: Side::Sell,
+                role: OrderRole::Taker,
+                amount: OrderAmount::Shares(shares_to_sell),
+                price: None,
+                max_slippage_pp: None,
+                expiration: None,
+                market_end_unix_ms: None,
+                timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
+                strict_book: None,
+            },
+            Box::new(move |rep| {
+                let _ = sell_tx.send(rep);
+            }),
+        )
+        .await
+        {
+            poly::test_tee_println!(
+                "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush — ошибка post taker SELL попытка {attempt}/{}: {err:#}",
+                UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
+            );
+            continue;
+        }
+        let sell_rep = match sell_rx.await {
+            Ok(rep) => rep,
+            Err(_) => {
+                poly::test_tee_println!(
+                    "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush — invoke-колбёк taker SELL потерян попытка {attempt}/{}",
+                    UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
+                );
+                continue;
+            }
+        };
+        if sell_rep.success {
+            let sold_shares = match &sell_rep.making_amount {
+                OrderAmount::Shares(s) if s.is_finite() && *s >= 0.0 => *s,
+                _ => 0.0,
+            };
+            duel.write()
+                .await
+                .apply_maker_sell_settled(outcome_t, sold_shares);
+            poly::test_tee_println!(
+                "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush итог попытка {attempt}/{}: success={} partial={} making={:?} taking={:?} err={:?}",
+                UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
+                sell_rep.success,
+                sell_rep.partial,
+                sell_rep.making_amount,
+                sell_rep.taking_amount,
+                sell_rep.error_msg,
+            );
+            break;
         }
     }
 }
@@ -456,6 +564,39 @@ async fn duel_post_buy_then_maker(
         shares_floor,
         maker_price_raw,
     );
+
+    // Гард: shares_floor < min_order_size — резидентный лимит CLOB пройти не сможет
+    // (`Size lower than the minimum: N`). Тут maker не выставляем; вместо этого
+    // сразу же `taker FAK SELL` своей ноги (FAK не подчиняется этому валидатору)
+    // и закрываем противоположную через unwind. Логика взята из наблюдения:
+    // см. `last_live_duel_maker_race.txt` строка 13 (maker-реджект 4.8 < 5)
+    // и успешный браузерный curl `orderType=FAK` на ту же 4.8 sh — FAK проходит.
+    if shares_floor < prep.min_order_size_shares {
+        poly::test_tee_println!(
+            "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: shares_floor={shares_floor:.2} < min_order_size={:.2} — \
+             maker-TP не выставляем (CLOB реджект); fallback: self-flush taker FAK SELL + unwind противоположной",
+            prep.min_order_size_shares,
+        );
+        duel_self_taker_sell_flush(
+            &account,
+            &duel,
+            outcome_t,
+            aid.as_str(),
+            wall_ms,
+            slug.as_str(),
+        )
+        .await;
+        duel_unwind_opposite_maker_and_taker_flush(
+            &account,
+            &duel,
+            outcome_t,
+            &opposite_prep,
+            wall_ms,
+            slug.as_str(),
+        )
+        .await;
+        return Ok(());
+    }
 
     if duel.read().await.opposite_maker_full_sell_succeeded(outcome_t) {
         poly::test_tee_println!(
@@ -620,7 +761,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     )?;
     let (dt, wall) = evt_ms!(last_evt, t0);
     poly::test_tee_println!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel: `[order_invoke/...]` tee → {}",
+        "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: `[order_invoke/...]` tee → {}",
         stream_log_path.display(),
     );
 
@@ -644,7 +785,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     );
     let (dt, wall) = evt_ms!(last_evt, t0);
     poly::test_tee_println!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel_up_down_maker_race_tp10: country_and_ip={country_and_ip:?}",
+        "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: country_and_ip={country_and_ip:?}",
     );
 
     let private_key_set = std::env::var(POLY_PRIVATE_KEY_ENV)
@@ -654,7 +795,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     if !private_key_set {
         let (dt, wall) = evt_ms!(last_evt, t0);
         poly::test_tee_println!(
-            "[от старта {wall} ms | с прошлого {dt} ms] live_duel: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
+            "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: {POLY_PRIVATE_KEY_ENV} не задан, тест пропущен",
         );
         poly::tee_log::finish_test_tee_log();
         poly::tee_log::finish_stream_tee_log();
@@ -682,7 +823,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(LIVE_TEST_USER_WS_WARMUP_SECS)).await;
     let (dt, wall) = evt_ms!(last_evt, t0);
     poly::test_tee_println!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel_up_down_maker_race_tp10: slug={slug} user-WS warmup {}s",
+        "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: slug={slug} user-WS warmup {}s",
         LIVE_TEST_USER_WS_WARMUP_SECS,
     );
 
@@ -720,12 +861,37 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
 
     let (dt, wall) = evt_ms!(last_evt, t0);
     poly::test_tee_println!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel: UP amount={:.4} asset={} ; DOWN amount={:.4} asset={}",
+        "[от старта {wall} ms | с прошлого {dt} ms] live_duel: UP amount={:.4} asset={} (min_order_size={:.2}) ; DOWN amount={:.4} asset={} (min_order_size={:.2})",
         prep_up.amount,
         prep_up.asset_id,
+        prep_up.min_order_size_shares,
         prep_down.amount,
         prep_down.asset_id,
+        prep_down.min_order_size_shares,
     );
+
+    // Гард: оцениваем сверху худшее количество shares от taker BUY = `amount / price`
+    // (worst case: всё купили по slippage cap'у `prep.price`). Если хоть одна нога не
+    // дотянет до своего `min_order_size`, **обе** ноги не запускаем — иначе в
+    // `duel_post_buy_then_maker` сработает реджект maker-TP (`Size lower than min`),
+    // и мы будем выкручиваться через self-flush + unwind. Лучше не заходить вовсе.
+    let expected_up = prep_up.amount / prep_up.price;
+    let expected_dn = prep_down.amount / prep_down.price;
+    if expected_up < prep_up.min_order_size_shares || expected_dn < prep_down.min_order_size_shares
+    {
+        let (dt, wall) = evt_ms!(last_evt, t0);
+        poly::test_tee_println!(
+            "[от старта {wall} ms | с прошлого {dt} ms] live_duel: НЕ заходим — \
+             ожидаемые shares в worst-case (amount/price) ниже min_order_size \
+             (UP expected={expected_up:.4} vs min={:.2}; DOWN expected={expected_dn:.4} vs min={:.2}); \
+             выходим без BUY",
+            prep_up.min_order_size_shares,
+            prep_down.min_order_size_shares,
+        );
+        poly::tee_log::finish_stream_tee_log();
+        poly::tee_log::finish_test_tee_log();
+        return Ok(());
+    }
 
     let duel_h = DuelHarness::new_shared();
 
@@ -775,7 +941,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     let (dt, wall) = evt_ms!(last_evt, t0);
     let snap = duel_h.read().await.clone();
     poly::test_tee_println!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel: после ног BUY+maker slug={slug} state={snap:?}",
+        "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: после ног BUY+maker slug={slug} state={snap:?}",
     );
 
     poly::tee_log::finish_stream_tee_log();
