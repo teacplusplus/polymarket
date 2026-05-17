@@ -368,18 +368,14 @@ async fn record_submit_close_to_csv_and_stats(
         raw_pred,
         cal_pred,
         kelly_f,
-        planned_buy_price,
         buy_price,
-        planned_shares_held,
         shares_held,
-        planned_entry_cost,
-        entry_cost,
+        position_size,
         p_win_ema,
         frames_held,
         event_end_ms,
         event_remaining_ms_at_open,
         open_order_id,
-        tp_order_id,
         price_to_beat,
         final_price,
         pnl_top5_shap,
@@ -411,18 +407,14 @@ async fn record_submit_close_to_csv_and_stats(
             p.raw_pred_at_open,
             p.cal_pred_at_open,
             p.kelly_f_at_open,
-            p.planned_buy_price,
             p.buy_price,
-            p.planned_shares_held,
             p.shares_held,
-            p.planned_entry_cost,
-            p.entry_cost,
+            p.position_size,
             p.p_win_ema,
             p.frames_held,
             p.event_end_ms,
             p.event_remaining_ms_at_open,
             p.open_order_id.clone(),
-            p.tp_order_id.clone(),
             p.price_to_beat,
             p.final_price,
             p.pnl_top5_shap_at_open.clone(),
@@ -430,9 +422,9 @@ async fn record_submit_close_to_csv_and_stats(
         )
     };
 
-    let (reason, exit_price, close_order_id) = {
+    let (reason, exit_price) = {
         let c = c_arc.read().await;
-        (c.reason.clone(), c.exit_price, c.close_order_id.clone())
+        (c.reason.clone(), c.exit_price)
     };
 
     let interval_kind = XFrameIntervalKind::from_i32(interval_type);
@@ -480,18 +472,13 @@ async fn record_submit_close_to_csv_and_stats(
         exit_reason: crate::history_sim::trade_csv_close_reason_label(&reason), // текст причины
         fill_role,           // Maker (TP) vs Taker
         finalized_via,       // источник финала (Ws, …)
-        planned_buy_price,   // план входа
         buy_price,           // факт входа
-        planned_shares_held, // план шэров
         shares_held,         // шэры после входа
-        planned_entry_cost,  // план USDC входа
-        entry_cost,          // факт USDC входа
+        position_size,          // факт USDC входа
         exit_price,          // VWAP выхода
         fee_usdc: 0.0,       // колонка: fee уже внутри pnl
         pnl,
         open_order_id: open_order_id.as_deref(), // входной ордер
-        tp_order_id: tp_order_id.as_deref(),     // TP лимит
-        close_order_id: close_order_id.as_deref(), // ордер закрытия
         raw_pred,                                // сырой прогноз на входе
         cal_pred,                                // откалиброванный
         kelly_f,                                 // kelly на входе

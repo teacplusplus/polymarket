@@ -5,7 +5,7 @@
 use crate::account_order_completion::TrackerEntry;
 use crate::account_proxy::PolyProxyEnvGuard;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
-use crate::history_sim::{INITIAL_BANKROLL, SharedClosingPosition, SharedOpenPosition};
+use crate::history_sim::{INITIAL_BANKROLL, SharedOpenPosition};
 use crate::real_sim::{RealSimState, interval_label, side_label};
 use crate::sim_stats::SimStats;
 use alloy::signers::Signer as _;
@@ -63,8 +63,6 @@ pub struct Account {
     pub positions: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
     /// Старый маркет до резолюции; не `manage_positions`.
     pub pending_resolution: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
-    /// Закрытия для user-WS; lifecycle в [`crate::history_sim::manage_positions`].
-    pub closing: Arc<RwLock<HashMap<LaneKey, Vec<SharedClosingPosition>>>>,
     /// Недавно зарезолвленные `market_id`; анти-повтор открытия ([`RECENTLY_RESOLVED_MARKETS_CAP`]).
     pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
     /// HTTP с rustls; тот же `Arc`, что у [`ProjectManager::http`](crate::project_manager::ProjectManager::http).
@@ -114,7 +112,6 @@ impl Account {
             last_prob: Arc::new(RwLock::new(HashMap::new())),
             positions: Arc::new(RwLock::new(HashMap::new())),
             pending_resolution: Arc::new(RwLock::new(HashMap::new())),
-            closing: Arc::new(RwLock::new(HashMap::new())),
             recently_resolved_markets: Arc::new(RwLock::new(IndexSet::new())),
             http,
             clob,
@@ -147,12 +144,10 @@ impl Account {
     ) {
         let mut positions = self.positions.write().await;
         let mut pending = self.pending_resolution.write().await;
-        let mut closing = self.closing.write().await;
         for (interval, side) in lanes {
             let key = (currency.to_string(), *interval, *side);
             positions.entry(key.clone()).or_default();
             pending.entry(key.clone()).or_default();
-            closing.entry(key).or_default();
         }
     }
 
@@ -173,12 +168,8 @@ impl Account {
         };
         let mut state_guard = state.write().await;
 
-        // Кандидаты на отмену TP после redeem (в sim `tp_order_id` нет — вектор пуст).
-        let mut positions_with_tp: Vec<crate::history_sim::SharedOpenPosition> = Vec::new();
-
         // Carry matching `market_id` в pending. `pnl_finalized` — дроп из positions (без двойного PnL).
         let mut skipped_finalized: usize = 0;
-        let mut skipped_non_redeemable: usize = 0;
         {
             let mut positions = account.positions.write().await;
             let mut pending = account.pending_resolution.write().await;
@@ -193,14 +184,12 @@ impl Account {
                     let (
                         matches_market,
                         pnl_finalized,
-                        open_status,
                         pos_id_for_log,
                     ) = {
                         let pos_g = pos_vec[idx].read().await;
                         (
                             pos_g.market_id == market_id,
                             pos_g.pnl_finalized,
-                            pos_g.open_status,
                             pos_g.id.clone(),
                         )
                     };
@@ -217,23 +206,7 @@ impl Account {
                         );
                         continue;
                     }
-                    if !redeemable {
-                        // OpenFailed и т.п. без шер на Safe — не платим.
-                        let _ = pos_vec.swap_remove(idx);
-                        skipped_non_redeemable += 1;
-                        crate::tee_println!(
-                            "[resolve] skip non-redeemable pos: pos_id={pos_id_for_log}, market_id={market_id}, currency={currency}, interval={interval:?}, \
-                             open_status={open_status:?}, optimistic_fill_replaced={optimistic_fill_replaced} \
-                             (нет реальных шер на Safe — payout не начисляем, дропаем из positions)"
-                        );
-                        continue;
-                    }
-                    let pos_arc = pos_vec.swap_remove(idx);
-                    let has_tp = pos_arc.read().await.tp_order_id.is_some();
-                    if has_tp {
-                        positions_with_tp.push(pos_arc.clone());
-                    }
-                    pending_vec.push(pos_arc);
+                    pending_vec.push(pos_vec.swap_remove(idx));
                 }
             }
         }
@@ -241,18 +214,6 @@ impl Account {
             crate::tee_println!(
                 "[resolve] market_id={market_id} currency={currency} interval={interval:?}: \
                  пропустили {skipped_finalized} уже финализированных позиций при carry в pending_resolution",
-            );
-        }
-        if skipped_non_redeemable > 0 {
-            crate::tee_println!(
-                "[resolve] market_id={market_id} currency={currency} interval={interval:?}: \
-                 пропустили {skipped_non_redeemable} non-redeemable позиций (OpenFailed / PendingOpen без real fills) при carry в pending_resolution",
-            );
-        }
-        if !positions_with_tp.is_empty() {
-            crate::account_submit::spawn_cancel_tp_orders_after_resolution(
-                account.clone(),
-                positions_with_tp,
             );
         }
 
@@ -335,17 +296,13 @@ impl Account {
                     );
                     continue;
                 }
-                if !redeemable {
-                    let _ = vec.swap_remove(i);
-                    continue;
-                }
                 {
                     let pos_arc = vec.swap_remove(i);
                     let pos = pos_arc.read().await.clone();
                     let pnl = if token_won {
-                        pos.shares_held - pos.entry_cost
+                        pos.shares_held - pos.position_size
                     } else {
-                        -pos.entry_cost
+                        -pos.position_size
                     };
                     {
                         let mut pw = pos_arc.write().await;
@@ -415,7 +372,7 @@ impl Account {
                                 raw_pred: pos.raw_pred_at_open,
                                 cal_pred: pos.cal_pred_at_open,
                                 kelly_f: pos.kelly_f_at_open,
-                                entry_cost: pos.entry_cost,
+                                position_size: pos.position_size,
                                 shares_held: pos.shares_held,
                                 exit_price: if token_won { 1.0 } else { 0.0 },
                                 fee_usdc: 0.0,
@@ -445,18 +402,13 @@ impl Account {
                                 exit_reason,
                                 fill_role: "AutoRedeem",
                                 finalized_via: "Resolution",
-                                planned_buy_price: pos.planned_buy_price,
                                 buy_price: pos.buy_price,
-                                planned_shares_held: pos.planned_shares_held,
                                 shares_held: pos.shares_held,
-                                planned_entry_cost: pos.planned_entry_cost,
-                                entry_cost: pos.entry_cost,
+                                position_size: pos.position_size,
                                 exit_price: if token_won { 1.0 } else { 0.0 },
                                 fee_usdc: 0.0,
                                 pnl,
                                 open_order_id: pos.open_order_id.as_deref(),
-                                tp_order_id: pos.tp_order_id.as_deref(),
-                                close_order_id: None,
                                 raw_pred: pos.raw_pred_at_open,
                                 cal_pred: pos.cal_pred_at_open,
                                 kelly_f: pos.kelly_f_at_open,

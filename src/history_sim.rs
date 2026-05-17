@@ -205,17 +205,6 @@ pub(crate) fn book_fill_sell_strict(
     Some(total_usdc)
 }
 
-/// Статус live BUY на CLOB; в sim по умолчанию [`Open`]; submit — [`PendingOpen`] до WS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenPositionStatus {
-    /// Ордер на книге, ждём WS.
-    PendingOpen,
-    /// BUY подтверждён или виртуальный sim.
-    Open,
-    /// BUY отменён или провалился (cleanup из позиций).
-    OpenFailed,
-}
-
 /// Один `Arc<RwLock<OpenPosition>>` везде ([`crate::account::Account`]; max один inner-lock за операцию).
 pub type SharedOpenPosition = std::sync::Arc<tokio::sync::RwLock<OpenPosition>>;
 
@@ -245,13 +234,7 @@ pub struct OpenPosition {
     /// Ref voluntary sell VWAP на входе (SL vs [`crate::xframe::Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`]).
     pub(crate) sell_vwap_entry: f64,
     /// Потраченные USDC; submit: аккумуляция WS; план — [`Self::planned_entry_cost`].
-    pub(crate) entry_cost: f64,
-    /// План шеры на входе (не меняется после [`open_position`]).
-    pub(crate) planned_shares_held: f64,
-    /// План VWAP входа.
-    pub(crate) planned_buy_price: f64,
-    /// План USDC входа.
-    pub(crate) planned_entry_cost: f64,
+    pub(crate) position_size: f64,
     /// L1 bid на входе (maker TP в [`close_position`]).
     pub(crate) best_bid_at_entry: Option<f64>,
     /// Кадров удержания ([`POSITION_TIMEOUT_FRAMES`]).
@@ -287,41 +270,20 @@ pub struct OpenPosition {
     /// Текст SHAP топ-5 для CSV.
     pub(crate) pnl_top5_shap_at_open: String,
     /// Статус ордера на открытие ([`OpenPositionStatus`]); виртуально сразу `Open`.
-    pub(crate) open_status: OpenPositionStatus,
     /// ID BUY-ордера CLOB из user-WS; `None` если виртуально.
     pub(crate) open_order_id: Option<String>,
-    /// ID TP (maker SELL) на CLOB; `None` пока не выставлен или уже снят.
-    pub(crate) tp_order_id: Option<String>,
-    /// Дедуп: попытка выставить TP-maker уже была (в т.ч. pre-suppress в hold-zone).
-    pub(crate) tp_placement_attempted: bool,
-    /// Дедуп: cancel maker-TP уже инициирован (hold-zone или перед taker SELL).
-    pub(crate) tp_cancel_attempted: bool,
-    /// Первый WS fill BUY уже смержен в shares/entry/buy_price (submit).
-    pub(crate) optimistic_fill_replaced: bool,
     /// PnL финализирован один раз (идемпотентность WS/polling путей).
     pub(crate) pnl_finalized: bool,
-    /// Weak на [`ClosingPosition`]; разрыв цикла с Arc-позицией.
-    pub(crate) closing_position: Option<WeakClosingPosition>,
+    pub(crate) maker_tp_position: Option<WeakClosingPosition>,
+    pub(crate) taker_tp_position: Option<WeakClosingPosition>,
+    pub(crate) sl_position: Option<WeakClosingPosition>,
+    pub(crate) timeout_position: Option<WeakClosingPosition>,
 }
 
 impl OpenPosition {
-    pub(crate) fn set_closing_position(&mut self, weak: WeakClosingPosition) {
-        if self.closing_position.is_some() {
-            return;
-        }
-        self.closing_position = Some(weak);
-    }
-}
 
-/// Статус live SELL на CLOB; в sim обычно сразу [`Closed`] после [`close_position`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClosingPositionStatus {
-    /// Ждём MATCHED/CONFIRMED по user-WS.
-    PendingClose,
-    /// Fill подтверждён, PnL финализирован.
-    Closed,
-    /// Ордер отменён/провалился; позицию вернуть в открытые (TODO real flow).
-    CloseFailed,
+    pub(crate) fn set_position(&mut self, weak: WeakClosingPosition) {
+    }
 }
 
 /// Запись закрытия для WS/polling ([`manage_positions`], [`crate::account::apply_user_ws_event`]).
@@ -335,12 +297,8 @@ pub struct ClosingPosition {
     pub reason: CloseReason,
     /// Реализованный PnL после fill; в sim сразу `Some`.
     pub pnl: Option<f64>,
-    /// Жизненный цикл ордера закрытия.
-    pub close_status: ClosingPositionStatus,
     /// ID SELL на CLOB; `None` в sim или пока не создан.
-    pub close_order_id: Option<String>,
-    /// Дедуп: первая попытка post SELL уже была (гонка manage vs polling).
-    pub close_placement_attempted: bool,
+    pub order_id: Option<String>,
     /// UTC ms создания записи (TTL/диагностика).
     pub created_unix_ms: i64,
 }
@@ -723,14 +681,11 @@ pub(crate) async fn run_side_simulation(
             let mut bankroll = account.bankroll.write().await;
             let mut positions = account.positions.write().await;
             let mut pending_resolution = account.pending_resolution.write().await;
-            let mut closing = account.closing.write().await;
             let positions_v = positions.entry(lane_key.clone()).or_default();
             let pending = pending_resolution.entry(lane_key.clone()).or_default();
-            let closing_v = closing.entry(lane_key.clone()).or_default();
             manage_positions(
                 positions_v,
                 pending,
-                closing_v,
                 frame,
                 is_last_idx,
                 p_win_now,
@@ -752,7 +707,7 @@ pub(crate) async fn run_side_simulation(
             let positions_v = positions.entry(lane_key.clone()).or_default();
             let mut same_side_locked = 0.0;
             for p in positions_v.iter() {
-                same_side_locked += p.read().await.entry_cost;
+                same_side_locked += p.read().await.position_size;
             }
             let available = (*bankroll - same_side_locked).max(0.0);
             try_open_position(
@@ -1057,7 +1012,7 @@ pub(crate) async fn try_open_position(
                 gamma_question_at_open,
                 &pnl_top5_shap_at_open,
             ) {
-                Some(mut pos) => {
+                Some(pos) => {
                     // Бакеты по фактическому VWAP входа и cal pred (не mid displayed-prob).
                     let bucket_entry = prob_bucket_index(pos.buy_price);
                     let bucket_pred = prob_bucket_index(pred as f64);
@@ -1066,7 +1021,6 @@ pub(crate) async fn try_open_position(
 
                     // Submit: optimistic fill + spawn BUY taker; правки по WS ([`crate::account_ws`]).
                     if submit {
-                        pos.open_status = OpenPositionStatus::PendingOpen;
                         let decision_price = strict_book
                             .and_then(crate::account_order::best_ask_strict)
                             .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
@@ -1211,7 +1165,7 @@ pub(crate) fn sell_gate(
         let ev_close: Option<(f64, CloseReason)> = new_p_win_ema.and_then(|p_ema| {
             let ev_hold = p_ema * pos.shares_held;
             if fill.net_usdc * (1.0 - EV_EXIT_MARGIN) > ev_hold {
-                if fill.net_usdc > pos.entry_cost {
+                if fill.net_usdc > pos.position_size {
                     Some((fill.sell_vwap, CloseReason::EvExitProfit))
                 } else {
                     Some((fill.sell_vwap, CloseReason::EvExitLoss))
@@ -1339,7 +1293,6 @@ pub(crate) async fn any_position_would_sell(
 pub(crate) async fn manage_positions(
     positions: &mut Vec<SharedOpenPosition>,
     pending_resolution: &mut Vec<SharedOpenPosition>,
-    closing: &mut Vec<SharedClosingPosition>,
     frame: &XFrame<SIZE>,
     is_last: bool,
     p_win_now: Option<f64>,
@@ -1350,63 +1303,10 @@ pub(crate) async fn manage_positions(
     submit: bool,
     account: &SharedAccount,
 ) -> bool {
-    // Snapshot Arc'ов `OpenPosition` с уже терминальным `close_status=Closed` —
-    // PnL финализирован WS-колбеком (см. [`crate::account_ws::finalize_close_pnl_in_place`])
-    // и `bankroll` уже обновлён. Сами `OpenPosition` для taker-SELL веток
-    // финализатор не трогает (только TP-ветка `apply_sell_fill` делает
-    // `vec.swap_remove`), поэтому здесь нам нужно явно дропнуть их из
-    // `positions`, иначе на следующем тике `sell_gate` увидит `open_status=Open`
-    // и инициирует **второй** `spawn_close_via_taker` (дубль ордера).
-    //
-    // Snapshot снимаем ДО `closing.retain`, который выкидывает терминальные
-    // записи. `CloseFailed` сюда не включаем — это сигнал «SELL отвергли», и
-    // следующий тик должен честно перезайти в `sell_gate` для retry.
-    // Сверка по `Arc::ptr_eq`, а не по `open_order_id`-строке — без
-    // synthetic-id'шников.
-    let mut closed_pos_arcs: Vec<SharedOpenPosition> = Vec::new();
-    for c_arc in closing.iter() {
-        let c = c_arc.read().await;
-        if !matches!(c.close_status, ClosingPositionStatus::Closed) {
-            continue;
-        }
-        closed_pos_arcs.push(c.position.clone());
-    }
-
-    // Cleanup: терминальные `Closed`/`CloseFailed` уже отработаны
-    // (виртуально или WS-колбеком), их можно отпускать. `PendingClose`
-    // оставляем — ждём подтверждения. Делаем «вручную», т.к. для retain
-    // нужен async-предикат, а его не существует.
-    {
-        let mut keep: Vec<SharedClosingPosition> = Vec::with_capacity(closing.len());
-        for c_arc in closing.drain(..) {
-            let keep_it = matches!(
-                c_arc.read().await.close_status,
-                ClosingPositionStatus::PendingClose
-            );
-            if keep_it {
-                keep.push(c_arc);
-            }
-        }
-        *closing = keep;
-    }
-
     for pos in positions.iter_mut() {
         pos.write().await.frames_held += 1;
     }
 
-    // Snapshot Arc'ов `OpenPosition`, у которых сейчас активна `PendingClose`
-    // запись в `closing` — для already_closing-проверки в основном цикле без
-    // повторного N×M обхода inner-локов. Сверяем по `Arc::ptr_eq` (идентичность
-    // shared-handle), а не по `open_order_id`: in-flight BUY-позиция может
-    // иметь `open_order_id=None`, и в этом случае string-сравнение не работает.
-    let mut pending_close_pos_arcs: Vec<SharedOpenPosition> = Vec::new();
-    for c_arc in closing.iter() {
-        let c = c_arc.read().await;
-        if !matches!(c.close_status, ClosingPositionStatus::PendingClose) {
-            continue;
-        }
-        pending_close_pos_arcs.push(c.position.clone());
-    }
 
     let mut sold = false;
     let mut remaining: Vec<SharedOpenPosition> = Vec::new();
@@ -1416,72 +1316,13 @@ pub(crate) async fn manage_positions(
         // через async-вызовы (CSV / spawn'ы).
         let snapshot = pos_arc.read().await.clone();
 
-        // PnL уже финализирован WS-колбеком (см.
-        // [`crate::account_ws::finalize_close_pnl_in_place`] /
-        // [`crate::account_ws::finalize_tp_close_after_creation`]):
-        // bankroll/stats обновлены, держать позицию дальше нельзя — иначе
-        // её подберёт либо carry в `pending_resolution` (asset_id !=
-        // frame.asset_id), либо повторный `sell_gate`. И то, и другое
-        // приведёт к двойному учёту PnL (resolution payout поверх уже
-        // зачисленного proceeds-entry_cost, либо второй SELL ордер на
-        // уже проданные шеры). Дроп **первым делом**, до carry-ветки —
-        // защита от race window между WS-finalize и сменой `asset_id`
-        // на следующем тике. Проверка `pnl_finalized` инвариантнее
-        // `closed_pos_arcs`/Arc::ptr_eq, т.к. покрывает и TP-fill путь
-        // (там `apply_sell_fill` уже удалил позицию из `positions`, но
-        // если ту же позицию занесли карри'ем из соседнего лейна — флаг
-        // всё равно будет true).
-        if snapshot.pnl_finalized {
+         if snapshot.pnl_finalized {
             continue;
         }
 
         if snapshot.asset_id != frame.asset_id {
             pending_resolution.push(pos_arc);
             continue;
-        }
-        // В submit-режиме пропускаем pending позиции через sell_gate
-        // (TP/SL/EvExit бессмысленны до подтверждения BUY-MATCHED), но всё
-        // равно даём `frames_held++` идти. `OpenFailed` тоже пропускаем —
-        // их уберёт следующий cleanup-pass (см. ниже).
-        if submit {
-            // Закрытие уже финализировано (Closed) WS-колбеком: bankroll/stats
-            // обновлены, дубль `sell_gate` тут запрещён — выбрасываем позицию.
-            // Сверка по `Arc::ptr_eq` (идентичность shared-handle).
-            //
-            // Этот путь покрывает редкий случай, когда `close_status=Closed`
-            // выставлен, но `pnl_finalized` ещё не успел подняться (race
-            // между `update_position_statuses` и `finalize_close_pnl_in_place`,
-            // см. doc у `OpenPosition::pnl_finalized`). `pnl_finalized`-гейт
-            // выше его не отловит, но `closed_pos_arcs` поймает.
-            let already_finalized_closed = closed_pos_arcs
-                .iter()
-                .any(|p| std::sync::Arc::ptr_eq(p, &pos_arc));
-            if already_finalized_closed {
-                continue;
-            }
-            if !matches!(snapshot.open_status, OpenPositionStatus::Open) {
-                // OpenFailed — позиция фактически не открылась, выбрасываем
-                // (entry_cost тоже больше не лочим: ничего не списано).
-                if matches!(snapshot.open_status, OpenPositionStatus::OpenFailed) {
-                    continue;
-                }
-                // PendingOpen: оставляем в активных, ждём WS-подтверждения.
-                remaining.push(pos_arc);
-                continue;
-            }
-            // Если позиция уже в процессе закрытия (есть запись в `closing` с
-            // тем же shared-handle и status=PendingClose), `sell_gate` снова
-            // дёргать не надо — иначе мы бы попытались инициировать второй
-            // SELL-ордер. Нашли совпадение — оставляем позицию в `remaining`
-            // (физически она пока живёт в `positions`, по WS-MATCHED её перенесут
-            // в `closing`-only).
-            let already_closing = pending_close_pos_arcs
-                .iter()
-                .any(|p| std::sync::Arc::ptr_eq(p, &pos_arc));
-            if already_closing {
-                remaining.push(pos_arc);
-                continue;
-            }
         }
         let close = match sell_gate(
             &snapshot,
@@ -1494,97 +1335,25 @@ pub(crate) async fn manage_positions(
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
             SellGate::HoldResolution { new_p_win_ema } => {
-                // Атомарно: обновить EMA + проверить/взвести single-shot
-                // флаг cancel'а maker-TP в hold-zone. Спавн самой cancel-таски
-                // делаем вне inner-write, чтобы HTTP не шёл под локом позиции.
-                //
-                // Условие spawn'а: submit-режим (TP-лимитка на CLOB существует
-                // только тут), TP-maker ещё жив (`tp_order_id.is_some()`),
-                // cancel ещё не пробовали (`!tp_cancel_attempted`).
-                // Стратегия: в hold-zone выходы — только resolution-модель
-                // (EvExit*-taker) или hard SL; фиксированный TP-таргет лимитки
-                // мешает поймать резолюционную выплату $1, см. doc у
-                // `OpenPosition::tp_cancel_attempted`.
-                let needs_tp_cancel_in_hold_zone = {
-                    let mut pw = pos_arc.write().await;
-                    pw.p_win_ema = new_p_win_ema;
-                    let needs = submit && pw.tp_order_id.is_some() && !pw.tp_cancel_attempted;
-                    if needs {
-                        pw.tp_cancel_attempted = true;
-                    }
-                    needs
-                };
-                if needs_tp_cancel_in_hold_zone {
-                    crate::account_submit::spawn_cancel_tp_for_hold_zone(
-                        account.clone(),
-                        pos_arc.clone(),
-                    );
-                }
                 None
             }
             SellGate::HoldPnl => None,
         };
         if let Some((exit_price, reason)) = close {
             if submit {
-                // Submit-режим: НЕ финализируем PnL/stats и НЕ удаляем `entry_cost`
-                // из bankroll-расчётов. Создаём `ClosingPosition` со статусом
-                // `PendingClose` + provisional `close_order_id` и спавним
-                // [`crate::account_submit::spawn_close_via_taker`]. WS-колбек
-                // (или polling) переведёт `Closed` и обновит bankroll/stats
-                // по реальным fills из `trade` events.
-                //
-                // `position` остаётся **физически в** `Account.positions` (через
-                // `remaining.push(pos_arc)` ниже), потому что `entry_cost` всё
-                // ещё должен лочиться для available bankroll до подтверждения SELL.
-                // Запись в `closing` ссылается на **тот же** Arc<RwLock<...>>
-                // (см. [`SharedOpenPosition`]), поэтому partial-fill'ы из WS
-                // видны и здесь, и в `Account.positions` без дублирования.
-                // Когда WS-колбек переведёт `close_status` в `Closed`, snapshot
-                // `closed_open_ids` в начале следующего вызова `manage_positions`
-                // дропнет `OpenPosition` из `positions`, одновременно
-                // `closing.retain` выкинет терминальную запись.
-                //
-                // In-flight идентификация — через сам Arc; без synthetic id.
-                // `close_status=PendingClose` + `close_order_id=None` означает
-                // «отправили SELL, ждём real `order_id` через HTTP». Spawned-
-                // таска [`crate::account_submit::spawn_close_via_taker`] получает
-                // Arc и читает `asset_id`/`shares_held`/`tp_order_id` сама из
-                // `closing_arc.position`, и пишет real id закрытия напрямую.
-                //
-                // Но `tp_placement_attempted=true` ставим **синхронно здесь**,
-                // под inner-write локом позиции, ДО `tokio::spawn`. Это
-                // закрывает окно между push'ем `ClosingPosition` и стартом
-                // спавн-таски, в которое запоздавший WS/polling-колбек мог бы
-                // вызвать `try_place_tp_maker` и поставить новый TP, о
-                // существовании которого `spawn_close_via_taker` потом не
-                // узнал бы. Сам `tp_order_id` НЕ берём здесь — его прочитает
-                // и `take()`-нет спавн-таска, что даёт небольшое окно для
-                // завершения in-flight HTTP TP-постановки (если она ещё
-                // выполнялась) и попадания её результата в `pos.tp_order_id`.
                 let closing_arc: SharedClosingPosition =
                     std::sync::Arc::new(tokio::sync::RwLock::new(ClosingPosition {
                         position: pos_arc.clone(),
                         exit_price,
                         reason: reason.clone(),
                         pnl: None,
-                        close_status: ClosingPositionStatus::PendingClose,
-                        close_order_id: None,
-                        // Идемпотентность: ставим `attempted=true` ДО спавна задачи.
-                        // Если manage_positions сюда вернётся повторно (та же позиция,
-                        // следующий тик), already_closing-проверка выше отсечёт повтор,
-                        // и эта ветка не выполнится снова.
-                        close_placement_attempted: false,
                         created_unix_ms: crate::util::current_timestamp_ms(),
+                        order_id: None,
                     }));
                 {
                     let mut pw = pos_arc.write().await;
-                    pw.tp_placement_attempted = true;
-                    // Прямая Weak-ссылка на ClosingPosition — единственный путь
-                    // матчинга для polling-fallback (без скана `Account.closing`).
-                    pw.set_closing_position(std::sync::Arc::downgrade(&closing_arc));
+                    pw.set_position(std::sync::Arc::downgrade(&closing_arc));
                 }
-                closing.push(closing_arc.clone());
-                crate::account_submit::spawn_close_via_taker(account.clone(), closing_arc);
                 // Counter-факт «решение принято»: считаем как намерение продать.
                 // Реальные тип-счётчики (tp/sl/timeout/ev*) обновит WS-колбек по факту.
                 sold = true;
@@ -1606,9 +1375,7 @@ pub(crate) async fn manage_positions(
                                 exit_price,
                                 reason,
                                 pnl: Some(pnl),
-                                close_status: ClosingPositionStatus::Closed,
-                                close_order_id: None,
-                                close_placement_attempted: false,
+                                order_id: None,
                                 created_unix_ms: crate::util::current_timestamp_ms(),
                             }));
                         // Прямая Weak-ссылка (см. real-flow выше). Для виртуального
@@ -1617,9 +1384,8 @@ pub(crate) async fn manage_positions(
                         // симметрии с submit-флоу и потенциальных будущих consumer'ов.
                         {
                             let mut pw = pos_arc.write().await;
-                            pw.set_closing_position(std::sync::Arc::downgrade(&closing_arc));
+                            pw.set_position(std::sync::Arc::downgrade(&closing_arc));
                         }
-                        closing.push(closing_arc);
                     }
                     None => {
                         stats.kelly_strict_sell_skips += 1;
@@ -1716,7 +1482,7 @@ fn open_position(
 
     let fee_usdc = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
     let fee_shares = fee_usdc / buy_price;
-    let actual_shares = nominal_shares - fee_shares;
+    let shares_held = nominal_shares - fee_shares;
 
     stats.fees_paid += fee_usdc;
 
@@ -1728,10 +1494,10 @@ fn open_position(
     };
 
     let gross_sell = match strict_book {
-        Some(book) => book_fill_sell_strict(book, actual_shares, None)?,
-        None => book_fill_sell(frame, actual_shares, None)?,
+        Some(book) => book_fill_sell_strict(book, shares_held, None)?,
+        None => book_fill_sell(frame, shares_held, None)?,
     };
-    let sell_vwap_entry = (gross_sell / actual_shares).clamp(0.001, 0.999);
+    let sell_vwap_entry = (gross_sell / shares_held).clamp(0.001, 0.999);
 
     // Hold-zone на входе: подавить TP-maker ([`OpenPosition::tp_placement_attempted`] / cancel-дедуп).
     let entering_in_hold_zone: bool = frame.event_remaining_ms > 0
@@ -1741,14 +1507,11 @@ fn open_position(
         id: uuid::Uuid::new_v4().to_string(),
         asset_id: frame.asset_id.clone(),
         market_id: frame.market_id.clone(),
-        shares_held: actual_shares,
+        shares_held,
         entry_prob,
         buy_price,
         sell_vwap_entry,
-        entry_cost: position_size,
-        planned_shares_held: actual_shares,
-        planned_buy_price: buy_price,
-        planned_entry_cost: position_size,
+        position_size,
         best_bid_at_entry,
         frames_held: 0,
         p_win_ema: None,
@@ -1766,13 +1529,12 @@ fn open_position(
         graph_dump_bin_path: graph_dump_bin_path.to_string(),
         gamma_question_at_open: gamma_question_at_open.map(|s| s.to_string()),
         pnl_top5_shap_at_open: pnl_top5_shap_at_open.to_string(),
-        open_status: OpenPositionStatus::Open,
         open_order_id: None,
-        tp_order_id: None,
-        tp_placement_attempted: entering_in_hold_zone,
-        tp_cancel_attempted: entering_in_hold_zone,
         pnl_finalized: false,
-        closing_position: None,
+        maker_tp_position: None,
+        taker_tp_position: None,
+        sl_position: None,
+        timeout_position: None,
     })
 }
 
@@ -1901,7 +1663,7 @@ fn close_position(
     stats.fees_paid += fee_usdc;
     let net_usdc = gross_usdc - fee_usdc;
 
-    let pnl = net_usdc - pos.entry_cost;
+    let pnl = net_usdc - pos.position_size;
     apply_close_to_side_stats(stats, reason, pnl, pos.raw_pred_at_open);
 
     let interval_str = position_interval_label(pos);
@@ -1932,7 +1694,7 @@ fn close_position(
         raw_pred: pos.raw_pred_at_open,
         cal_pred: pos.cal_pred_at_open,
         kelly_f: pos.kelly_f_at_open,
-        entry_cost: pos.entry_cost,
+        position_size: pos.position_size,
         shares_held: pos.shares_held,
         exit_price: sell_price,
         fee_usdc,

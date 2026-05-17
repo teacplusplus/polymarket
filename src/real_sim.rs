@@ -413,7 +413,7 @@ async fn tick_once(
         let mut total_locked = 0.0;
         for v in positions_guard.values() {
             for p in v.iter() {
-                total_locked += p.read().await.entry_cost;
+                total_locked += p.read().await.position_size;
             }
         }
         let available = (*bankroll_guard - total_locked).max(0.0);
@@ -520,7 +520,6 @@ async fn tick_once(
         let mut last_prob_guard = account.last_prob.write().await;
         let mut positions_guard = account.positions.write().await;
         let mut pending_guard = account.pending_resolution.write().await;
-        let mut closing_guard = account.closing.write().await;
         let recently_resolved_guard = account.recently_resolved_markets.read().await;
 
         last_prob_guard.insert(lane_key.clone(), effective_prob);
@@ -552,7 +551,7 @@ async fn tick_once(
                     continue;
                 }
                 for p in v.iter() {
-                    cross_lanes_locked += p.read().await.entry_cost;
+                    cross_lanes_locked += p.read().await.position_size;
                 }
             }
             for (k, v) in pending_guard.iter() {
@@ -560,7 +559,7 @@ async fn tick_once(
                     continue;
                 }
                 for p in v.iter() {
-                    cross_lanes_locked += p.read().await.entry_cost;
+                    cross_lanes_locked += p.read().await.position_size;
                 }
             }
 
@@ -579,15 +578,11 @@ async fn tick_once(
             let this_pending: &mut Vec<crate::history_sim::SharedOpenPosition> = pending_guard
                 .get_mut(&lane_key)
                 .expect("Account.pending_resolution pre-populated by run_real_sim");
-            let this_closing: &mut Vec<crate::history_sim::SharedClosingPosition> = closing_guard
-                .get_mut(&lane_key)
-                .expect("Account.closing pre-populated by run_real_sim");
 
             if has_positions {
                 sold = manage_positions(
                     this_positions,
                     this_pending,
-                    this_closing,
                     &frame,
                     false,
                     p_win_now,
@@ -604,10 +599,10 @@ async fn tick_once(
             if may_open && !ws_lagging {
                 let mut same_locked_post = 0.0;
                 for p in this_positions.iter() {
-                    same_locked_post += p.read().await.entry_cost;
+                    same_locked_post += p.read().await.position_size;
                 }
                 for p in this_pending.iter() {
-                    same_locked_post += p.read().await.entry_cost;
+                    same_locked_post += p.read().await.position_size;
                 }
                 let available_bankroll_post =
                     (*bankroll_guard - cross_lanes_locked - same_locked_post).max(0.0);
@@ -651,7 +646,6 @@ async fn tick_once(
         }
 
         drop(state_guard);
-        drop(closing_guard);
 
         let total_value: f64 = {
             let mut active = 0.0;
