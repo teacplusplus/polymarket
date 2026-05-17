@@ -193,18 +193,14 @@ impl Account {
                     let (
                         matches_market,
                         pnl_finalized,
-                        redeemable,
                         open_status,
-                        optimistic_fill_replaced,
                         pos_id_for_log,
                     ) = {
                         let pos_g = pos_vec[idx].read().await;
                         (
                             pos_g.market_id == market_id,
                             pos_g.pnl_finalized,
-                            pos_g.is_redeemable_at_resolution(),
                             pos_g.open_status,
-                            pos_g.optimistic_fill_replaced,
                             pos_g.id.clone(),
                         )
                     };
@@ -315,12 +311,11 @@ impl Account {
 
             let mut i = 0;
             while i < vec.len() {
-                let (matches_market, pnl_already_finalized, redeemable) = {
+                let (matches_market, pnl_already_finalized) = {
                     let g = vec[i].read().await;
                     (
                         g.market_id == market_id,
                         g.pnl_finalized,
-                        g.is_redeemable_at_resolution(),
                     )
                 };
                 if !matches_market {

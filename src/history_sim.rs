@@ -311,15 +311,6 @@ impl OpenPosition {
         }
         self.closing_position = Some(weak);
     }
-
-    /// Учитывать ли позицию в resolution payout (есть ли реальные шеры на Safe).
-    pub(crate) fn is_redeemable_at_resolution(&self) -> bool {
-        match self.open_status {
-            OpenPositionStatus::Open => true,
-            OpenPositionStatus::PendingOpen => self.optimistic_fill_replaced,
-            OpenPositionStatus::OpenFailed => false,
-        }
-    }
 }
 
 /// Статус live SELL на CLOB; в sim обычно сразу [`Closed`] после [`close_position`].
@@ -981,8 +972,7 @@ pub(crate) async fn try_open_position(
     submit: bool,
     account: &SharedAccount,
 ) -> bool {
-    // Submit + graceful exit: блок новых BUY ([`crate::account_exit`]).
-    if submit && crate::account_exit::is_halted() {
+    if crate::account_exit::is_halted() {
         stats.late_entry_skips += 1;
         return false;
     }
@@ -1081,8 +1071,7 @@ pub(crate) async fn try_open_position(
                             .and_then(crate::account_order::best_ask_strict)
                             .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
                         let decision_book = strict_book.cloned();
-                        let pos_arc: SharedOpenPosition =
-                            std::sync::Arc::new(tokio::sync::RwLock::new(pos));
+                        let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
                         positions.push(pos_arc.clone());
                         crate::account_submit::spawn_open_buy_taker(
                             account.clone(),
@@ -1447,9 +1436,6 @@ pub(crate) async fn manage_positions(
         }
 
         if snapshot.asset_id != frame.asset_id {
-            if !snapshot.is_redeemable_at_resolution() {
-                continue;
-            }
             pending_resolution.push(pos_arc);
             continue;
         }
@@ -1785,7 +1771,6 @@ fn open_position(
         tp_order_id: None,
         tp_placement_attempted: entering_in_hold_zone,
         tp_cancel_attempted: entering_in_hold_zone,
-        optimistic_fill_replaced: false,
         pnl_finalized: false,
         closing_position: None,
     })

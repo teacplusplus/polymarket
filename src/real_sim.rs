@@ -460,10 +460,8 @@ async fn tick_once(
     } else {
         true
     };
-    let may_open = !dd_halt_active
-        && !market_already_resolved
-        && buy_gate_proceed
-        && submit_market_window_open;
+    let may_open = !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
+    
     if buy_gate_proceed && dd_halt_active {
         crate::tee_eprintln!(
             "[real_sim] {tag}: halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
@@ -471,18 +469,7 @@ async fn tick_once(
             account_max_dd_pct
         );
     }
-    if buy_gate_proceed && market_already_resolved {
-        crate::tee_eprintln!(
-            "[real_sim] {tag}: skip open — market={market_id} уже резолвнулся, кадр пришёл с задержкой"
-        );
-    }
-    if buy_gate_proceed && submit && !submit_market_window_open {
-        crate::tee_eprintln!(
-            "[real_sim] {tag}: skip open — submit-режим: маркет вне окна жизни \
-             (now_wall_ms={now_wall_ms}, event_start_ms={event_start_ms:?}, \
-             event_end_ms={event_end_ms:?}, market={market_id})"
-        );
-    }
+    
     let needs_http = needs_sell || may_open;
 
     let strict_book: Option<StrictBook> = if needs_http {
