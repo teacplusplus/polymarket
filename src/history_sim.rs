@@ -1014,19 +1014,17 @@ pub(crate) async fn try_open_position(
                     stats.histogram_cal_pred[bucket_pred] += 1;
 
                     // Submit: optimistic fill + spawn BUY taker; правки по WS ([`crate::account_ws`]).
+                    let decision_price = strict_book.and_then(crate::account_order::best_ask_strict).map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
+                    let decision_book = strict_book.cloned();
+                    let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
+                    positions.push(pos_arc.clone());
                     if submit {
-                        let decision_price = strict_book.and_then(crate::account_order::best_ask_strict).map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
-                        let decision_book = strict_book.cloned();
-                        let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
-                        positions.push(pos_arc.clone());
                         crate::account_submit::spawn_open_buy_taker(
                             account.clone(),
                             pos_arc,
                             decision_price,
                             decision_book,
                         );
-                    } else {
-                        positions.push(std::sync::Arc::new(tokio::sync::RwLock::new(pos)));
                     }
                     true
                 }

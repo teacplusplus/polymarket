@@ -24,7 +24,7 @@ use std::time::Duration;
 pub(crate) const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
 /// Повторы taker SELL при SL/timeout/ev-exit (FAK без матча и т.п.), как
 /// [`UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS`] в live duel test.
-pub(crate) const TAKER_SELL_ATTEMPTS: u32 = 3;
+pub(crate) const TAKER_SELL_ATTEMPTS: u32 = 10;
 
 pub(crate) fn spawn_cancel_order(
     account: SharedAccount,
