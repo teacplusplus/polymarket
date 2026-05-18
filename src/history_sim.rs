@@ -3,6 +3,7 @@
 //! Логика: Kelly/gates, выход TP/SL/timeout/EV или резолюция (`calc_y_train_pnl`).
 
 use crate::account::{Account, SharedAccount};
+use crate::account_order::SingleOrderClobInvocationReport;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
 use crate::train_mode::{
@@ -272,6 +273,8 @@ pub struct OpenPosition {
     /// Статус ордера на открытие ([`OpenPositionStatus`]); виртуально сразу `Open`.
     /// ID BUY-ордера CLOB из user-WS; `None` если виртуально.
     pub(crate) open_order_id: Option<String>,
+    /// Settled invoke-отчёт taker BUY ([`SingleOrderClobInvocationReport`]); `None` до колбэка submit.
+    pub(crate) open_buy_invoke_report: Option<SingleOrderClobInvocationReport>,
     /// PnL финализирован один раз (идемпотентность WS/polling путей).
     pub(crate) pnl_finalized: bool,
     pub(crate) maker_tp_position: Option<WeakClosingPosition>,
@@ -291,14 +294,14 @@ impl OpenPosition {
 pub struct ClosingPosition {
     /// Та же позиция, что в `Account.positions` (актуальный entry после partial BUY).
     pub position: SharedOpenPosition,
-    /// VWAP выхода из [`sell_gate`] / цена ордера.
-    pub exit_price: f64,
     /// Причина (как в CSV).
     pub reason: CloseReason,
     /// Реализованный PnL после fill; в sim сразу `Some`.
     pub pnl: Option<f64>,
     /// ID SELL на CLOB; `None` в sim или пока не создан.
     pub order_id: Option<String>,
+    /// Settled invoke-отчёт maker/taker SELL; `None` до колбэка submit.
+    pub invoke_report: Option<SingleOrderClobInvocationReport>,
     /// UTC ms создания записи (TTL/диагностика).
     pub created_unix_ms: i64,
 }
@@ -1021,9 +1024,7 @@ pub(crate) async fn try_open_position(
 
                     // Submit: optimistic fill + spawn BUY taker; правки по WS ([`crate::account_ws`]).
                     if submit {
-                        let decision_price = strict_book
-                            .and_then(crate::account_order::best_ask_strict)
-                            .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
+                        let decision_price = strict_book.and_then(crate::account_order::best_ask_strict).map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
                         let decision_book = strict_book.cloned();
                         let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
                         positions.push(pos_arc.clone());
@@ -1304,8 +1305,7 @@ pub(crate) async fn manage_positions(
     account: &SharedAccount,
 ) -> bool {
     for pos in positions.iter_mut() {
-        pos.write().await.frames_held += 1;
-    }
+        pos.write().await.frames_held += 1;    }
 
 
     let mut sold = false;
@@ -1340,57 +1340,23 @@ pub(crate) async fn manage_positions(
             SellGate::HoldPnl => None,
         };
         if let Some((exit_price, reason)) = close {
-            if submit {
-                let closing_arc: SharedClosingPosition =
-                    std::sync::Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-                        position: pos_arc.clone(),
-                        exit_price,
-                        reason: reason.clone(),
-                        pnl: None,
-                        created_unix_ms: crate::util::current_timestamp_ms(),
-                        order_id: None,
-                    }));
-                {
-                    let mut pw = pos_arc.write().await;
-                    pw.set_position(std::sync::Arc::downgrade(&closing_arc));
+            match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
+                Some(pnl) => {
+                    *bankroll += pnl;
+                    sold = true;  
+                    if submit {
+                        crate::account_submit::spawn_sell_taker(
+                            account.clone(),
+                            pos_arc,
+                            exit_price,
+                            reason,
+                            strict_book.cloned(),
+                        );
+                    }                      
                 }
-                // Counter-факт «решение принято»: считаем как намерение продать.
-                // Реальные тип-счётчики (tp/sl/timeout/ev*) обновит WS-колбек по факту.
-                sold = true;
-                remaining.push(pos_arc);
-            } else {
-                match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
-                    Some(pnl) => {
-                        *bankroll += pnl;
-                        sold = true;
-                        // Виртуальное закрытие: PnL уже в `bankroll`/`stats`,
-                        // теневая запись `Closed` нужна только для:
-                        //   (а) симметрии с real-flow (в обоих случаях
-                        //       завершённое закрытие проходит через `closing`),
-                        //   (б) того, чтобы cleanup-шаг следующего тика её
-                        //       отпустил — без cleanup'а Vec бы рос неограниченно.
-                        let closing_arc: SharedClosingPosition =
-                            std::sync::Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-                                position: pos_arc.clone(),
-                                exit_price,
-                                reason,
-                                pnl: Some(pnl),
-                                order_id: None,
-                                created_unix_ms: crate::util::current_timestamp_ms(),
-                            }));
-                        // Прямая Weak-ссылка (см. real-flow выше). Для виртуального
-                        // closure `pnl_finalized`-маркер не нужен (финализация
-                        // синхронная, прямо тут), но поле всё равно заполняем для
-                        // симметрии с submit-флоу и потенциальных будущих consumer'ов.
-                        {
-                            let mut pw = pos_arc.write().await;
-                            pw.set_position(std::sync::Arc::downgrade(&closing_arc));
-                        }
-                    }
-                    None => {
-                        stats.kelly_strict_sell_skips += 1;
-                        remaining.push(pos_arc);
-                    }
+                None => {
+                    stats.kelly_strict_sell_skips += 1;
+                    remaining.push(pos_arc);
                 }
             }
         } else {
@@ -1530,6 +1496,7 @@ fn open_position(
         gamma_question_at_open: gamma_question_at_open.map(|s| s.to_string()),
         pnl_top5_shap_at_open: pnl_top5_shap_at_open.to_string(),
         open_order_id: None,
+        open_buy_invoke_report: None,
         pnl_finalized: false,
         maker_tp_position: None,
         taker_tp_position: None,
