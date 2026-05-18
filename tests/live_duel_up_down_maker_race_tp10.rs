@@ -6,8 +6,9 @@ use poly::account::{
     try_authenticate_clob_for_heartbeats,
 };
 use poly::account_order::{
-    best_ask_sdk, cancel_order_on_clob, post_order_on_clob, CancelOrderRequest, OrderAmount,
-    OrderRole, PostOrderRequest, SingleOrderClobInvocationReport,
+    best_ask_sdk, cancel_order_on_clob, invoke_settlement_watch, post_order_on_clob,
+    wait_invoke_settlement, CancelOrderRequest, OrderAmount, OrderRole, PostOrderRequest,
+    SingleOrderClobInvocationReport,
 };
 use poly::account_ws::spawn_user_ws_listener;
 use poly::constants::CurrencyUpDownOutcome;
@@ -22,7 +23,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::RwLock;
 
 /// Период в секундах у slug `btc-updown-5m-{ts}`.
 const BTC_UPDOWN_5M_PERIOD_SEC: i64 = 300;
@@ -146,6 +147,15 @@ const LIVE_MAKER_TP_MULT: f64 = 1.1;
 const LIVE_DUEL_BUY_USD_HEADROOM: f64 = 0.03;
 /// Повторы taker SELL при unwind противоположной ноги (FAK без матча и т.п.), подряд без пауз.
 const UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS: u32 = 3;
+
+fn invoke_wait_until_market_end_plus(market_end_unix_ms: Option<i64>) -> Duration {
+    let now_ms = current_timestamp_ms();
+    let deadline_ms = market_end_unix_ms
+        .map(|end_ms| end_ms.saturating_add((LIVE_ORDER_HTTP_TIMEOUT_SEC * 1000) as i64))
+        .unwrap_or(now_ms.saturating_add((LIVE_ORDER_HTTP_TIMEOUT_SEC * 1000) as i64));
+    let wait_ms = deadline_ms.saturating_sub(now_ms).max(1_000);
+    Duration::from_millis(wait_ms as u64)
+}
 
 #[derive(Clone, Debug, Default)]
 struct DuelHarness {
@@ -277,7 +287,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
             opposite_prep.asset_id,
             UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
         );
-        let (sell_tx, sell_rx) = oneshot::channel();
+        let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
         if let Err(err) = post_order_on_clob(
             account,
             PostOrderRequest {
@@ -293,7 +303,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 strict_book: None,
             },
             Box::new(move |rep| {
-                let _ = sell_tx.send(rep);
+                let _ = sell_invoke_tx.send(Some(rep));
             }),
         )
         .await
@@ -306,11 +316,16 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
             continue;
         }
 
-        let sell_rep = match sell_rx.await {
-            Ok(rep) => rep,
-            Err(_) => {
+        let sell_rep = match wait_invoke_settlement(
+            &mut sell_invoke_rx,
+            Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC.saturating_mul(30)),
+        )
+        .await
+        {
+            Some(rep) => rep,
+            None => {
                 poly::test_tee_println!(
-                    "[от старта {wall_ms} ms] duel: нога {:?} — ошибка unwind opposite: invoke-колбёк taker SELL потерян попытка {attempt}/{}",
+                    "[от старта {wall_ms} ms] duel: нога {:?} — ошибка unwind opposite: invoke taker SELL timeout попытка {attempt}/{}",
                     this_outcome,
                     UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
                 );
@@ -368,7 +383,7 @@ async fn duel_self_taker_sell_flush(
             "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush — taker FAK SELL slug={slug} asset_id={asset_id} shares={shares_to_sell:.2} (raw remaining={my_shares:.6}) попытка {attempt}/{}",
             UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
         );
-        let (sell_tx, sell_rx) = oneshot::channel();
+        let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
         if let Err(err) = post_order_on_clob(
             account,
             PostOrderRequest {
@@ -384,7 +399,7 @@ async fn duel_self_taker_sell_flush(
                 strict_book: None,
             },
             Box::new(move |rep| {
-                let _ = sell_tx.send(rep);
+                let _ = sell_invoke_tx.send(Some(rep));
             }),
         )
         .await
@@ -395,11 +410,16 @@ async fn duel_self_taker_sell_flush(
             );
             continue;
         }
-        let sell_rep = match sell_rx.await {
-            Ok(rep) => rep,
-            Err(_) => {
+        let sell_rep = match wait_invoke_settlement(
+            &mut sell_invoke_rx,
+            Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC.saturating_mul(30)),
+        )
+        .await
+        {
+            Some(rep) => rep,
+            None => {
                 poly::test_tee_println!(
-                    "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush — invoke-колбёк taker SELL потерян попытка {attempt}/{}",
+                    "[от старта {wall_ms} ms] duel: нога {outcome_t:?}: self-flush — invoke taker SELL timeout попытка {attempt}/{}",
                     UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS,
                 );
                 continue;
@@ -441,7 +461,7 @@ async fn duel_post_buy_then_maker(
     let outcome_t = prep.outcome;
 
 
-    let (buy_invoke_tx, buy_invoke_rx) = oneshot::channel();
+    let (buy_invoke_tx, mut buy_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
         PostOrderRequest {
@@ -457,15 +477,18 @@ async fn duel_post_buy_then_maker(
             strict_book: None,
         },
         Box::new(move |buy_rep| {
-            let _ = buy_invoke_tx.send(buy_rep);
+            let _ = buy_invoke_tx.send(Some(buy_rep));
         }),
     )
     .await
     .with_context(|| format!("duel BUY taker {:?}", outcome_t))?;
 
-    let buy_rep = buy_invoke_rx.await.map_err(|_| {
-        anyhow::anyhow!("duel BUY taker {:?}: invoke-колбёк потерян", outcome_t)
-    })?;
+    let buy_rep = wait_invoke_settlement(
+        &mut buy_invoke_rx,
+        Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC.saturating_mul(30)),
+    )
+    .await
+    .ok_or_else(|| anyhow::anyhow!("duel BUY taker {:?}: invoke timeout", outcome_t))?;
 
     let wall_ms = wall_anchor.elapsed().as_millis() as u64;
     poly::test_tee_println!(
@@ -613,7 +636,7 @@ async fn duel_post_buy_then_maker(
         Some((ws.saturating_add(BTC_UPDOWN_5M_PERIOD_SEC)).saturating_mul(1000))
     });
 
-    let (mk_invoke_tx, mk_invoke_rx) = oneshot::channel();
+    let (mk_invoke_tx, mut mk_invoke_rx) = invoke_settlement_watch();
     let post_res = post_order_on_clob(
         &account,
         PostOrderRequest {
@@ -629,7 +652,7 @@ async fn duel_post_buy_then_maker(
             strict_book: None,
         },
         Box::new(move |rep| {
-            let _ = mk_invoke_tx.send(rep);
+            let _ = mk_invoke_tx.send(Some(rep));
         }),
     )
     .await;
@@ -672,10 +695,11 @@ async fn duel_post_buy_then_maker(
         );
     }
 
-    let maker_fin = mk_invoke_rx.await;
+    let maker_invoke_wait = invoke_wait_until_market_end_plus(market_end_unix_ms);
+    let maker_fin = wait_invoke_settlement(&mut mk_invoke_rx, maker_invoke_wait).await;
 
     match maker_fin {
-        Ok(maker_rep) => {
+        Some(maker_rep) => {
             let sold_shares = match &maker_rep.making_amount {
                 OrderAmount::Shares(s) if s.is_finite() && *s >= 0.0 => *s,
                 _ => 0.0,
@@ -705,8 +729,8 @@ async fn duel_post_buy_then_maker(
                 );
             }
         }
-        Err(_) => poly::test_tee_println!(
-            "duel: {:?} maker invoke-колбёк потерян до финала агрегатора",
+        None => poly::test_tee_println!(
+            "duel: {:?} maker invoke timeout до финала агрегатора ({maker_invoke_wait:?})",
             outcome_t,
         ),
     }

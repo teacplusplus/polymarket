@@ -303,6 +303,52 @@ fn nonempty_order_id_str(s: &str) -> Option<String> {
 
 pub type SingleOrderInvokeCb = Box<dyn FnOnce(SingleOrderClobInvocationReport) + Send + 'static>;
 
+/// Ожидание settle invoke: `watch` (не `oneshot`) — `Receiver` клонируется, несколько тасков
+/// могут ждать один и тот же [`SingleOrderClobInvocationReport`].
+pub type InvokeSettlementWatch =
+    tokio::sync::watch::Receiver<Option<SingleOrderClobInvocationReport>>;
+pub type InvokeSettlementWatchTx =
+    tokio::sync::watch::Sender<Option<SingleOrderClobInvocationReport>>;
+
+/// `None` в канале до колбэка POST; затем `Some(report)`.
+pub fn invoke_settlement_watch() -> (InvokeSettlementWatchTx, InvokeSettlementWatch) {
+    tokio::sync::watch::channel(None)
+}
+
+pub fn invoke_settlement_ready(watch: &InvokeSettlementWatch) -> bool {
+    watch.borrow().is_some()
+}
+
+pub fn invoke_settlement_report(
+    watch: &InvokeSettlementWatch,
+) -> Option<SingleOrderClobInvocationReport> {
+    watch.borrow().clone()
+}
+
+pub async fn wait_invoke_settlement(
+    watch: &mut InvokeSettlementWatch,
+    timeout: std::time::Duration,
+) -> Option<SingleOrderClobInvocationReport> {
+    if let Some(report) = invoke_settlement_report(watch) {
+        return Some(report);
+    }
+    match tokio::time::timeout(timeout, async {
+        loop {
+            if watch.changed().await.is_err() {
+                return None;
+            }
+            if let Some(report) = invoke_settlement_report(watch) {
+                return Some(report);
+            }
+        }
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(_) => None,
+    }
+}
+
 /// Контекст после успешного HTTP POST для агрегатора invoke.
 #[derive(Debug, Clone)]
 pub struct PostOrderInvokeContext {

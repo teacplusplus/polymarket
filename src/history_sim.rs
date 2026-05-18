@@ -3,7 +3,7 @@
 //! Логика: Kelly/gates, выход TP/SL/timeout/EV или резолюция (`calc_y_train_pnl`).
 
 use crate::account::{Account, SharedAccount};
-use crate::account_order::SingleOrderClobInvocationReport;
+use crate::account_order::InvokeSettlementWatch;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
 use crate::train_mode::{
@@ -273,14 +273,11 @@ pub struct OpenPosition {
     /// Статус ордера на открытие ([`OpenPositionStatus`]); виртуально сразу `Open`.
     /// ID BUY-ордера CLOB из user-WS; `None` если виртуально.
     pub(crate) open_order_id: Option<String>,
-    /// Settled invoke-отчёт taker BUY ([`SingleOrderClobInvocationReport`]); `None` до колбэка submit.
-    pub(crate) open_buy_invoke_report: Option<SingleOrderClobInvocationReport>,
-    /// PnL финализирован один раз (идемпотентность WS/polling путей).
-    pub(crate) pnl_finalized: bool,
+    /// Taker BUY invoke: `None` до POST; затем [`InvokeSettlementWatch`] (`Some(report)` после колбэка).
+    pub(crate) open_buy_invoke: Option<InvokeSettlementWatch>,
     pub(crate) maker_tp_position: Option<WeakClosingPosition>,
-    pub(crate) taker_tp_position: Option<WeakClosingPosition>,
-    /// Taker SL/timeout/ev-exit: по одной записи на каждый успешный FAK SELL ([`crate::account_submit`]).
-    pub(crate) sl_positions: Vec<WeakClosingPosition>,
+    /// Taker FAK SELL: по одной записи на каждый успешный invoke ([`crate::account_submit`]).
+    pub(crate) taker_positions: Vec<WeakClosingPosition>,
 }
 
 /// Запись закрытия для WS/polling ([`manage_positions`], [`crate::account::apply_user_ws_event`]).
@@ -292,8 +289,10 @@ pub struct ClosingPosition {
     pub reason: CloseReason,
     /// ID SELL на CLOB; `None` в sim или пока не создан.
     pub order_id: Option<String>,
-    /// Settled invoke-отчёт maker/taker SELL; `None` до колбэка submit.
-    pub invoke_report: Option<SingleOrderClobInvocationReport>,
+    /// SELL invoke: `None` до POST; затем [`InvokeSettlementWatch`] (`Some(report)` после колбэка).
+    pub invoke_settle: Option<InvokeSettlementWatch>,
+    /// Был вызван [`crate::account_order::cancel_order_on_clob`] для этой записи.
+    pub canceled: bool,
     /// UTC ms создания записи (TTL/диагностика).
     pub created_unix_ms: i64,
 }
@@ -1297,8 +1296,8 @@ pub(crate) async fn manage_positions(
     account: &SharedAccount,
 ) -> bool {
     for pos in positions.iter_mut() {
-        pos.write().await.frames_held += 1;    }
-
+        pos.write().await.frames_held += 1;
+    }
 
     let mut sold = false;
     let mut remaining: Vec<SharedOpenPosition> = Vec::new();
@@ -1307,10 +1306,6 @@ pub(crate) async fn manage_positions(
         // ниже работают на этом snapshot'е. Нам не нужно держать pos-lock
         // через async-вызовы (CSV / spawn'ы).
         let snapshot = pos_arc.read().await.clone();
-
-         if snapshot.pnl_finalized {
-            continue;
-        }
 
         if snapshot.asset_id != frame.asset_id {
             pending_resolution.push(pos_arc);
@@ -1327,6 +1322,12 @@ pub(crate) async fn manage_positions(
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
             SellGate::HoldResolution { new_p_win_ema } => {
+                if submit {
+                    crate::account_submit::spawn_cancel_order(account.clone(), pos_arc.clone());
+                }
+                if let Some(ema) = new_p_win_ema {
+                    pos_arc.write().await.p_win_ema = Some(ema);
+                }
                 None
             }
             SellGate::HoldPnl => None,
@@ -1457,10 +1458,6 @@ fn open_position(
     };
     let sell_vwap_entry = (gross_sell / shares_held).clamp(0.001, 0.999);
 
-    // Hold-zone на входе: подавить TP-maker ([`OpenPosition::tp_placement_attempted`] / cancel-дедуп).
-    let entering_in_hold_zone: bool = frame.event_remaining_ms > 0
-        && frame.event_remaining_ms <= HOLD_TO_END_THRESHOLD_SEC * 1000;
-
     Some(OpenPosition {
         id: uuid::Uuid::new_v4().to_string(),
         asset_id: frame.asset_id.clone(),
@@ -1488,11 +1485,9 @@ fn open_position(
         gamma_question_at_open: gamma_question_at_open.map(|s| s.to_string()),
         pnl_top5_shap_at_open: pnl_top5_shap_at_open.to_string(),
         open_order_id: None,
-        open_buy_invoke_report: None,
-        pnl_finalized: false,
+        open_buy_invoke: None,
         maker_tp_position: None,
-        taker_tp_position: None,
-        sl_positions: Vec::new(),
+        taker_positions: Vec::new(),
     })
 }
 

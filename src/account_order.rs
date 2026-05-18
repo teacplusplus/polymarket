@@ -67,7 +67,11 @@ pub struct PostOrderRequest {
     pub strict_book: Option<StrictBook>,
 }
 
-pub use crate::account_order_completion::{SingleOrderClobInvocationReport, SingleOrderInvokeCb};
+pub use crate::account_order_completion::{
+    InvokeSettlementWatch, InvokeSettlementWatchTx, SingleOrderClobInvocationReport,
+    SingleOrderInvokeCb, invoke_settlement_ready, invoke_settlement_report,
+    invoke_settlement_watch, wait_invoke_settlement,
+};
 
 /// `POST /order`: колбэк [`SingleOrderInvokeCb`] вызывается **ровно один раз** при любом исходе
 /// (валидация, отсутствие auth/signer, ошибка билда/подписи, HTTP/SDK error, timeout,

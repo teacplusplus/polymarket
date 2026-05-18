@@ -168,8 +168,6 @@ impl Account {
         };
         let mut state_guard = state.write().await;
 
-        // Carry matching `market_id` в pending. `pnl_finalized` — дроп из positions (без двойного PnL).
-        let mut skipped_finalized: usize = 0;
         {
             let mut positions = account.positions.write().await;
             let mut pending = account.pending_resolution.write().await;
@@ -181,42 +179,18 @@ impl Account {
                 let pending_vec = pending.entry(key).or_default();
                 let mut idx = 0;
                 while idx < pos_vec.len() {
-                    let (
-                        matches_market,
-                        pnl_finalized,
-                        pos_id_for_log,
-                    ) = {
+                    let matches_market = {
                         let pos_g = pos_vec[idx].read().await;
-                        (
-                            pos_g.market_id == market_id,
-                            pos_g.pnl_finalized,
-                            pos_g.id.clone(),
-                        )
+                        pos_g.market_id == market_id
                     };
                     if !matches_market {
                         idx += 1;
-                        continue;
-                    }
-                    if pnl_finalized {
-                        let _ = pos_vec.swap_remove(idx);
-                        skipped_finalized += 1;
-                        crate::tee_println!(
-                            "[resolve] skip already-finalized pos: pos_id={pos_id_for_log}, market_id={market_id}, currency={currency}, interval={interval:?} \
-                             (PnL уже учтён WS-finalize'ом, не переносим в pending_resolution — иначе двойной счёт)"
-                        );
                         continue;
                     }
                     pending_vec.push(pos_vec.swap_remove(idx));
                 }
             }
         }
-        if skipped_finalized > 0 {
-            crate::tee_println!(
-                "[resolve] market_id={market_id} currency={currency} interval={interval:?}: \
-                 пропустили {skipped_finalized} уже финализированных позиций при carry в pending_resolution",
-            );
-        }
-
         let sim_stats = state_guard
             .stats
             .get_mut(&interval)
@@ -272,30 +246,15 @@ impl Account {
 
             let mut i = 0;
             while i < vec.len() {
-                let (matches_market, pnl_already_finalized) = {
+                let matches_market = {
                     let g = vec[i].read().await;
-                    (
-                        g.market_id == market_id,
-                        g.pnl_finalized,
-                    )
+                    g.market_id == market_id
                 };
                 if !matches_market {
                     i += 1;
                     continue;
                 }
-                // Уже финализировано WS — без повторного payout.
-                if pnl_already_finalized {
-                    let pos_arc = vec.swap_remove(i);
-                    let pos_id_for_log = pos_arc.read().await.id.clone();
-                    crate::tee_println!(
-                        "[resolve_sync] skip already-finalized pos: pos_id={pos_id_for_log}, \
-                         market_id={market_id}, currency={currency}, interval={int_kind:?}, side={side:?} \
-                         (PnL уже учтён WS-finalize'ом, payout пропускаем — иначе двойной счёт; \
-                         запись `Resolution`/`AutoRedeem` в submit-CSV тоже не пишем — \
-                         финальная строка трейда уже записана в `finalize_close_pnl_in_place`)"
-                    );
-                    continue;
-                }
+
                 {
                     let pos_arc = vec.swap_remove(i);
                     let pos = pos_arc.read().await.clone();
@@ -304,12 +263,6 @@ impl Account {
                     } else {
                         -pos.position_size
                     };
-                    {
-                        let mut pw = pos_arc.write().await;
-                        if !pw.pnl_finalized {
-                            pw.pnl_finalized = true;
-                        }
-                    }
                     *bankroll += pnl;
                     side_stats.pnl_usd += pnl;
                     side_stats.trades += 1;

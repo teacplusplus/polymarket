@@ -6,7 +6,8 @@ use poly::account::{
     try_authenticate_clob_for_heartbeats,
 };
 use poly::account_order::{
-    best_ask_sdk, OrderAmount, OrderRole, PostOrderRequest, post_order_on_clob,
+    best_ask_sdk, invoke_settlement_watch, post_order_on_clob, wait_invoke_settlement, OrderAmount,
+    OrderRole, PostOrderRequest,
 };
 use poly::account_ws::spawn_user_ws_listener;
 use poly::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
@@ -199,7 +200,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: taker BUY market_floor_buy_usd≈{market_floor_buy_usd:.4}",
     );
 
-    let (buy_invoke_tx, buy_invoke_rx) = tokio::sync::oneshot::channel();
+    let (buy_invoke_tx, mut buy_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
         PostOrderRequest {
@@ -215,7 +216,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
             strict_book: None,
         },
         Box::new(move |rep| {
-            let _ = buy_invoke_tx.send(rep);
+            let _ = buy_invoke_tx.send(Some(rep));
         }),
     )
     .await
@@ -225,9 +226,14 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
             "[от старта {wall} ms | с прошлого {dt} ms] BUY taker slug={slug} asset_id={asset_id}"
         )
     })?;
-    let buy_single_order_clob_invocation_report = buy_invoke_rx.await.map_err(|_| {
+    let buy_single_order_clob_invocation_report = wait_invoke_settlement(
+        &mut buy_invoke_rx,
+        Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC.saturating_mul(30)),
+    )
+    .await
+    .ok_or_else(|| {
         let (dt, wall) = evt_ms!(last_evt, t0);
-        anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] BUY taker колбёк потерян")
+        anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] BUY taker invoke timeout")
     })?;
 
     let (dt, wall) = evt_ms!(last_evt, t0);
@@ -286,7 +292,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         "[от старта {wall} ms | с прошлого {dt} ms] live_taker_roundtrip_btc_updown_5m: taker SELL shares_to_sell={shares_to_sell:.2} taking_amount_shares_net={taking_amount_shares_net:.6}",
     );
 
-    let (sell_invoke_tx, sell_invoke_rx) = tokio::sync::oneshot::channel();
+    let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
         PostOrderRequest {
@@ -302,7 +308,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
             strict_book: None,
         },
         Box::new(move |rep| {
-            let _ = sell_invoke_tx.send(rep);
+            let _ = sell_invoke_tx.send(Some(rep));
         }),
     )
     .await
@@ -312,9 +318,14 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
             "[от старта {wall} ms | с прошлого {dt} ms] SELL taker slug={slug} asset_id={asset_id}"
         )
     })?;
-    let sell_single_order_clob_invocation_report = sell_invoke_rx.await.map_err(|_| {
+    let sell_single_order_clob_invocation_report = wait_invoke_settlement(
+        &mut sell_invoke_rx,
+        Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC.saturating_mul(30)),
+    )
+    .await
+    .ok_or_else(|| {
         let (dt, wall) = evt_ms!(last_evt, t0);
-        anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] SELL taker колбёк потерян")
+        anyhow::anyhow!("[от старта {wall} ms | с прошлого {dt} ms] SELL taker invoke timeout")
     })?;
 
     let (dt, wall) = evt_ms!(last_evt, t0);
