@@ -279,14 +279,8 @@ pub struct OpenPosition {
     pub(crate) pnl_finalized: bool,
     pub(crate) maker_tp_position: Option<WeakClosingPosition>,
     pub(crate) taker_tp_position: Option<WeakClosingPosition>,
-    pub(crate) sl_position: Option<WeakClosingPosition>,
-    pub(crate) timeout_position: Option<WeakClosingPosition>,
-}
-
-impl OpenPosition {
-
-    pub(crate) fn set_position(&mut self, weak: WeakClosingPosition) {
-    }
+    /// Taker SL/timeout/ev-exit: по одной записи на каждый успешный FAK SELL ([`crate::account_submit`]).
+    pub(crate) sl_positions: Vec<WeakClosingPosition>,
 }
 
 /// Запись закрытия для WS/polling ([`manage_positions`], [`crate::account::apply_user_ws_event`]).
@@ -296,8 +290,6 @@ pub struct ClosingPosition {
     pub position: SharedOpenPosition,
     /// Причина (как в CSV).
     pub reason: CloseReason,
-    /// Реализованный PnL после fill; в sim сразу `Some`.
-    pub pnl: Option<f64>,
     /// ID SELL на CLOB; `None` в sim или пока не создан.
     pub order_id: Option<String>,
     /// Settled invoke-отчёт maker/taker SELL; `None` до колбэка submit.
@@ -1500,8 +1492,7 @@ fn open_position(
         pnl_finalized: false,
         maker_tp_position: None,
         taker_tp_position: None,
-        sl_position: None,
-        timeout_position: None,
+        sl_positions: Vec::new(),
     })
 }
 
