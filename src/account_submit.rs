@@ -26,6 +26,16 @@ pub(crate) const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
 /// [`UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS`] в live duel test.
 pub(crate) const TAKER_SELL_ATTEMPTS: u32 = 10;
 
+fn is_past_market_end(event_end_unix_ms: Option<i64>) -> bool {
+    event_end_unix_ms.is_some_and(|end_ms| crate::util::current_timestamp_ms() >= end_ms)
+}
+
+async fn taker_sell_attempt_backoff(attempt: u32) {
+    if attempt > 3 {
+        tokio::time::sleep(Duration::from_secs(u64::from(attempt - 3))).await;
+    }
+}
+
 pub(crate) fn spawn_cancel_order(
     account: SharedAccount,
     position: SharedOpenPosition,
@@ -214,6 +224,13 @@ pub(crate) fn spawn_sell_taker(
         let sell_invoke_wait = invoke_wait_until_market_end_plus(event_end_unix_ms);
 
         for attempt in 1..=TAKER_SELL_ATTEMPTS {
+            if is_past_market_end(event_end_unix_ms) {
+                crate::tee_println!(
+                    "[submit] sell taker pos_id={position_id}: event_end_ms достигнут — прекращаем taker SELL",
+                );
+                break;
+            }
+
             let shares_sold_by_takers = {
                 let taker_weaks = position.read().await.taker_positions.clone();
                 let mut total = 0.0_f64;
@@ -307,6 +324,7 @@ pub(crate) fn spawn_sell_taker(
                         "[submit] sell taker pos_id={position_id}: POST вернул пустой order_id \
                          попытка {attempt}/{TAKER_SELL_ATTEMPTS}",
                     );
+                    taker_sell_attempt_backoff(attempt).await;
                     continue;
                 }
                 Ok(None) => {
@@ -314,6 +332,7 @@ pub(crate) fn spawn_sell_taker(
                         "[submit] sell taker pos_id={position_id}: POST Ok(None) \
                          попытка {attempt}/{TAKER_SELL_ATTEMPTS}",
                     );
+                    taker_sell_attempt_backoff(attempt).await;
                     continue;
                 }
                 Err(post_err) => {
@@ -321,6 +340,7 @@ pub(crate) fn spawn_sell_taker(
                         "[submit] sell taker pos_id={position_id}: POST err={post_err:#} \
                          попытка {attempt}/{TAKER_SELL_ATTEMPTS}",
                     );
+                    taker_sell_attempt_backoff(attempt).await;
                     continue;
                 }
             };
@@ -340,6 +360,7 @@ pub(crate) fn spawn_sell_taker(
                         "[submit] sell taker pos_id={position_id} order_id={sell_order_id:?}: \
                          invoke timeout {sell_invoke_wait:?} попытка {attempt}/{TAKER_SELL_ATTEMPTS}",
                     );
+                    taker_sell_attempt_backoff(attempt).await;
                     continue;
                 }
             };
@@ -356,7 +377,8 @@ pub(crate) fn spawn_sell_taker(
                 sell_invoke_report.error_msg,
             );
 
-        }        
+            taker_sell_attempt_backoff(attempt).await;
+        }
     });
 }
 
