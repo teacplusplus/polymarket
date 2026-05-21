@@ -3,6 +3,7 @@
 //! Логика: Kelly/gates, выход TP/SL/timeout/EV или резолюция (`calc_y_train_pnl`).
 
 use crate::account::{Account, SharedAccount};
+use crate::project_manager::ProjectManager;
 use crate::account_order::InvokeSettlementWatch;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
@@ -21,6 +22,7 @@ use crate::{tee_eprintln, tee_println};
 pub use crate::sim_stats::{print_side_stats, print_sim_stats, SideStats, SimStats};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use xgb::{Booster, DMatrix};
 
 /// Нижний порог raw перед Kelly (`f* > 0`).
@@ -688,6 +690,8 @@ pub(crate) async fn run_side_simulation(
                 None,
                 Some(MINPOSITION_FRAMES),
                 false, // history_sim: submit всегда выключен
+                false,
+                None,
                 account,
             )
             .await;
@@ -1291,6 +1295,8 @@ pub(crate) async fn manage_positions(
     strict_book: Option<&StrictBook>,
     min_position_frames: Option<usize>,
     submit: bool,
+    spawn_partial_graph_html_on_close: bool,
+    project_manager: Option<&Arc<ProjectManager>>,
     account: &SharedAccount,
 ) -> bool {
     for pos in positions.iter_mut() {
@@ -1334,7 +1340,15 @@ pub(crate) async fn manage_positions(
             match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
                 Some(pnl) => {
                     *bankroll += pnl;
-                    sold = true;  
+                    sold = true;
+                    if spawn_partial_graph_html_on_close {
+                        if let Some(project_manager) = project_manager {
+                            crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close(
+                                project_manager.clone(),
+                                &snapshot,
+                            );
+                        }
+                    }
                     if submit {
                         crate::account_submit::spawn_sell_taker(
                             account.clone(),

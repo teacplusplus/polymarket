@@ -5,7 +5,7 @@ use crate::history_sim::{
     NO_KELLY_POSITION_SIZE_USD, OpenPosition, SIM_MAX_SLIPPAGE_FROM_L1_PCT, book_fill_buy,
     book_fill_sell,
 };
-use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager};
+use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager, XFRAMES_LANE_1S};
 use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
 use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
@@ -564,4 +564,140 @@ pub async fn dump_market_graph_html_lane(
     let html = render_graph_html(&market_id, &payload)?;
     tokio::fs::write(&path, html.as_bytes()).await?;
     Ok(())
+}
+
+/// Фоновый партиальный HTML по кадрам PM → `graph_html_path_from_bin(pos.graph_dump_bin_path)` (ссылка из CSV).
+/// Только real_sim при `spawn_partial_graph_html_on_close`; `final_price` — последний спот из `rtds_currency_prices_by_sec`.
+pub fn spawn_partial_market_graph_html_for_close(
+    project_manager: Arc<ProjectManager>,
+    pos: &OpenPosition,
+) {
+    let market_id = pos.market_id.clone();
+    let bin_path_str = pos.graph_dump_bin_path.clone();
+    let price_to_beat = pos.price_to_beat.unwrap_or(0.0);
+    let interval_kind_i32 = pos.xframe_interval_type_at_open;
+
+    tokio::spawn(async move {
+        if bin_path_str.is_empty() {
+            return;
+        }
+        let Some(interval_kind) = XFrameIntervalKind::from_i32(interval_kind_i32) else {
+            return;
+        };
+        let bin_path = PathBuf::from(&bin_path_str);
+        let Some(target_html_path) = graph_html_path_from_bin(&bin_path) else {
+            return;
+        };
+
+        let pm = project_manager;
+
+        // final_price = «цена последнего xframe»: последний секундный
+        // спот валюты, который PM кладёт в `rtds_currency_prices_by_sec`
+        // (там же, откуда берётся `currency_spot_usd` в
+        // `build_frames_from_buffer_lane_once`).
+        let final_price = pm
+            .rtds_currency_prices_by_sec
+            .read()
+            .await
+            .iter()
+            .next_back()
+            .map(|(_, p)| *p)
+            .unwrap_or(0.0);
+
+        if pm.xframes_by_market.is_empty() {
+            return;
+        }
+        let by_asset = {
+            let lock = pm.xframes_by_market[XFRAMES_LANE_1S].read().await;
+            lock.get(&market_id).cloned()
+        };
+        let Some(by_asset) = by_asset else {
+            return;
+        };
+
+        let mut flat: Vec<(i64, XFrame<SIZE>)> = Vec::new();
+        for (_asset_id, by_ts) in by_asset.iter() {
+            for (aligned_ts, frame) in by_ts.iter() {
+                flat.push((*aligned_ts, frame.clone()));
+            }
+        }
+        flat.sort_by_key(|(aligned_ts, _)| *aligned_ts);
+
+        let mut up: Vec<GraphHtmlRow> = Vec::new();
+        let mut down: Vec<GraphHtmlRow> = Vec::new();
+        for (aligned_ts, frame) in flat {
+            if !frame.stable {
+                continue;
+            }
+            let row = graph_html_row(&frame, aligned_ts);
+            match CurrencyUpDownOutcome::from_i32(frame.currency_up_down_outcome) {
+                Some(CurrencyUpDownOutcome::Up) => up.push(row),
+                Some(CurrencyUpDownOutcome::Down) => down.push(row),
+                None => {}
+            }
+        }
+        if up.is_empty() && down.is_empty() {
+            return;
+        }
+
+        let interval_ms = interval_kind.interval_ms();
+        let window_start_ms = lane_window_start_ms_from_rows(up.iter().chain(down.iter()), interval_ms)
+            .unwrap_or_else(|| {
+                up.iter()
+                    .chain(down.iter())
+                    .map(|r| r.t)
+                    .min()
+                    .unwrap_or(0)
+            });
+        let window_end_ms = window_start_ms.saturating_add(interval_ms);
+        let up_f: Vec<GraphHtmlRow> = up
+            .iter()
+            .filter(|r| r.t >= window_start_ms && r.t <= window_end_ms)
+            .cloned()
+            .collect();
+        let down_f: Vec<GraphHtmlRow> = down
+            .iter()
+            .filter(|r| r.t >= window_start_ms && r.t <= window_end_ms)
+            .cloned()
+            .collect();
+        let (up, down) = if up_f.is_empty() && down_f.is_empty() {
+            (up, down)
+        } else {
+            (up_f, down_f)
+        };
+        let window_duration_sec = interval_ms / 1000;
+
+        let payload = GraphHtmlPayload {
+            price_to_beat,
+            final_price,
+            window_start_ms,
+            window_duration_sec,
+            up,
+            down,
+        };
+        let html = match render_graph_html(&market_id, &payload) {
+            Ok(s) => s,
+            Err(err) => {
+                crate::tee_eprintln!(
+                    "[partial_graph_html] {market_id}: render failed: {err:#}"
+                );
+                return;
+            }
+        };
+        if let Some(parent) = target_html_path.parent() {
+            if let Err(err) = tokio::fs::create_dir_all(parent).await {
+                crate::tee_eprintln!(
+                    "[partial_graph_html] {market_id}: create_dir_all {} failed: {err:#}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+        if let Err(err) = tokio::fs::write(&target_html_path, html.as_bytes()).await {
+            crate::tee_eprintln!(
+                "[partial_graph_html] {market_id}: write {} failed: {err:#}",
+                target_html_path.display()
+            );
+        }
+    });
 }

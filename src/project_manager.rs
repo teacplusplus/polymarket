@@ -82,6 +82,8 @@ struct BuiltXframeEntry {
 
 /// Интервал(s) тика сборщика по лейну; один лейн — все маркеты на этом шаге.
 pub const FRAME_BUILD_INTERVALS_SEC: [u64; 1] = [1];
+/// Индекс лейна 1s в [`FRAME_BUILD_INTERVALS_SEC`] и `xframes_by_market`.
+pub const XFRAMES_LANE_1S: usize = 0;
 /// Очередь команд единого market WS (5m+15m).
 const MARKET_WS_SUBSCRIPTION_CHANNEL_CAP: usize = 8;
 
