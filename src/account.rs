@@ -1,6 +1,6 @@
 //! Капитал и MtM (`bankroll`, peak, max DD); per-lane позиции и CLOB-клиенты.
 //! Один [`SharedAccount`] на процесс: поля под отдельными `RwLock`, auth в [`ArcSwapAny`] (read-mostly).
-//! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_resolution` → `closing` → `recently_resolved_markets` → один inner на позицию.
+//! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `closing` → `recently_resolved_markets` → один inner на позицию.
 
 use crate::account_order_completion::TrackerEntry;
 use crate::account_proxy::PolyProxyEnvGuard;
@@ -59,10 +59,11 @@ pub struct Account {
     pub max_drawdown_pct: Arc<RwLock<f64>>,
     /// Последняя implied prob по лейну (MtM, по `currency` в ключе).
     pub last_prob: Arc<RwLock<HashMap<LaneKey, f64>>>,
-    /// Открытые позиции; тот же `Arc`, что в `pending_resolution` и в записи закрытия (`position`).
+    /// Открытые позиции; тот же `Arc`, что в записи закрытия (`position`).
+    /// Для одной лейны могут сосуществовать позиции разных `market_id` — старые
+    /// (с чужим `asset_id` относительно текущего кадра) живут здесь как
+    /// «припаркованные» до резолюции; см. [`Self::resolve_pending_market_sync`].
     pub positions: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
-    /// Старый маркет до резолюции; не `manage_positions`.
-    pub pending_resolution: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
     /// Недавно зарезолвленные `market_id`; анти-повтор открытия ([`RECENTLY_RESOLVED_MARKETS_CAP`]).
     pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
     /// HTTP с rustls; тот же `Arc`, что у [`ProjectManager::http`](crate::project_manager::ProjectManager::http).
@@ -111,7 +112,6 @@ impl Account {
             max_drawdown_pct: Arc::new(RwLock::new(0.0)),
             last_prob: Arc::new(RwLock::new(HashMap::new())),
             positions: Arc::new(RwLock::new(HashMap::new())),
-            pending_resolution: Arc::new(RwLock::new(HashMap::new())),
             recently_resolved_markets: Arc::new(RwLock::new(IndexSet::new())),
             http,
             clob,
@@ -143,71 +143,22 @@ impl Account {
         lanes: &[(XFrameIntervalKind, CurrencyUpDownOutcome)],
     ) {
         let mut positions = self.positions.write().await;
-        let mut pending = self.pending_resolution.write().await;
         for (interval, side) in lanes {
             let key = (currency.to_string(), *interval, *side);
             positions.entry(key.clone()).or_default();
-            pending.entry(key.clone()).or_default();
         }
     }
 
-    /// Бинарный payout по `market_id`: перенос из `positions` в `pending`, затем [`resolve_pending_market_sync`].
-    /// `final_price` в CSV resolution; `up_won` — исход UP. Drawdown — на следующем тике.
+    /// Ядро: дренирует `positions[lane]` по `market_id` (включая «припаркованные» с чужим
+    /// `asset_id` текущего тика), считает бинарный payout, обновляет `bankroll`/`SimStats`,
+    /// пишет CSV + [`crate::trade_csv_log::record_market_outcome`].
     ///
-    /// Локи: `RealSimState.write`, затем `bankroll` → `pending` → `recently_resolved` в этом порядке.
-    pub async fn resolve_pending_market(
-        account: &SharedAccount,
-        currency: &str,
-        interval: XFrameIntervalKind,
-        market_id: &str,
-        up_won: bool,
-        final_price: f64,
-    ) {
-        let Some(state) = account.real_sim_state_for_currency(currency).await else {
-            return;
-        };
-        let mut state_guard = state.write().await;
-
-        {
-            let mut positions = account.positions.write().await;
-            let mut pending = account.pending_resolution.write().await;
-            for ((cur, int_kind, side), pos_vec) in positions.iter_mut() {
-                if cur.as_str() != currency || *int_kind != interval {
-                    continue;
-                }
-                let key = (cur.clone(), *int_kind, *side);
-                let pending_vec = pending.entry(key).or_default();
-                let mut idx = 0;
-                while idx < pos_vec.len() {
-                    let matches_market = {
-                        let pos_g = pos_vec[idx].read().await;
-                        pos_g.market_id == market_id
-                    };
-                    if !matches_market {
-                        idx += 1;
-                        continue;
-                    }
-                    pending_vec.push(pos_vec.swap_remove(idx));
-                }
-            }
-        }
-        let sim_stats = state_guard
-            .stats
-            .get_mut(&interval)
-            .expect("RealSimState.stats: оба интервала пред-инициализированы в new()");
-        account
-            .resolve_pending_market_sync(
-                sim_stats,
-                currency,
-                interval,
-                market_id,
-                up_won,
-                Some(final_price),
-            )
-            .await;
-    }
-
-    /// Ядро: `pending_resolution` + банкролл + CSV + [`crate::trade_csv_log::record_market_outcome`].
+    /// **Drain stale-маркетов:** позиции той же лейны (`currency`+`interval`), но с
+    /// **другим** `market_id` (хвост от прошлого маркета, для которого resolution-событие
+    /// не пришло), считаются полностью неактуальными — списываются как полная потеря
+    /// (`pnl = -position_size`), `bankroll` корректируется, в `SimStats` они **не** попадают
+    /// (это не легитимный trade outcome, а защита от утечки локнутого капитала), CSV-строка
+    /// тоже не пишется. На каждый такой инцидент — `tee_eprintln!`-предупреждение.
     ///
     /// `final_price`: `None` → `pos.final_price`, иначе override для realtime.
     pub async fn resolve_pending_market_sync(
@@ -219,7 +170,7 @@ impl Account {
         up_won: bool,
         final_price: Option<f64>,
     ) {
-        // bankroll → pending → recently_resolved
+        // bankroll → positions → recently_resolved
         let mut recently_resolved = self.recently_resolved_markets.write().await;
         if recently_resolved.insert(market_id.to_string()) {
             while recently_resolved.len() > RECENTLY_RESOLVED_MARKETS_CAP {
@@ -229,9 +180,9 @@ impl Account {
         drop(recently_resolved);
 
         let mut bankroll = self.bankroll.write().await;
-        let mut pending_resolution = self.pending_resolution.write().await;
+        let mut positions = self.positions.write().await;
 
-        for ((cur, int_kind, side), vec) in pending_resolution.iter_mut() {
+        for ((cur, int_kind, side), vec) in positions.iter_mut() {
             if cur.as_str() != currency || *int_kind != interval {
                 continue;
             }
@@ -340,48 +291,13 @@ impl Account {
                                 pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
                             },
                         );
-                        // Расширенный submit-CSV; без лога виртуально no-op.
-                        crate::trade_csv_log::write_submit_trade_csv_row(
-                            crate::trade_csv_log::SubmitTradeCsvRow {
-                                pos_id: &pos.id,
-                                polymarket_url: &pos.polymarket_url,
-                                price_to_beat: pos.price_to_beat,
-                                final_price: final_price.or(pos.final_price),
-                                currency: cur,
-                                interval: interval_str,
-                                side: side_str,
-                                market_id,
-                                asset_id: &pos.asset_id,
-                                exit_reason,
-                                fill_role: "AutoRedeem",
-                                finalized_via: "Resolution",
-                                buy_price: pos.buy_price,
-                                shares_held: pos.shares_held,
-                                position_size: pos.position_size,
-                                exit_price: if token_won { 1.0 } else { 0.0 },
-                                fee_usdc: 0.0,
-                                pnl,
-                                open_order_id: pos.open_order_id.as_deref(),
-                                raw_pred: pos.raw_pred_at_open,
-                                cal_pred: pos.cal_pred_at_open,
-                                kelly_f: pos.kelly_f_at_open,
-                                p_win_ema_at_close: pos.p_win_ema,
-                                frames_held: pos.frames_held,
-                                event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
-                                event_remaining_ms_at_close: 0,
-                                open_unix_ms,
-                                close_unix_ms,
-                                graph_html_file_uri: graph_html_file_uri.as_str(),
-                                pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
-                            },
-                        );
                     }
                     let _ = pos_arc;
                 }
                 // После swap_remove на `i` на этом индексе новая позиция — без i += 1.
             }
         }
-        drop(pending_resolution);
+        drop(positions);
         drop(bankroll);
 
         crate::trade_csv_log::record_market_outcome(market_id, up_won);

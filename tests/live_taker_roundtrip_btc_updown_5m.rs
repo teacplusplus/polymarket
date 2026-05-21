@@ -203,6 +203,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
     let (buy_invoke_tx, mut buy_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
+        None,
         PostOrderRequest {
             asset_id: asset_id.clone(),
             side: Side::Buy,
@@ -295,6 +296,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
     let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
+        None,
         PostOrderRequest {
             asset_id: asset_id.clone(),
             side: Side::Sell,

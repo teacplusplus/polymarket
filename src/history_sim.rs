@@ -320,7 +320,7 @@ pub struct ClosingPosition {
     pub created_unix_ms: i64,
 }
 
-/// Выход до резолюции; иначе см. [`crate::account::Account::resolve_pending_market`].
+/// Выход до резолюции; иначе см. [`crate::account::Account::resolve_pending_market_sync`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum CloseReason {
     /// TP по [`crate::xframe::Y_TRAIN_TAKE_PROFIT_PP`].
@@ -615,31 +615,16 @@ async fn simulate_event(
             .await;
     }
 
-    // После resolve pending по этому маркету должен быть пуст (иначе утечка между маркетами).
-    {
-        let pending = account.pending_resolution.read().await;
-        assert!(
-            pending
-                .get(&lane_key_up)
-                .map(|v| v.is_empty())
-                .unwrap_or(true)
-                && pending
-                    .get(&lane_key_down)
-                    .map(|v| v.is_empty())
-                    .unwrap_or(true),
-            "history_sim: pending_resolution не опустошён после resolve_pending_market_sync \
-             (lane_key_up={lane_key_up:?}, lane_key_down={lane_key_down:?}); \
-             dump invariant violated",
-        );
-    }
+
 }
 
 /// Один проход стороны (UP/DOWN) по ряду кадров: manage/open → MtM equity.
 /// Живые позиции — `account.positions[lane_key]` (source-of-truth, как в [`crate::real_sim`]);
-/// после цикла дренируются в `account.pending_resolution[lane_key]`, финальный payout —
-/// в [`simulate_event`].
+/// финальный payout по ним делает caller через
+/// [`crate::account::Account::resolve_pending_market_sync`] (см. [`simulate_event`]).
 ///
-/// Equity: `bankroll + Σ(local×prob) + Σ(pending×buy_price)` (как `real_sim::tick_once`).
+/// Equity: `bankroll + Σ(local×prob)` (под `lane_key`); pending-веток нет —
+/// в этом режиме под лейной всегда позиции текущего маркета.
 /// Сайзинг от `bankroll − Σ(entry_cost)` на этой стороне.
 ///
 /// `hold_to_end_threshold_sec` — окно, в котором применяется resolution-модель
@@ -692,17 +677,14 @@ pub(crate) async fn run_side_simulation(
         let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl, is_kelly);
 
         // Фаза 1: manage_positions. Берём поля Account под отдельными write-локами
-        // в каноническом порядке (`bankroll → positions → pending_resolution → closing`),
+        // в каноническом порядке (`bankroll → positions → closing`),
         // как в real_sim::tick_once — иначе deadlock с другими потребителями.
         {
             let mut bankroll = account.bankroll.write().await;
             let mut positions = account.positions.write().await;
-            let mut pending_resolution = account.pending_resolution.write().await;
             let positions_v = positions.entry(lane_key.clone()).or_default();
-            let pending = pending_resolution.entry(lane_key.clone()).or_default();
             manage_positions(
                 positions_v,
-                pending,
                 frame,
                 is_last_idx,
                 p_win_now,
@@ -710,7 +692,7 @@ pub(crate) async fn run_side_simulation(
                 &mut bankroll,
                 None,
                 Some(MINPOSITION_FRAMES),
-                false, // history_sim: submit всегда выключен
+                crate::account_submit::SubmitMode::None,
                 false,
                 None,
                 account,
@@ -746,49 +728,38 @@ pub(crate) async fn run_side_simulation(
                 graph_dump_bin_path,
                 None,
                 None,
-                false, // history_sim: submit всегда выключен
+                crate::account_submit::SubmitMode::None,
+                None,
                 account,
             )
             .await;
         }
 
         // MtM equity (как real_sim): без prob на кадре тик пропускаем.
+        // В history_sim/train_mode внутри одного `run_side_simulation` под `lane_key`
+        // живут только позиции текущего маркета (`asset_id` совпадает с кадровым),
+        // поэтому оцениваем их по текущему `prob`. «Припаркованных» с чужим
+        // `asset_id` здесь не бывает — они появлялись бы только в real_sim.
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
             let equity = {
                 let bankroll = account.bankroll.read().await;
                 let positions = account.positions.read().await;
-                let pending = account.pending_resolution.read().await;
                 let mut positions_value = 0.0;
                 if let Some(v) = positions.get(lane_key) {
                     for p in v {
                         positions_value += p.read().await.shares_held * prob;
                     }
                 }
-                let mut pending_value = 0.0;
-                for v in pending.values() {
-                    for p in v {
-                        let g = p.read().await;
-                        pending_value += g.shares_held * g.buy_price;
-                    }
-                }
-                *bankroll + positions_value + pending_value
+                *bankroll + positions_value
             };
             account.update_drawdown(equity).await;
         }
     }
 
-    // Хвост открытых позиций уезжает в pending_resolution — финальный payout
-    // делает caller через `Account::resolve_pending_market_sync`.
-    {
-        let mut positions = account.positions.write().await;
-        let mut pending_resolution = account.pending_resolution.write().await;
-        let positions_v = positions.entry(lane_key.clone()).or_default();
-        if !positions_v.is_empty() {
-            let pending = pending_resolution.entry(lane_key.clone()).or_default();
-            pending.append(positions_v);
-        }
-    }
+    // Хвост открытых позиций остаётся в `account.positions[lane_key]`; финальный
+    // payout делает caller через `Account::resolve_pending_market_sync`, который
+    // дренирует их по `market_id` напрямую из `positions`.
 }
 
 /// Сырой (`raw`) и калиброванный (`pred`) скор PnL; см. [`compute_pnl_inference`].
@@ -943,7 +914,8 @@ pub(crate) async fn try_open_position(
     graph_dump_bin_path: &str,
     gamma_question_at_open: Option<&str>,
     pnl_top5_shap_at_open_override: Option<String>,
-    submit: bool,
+    submit_mode: crate::account_submit::SubmitMode,
+    project_manager: Option<&Arc<ProjectManager>>,
     account: &SharedAccount,
 ) -> bool {
     if crate::account_exit::is_halted() {
@@ -1049,14 +1021,14 @@ pub(crate) async fn try_open_position(
                     let decision_book = strict_book.cloned();
                     let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
                     positions.push(pos_arc.clone());
-                    if submit {
-                        crate::account_submit::spawn_open_buy_taker(
-                            account.clone(),
-                            pos_arc,
-                            decision_price,
-                            decision_book,
-                        );
-                    }
+                    crate::account_submit::spawn_open_buy_taker(
+                        account.clone(),
+                        project_manager.cloned(),
+                        pos_arc,
+                        decision_price,
+                        decision_book,
+                        submit_mode,
+                    );
                     true
                 }
                 None => {
@@ -1291,7 +1263,9 @@ pub(crate) async fn any_position_would_sell(
     false
 }
 
-/// Закрытия через [`sell_gate`] / `close_position`; чужой `asset_id` → [`pending_resolution`](crate::account::Account::pending_resolution).
+/// Закрытия через [`sell_gate`] / `close_position`; чужой `asset_id` (позиция
+/// другого маркета той же лейны) — позиция возвращается в `positions` как
+/// «припаркованная» и ждёт [`crate::account::Account::resolve_pending_market_sync`].
 /// `true`, если был хотя бы один успешный close (bankroll обновился).
 /// `min_position_frames` пробрасывается в [`sell_gate`] (см. там).
 ///
@@ -1313,7 +1287,6 @@ pub(crate) async fn any_position_would_sell(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn manage_positions(
     positions: &mut Vec<SharedOpenPosition>,
-    pending_resolution: &mut Vec<SharedOpenPosition>,
     frame: &XFrame<SIZE>,
     is_last: bool,
     p_win_now: Option<f64>,
@@ -1321,7 +1294,7 @@ pub(crate) async fn manage_positions(
     bankroll: &mut f64,
     strict_book: Option<&StrictBook>,
     min_position_frames: Option<usize>,
-    submit: bool,
+    submit_mode: crate::account_submit::SubmitMode,
     spawn_partial_graph_html_on_close: bool,
     project_manager: Option<&Arc<ProjectManager>>,
     account: &SharedAccount,
@@ -1339,7 +1312,7 @@ pub(crate) async fn manage_positions(
         let snapshot = pos_arc.read().await.clone();
 
         if snapshot.asset_id != frame.asset_id {
-            pending_resolution.push(pos_arc);
+            remaining.push(pos_arc);
             continue;
         }
         let close = match sell_gate(
@@ -1353,9 +1326,12 @@ pub(crate) async fn manage_positions(
         ) {
             SellGate::Close { exit_price, reason } => Some((exit_price, reason)),
             SellGate::HoldResolution { new_p_win_ema } => {
-                if submit {
-                    crate::account_submit::spawn_cancel_order(account.clone(), pos_arc.clone());
-                }
+                crate::account_submit::spawn_cancel_order(
+                    account.clone(),
+                    project_manager.cloned(),
+                    pos_arc.clone(),
+                    submit_mode,
+                );
                 if let Some(ema) = new_p_win_ema {
                     pos_arc.write().await.p_win_ema = Some(ema);
                 }
@@ -1364,33 +1340,36 @@ pub(crate) async fn manage_positions(
             SellGate::HoldPnl => None,
         };
         if let Some((exit_price, reason)) = close {
-            match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
-                Some(pnl) => {
-                    *bankroll += pnl;
-                    sold = true;
-                    if spawn_partial_graph_html_on_close {
-                        if let Some(project_manager) = project_manager {
-                            crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close(
-                                project_manager.clone(),
-                                &snapshot,
-                            );
-                        }
+            if submit_mode == crate::account_submit::SubmitMode::None {
+                match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
+                    Some(pnl) => {
+                        *bankroll += pnl;
+                        sold = true;                    
                     }
-                    if submit {
-                        crate::account_submit::spawn_sell_taker(
-                            account.clone(),
-                            pos_arc,
-                            exit_price,
-                            reason,
-                            strict_book.cloned(),
+                    None => {
+                        stats.kelly_strict_sell_skips += 1;
+                        remaining.push(pos_arc);
+                    }
+                }
+            } else {
+                crate::account_submit::spawn_sell_taker(
+                    account.clone(),
+                    project_manager.cloned(),
+                    pos_arc,
+                    exit_price,
+                    reason,
+                    strict_book.cloned(),
+                    submit_mode,
+                );
+                if spawn_partial_graph_html_on_close {
+                    if let Some(project_manager) = project_manager {
+                        crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close(
+                            project_manager.clone(),
+                            &snapshot,
                         );
-                    }                      
-                }
-                None => {
-                    stats.kelly_strict_sell_skips += 1;
-                    remaining.push(pos_arc);
-                }
-            }
+                    }
+                }  
+            }         
         } else {
             remaining.push(pos_arc);
         }

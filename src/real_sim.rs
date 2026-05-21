@@ -54,7 +54,8 @@ pub(crate) const WS_STRICT_BOOK_MAX_AGE_MS: i64 = 1_000;
 /// Таймаут ответа координатора в [`fetch_http_strict_book`] (~3× HTTP).
 const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
 
-/// Max время от старта [`tick_once`] до [`try_open_position`]; продажи не ограничиваются.
+/// Max время от старта [`tick_once`] до [`try_open_position`]; продажи не ограничиваются,
+/// но lag на пути закрытия тоже логируем.
 const TICK_OPEN_MAX_ELAPSED: Duration = Duration::from_millis(500);
 
 /// Лимит FIFO [`RealSimState::seen_market_ids`] на интервал.
@@ -157,8 +158,13 @@ pub(crate) fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
     }
 }
 
-/// Загрузка моделей, публикация [`RealSimState`] в [`crate::account::Account`], 4 воркера [`tick_once`]. `submit` — реальный CLOB vs виртуальный fill.
-pub async fn run_real_sim(project_manager: Arc<ProjectManager>, submit: bool) -> Result<()> {
+/// Загрузка моделей, публикация [`RealSimState`] в [`crate::account::Account`], 4 воркера
+/// [`tick_once`]. `submit_mode` — выбор CLOB-исполнителя (`Submit` боевой, `Mock` фейковый
+/// через WS-стакан, `None` чисто виртуально); см. [`crate::account_submit::SubmitMode`].
+pub async fn run_real_sim(
+    project_manager: Arc<ProjectManager>,
+    submit_mode: crate::account_submit::SubmitMode,
+) -> Result<()> {
     let currency_arc = project_manager.currency.clone();
     let currency = currency_arc.as_str().to_string();
     let version_path = latest_version_path(&currency)
@@ -227,7 +233,7 @@ pub async fn run_real_sim(project_manager: Arc<ProjectManager>, submit: bool) ->
             models,
             tag_prefix.clone(),
             rx,
-            submit,
+            submit_mode,
         );
     }
 
@@ -247,7 +253,7 @@ fn spawn_side_worker(
     models: SideModels,
     tag_prefix: String,
     mut rx: mpsc::Receiver<LaneFrame>,
-    submit: bool,
+    submit_mode: crate::account_submit::SubmitMode,
 ) {
     tokio::spawn(async move {
         let tag = format!(
@@ -271,7 +277,7 @@ fn spawn_side_worker(
                 &tag,
                 &mut last_market_id,
                 lane_frame,
-                submit,
+                submit_mode,
             ))
             .catch_unwind()
             .await;
@@ -352,7 +358,7 @@ async fn tick_once(
     tag: &str,
     last_market_id: &mut Option<String>,
     lane_frame: LaneFrame,
-    submit: bool,
+    submit_mode: crate::account_submit::SubmitMode,
 ) -> Result<()> {
     let LaneFrame {
         market_id,
@@ -463,15 +469,12 @@ async fn tick_once(
         buy_gate(&frame, pnl_inference, available_bankroll_pre, None, true),
         BuyGate::Proceed { .. }
     );
-    // Submit: новые BUY только при wall-clock внутри `[event_start_ms, event_end_ms)` от Gamma.
+    // Submit/Mock: новые BUY только при wall-clock внутри `[event_start_ms, event_end_ms)` от Gamma.
+    // Для `SubmitMode::None` (чисто виртуальный fill) window-гейта нет.
     let now_wall_ms = current_timestamp_ms();
-    let submit_market_window_open: bool = if submit {
-        match (event_start_ms, event_end_ms) {
-            (Some(start_ms), Some(end_ms)) => now_wall_ms >= start_ms && now_wall_ms < end_ms,
-            _ => false,
-        }
-    } else {
-        true
+    let submit_market_window_open: bool = match (event_start_ms, event_end_ms) {
+        (Some(start_ms), Some(end_ms)) => now_wall_ms >= start_ms && now_wall_ms < end_ms,
+        _ => false,
     };
     let may_open = !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
     
@@ -532,7 +535,6 @@ async fn tick_once(
         let mut max_dd_guard = account.max_drawdown_pct.write().await;
         let mut last_prob_guard = account.last_prob.write().await;
         let mut positions_guard = account.positions.write().await;
-        let mut pending_guard = account.pending_resolution.write().await;
         let recently_resolved_guard = account.recently_resolved_markets.read().await;
 
         last_prob_guard.insert(lane_key.clone(), effective_prob);
@@ -567,14 +569,6 @@ async fn tick_once(
                     cross_lanes_locked += p.read().await.position_size;
                 }
             }
-            for (k, v) in pending_guard.iter() {
-                if k == &lane_key {
-                    continue;
-                }
-                for p in v.iter() {
-                    cross_lanes_locked += p.read().await.position_size;
-                }
-            }
 
             let stats: &mut SimStats = state_guard
                 .stats
@@ -588,14 +582,10 @@ async fn tick_once(
             let this_positions: &mut Vec<crate::history_sim::SharedOpenPosition> = positions_guard
                 .get_mut(&lane_key)
                 .expect("Account.positions pre-populated by run_real_sim");
-            let this_pending: &mut Vec<crate::history_sim::SharedOpenPosition> = pending_guard
-                .get_mut(&lane_key)
-                .expect("Account.pending_resolution pre-populated by run_real_sim");
 
             if has_positions {
                 sold = manage_positions(
                     this_positions,
-                    this_pending,
                     &frame,
                     false,
                     p_win_now,
@@ -603,12 +593,20 @@ async fn tick_once(
                     &mut bankroll_guard,
                     strict_book.as_ref(),
                     None,
-                    submit,
+                    submit_mode,
                     spawn_partial_graph_html_on_close,
                     Some(project_manager),
                     account,
                 )
                 .await;
+                if needs_sell && tick_started.elapsed() > TICK_OPEN_MAX_ELAPSED {
+                    crate::tee_eprintln!(
+                        "[real_sim] {tag}: tick elapsed {:.0}ms > {}ms \
+                         (market={market_id}) — закрытие позиции обработано с лагом",
+                        tick_started.elapsed().as_secs_f64() * 1000.0,
+                        TICK_OPEN_MAX_ELAPSED.as_millis(),
+                    );
+                }
             }
 
             if may_open && !ws_lagging {
@@ -622,9 +620,6 @@ async fn tick_once(
                 } else {
                     let mut same_locked_post = 0.0;
                     for p in this_positions.iter() {
-                        same_locked_post += p.read().await.position_size;
-                    }
-                    for p in this_pending.iter() {
                         same_locked_post += p.read().await.position_size;
                     }
                     let available_bankroll_post =
@@ -661,7 +656,8 @@ async fn tick_once(
                         graph_dump_bin_path_str.as_str(),
                         gamma_question.as_deref(),
                         pnl_top5_shap_at_open_precomputed,
-                        submit,
+                        submit_mode,
+                        Some(project_manager),
                         account,
                     )
                     .await;
@@ -691,14 +687,7 @@ async fn tick_once(
                     active += p.read().await.shares_held * prob;
                 }
             }
-            let mut pending = 0.0;
-            for v in pending_guard.values() {
-                for p in v.iter() {
-                    let g = p.read().await;
-                    pending += g.shares_held * g.buy_price;
-                }
-            }
-            active + pending
+            active
         };
         let equity = *bankroll_guard + total_value;
         if equity > *peak_guard {

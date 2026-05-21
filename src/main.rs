@@ -128,7 +128,11 @@ async fn main() -> Result<()> {
 
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
-                real_sim::run_real_sim(project_manager, false).await?;
+                real_sim::run_real_sim(
+                    project_manager,
+                    poly::account_submit::SubmitMode::Mock,
+                )
+                .await?;
             }
 
             std::future::pending::<()>().await;
@@ -165,7 +169,11 @@ async fn main() -> Result<()> {
 
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
-                real_sim::run_real_sim(project_manager, true).await?;
+                real_sim::run_real_sim(
+                    project_manager,
+                    poly::account_submit::SubmitMode::Submit,
+                )
+                .await?;
             }
 
             wait_for_shutdown_signal().await;

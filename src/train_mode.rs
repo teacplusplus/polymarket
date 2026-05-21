@@ -324,7 +324,7 @@ impl Calibration {
 ///
 /// На каждый маркет создаётся свежий [`Account`] с очень большим bankroll
 /// (чтобы фиксированный $30-entry не урезался по `min(size, bankroll)` после
-/// серии трейдов). [`SimStats`] / `positions` / `pending_resolution` тоже
+/// серии трейдов). [`SimStats`] / `positions` тоже
 /// per-маркет. CSV-лог трейдов обычно не открыт в момент train_mode
 /// ([`crate::trade_csv_log::init_trade_csv_log_file`] дёргается только в
 /// [`crate::history_sim::run_sim_mode`]); если открыт — туда попадут лишние
@@ -491,9 +491,9 @@ async fn fit_calibration_via_sim_replay(
             .await;
         }
 
-        // Хвост позиций, доехавших до конца окна, лежит в `account.pending_resolution`
+        // Хвост позиций, доехавших до конца окна, остаётся в `account.positions`
         // под нашим `lane_key`. resolve_pending_market_sync закрывает их бинарной
-        // выплатой и (благодаря патчу в account.rs) push'ит в closed_trade_entries.
+        // выплатой (по `market_id`) и push'ит в closed_trade_entries.
         if let Some(market_id) = market_id_opt {
             account
                 .resolve_pending_market_sync(

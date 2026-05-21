@@ -1,5 +1,7 @@
 pub mod account;
 pub mod account_exit;
+pub mod account_mock_order;
+pub mod account_mock_order_completion;
 pub mod account_order;
 pub mod account_order_completion;
 pub mod account_proxy;

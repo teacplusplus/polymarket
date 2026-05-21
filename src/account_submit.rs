@@ -6,20 +6,44 @@
 //!
 //! `event_end_ms` из [`crate::history_sim::OpenPosition`] всегда пробрасывается в
 //! [`crate::account_order::PostOrderRequest::market_end_unix_ms`] для POST здесь (дедлайн invoke/poll).
+//!
+//! Способ исполнения CLOB-ордеров выбирается параметром [`SubmitMode`]:
+//! * [`SubmitMode::Submit`] — реальный CLOB ([`crate::account_order`]);
+//! * [`SubmitMode::Mock`] — фейковая симуляция по WS-стакану
+//!   ([`crate::account_mock_order`]);
+//! * [`SubmitMode::None`] — ничего не вызываем (чистое виртуальное исполнение,
+//!   как в `history_sim` backtest).
 use crate::account::SharedAccount;
 use crate::account_order::{
-    cancel_order_on_clob, invoke_settlement_ready, invoke_settlement_report,
-    invoke_settlement_watch, post_order_on_clob, wait_invoke_settlement, CancelOrderRequest,
-    OrderAmount, OrderRole, PostOrderRequest, SingleOrderClobInvocationReport,
+    CancelOrderRequest, CancelOrderResult, OrderAmount, OrderRole, PostOrderRequest,
+    SingleOrderClobInvocationReport, invoke_settlement_ready, invoke_settlement_report,
+    invoke_settlement_watch, wait_invoke_settlement,
 };
 use crate::history_sim::{
-    CloseReason, ClosingPosition, SharedClosingPosition, SharedOpenPosition, StrictBook,
-    SIM_MAX_SLIPPAGE_FROM_L1_PCT,
+    CloseReason, ClosingPosition, SIM_MAX_SLIPPAGE_FROM_L1_PCT, SharedClosingPosition,
+    SharedOpenPosition, StrictBook,
 };
+use crate::project_manager::ProjectManager;
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
 use polymarket_client_sdk::clob::types::Side;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Способ исполнения CLOB-ордеров [`spawn_open_buy_taker`] / [`spawn_sell_taker`] /
+/// [`spawn_cancel_order`]. При `None` `spawn_*` выходит ранним return; в
+/// [`crate::real_sim::tick_once`] также отключает submit-window-гейт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitMode {
+    /// Боевые методы [`crate::account_order::post_order_on_clob`] /
+    /// [`crate::account_order::cancel_order_on_clob`].
+    Submit,
+    /// Мок [`crate::account_mock_order::post_order_on_clob`] /
+    /// [`crate::account_mock_order::cancel_order_on_clob`] — данные из WS-стакана
+    /// [`crate::project_manager::ProjectManager::last_snapshot_by_asset_id`].
+    Mock,
+    /// CLOB не дёргаем — чистое виртуальное исполнение (`spawn_*` ранний return).
+    None,
+}
 /// Один REST/SUBMIT timeout — также для [`crate::account_order_completion`] и invoke-poll (через дубль константы там).
 pub(crate) const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
 /// Повторы taker SELL при SL/timeout/ev-exit (FAK без матча и т.п.), как
@@ -36,11 +60,71 @@ async fn taker_sell_attempt_backoff(attempt: u32) {
     }
 }
 
+/// Диспатч `post_order_on_clob` по [`SubmitMode`]: единая точка ветвления real↦mock, чтобы
+/// тело `spawn_open_buy_taker` / `spawn_sell_taker` не дублировало `match`. `None` не ожидается —
+/// `spawn_*` уже выходит ранним return при `submit_mode == SubmitMode::None`.
+async fn post_order_on_clob(
+    account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
+    submit_mode: SubmitMode,
+    request: PostOrderRequest,
+    invoke: crate::account_order::SingleOrderInvokeCb,
+) -> anyhow::Result<Option<String>> {
+    match submit_mode {
+        SubmitMode::Submit => {
+            crate::account_order::post_order_on_clob(account, None, request, invoke).await
+        }
+        SubmitMode::Mock => {
+            crate::account_mock_order::post_order_on_clob(
+                account,
+                project_manager,
+                request,
+                invoke,
+            )
+            .await
+        }
+        SubmitMode::None => unreachable!(
+            "post_order_on_clob (account_submit) вызывается из spawn_* только при \
+             submit_mode != SubmitMode::None"
+        ),
+    }
+}
+
+/// Диспатч `cancel_order_on_clob` по [`SubmitMode`]: симметричный двойник
+/// [`post_order_on_clob`]. `None` не ожидается — [`spawn_cancel_order`] выходит ранним return
+/// при `submit_mode == SubmitMode::None`.
+async fn cancel_order_on_clob(
+    account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
+    submit_mode: SubmitMode,
+    request: CancelOrderRequest,
+) -> anyhow::Result<CancelOrderResult> {
+    match submit_mode {
+        SubmitMode::Submit => {
+            crate::account_order::cancel_order_on_clob(account, None, request).await
+        }
+        SubmitMode::Mock => {
+            crate::account_mock_order::cancel_order_on_clob(account, project_manager, request)
+                .await
+        }
+        SubmitMode::None => unreachable!(
+            "cancel_order_on_clob (account_submit) вызывается из spawn_* только при \
+             submit_mode != SubmitMode::None"
+        ),
+    }
+}
+
 pub(crate) fn spawn_cancel_order(
     account: SharedAccount,
+    project_manager: Option<Arc<ProjectManager>>,
     position: SharedOpenPosition,
+    submit_mode: SubmitMode,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if submit_mode == SubmitMode::None {
+            return;
+        }
+
         let (position_id, maker_tp_position) = {
             let open_position = position.read().await;
             (
@@ -49,55 +133,59 @@ pub(crate) fn spawn_cancel_order(
             )
         };
 
-        if let Some(maker_tp_position) = maker_tp_position {
-            if let Some(maker_tp_position) = maker_tp_position.upgrade() {
-                let (maker_tp_order_id, maker_already_canceled) = {
-                    let maker_closing_read = maker_tp_position.read().await;
-                    (
-                        maker_closing_read
-                            .order_id
-                            .clone()
-                            .filter(|order_id| !order_id.trim().is_empty()),
-                        maker_closing_read.canceled,
-                    )
-                };
+        let Some(maker_tp_position) = maker_tp_position.and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+        let (maker_tp_order_id, maker_already_canceled) = {
+            let maker_closing_read = maker_tp_position.read().await;
+            (
+                maker_closing_read
+                    .order_id
+                    .clone()
+                    .filter(|order_id| !order_id.trim().is_empty()),
+                maker_closing_read.canceled,
+            )
+        };
+        let Some(order_id) = maker_tp_order_id else { return };
+        if maker_already_canceled {
+            return;
+        }
+        {
+            let mut maker_closing_write = maker_tp_position.write().await;
+            maker_closing_write.canceled = true;
+        }
 
-                if let Some(order_id) = maker_tp_order_id {
-                    if !maker_already_canceled {
-                        {
-                            let mut maker_closing_write = maker_tp_position.write().await;
-                            maker_closing_write.canceled = true;
-                        }
-                        match cancel_order_on_clob(
-                            &account,
-                            CancelOrderRequest {
-                                order_id: order_id.clone(),
-                                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-                            },
-                        )
-                        .await
-                        {
-                            Ok(cancel_result) => {
-                                crate::tee_println!(
-                                    "[submit] cancel order pos_id={position_id}: cancel maker TP order_id={} canceled={} err={:?}",
-                                    cancel_result.order_id,
-                                    cancel_result.canceled,
-                                    cancel_result.error_msg,
-                                );
-                                if cancel_result.canceled {
-                                    let mut maker_closing_write =
-                                        maker_tp_position.write().await;
-                                    maker_closing_write.order_id = None;
-                                }
-                            }
-                            Err(cancel_err) => {
-                                crate::tee_eprintln!(
-                                    "[submit] cancel order pos_id={position_id}: cancel maker TP order_id={order_id}: {cancel_err:#}",
-                                );
-                            }
-                        }
-                    }
+        let cancel_request = CancelOrderRequest {
+            order_id: order_id.clone(),
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+        };
+        let cancel_outcome = cancel_order_on_clob(
+            &account,
+            project_manager.as_ref(),
+            submit_mode,
+            cancel_request,
+        )
+        .await;
+
+        match cancel_outcome {
+            Ok(cancel_result) => {
+                crate::tee_println!(
+                    "[submit/{submit_mode:?}] cancel order pos_id={position_id}: cancel maker TP \
+                     order_id={} canceled={} err={:?}",
+                    cancel_result.order_id,
+                    cancel_result.canceled,
+                    cancel_result.error_msg,
+                );
+                if cancel_result.canceled {
+                    let mut maker_closing_write = maker_tp_position.write().await;
+                    maker_closing_write.order_id = None;
                 }
+            }
+            Err(cancel_err) => {
+                crate::tee_eprintln!(
+                    "[submit/{submit_mode:?}] cancel order pos_id={position_id}: cancel maker TP \
+                     order_id={order_id}: {cancel_err:#}",
+                );
             }
         }
     })
@@ -105,11 +193,16 @@ pub(crate) fn spawn_cancel_order(
 
 pub(crate) fn spawn_sell_taker(
     account: SharedAccount,
+    project_manager: Option<Arc<ProjectManager>>,
     position: SharedOpenPosition,
     exit_price: f64,
     reason: CloseReason,
     strict_book: Option<StrictBook>,
+    submit_mode: SubmitMode,
 ) {
+    if submit_mode == SubmitMode::None {
+        return;
+    }
     tokio::spawn(async move {
         let open_position = position.read().await;
         let position_id = open_position.id.clone();
@@ -178,9 +271,14 @@ pub(crate) fn spawn_sell_taker(
             }
         }
 
-        spawn_cancel_order(account.clone(), position.clone())
-            .await
-            .ok();
+        spawn_cancel_order(
+            account.clone(),
+            project_manager.clone(),
+            position.clone(),
+            submit_mode,
+        )
+        .await
+        .ok();
 
         if let Some(maker_tp_position) = maker_tp_position {
             if let Some(maker_tp_position) = maker_tp_position.upgrade() {
@@ -297,23 +395,28 @@ pub(crate) fn spawn_sell_taker(
                 taker_closing
             };
 
-            let sell_post_result = post_order_on_clob(
-                &account,
-                PostOrderRequest {
-                    asset_id: asset_id.clone(),
-                    side: Side::Sell,
-                    role: OrderRole::Taker,
-                    amount: OrderAmount::Shares(shares_to_sell),
-                    price: None,
-                    max_slippage_pp: Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
-                    expiration: None,
-                    market_end_unix_ms: event_end_unix_ms,
-                    timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-                    strict_book: strict_book.clone(),
-                },
+            let sell_post_request = PostOrderRequest {
+                asset_id: asset_id.clone(),
+                side: Side::Sell,
+                role: OrderRole::Taker,
+                amount: OrderAmount::Shares(shares_to_sell),
+                price: None,
+                max_slippage_pp: Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
+                expiration: None,
+                market_end_unix_ms: event_end_unix_ms,
+                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                strict_book: strict_book.clone(),
+            };
+            let sell_invoke_cb: crate::account_order::SingleOrderInvokeCb =
                 Box::new(move |sell_invoke_report| {
                     let _ = sell_invoke_tx.send(Some(sell_invoke_report));
-                }),
+                });
+            let sell_post_result = post_order_on_clob(
+                &account,
+                project_manager.as_ref(),
+                submit_mode,
+                sell_post_request,
+                sell_invoke_cb,
             )
             .await;
 
@@ -385,10 +488,15 @@ pub(crate) fn spawn_sell_taker(
 
 pub(crate) fn spawn_open_buy_taker(
     account: SharedAccount,
+    project_manager: Option<Arc<ProjectManager>>,
     position: SharedOpenPosition,
     price: Option<f64>,
     strict_book: Option<StrictBook>,
+    submit_mode: SubmitMode,
 ) {
+    if submit_mode == SubmitMode::None {
+        return;
+    }
     tokio::spawn(async move {
         let (asset_id, amount, event_end_ms, pos_id) = {
             let p = position.read().await;
@@ -419,23 +527,28 @@ pub(crate) fn spawn_open_buy_taker(
             let mut open_position = position.write().await;
             open_position.open_buy_invoke = Some(invoke_rx.clone());
         }
-        let post_result = post_order_on_clob(
-            &account,
-            PostOrderRequest {
-                asset_id: asset_id.clone(),
-                side: Side::Buy,
-                role: OrderRole::Taker,
-                amount: OrderAmount::UsdNotional(amount),
-                price,
-                max_slippage_pp: None,
-                expiration: None,
-                market_end_unix_ms: event_end_ms,
-                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-                strict_book,
-            },
+        let buy_post_request = PostOrderRequest {
+            asset_id: asset_id.clone(),
+            side: Side::Buy,
+            role: OrderRole::Taker,
+            amount: OrderAmount::UsdNotional(amount),
+            price,
+            max_slippage_pp: None,
+            expiration: None,
+            market_end_unix_ms: event_end_ms,
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+            strict_book,
+        };
+        let buy_invoke_cb: crate::account_order::SingleOrderInvokeCb =
             Box::new(move |buy_rep| {
                 let _ = invoke_tx.send(Some(buy_rep));
-            }),
+            });
+        let post_result = post_order_on_clob(
+            &account,
+            project_manager.as_ref(),
+            submit_mode,
+            buy_post_request,
+            buy_invoke_cb,
         )
         .await;
 
@@ -544,23 +657,28 @@ pub(crate) fn spawn_open_buy_taker(
             p.maker_tp_position = Some(Arc::downgrade(&closing_arc));
         }
 
-        let post_res = post_order_on_clob(
-            &account,
-            PostOrderRequest {
-                asset_id: asset_id.clone(),
-                side: Side::Sell,
-                role: OrderRole::Maker,
-                amount: OrderAmount::Shares(shares_floor),
-                price: Some(maker_price),
-                max_slippage_pp: None,
-                expiration: None,
-                market_end_unix_ms: event_end_ms,
-                timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-                strict_book: None,
-            },
+        let maker_post_request = PostOrderRequest {
+            asset_id: asset_id.clone(),
+            side: Side::Sell,
+            role: OrderRole::Maker,
+            amount: OrderAmount::Shares(shares_floor),
+            price: Some(maker_price),
+            max_slippage_pp: None,
+            expiration: None,
+            market_end_unix_ms: event_end_ms,
+            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+            strict_book: None,
+        };
+        let maker_invoke_cb: crate::account_order::SingleOrderInvokeCb =
             Box::new(move |rep| {
                 let _ = mk_invoke_tx.send(Some(rep));
-            }),
+            });
+        let post_res = post_order_on_clob(
+            &account,
+            project_manager.as_ref(),
+            submit_mode,
+            maker_post_request,
+            maker_invoke_cb,
         )
         .await;
 

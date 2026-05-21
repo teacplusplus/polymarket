@@ -9,6 +9,7 @@ use crate::account_order_completion::{
     fire_failed_invocation_for_side, wrap_post_order_cb,
 };
 use crate::history_sim::StrictBook;
+use crate::project_manager::ProjectManager;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use polymarket_client_sdk::auth::Normal;
@@ -103,11 +104,17 @@ pub use crate::account_order_completion::{
 ///
 /// При ошибке до HTTP-ответа отчёт несёт `success=false, partial=false, order_id=None` и нули в
 /// корректной типовой раскладке по `side` ([`crate::account_order_completion::SingleOrderClobInvocationReport`]).
+///
+/// `project_manager` — заглушка ради единой сигнатуры с
+/// [`crate::account_mock_order::post_order_on_clob`]: реальный CLOB-путь
+/// никаких полей из [`ProjectManager`] не читает.
 pub async fn post_order_on_clob(
     account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
     request: PostOrderRequest,
     invoke: SingleOrderInvokeCb,
 ) -> Result<Option<String>> {
+    let _ = project_manager;
     let invoke_slot = wrap_post_order_cb(invoke);
 
     if let Err(err) = validate_post_order_request(&request) {
@@ -270,7 +277,7 @@ pub async fn post_order_on_clob(
 }
 
 /// Ошибки комбинаций полей до сети/SDK `build`.
-fn validate_post_order_request(req: &PostOrderRequest) -> Result<()> {
+pub(crate) fn validate_post_order_request(req: &PostOrderRequest) -> Result<()> {
     if req.timeout.is_zero() {
         bail!("post_order_on_clob: timeout=0 — POST /order не дождётся ответа");
     }
@@ -572,10 +579,15 @@ pub struct CancelOrderResult {
 }
 
 /// `DELETE /order` под API-key; нужен только `clob_authed`. При сетевой/SDK-ошибке, таймауте или пустом теле ответа — **`Err`**; если ответ есть, **`Ok`** поля задают результат снятия (в т.ч. `not_canceled` от CLOB).
+///
+/// `project_manager` — заглушка ради единой сигнатуры с
+/// [`crate::account_mock_order::cancel_order_on_clob`].
 pub async fn cancel_order_on_clob(
     account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
     request: CancelOrderRequest,
 ) -> Result<CancelOrderResult> {
+    let _ = project_manager;
     let oid = request.order_id.clone();
 
     if request.timeout.is_zero() {
@@ -765,6 +777,7 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
         let (invoke_tx, invoke_rx) = tokio::sync::oneshot::channel();
         match post_order_on_clob(
             account,
+            None,
             request,
             Box::new(move |rep| {
                 let _ = invoke_tx.send(rep);

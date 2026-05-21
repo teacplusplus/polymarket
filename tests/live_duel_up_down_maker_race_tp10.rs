@@ -234,6 +234,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
     if let Some(oid) = maybe_oid.filter(|s| !s.trim().is_empty()) {
         match cancel_order_on_clob(
             account,
+            None,
             CancelOrderRequest {
                 order_id: oid.clone(),
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
@@ -290,6 +291,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
         let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
         if let Err(err) = post_order_on_clob(
             account,
+            None,
             PostOrderRequest {
                 asset_id: opposite_prep.asset_id.clone(),
                 side: Side::Sell,
@@ -386,6 +388,7 @@ async fn duel_self_taker_sell_flush(
         let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
         if let Err(err) = post_order_on_clob(
             account,
+            None,
             PostOrderRequest {
                 asset_id: asset_id.to_string(),
                 side: Side::Sell,
@@ -464,6 +467,7 @@ async fn duel_post_buy_then_maker(
     let (buy_invoke_tx, mut buy_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
+        None,
         PostOrderRequest {
             asset_id: aid.clone(),
             side: Side::Buy,
@@ -639,6 +643,7 @@ async fn duel_post_buy_then_maker(
     let (mk_invoke_tx, mut mk_invoke_rx) = invoke_settlement_watch();
     let post_res = post_order_on_clob(
         &account,
+        None,
         PostOrderRequest {
             asset_id: aid.clone(),
             side: Side::Sell,
