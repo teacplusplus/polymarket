@@ -28,7 +28,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use xgb::Booster;
@@ -53,6 +53,9 @@ pub(crate) const WS_STRICT_BOOK_MAX_AGE_MS: i64 = 1_000;
 
 /// Таймаут ответа координатора в [`fetch_http_strict_book`] (~3× HTTP).
 const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
+
+/// Max время от старта [`tick_once`] до [`try_open_position`]; продажи не ограничиваются.
+const TICK_OPEN_MAX_ELAPSED: Duration = Duration::from_millis(500);
 
 /// Лимит FIFO [`RealSimState::seen_market_ids`] на интервал.
 const SEEN_MARKET_IDS_CAP: usize = 8;
@@ -361,6 +364,8 @@ async fn tick_once(
         frame,
     } = lane_frame;
 
+    let tick_started = Instant::now();
+
     let market_changed = last_market_id.as_deref() != Some(market_id.as_str());
 
     if market_changed {
@@ -607,51 +612,60 @@ async fn tick_once(
             }
 
             if may_open && !ws_lagging {
-                let mut same_locked_post = 0.0;
-                for p in this_positions.iter() {
-                    same_locked_post += p.read().await.position_size;
+                if tick_started.elapsed() > TICK_OPEN_MAX_ELAPSED {
+                    crate::tee_eprintln!(
+                        "[real_sim] {tag}: tick elapsed {:.0}ms > {}ms \
+                         (market={market_id}) — новый вход пропущен",
+                        tick_started.elapsed().as_secs_f64() * 1000.0,
+                        TICK_OPEN_MAX_ELAPSED.as_millis(),
+                    );
+                } else {
+                    let mut same_locked_post = 0.0;
+                    for p in this_positions.iter() {
+                        same_locked_post += p.read().await.position_size;
+                    }
+                    for p in this_pending.iter() {
+                        same_locked_post += p.read().await.position_size;
+                    }
+                    let available_bankroll_post =
+                        (*bankroll_guard - cross_lanes_locked - same_locked_post).max(0.0);
+                    let polymarket_url =
+                        polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
+                    let graph_dump_bin_path_str = gamma_question
+                        .as_deref()
+                        .map(|gq| {
+                            let stem = crate::util::sanitized_filename_from_gamma_question(Some(gq));
+                            crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(
+                                currency,
+                                interval_kind,
+                                &stem,
+                            )
+                        })
+                        .flatten()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    bought = try_open_position(
+                        &frame,
+                        pnl_inference,
+                        Some(&models.booster_pnl),
+                        this_positions,
+                        side_stats,
+                        available_bankroll_post,
+                        strict_book.as_ref(),
+                        currency,
+                        true,
+                        &polymarket_url,
+                        price_to_beat,
+                        None,
+                        event_end_ms,
+                        graph_dump_bin_path_str.as_str(),
+                        gamma_question.as_deref(),
+                        pnl_top5_shap_at_open_precomputed,
+                        submit,
+                        account,
+                    )
+                    .await;
                 }
-                for p in this_pending.iter() {
-                    same_locked_post += p.read().await.position_size;
-                }
-                let available_bankroll_post =
-                    (*bankroll_guard - cross_lanes_locked - same_locked_post).max(0.0);
-                let polymarket_url =
-                    polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
-                let graph_dump_bin_path_str = gamma_question
-                    .as_deref()
-                    .map(|gq| {
-                        let stem = crate::util::sanitized_filename_from_gamma_question(Some(gq));
-                        crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(
-                            currency,
-                            interval_kind,
-                            &stem,
-                        )
-                    })
-                    .flatten()
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                bought = try_open_position(
-                    &frame,
-                    pnl_inference,
-                    Some(&models.booster_pnl),
-                    this_positions,
-                    side_stats,
-                    available_bankroll_post,
-                    strict_book.as_ref(),
-                    currency,
-                    true,
-                    &polymarket_url,
-                    price_to_beat,
-                    None,
-                    event_end_ms,
-                    graph_dump_bin_path_str.as_str(),
-                    gamma_question.as_deref(),
-                    pnl_top5_shap_at_open_precomputed,
-                    submit,
-                    account,
-                )
-                .await;
             }
         }
 

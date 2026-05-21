@@ -409,13 +409,6 @@ pub(crate) fn spawn_open_buy_taker(
         // Как в duel: USDC к центам вверх (`ceil`), иначе CLOB видит лишние знаки.
         let amount = (amount * 100.0).ceil() / 100.0;
 
-        if let Err(reason) = open_buy_min_size_guard(amount, price, strict_book.as_ref()) {
-            crate::tee_eprintln!(
-                "[submit] open BUY taker pos_id={pos_id} asset_id={asset_id}: min_order_size guard: {reason} — пропуск POST",
-            );
-            return;
-        }
-
         let min_order_size_shares = strict_book
             .as_ref()
             .and_then(|b| b.min_order_size)
@@ -648,35 +641,4 @@ fn implied_buy_price_per_share(rep: &SingleOrderClobInvocationReport) -> Option<
         _ => return None,
     };
     Some((usd / shares).clamp(0.001, 0.999))
-}
-
-
-fn open_buy_price_cap(price: Option<f64>) -> Result<f64, String> {
-    price
-        .filter(|p| p.is_finite() && *p > 0.0)
-        .map(|p| p.clamp(0.001, 0.999))
-        .ok_or_else(|| "нет price (worst-price cap для min_order_size guard)".to_string())
-}
-
-/// Worst-case shares при `amount / price_cap` должны быть ≥ CLOB `min_order_size` (как [`duel_leg_prep`] / post-BUY floor в duel).
-fn open_buy_min_size_guard(
-    amount_usd: f64,
-    price: Option<f64>,
-    strict_book: Option<&StrictBook>,
-) -> Result<(), String> {
-    let book = strict_book.ok_or_else(|| "нет strict_book".to_string())?;
-    let min_shares = book
-        .min_order_size
-        .filter(|m| m.is_finite() && *m > 0.0)
-        .ok_or_else(|| "strict_book.min_order_size отсутствует".to_string())?;
-    let price_cap = open_buy_price_cap(price)?;
-    let worst_case_shares = amount_usd / price_cap;
-    let shares_floor = (worst_case_shares * 100.0).floor() / 100.0;
-    if shares_floor + 1e-9 < min_shares {
-        return Err(format!(
-            "shares_floor={shares_floor:.4} < min_order_size={min_shares:.4} \
-             (amount={amount_usd:.4} USDC, price_cap={price_cap:.5})"
-        ));
-    }
-    Ok(())
 }

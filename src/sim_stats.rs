@@ -39,6 +39,8 @@ pub struct SideStats {
     pub(crate) unstable_skips: usize,
     /// Пропуск: уже открыта позиция на том же `asset_id`.
     pub(crate) same_asset_open_skips: usize,
+    /// Пропуск: лимит одновременных позиций в лейне ([`crate::history_sim::MAX_OPEN_POSITIONS`]).
+    pub(crate) max_open_positions_skips: usize,
     /// Пропуск: Kelly f* ≤ 0.
     pub(crate) kelly_skips: usize,
     /// Пропуск: `entry_prob` в no-trade зоне ([`crate::history_sim::BuyGate::EntryProbOutOfRange`]).
@@ -128,6 +130,9 @@ impl SimStats {
     pub(crate) fn total_same_asset_open_skips(&self) -> usize {
         self.up.same_asset_open_skips + self.down.same_asset_open_skips
     }
+    pub(crate) fn total_max_open_positions_skips(&self) -> usize {
+        self.up.max_open_positions_skips + self.down.max_open_positions_skips
+    }
     pub(crate) fn total_entry_prob_skips(&self) -> usize {
         self.up.entry_prob_skips + self.down.entry_prob_skips
     }
@@ -137,7 +142,7 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
     let n = s.raw_above_threshold.max(1) as f64;
     let diag = if is_kelly {
         format!(
-            "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} entry_prob_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
+            "raw≥thr={} avg_raw={:.3} avg_cal={:.3} avg_entry={:.3} avg_kelly_f={:.4} kelly_skips={} entry_prob_skips={} same_asset_open_skips={} max_open_positions_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
             s.raw_above_threshold,
             s.diag_sum_raw / n,
             s.diag_sum_calibrated / n,
@@ -146,17 +151,19 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
             s.kelly_skips,
             s.entry_prob_skips,
             s.same_asset_open_skips,
+            s.max_open_positions_skips,
             s.kelly_strict_buy_skips,
             s.kelly_strict_sell_skips,
         )
     } else {
         format!(
-            "raw≥thr={} avg_raw={:.3} avg_entry={:.3} entry_prob_skips={} same_asset_open_skips={} bankroll_too_small_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
+            "raw≥thr={} avg_raw={:.3} avg_entry={:.3} entry_prob_skips={} same_asset_open_skips={} max_open_positions_skips={} bankroll_too_small_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={}",
             s.raw_above_threshold,
             s.diag_sum_raw / n,
             s.diag_sum_entry_prob / n,
             s.entry_prob_skips,
             s.same_asset_open_skips,
+            s.max_open_positions_skips,
             s.kelly_skips,
             s.kelly_strict_buy_skips,
             s.kelly_strict_sell_skips,
@@ -174,7 +181,7 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
-         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={}(profit={}/loss={}) Res✗={} late_skips={} unstable_skips={} same_asset_open_skips={}",
+         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={}(profit={}/loss={}) Res✗={} late_skips={} unstable_skips={} same_asset_open_skips={} max_open_positions_skips={}",
         s.trades,
         win_rate,
         s.pnl_usd,
@@ -192,6 +199,7 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
         s.late_entry_skips,
         s.unstable_skips,
         s.same_asset_open_skips,
+        s.max_open_positions_skips,
     );
 
     tee_println!(
@@ -250,20 +258,22 @@ pub fn print_sim_stats(
     if total_trades == 0 {
         if is_kelly {
             tee_println!(
-                "[sim] {tag}: нет сделок ({} событий, kelly_skips={} entry_prob_skips={} same_asset_open_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={})",
+                "[sim] {tag}: нет сделок ({} событий, kelly_skips={} entry_prob_skips={} same_asset_open_skips={} max_open_positions_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={})",
                 sim_stats.events,
                 sim_stats.total_kelly_skips(),
                 sim_stats.total_entry_prob_skips(),
                 sim_stats.total_same_asset_open_skips(),
+                sim_stats.total_max_open_positions_skips(),
                 sim_stats.total_kelly_strict_buy_skips(),
                 sim_stats.total_kelly_strict_sell_skips(),
             );
         } else {
             tee_println!(
-                "[sim] {tag}: нет сделок ({} событий, entry_prob_skips={} same_asset_open_skips={} bankroll_too_small_skips={})",
+                "[sim] {tag}: нет сделок ({} событий, entry_prob_skips={} same_asset_open_skips={} max_open_positions_skips={} bankroll_too_small_skips={})",
                 sim_stats.events,
                 sim_stats.total_entry_prob_skips(),
                 sim_stats.total_same_asset_open_skips(),
+                sim_stats.total_max_open_positions_skips(),
                 sim_stats.total_kelly_skips(),
             );
         }
@@ -286,7 +296,7 @@ pub fn print_sim_stats(
              | events={} trades={} win={:.1}% \
              | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
              | wins={total_wins} losses={total_losses} \
-             | kelly_skips={ks} entry_prob_skips={eps} same_asset_open_skips={sas} kelly_strict_buy_skips={ksb} kelly_strict_sell_skips={kss}",
+             | kelly_skips={ks} entry_prob_skips={eps} same_asset_open_skips={sas} max_open_positions_skips={mops} kelly_strict_buy_skips={ksb} kelly_strict_sell_skips={kss}",
             sim_stats.events,
             total_trades,
             win_rate,
@@ -296,6 +306,7 @@ pub fn print_sim_stats(
             ks = sim_stats.total_kelly_skips(),
             eps = sim_stats.total_entry_prob_skips(),
             sas = sim_stats.total_same_asset_open_skips(),
+            mops = sim_stats.total_max_open_positions_skips(),
             ksb = sim_stats.total_kelly_strict_buy_skips(),
             kss = sim_stats.total_kelly_strict_sell_skips(),
         );
@@ -305,7 +316,7 @@ pub fn print_sim_stats(
              | events={} trades={} win={:.1}% \
              | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
              | wins={total_wins} losses={total_losses} \
-             | entry_prob_skips={eps} same_asset_open_skips={sas} bankroll_too_small_skips={bts}",
+             | entry_prob_skips={eps} same_asset_open_skips={sas} max_open_positions_skips={mops} bankroll_too_small_skips={bts}",
             sim_stats.events,
             total_trades,
             win_rate,
@@ -314,6 +325,7 @@ pub fn print_sim_stats(
             total_fees,
             eps = sim_stats.total_entry_prob_skips(),
             sas = sim_stats.total_same_asset_open_skips(),
+            mops = sim_stats.total_max_open_positions_skips(),
             bts = sim_stats.total_kelly_skips(),
         );
     }

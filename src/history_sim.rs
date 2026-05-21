@@ -70,6 +70,12 @@ pub const MINPOSITION_FRAMES: usize = 2;
 /// Одна активная позиция на `asset_id`; синхронно с калибровкой [`crate::train_mode::first_entry_calibration_samples`].
 pub const BLOCK_SAME_ASSET_OPEN: bool = false;
 
+/// Max одновременных позиций в лейне (`positions.len()`); `None` — без лимита.
+pub const MAX_OPEN_POSITIONS: Option<usize> = None;
+
+/// Запас к CLOB `min_order_size` при расчёте BUY notional: `min_shares × price_cap × (1 + pct)`.
+pub const MIN_ORDER_SIZE_BUY_HEADROOM_PCT: f64 = 0.05;
+
 /// Min `event_remaining_ms` для входа ([`BuyGate::LateEntry`]).
 pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
 
@@ -121,6 +127,26 @@ pub(crate) fn effective_implied_prob(
     frame.currency_implied_prob
 }
 
+/// Min USDC notional для strict BUY: `min_order_size × (best_ask + slippage) × (1 + headroom)`.
+pub(crate) fn min_order_size_buy_usd_floor(book: &StrictBook) -> Option<f64> {
+    let min_shares = book.min_order_size.filter(|m| m.is_finite() && *m > 0.0)?;
+    let best_ask = book
+        .asks
+        .iter()
+        .find(|l| l.price > 0.0 && l.size > 0.0)
+        .map(|l| l.price)?;
+    let price_cap = (best_ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
+    Some(min_shares * price_cap * (1.0 + MIN_ORDER_SIZE_BUY_HEADROOM_PCT))
+}
+
+/// Strict BUY notional: не ниже [`min_order_size_buy_usd_floor`] (как live-тесты duel/roundtrip).
+pub(crate) fn effective_buy_usdc_strict(book: &StrictBook, position_size: f64) -> f64 {
+    match min_order_size_buy_usd_floor(book) {
+        Some(floor) => position_size.max(floor),
+        None => position_size,
+    }
+}
+
 /// Покупка по HTTP asks: полный fill `position_size`, cap от L1 ask, опционально `min_order_size`.
 pub(crate) fn book_fill_buy_strict(book: &StrictBook, position_size: f64) -> Option<(f64, f64)> {
     if position_size <= 0.0 {
@@ -162,7 +188,7 @@ pub(crate) fn book_fill_buy_strict(book: &StrictBook, position_size: f64) -> Opt
     Some((vwap, total_shares))
 }
 
-/// Продажа по HTTP bids: gross USDC до fee; `Some(cap)` — voluntary (TP/EvProfit), `None` — urgent (SL/timeout/…); проверка `min_order_size`.
+/// Продажа по HTTP bids: gross USDC до fee; `Some(cap)` — voluntary (TP/EvProfit), `None` — urgent (SL/timeout/…).
 pub(crate) fn book_fill_sell_strict(
     book: &StrictBook,
     shares_to_sell: f64,
@@ -170,11 +196,6 @@ pub(crate) fn book_fill_sell_strict(
 ) -> Option<f64> {
     if shares_to_sell <= 0.0 {
         return Some(0.0);
-    }
-    if let Some(min) = book.min_order_size {
-        if shares_to_sell < min {
-            return None;
-        }
     }
     let best_bid = book
         .bids
@@ -974,6 +995,12 @@ pub(crate) async fn try_open_position(
                     return false;
                 }
             }
+            if let Some(max_open) = MAX_OPEN_POSITIONS {
+                if positions.len() >= max_open {
+                    stats.max_open_positions_skips += 1;
+                    return false;
+                }
+            }
             stats.raw_above_threshold += 1;
             stats.diag_sum_raw += raw as f64;
             stats.diag_sum_calibrated += pred as f64;
@@ -1442,8 +1469,12 @@ fn open_position(
     gamma_question_at_open: Option<&str>,
     pnl_top5_shap_at_open: &str,
 ) -> Option<OpenPosition> {
+    let effective_size = match strict_book {
+        Some(book) => effective_buy_usdc_strict(book, position_size),
+        None => position_size,
+    };
     let (buy_price, nominal_shares) = match strict_book {
-        Some(book) => book_fill_buy_strict(book, position_size)?,
+        Some(book) => book_fill_buy_strict(book, effective_size)?,
         None => book_fill_buy(frame, position_size, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT))?,
     };
     if nominal_shares <= 0.0 {
@@ -1478,7 +1509,7 @@ fn open_position(
         entry_prob,
         buy_price,
         sell_vwap_entry,
-        position_size,
+        position_size: effective_size,
         best_bid_at_entry,
         frames_held: 0,
         p_win_ema: None,

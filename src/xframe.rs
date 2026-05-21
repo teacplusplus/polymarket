@@ -1361,8 +1361,8 @@ pub fn calc_y_train_pnl(
         // выйти нельзя ни добровольно, ни принудительно; держим до
         // следующего кадра. Это **не** SL (SL — это про цену, а не про
         // ликвидность); в реальности `manage_positions` тоже бы
-        // продолжил держать (`book_fill_sell_strict` вернул бы None и
-        // на SL-ветке тоже).
+        // продолжил держать (`book_fill_sell_strict` вернул бы None при нехватке
+        // глубины bid, но не из-за min_order_size).
         let sell = match walk_sell_xfeatures(future, actual_shares) {
             Some(s) => s,
             None => return Some(0.0),
