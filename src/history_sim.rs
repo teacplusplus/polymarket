@@ -4,7 +4,10 @@
 
 use crate::account::{Account, SharedAccount};
 use crate::project_manager::ProjectManager;
-use crate::account_order::InvokeSettlementWatch;
+use crate::account_order::{
+    InvokeSettlementWatch, OrderAmount, invoke_settlement_ready, invoke_settlement_report,
+    wait_invoke_settlement,
+};
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
 use crate::train_mode::{
@@ -301,6 +304,108 @@ pub struct OpenPosition {
     pub(crate) maker_tp_position: Option<WeakClosingPosition>,
     /// Taker FAK SELL: по одной записи на каждый успешный invoke ([`crate::account_submit`]).
     pub(crate) taker_positions: Vec<WeakClosingPosition>,
+}
+
+/// Возврат [`OpenPosition::shares_remaining_to_sell`] при не-settled invoke-колбэке:
+/// при `block_on_pending_invokes=false` любая нога без settled-колбэка немедленно
+/// даёт эту ошибку; при `=true` — только если [`wait_invoke_settlement`] ушёл в
+/// таймаут (по умолчанию `event_end_ms` + `ORDER_HTTP_TIMEOUT_SEC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvokePendingError {
+    /// Какая нога не settled: `"open_buy"` / `"maker_tp"` / `"taker_sell"`.
+    pub which: &'static str,
+}
+
+impl std::fmt::Display for InvokePendingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invoke not settled: {}", self.which)
+    }
+}
+
+impl std::error::Error for InvokePendingError {}
+
+impl OpenPosition {
+    /// Сколько ещё нужно продать шеров (raw `f64`, **без округления** — caller
+    /// сам `floor`'ит до CLOB-lot'а 0.01); читает [`Self::open_buy_invoke`] и
+    /// invoke-каналы `maker_tp_position` + `taker_positions`.
+    pub async fn shares_remaining_to_sell(
+        &self,
+        block_on_pending_invokes: bool,
+    ) -> Result<Option<f64>, InvokePendingError> {
+        let resolve_report = async |watch_opt: Option<InvokeSettlementWatch>, which: &'static str|-> Result<Option<crate::account_order::SingleOrderClobInvocationReport>, InvokePendingError> {
+            let Some(mut watch) = watch_opt else {
+                return Ok(None);
+            };
+            if invoke_settlement_ready(&watch) {
+                return Ok(invoke_settlement_report(&watch));
+            }
+            if !block_on_pending_invokes {
+                return Err(InvokePendingError { which });
+            }
+            let timeout = crate::account_submit::invoke_wait_until_market_end_plus(self.event_end_ms);
+            match wait_invoke_settlement(&mut watch, timeout).await {
+                Some(report) => Ok(Some(report)),
+                None => Err(InvokePendingError { which }),
+            }
+        };
+
+        // BUY invoke → shares_bought_net.
+        let Some(buy_report) = resolve_report(self.open_buy_invoke.clone(), "open_buy").await? else {
+            return Ok(None);
+        };
+        if !buy_report.success {
+            return Ok(None);
+        }
+        let shares_bought_net = match buy_report.taking_amount {
+            OrderAmount::Shares(s) if s.is_finite() && s > 0.0 => s,
+            _ => return Ok(None),
+        };
+
+        let mut shares_sold = 0.0_f64;
+
+        // maker TP (если есть): settled+success → making_amount как shares.
+        if let Some(weak) = self.maker_tp_position.as_ref() {
+            if let Some(arc) = weak.upgrade() {
+                let watch_opt = {
+                    let closing = arc.read().await;
+                    closing.invoke_settle.clone()
+                };
+                if let Some(report) = resolve_report(watch_opt, "maker_tp").await? {
+                    if report.success {
+                        if let OrderAmount::Shares(s) = report.making_amount {
+                            if s.is_finite() && s > 0.0 {
+                                shares_sold += s;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // taker FAK SELL'ы: сумма making_amount по settled+success invoke'ам.
+        for weak in &self.taker_positions {
+            let Some(arc) = weak.upgrade() else {
+                continue;
+            };
+            let watch_opt = {
+                let closing = arc.read().await;
+                closing.invoke_settle.clone()
+            };
+            let Some(report) = resolve_report(watch_opt, "taker_sell").await? else {
+                continue;
+            };
+            if !report.success {
+                continue;
+            }
+            if let OrderAmount::Shares(s) = report.making_amount {
+                if s.is_finite() && s >= 0.0 {
+                    shares_sold += s;
+                }
+            }
+        }
+
+        Ok(Some((shares_bought_net - shares_sold).max(0.0)))
+    }
 }
 
 /// Запись закрытия для WS/polling ([`manage_positions`], [`crate::account::apply_user_ws_event`]).

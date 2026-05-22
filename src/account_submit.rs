@@ -329,39 +329,39 @@ pub(crate) fn spawn_sell_taker(
                 break;
             }
 
-            let shares_sold_by_takers = {
-                let taker_weaks = position.read().await.taker_positions.clone();
-                let mut total = 0.0_f64;
-                for weak in taker_weaks {
-                    let Some(taker_arc) = weak.upgrade() else {
-                        continue;
-                    };
-                    let mut invoke_watch = {
-                        let taker_closing = taker_arc.read().await;
-                        taker_closing.invoke_settle.clone()
-                    };
-                    let Some(watch) = invoke_watch.as_mut() else {
-                        continue;
-                    };
-                    let report = if invoke_settlement_ready(watch) {
-                        invoke_settlement_report(watch)
-                    } else {
-                        wait_invoke_settlement(watch, sell_invoke_wait).await
-                    };
-                    if let Some(report) = report {
-                        if report.success {
-                            if let OrderAmount::Shares(shares) = report.making_amount {
-                                if shares.is_finite() && shares >= 0.0 {
-                                    total += shares;
-                                }
-                            }
-                        }
-                    }
+            // `block_on_pending_invokes=true`: метод сам дождётся pending taker
+            // SELL invoke'ов (и maker TP / BUY если они в полёте), иначе мы
+            // рискуем повторно отправить SELL на уже проданные шеры.
+            //
+            // Клонируем `OpenPosition` перед вызовом, чтобы не держать
+            // `position` read-lock на время ожидания (внутри одного `attempt`
+            // ниже идёт `position.write().await` для записи нового
+            // `taker_closing` — read-lock через await его бы заблокировал).
+            let position_snapshot = position.read().await.clone();
+            let shares_remaining = match position_snapshot
+                .shares_remaining_to_sell(true)
+                .await
+            {
+                Ok(Some(n)) => n,
+                Ok(None) => {
+                    crate::tee_eprintln!(
+                        "[submit] sell taker pos_id={position_id}: BUY-invoke не settled \
+                         с NET shares — нечего продавать, прекращаем retry",
+                    );
+                    break;
                 }
-                total
+                Err(err) => {
+                    crate::tee_eprintln!(
+                        "[submit] sell taker pos_id={position_id}: \
+                         shares_remaining_to_sell ошибка — invoke '{}' не settled даже после \
+                         ожидания до event_end+{ORDER_HTTP_TIMEOUT_SEC}s, прекращаем retry",
+                        err.which,
+                    );
+                    break;
+                }
             };
-            let shares_remaining =
-                (shares_bought_net - shares_sold_by_maker - shares_sold_by_takers).max(0.0);
+            // CLOB-lot Polymarket = 0.01; `floor` чтобы не превысить остаток и
+            // не словить `OrderStatusType::InsufficientBalance`.
             let shares_to_sell = (shares_remaining * 100.0).floor() / 100.0;
             if !(shares_to_sell > 0.0 && shares_to_sell.is_finite()) {
                 break;
@@ -369,7 +369,7 @@ pub(crate) fn spawn_sell_taker(
 
             crate::tee_println!(
                 "[submit] sell taker pos_id={position_id} asset_id={asset_id} reason={reason:?}: \
-                 taker FAK SELL shares={shares_to_sell:.2} (shares_remaining {shares_remaining:.6}) \
+                 taker FAK SELL shares={shares_to_sell:.2} \
                  exit_price≈{exit_price:.6} попытка {attempt}/{TAKER_SELL_ATTEMPTS}",
             );
 
@@ -740,7 +740,7 @@ pub(crate) fn spawn_open_buy_taker(
 }
 
 /// Сколько ждать invoke-колбэк: до `market_end_unix_ms` + [`ORDER_HTTP_TIMEOUT_SEC`] с текущего момента.
-fn invoke_wait_until_market_end_plus(market_end_unix_ms: Option<i64>) -> Duration {
+pub(crate) fn invoke_wait_until_market_end_plus(market_end_unix_ms: Option<i64>) -> Duration {
     let now_ms = crate::util::current_timestamp_ms();
     let deadline_ms = market_end_unix_ms
         .map(|end_ms| end_ms.saturating_add((ORDER_HTTP_TIMEOUT_SEC * 1000) as i64))
