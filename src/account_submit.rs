@@ -553,7 +553,7 @@ pub(crate) fn spawn_sell_taker(
             &account,
             &position,
             project_manager.as_ref(),
-            &reason,
+            Some(&reason),
             "Taker",
             "taker_sell_fill",
         )
@@ -800,16 +800,17 @@ pub(crate) fn spawn_open_buy_taker(
                 crate::tee_println!(
                     "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
                      остаток {shares_remaining:.6} шер на счёте после market end + \
-                     {POST_MARKET_END_RESOLUTION_DELAY_MS}ms — финализируем PNL \
-                     по факт. SELL-fills (residual on-chain resolution — отдельным промтом)",
+                     {POST_MARKET_END_RESOLUTION_DELAY_MS}ms — финализируем через \
+                     close_position_after_submit с reason=None (residual @ $0/$1 \
+                     по MarketResolution)",
                 );
                 crate::account_close_position::close_position_after_submit(
                     &account_post_end,
                     &position_post_end,
                     project_manager_post_end.as_ref(),
-                    &CloseReason::Timeout,
-                    "Resolution",
-                    "post_market_end_resolution",
+                    None,
+                    "Residual",
+                    "post_market_end_residual",
                 )
                 .await;
             });
@@ -946,7 +947,7 @@ pub(crate) fn spawn_open_buy_taker(
             &account,
             &position,
             project_manager.as_ref(),
-            &CloseReason::TakeProfit,
+            Some(&CloseReason::TakeProfit),
             "Maker",
             "maker_tp_fill",
         )

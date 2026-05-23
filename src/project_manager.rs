@@ -94,28 +94,28 @@ pub struct MarketEventData {
     pub gamma_question: Option<String>,
 }
 
-/// Цены окна одного маркета: `price_to_beat` известен сразу (быстрый/exact PTB
-/// от Vatic API через [`ProjectManager::merge_market_price_to_beat`]), а
-/// `final_price` — только после refine PTB следующего окна (exact PTB следующего
-/// окна = spot-цена валюты на момент закрытия этого окна, см.
-/// [`spawn_bg_price_to_beat_refine`]). Победитель окна:
-/// `final_price >= price_to_beat` ⇒ UP, иначе DOWN — используется в post-market-end
-/// резолюции submit-позиций ([`crate::account_close_position::close_position_after_submit`]
-/// при [`crate::history_sim::CloseReason::Resolution`]).
-#[derive(Debug, Clone)]
-pub struct MarketWindowPrices {
-    pub market_id: String,
+/// Резолюционное состояние маркета: порог (`price_to_beat`, спот в начале окна,
+/// фетчится из Vatic API) и финальная цена (`final_price`, спот в конце окна =
+/// `price_to_beat` следующего окна). По правилу `final_price >= price_to_beat`
+/// определяется победившая сторона UP/DOWN — нужно для post-market-end
+/// финализации в [`crate::account_close_position::close_position_submit_resolution`]:
+/// несённые residual-шеры payout'ятся `1.0` (наша сторона выиграла) или `0.0`.
+///
+/// `final_price = None` до тех пор, пока следующее окно не подтянет свой
+/// `current_exact` — тогда [`ProjectManager::merge_market_final_price`] апдейтит
+/// поле у prev-market. До этого момента residual-резолюция вынуждена скипать.
+#[derive(Debug, Clone, Copy)]
+pub struct MarketResolution {
     pub price_to_beat: f64,
     pub final_price: Option<f64>,
 }
 
-/// Кэш «последних» окон в [`ProjectManager::market_window_prices_by_window_start_sec`]:
-/// при превышении лимита `BTreeMap::pop_first` удаляет окно с минимальным
-/// `window_start_sec` (самое старое). 10 окон ≈ 50 минут для 5m и ≈ 2.5 часа
-/// для 15m — достаточно, чтобы post-market-end резолюция submit-позиции
-/// нашла своё окно даже при задержке refine следующего окна (по умолчанию
-/// до 30 × 5s = 2.5 мин refine + [`crate::account_submit::POST_MARKET_END_RESOLUTION_DELAY_MS`]).
-pub const MARKET_WINDOW_PRICES_CAP: usize = 10;
+/// Capacity-cap для [`ProjectManager::market_resolution_by_market`]: при
+/// `len > MARKET_RESOLUTION_RETENTION` дёргаем `BTreeMap::pop_first` (старейший
+/// по `market_id` лексикографически — backstop поверх явного
+/// [`ProjectManager::cleanup_stale_market_data`], чтобы кэш не рос неограниченно
+/// даже если cleanup сломан/пропущен).
+pub const MARKET_RESOLUTION_RETENTION: usize = 10;
 
 pub struct ProjectManager {
     pub currency: Arc<String>,
@@ -124,7 +124,15 @@ pub struct ProjectManager {
     pub ws_stream_by_asset_id: Arc<RwLock<HashMap<String, Vec<WsStreamEntry>>>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub slug_to_market_id: Arc<RwLock<HashMap<String, String>>>,
-    pub price_to_beat_by_market: Arc<RwLock<HashMap<String, f64>>>,
+    /// Резолюционные данные по `market_id`: `price_to_beat` (порог) + `final_price`
+    /// (спот в конце окна, известен с задержкой через `current_exact` следующего
+    /// окна). `BTreeMap` с capacity-cap [`MARKET_RESOLUTION_RETENTION`] —
+    /// backstop поверх явного [`Self::cleanup_stale_market_data`]: даже если
+    /// cleanup пропустил, старые записи будут вытеснены `pop_first` на следующем
+    /// `merge_*`. Используется post-market-end финализацией submit-режима
+    /// ([`crate::account_close_position::close_position_submit_resolution`])
+    /// для расчёта residual-payout (`1.0` если наша сторона выиграла, `0.0` иначе).
+    pub market_resolution_by_market: Arc<RwLock<BTreeMap<String, MarketResolution>>>,
     pub currency_up_down_by_asset_id: Arc<RwLock<HashMap<String, CurrencyUpDownOutcome>>>,
     pub ws_connect_wall_ms_by_asset_id: Arc<RwLock<HashMap<String, i64>>>,
     pub currency_updown_sibling_state: Arc<RwLock<CurrencyUpDownSiblingState>>,
@@ -178,7 +186,7 @@ impl ProjectManager {
             ws_stream_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             slug_to_market_id: Arc::new(RwLock::new(HashMap::new())),
-            price_to_beat_by_market: Arc::new(RwLock::new(HashMap::new())),
+            market_resolution_by_market: Arc::new(RwLock::new(BTreeMap::new())),
             currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<
                 String,
                 CurrencyUpDownOutcome,
@@ -382,7 +390,11 @@ impl ProjectManager {
             }
         }
         self.event_data_by_market.write().await.remove(market_id);
-        self.price_to_beat_by_market.write().await.remove(market_id);
+        // `market_resolution_by_market` намеренно НЕ дёргаем здесь: post-market-end
+        // финализация submit-режима читает её через ~5s после `event_end_ms`, а
+        // cleanup может прилететь раньше (xframe_dump завершается быстро при
+        // успешном дампе). BTreeMap с capacity-cap [`MARKET_RESOLUTION_RETENTION`]
+        // сам вытеснит старые записи на следующем `merge_*`.
 
         {
             let mut currency_up_down_by_asset_id_lock =
@@ -489,10 +501,42 @@ impl ProjectManager {
         ))
     }
 
-    /// Один `market_id` на окно up/down — одно значение PTB в кэше.
+    /// Один `market_id` на окно up/down — одно значение PTB в кэше. Сохраняет
+    /// уже записанный `final_price` (если был выставлен через
+    /// [`Self::merge_market_final_price`] — теоретически возможно при out-of-order
+    /// колбэке). Evicts старейшие записи если `len > MARKET_RESOLUTION_RETENTION`.
     pub async fn merge_market_price_to_beat(&self, price_to_beat: f64, market_id: &str) {
-        let mut map = self.price_to_beat_by_market.write().await;
-        map.insert(market_id.to_string(), price_to_beat);
+        let mut map = self.market_resolution_by_market.write().await;
+        map.entry(market_id.to_string())
+            .and_modify(|entry| entry.price_to_beat = price_to_beat)
+            .or_insert(MarketResolution {
+                price_to_beat,
+                final_price: None,
+            });
+        while map.len() > MARKET_RESOLUTION_RETENTION {
+            map.pop_first();
+        }
+    }
+
+    /// Выставляет `final_price` для завершившегося маркета (вызывается из
+    /// [`spawn_bg_price_to_beat_refine`] следующего окна, чьё `current_exact` =
+    /// `final_price` предыдущего окна). Если `price_to_beat` ещё не известен —
+    /// пишем placeholder-запись с теми же значениями (final_price=spot,
+    /// price_to_beat=spot), это лучше чем терять final_price: на сторону
+    /// потребителя (`close_position_submit_resolution`) такая запись даст
+    /// `up_won = (spot >= spot) = true` — приемлемая дефолтная политика для
+    /// крайне редкого race. Evicts при `len > MARKET_RESOLUTION_RETENTION`.
+    pub async fn merge_market_final_price(&self, final_price: f64, market_id: &str) {
+        let mut map = self.market_resolution_by_market.write().await;
+        map.entry(market_id.to_string())
+            .and_modify(|entry| entry.final_price = Some(final_price))
+            .or_insert(MarketResolution {
+                price_to_beat: final_price,
+                final_price: Some(final_price),
+            });
+        while map.len() > MARKET_RESOLUTION_RETENTION {
+            map.pop_first();
+        }
     }
 
     /// После подписки на market WS — wall time для [`compute_xframe_stable`](crate::xframe::compute_xframe_stable).
@@ -631,8 +675,8 @@ impl ProjectManager {
             drop(event_guard);
 
             let price_to_beat = {
-                let ptb = self.price_to_beat_by_market.read().await;
-                ptb.get(&market_id).copied()
+                let map = self.market_resolution_by_market.read().await;
+                map.get(&market_id).map(|entry| entry.price_to_beat)
             };
 
             let ws_connect_wall_ms = {
@@ -805,11 +849,14 @@ impl ProjectManager {
             (start_map, end_map)
         };
         let price_to_beat_by_market_snapshot: HashMap<String, Option<f64>> = {
-            let guard = self.price_to_beat_by_market.read().await;
+            let guard = self.market_resolution_by_market.read().await;
             let mut map: HashMap<String, Option<f64>> = HashMap::new();
             for entry in &built_xframes {
-                map.entry(entry.market_id.clone())
-                    .or_insert_with(|| guard.get(&entry.market_id).copied());
+                map.entry(entry.market_id.clone()).or_insert_with(|| {
+                    guard
+                        .get(&entry.market_id)
+                        .map(|resolution| resolution.price_to_beat)
+                });
             }
             map
         };
@@ -1189,6 +1236,16 @@ fn spawn_bg_price_to_beat_refine(
         let Some(prev_market_id) = prev.market_id.clone() else {
             return;
         };
+
+        // `current_exact` для окна N = `final_price` окна N-1 (спот в момент
+        // открытия нового окна = спот на закрытие предыдущего). Пишем в
+        // `market_resolution_by_market` ДО guard'ов ниже (window-continuity /
+        // exact_price_to_beat_rx), чтобы even при early-return из-за разрыва
+        // окон prev-market получил `final_price` — submit-резолюция читает
+        // именно её.
+        project_manager
+            .merge_market_final_price(current_exact, &prev_market_id)
+            .await;
 
         let expected_current_window_start_sec = prev.window_start_sec.saturating_add(period_sec);
         if current_window_start_sec != expected_current_window_start_sec {

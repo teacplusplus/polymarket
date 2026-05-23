@@ -381,12 +381,36 @@ pub(crate) async fn close_position_resolution(
 /// `bankroll` и CSV всё равно обновляются.
 ///
 /// Решение «пора закрывать» — у caller'а (`maker_rep.success && !maker_rep.partial`
-/// для maker-сайта; `shares_remaining_to_sell ≤ TOL` для taker-сайта).
-/// Резолюция внутри submit — отдельным промтом, сейчас ветки нет.
+/// для maker-сайта; `shares_remaining_to_sell ≤ TOL` для taker-сайта; либо
+/// `event_end_ms + POST_MARKET_END_RESOLUTION_DELAY_MS` для post-market
+/// residual).
 ///
-/// **Идемпотентность.** Maker-TP callback в `spawn_open_buy_taker` и taker-FAK
-/// callback в `spawn_sell_taker` могут параллельно посчитать позицию закрытой —
-/// флаг [`crate::history_sim::OpenPosition::close_after_submit_finalized`]
+/// **Path detection (внутри функции — НЕ по `reason.is_none()`):**
+///
+/// «Post-market residual» путь триггерится если **рынок завершился**
+/// (`now > event_end_ms`) **И** на счёте остался residual для оценки
+/// (`actual_shares_net - shares_sold > CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE`).
+/// В этом режиме residual оценивается бинарно через
+/// [`crate::project_manager::MarketResolution`]: `$1`/шер если наша сторона
+/// выиграла (`final_price >= price_to_beat` для UP, обратное для DOWN), иначе
+/// `$0`. PNL = `usd_received + residual_payout - actual_entry_cost`; SideStats
+/// апдейтит `resolution_win` / `resolution_loss` / `pnl_resolution_*`;
+/// `exit_reason` в CSV — `"ResolutionWin"` / `"ResolutionLoss"`. Если
+/// `MarketResolution` отсутствует или `final_price = None` — выходим БЕЗ
+/// взвода `close_after_submit_finalized` (флаг сохраняем для будущего триггера).
+///
+/// Иначе («after-sell» путь): позиция полностью распродана через maker TP /
+/// taker FAK. PNL = `usd_received - actual_entry_cost`; SideStats апдейтит
+/// ветку по `reason` (`tp_count` / `sl_count` / `timeout_count` / `ev_exit_*`);
+/// `exit_reason` в CSV — [`trade_csv_close_reason_label`]. Bail если SELL-fills
+/// нулевые. Post-market caller передаёт `reason = None`; если до flag-set'а
+/// другой callback успел добить позицию (residual ≈ 0) — выходим тихо (никаких
+/// данных для логирования нет).
+///
+/// **Идемпотентность.** Maker-TP callback в `spawn_open_buy_taker`, taker-FAK
+/// callback в `spawn_sell_taker` и post-market-end task могут параллельно
+/// посчитать позицию закрытой — флаг
+/// [`crate::history_sim::OpenPosition::close_after_submit_finalized`]
 /// взводится в `true` под `position.write().await` при первом входе; второй
 /// конкурент видит `true` и тихо выходит. `buy_rep` для sanity-check'а
 /// (`making_amount` vs `position.position_size`) берётся из
@@ -397,67 +421,50 @@ pub(crate) async fn close_position_after_submit(
     account: &SharedAccount,
     position: &SharedOpenPosition,
     project_manager: Option<&Arc<ProjectManager>>,
-    reason: &CloseReason,
+    reason: Option<&CloseReason>,
     fill_role: &'static str,
     finalized_via: &'static str,
 ) {
-    let pos_id = {
-        let mut open_position = position.write().await;
-        if open_position.close_after_submit_finalized {
-            crate::tee_println!(
-                "[submit] pnl after sell pos_id={} reason={reason:?} role={fill_role}: \
-                 close_after_submit_finalized=true — повторный вызов пропускаем",
-                open_position.id,
-            );
-            return;
-        }
-        open_position.close_after_submit_finalized = true;
-        open_position.id.clone()
-    };
-    {
-        let mut positions_guard = account.positions.write().await;
-        for lane_positions in positions_guard.values_mut() {
-            lane_positions.remove(&pos_id);
-        }
-    }
-    // Клонируем OpenPosition, чтобы не держать read-guard через await
-    // (см. doc у `shares_remaining_to_sell`). К этому моменту
-    // `spawn_open_buy_taker` уже применил actual из `buy_rep` в поля
-    // `shares_held` / `buy_price` / `position_size`, а `planned_*` остались
-    // снимком от `crate::history_sim::open_position`.
+    // Pre-flight snapshot: все reads + aggregation БЕЗ установки idempotency
+    // флага. Path detection ниже требует `residual_shares` (а значит и
+    // `actual_shares_net` + sums), поэтому делаем агрегацию заранее.
+    // Параллельные callers могут продублировать это — безопасно, нет write'ов.
     let position_snapshot = position.read().await.clone();
+    let pos_id = position_snapshot.id.clone();
+    let market_id = position_snapshot.market_id.clone();
+    let event_end_ms = position_snapshot.event_end_ms;
     let asset_id = position_snapshot.asset_id.as_str();
     let currency = position_snapshot.currency.as_str();
     let planned_buy_price = position_snapshot.planned_buy_price;
     let planned_shares_held = position_snapshot.planned_shares_held;
     let planned_entry_cost = position_snapshot.planned_entry_cost;
-    let actual_shares_net = position_snapshot.shares_held;
     let actual_buy_price = position_snapshot.buy_price;
     let actual_entry_cost = position_snapshot.position_size;
-    let remaining_shares = match position_snapshot.shares_remaining_to_sell(false).await {
-        Ok(Some(remaining)) => remaining,
-        Ok(None) => {
-            crate::tee_eprintln!(
-                "[submit] pnl after sell pos_id={pos_id} reason={reason:?} role={fill_role}: \
-                 shares_remaining_to_sell=None (BUY invoke отсутствует/неуспешен) — лог пропускаем",
-            );
-            return;
-        }
-        Err(err) => {
-            crate::tee_eprintln!(
-                "[submit] pnl after sell pos_id={pos_id} reason={reason:?} role={fill_role}: \
-                 shares_remaining_to_sell pending invoke ({}) — лог пропускаем",
-                err.which,
-            );
-            return;
-        }
-    };
+
+    // `actual_shares_net` берём напрямую из BUY-invoke watch'а
+    // ([`crate::history_sim::OpenPosition::open_buy_invoke`]) — authoritative от
+    // CLOB через WS-fill report. `position.shares_held` — derived field,
+    // выставленный в [`crate::account_submit::spawn_open_buy_taker`] из того же
+    // report'а, но при late WS-update'ах может расходиться. Если BUY-invoke
+    // отсутствует / не settled / не success / taking_amount не Shares — `0.0`
+    // (defensive: дальше aggregator-guard для after-sell поймает; для resolution
+    // residual просто будет 0).
+    let actual_shares_net = position_snapshot
+        .open_buy_invoke
+        .as_ref()
+        .and_then(invoke_settlement_report)
+        .filter(|report| report.success)
+        .and_then(|report| match report.taking_amount {
+            OrderAmount::Shares(shares) if shares.is_finite() && shares > 0.0 => Some(shares),
+            _ => None,
+        })
+        .unwrap_or(0.0);
 
     // Агрегируем SELL fills по позиции: maker TP (если есть, settled+success;
     // partial допустим) + все taker SELL'ы (settled+success; partial допустим).
     // Зеркало логики [`crate::history_sim::OpenPosition::shares_remaining_to_sell`]
     // (там тоже суммируем `making_amount` по success-invoke'ам обеих веток). Это
-    // гарантирует консистентность `shares_sold + shares_remaining ≈ shares_bought_net`.
+    // гарантирует консистентность `shares_sold + residual ≈ actual_shares_net`.
     let mut shares_sold = 0.0_f64;
     let mut usd_received = 0.0_f64;
     let mut tp_order_id: Option<String> = None;
@@ -517,14 +524,126 @@ pub(crate) async fn close_position_after_submit(
         }
     }
 
-    if !(shares_sold.is_finite() && shares_sold > 0.0 && usd_received.is_finite() && usd_received > 0.0) {
+    let residual_shares = (actual_shares_net - shares_sold).max(0.0);
+
+    // Path detection: post-market-residual ИФФ (1) рынок завершился
+    // (`now > event_end_ms`) И (2) остался непроданный residual выше
+    // tolerance. НЕ полагаемся на `reason.is_none()`: post-market caller может
+    // передать `None`, но если до нашего входа другой callback успел добить
+    // позицию (residual ≈ 0) — этот вызов уйдёт в after-sell ветку и тихо
+    // выйдет ниже (нет `reason` и нет residual для resolution).
+    let now_ms = crate::util::current_timestamp_ms();
+    let market_ended = event_end_ms.is_some_and(|end_ms| now_ms > end_ms);
+    let is_post_market_residual = market_ended
+        && residual_shares > crate::account_submit::CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE;
+
+    // Resolution-path: lookup MarketResolution ДО взвода флага idempotency
+    // (если данных нет — выходим, флаг сохраняем для будущего триггера).
+    let market_price_to_beat_and_final_price: Option<(f64, f64)> = if is_post_market_residual {
+        let Some(pm) = project_manager else {
+            crate::tee_eprintln!(
+                "[submit] post-market resolution pos_id={pos_id}: \
+                 project_manager=None — финализация невозможна, пропуск",
+            );
+            return;
+        };
+        let lookup: Option<crate::project_manager::MarketResolution> = pm
+            .market_resolution_by_market
+            .read()
+            .await
+            .get(&market_id)
+            .copied();
+        let Some(market_resolution) = lookup else {
+            crate::tee_eprintln!(
+                "[submit] post-market resolution pos_id={pos_id} \
+                 market_id={market_id}: MarketResolution отсутствует в кэше \
+                 — финализация отложена (флаг НЕ взводим)",
+            );
+            return;
+        };
+        let Some(final_price) = market_resolution.final_price else {
+            crate::tee_eprintln!(
+                "[submit] post-market resolution pos_id={pos_id} \
+                 market_id={market_id}: final_price=None (refine следующего \
+                 окна ещё не пришёл) — финализация отложена (флаг НЕ взводим)",
+            );
+            return;
+        };
+        Some((market_resolution.price_to_beat, final_price))
+    } else {
+        None
+    };
+
+    // After-sell path требует ненулевых SELL-fills (`pnl = usd_received - entry`
+    // даст шум если 0); resolution path допускает 0 (residual подберёт всё).
+    // Бэйлим ДО взвода флага idempotency, чтобы не блокировать future-триггеры.
+    let has_valid_sell_fills = shares_sold.is_finite()
+        && shares_sold > 0.0
+        && usd_received.is_finite()
+        && usd_received > 0.0;
+    if !(is_post_market_residual || has_valid_sell_fills) {
         crate::tee_eprintln!(
-            "[submit] pnl after sell pos_id={pos_id} reason={reason:?} role={fill_role}: \
+            "[submit] pnl pos_id={pos_id} reason={reason:?} role={fill_role}: \
              сумма SELL-fills нулевая/невалидная (shares={shares_sold:.6} USD={usd_received:.6}) — \
-             лог пропускаем",
+             лог пропускаем (флаг НЕ взводим)",
         );
         return;
     }
+
+    // Edge case: caller — post-market spawn (`reason = None`), но между его
+    // pre-check (residual > TOL) и нашим pre-flight другой callback успел
+    // добить позицию (residual ≤ TOL → `is_post_market_residual = false`).
+    // SideStats-ветка для `(None, None)` не определена; флаг не трогаем —
+    // финализирует тот callback, что захватит флаг первым.
+    if !is_post_market_residual && reason.is_none() {
+        crate::tee_println!(
+            "[submit] pnl pos_id={pos_id} role={fill_role}: reason=None и \
+             residual≤TOL ⇒ финализация уже идёт через другой callback, пропуск",
+        );
+        return;
+    }
+
+    // Атомарный check-and-set флага идемпотентности (под write-lock без await
+    // внутри — гонка с другими caller'ами разрешена однозначно).
+    {
+        let mut open_position = position.write().await;
+        if open_position.close_after_submit_finalized {
+            crate::tee_println!(
+                "[submit] pnl pos_id={pos_id} reason={reason:?} role={fill_role}: \
+                 close_after_submit_finalized=true — повторный вызов пропускаем",
+            );
+            return;
+        }
+        open_position.close_after_submit_finalized = true;
+    }
+    {
+        let mut positions_guard = account.positions.write().await;
+        for lane_positions in positions_guard.values_mut() {
+            lane_positions.remove(&pos_id);
+        }
+    }
+
+    // Resolution-path: `token_won` из `(price_to_beat, final_price)` + нашей
+    // стороны UP/DOWN. Неизвестная сторона → loss (consistency с
+    // `close_position_resolution`).
+    let our_side =
+        CurrencyUpDownOutcome::from_i32(position_snapshot.currency_up_down_outcome_at_open);
+    let token_won_resolution: Option<bool> =
+        market_price_to_beat_and_final_price.map(|(ptb, final_price)| {
+            let up_won = final_price >= ptb;
+            match our_side {
+                Some(CurrencyUpDownOutcome::Up) => up_won,
+                Some(CurrencyUpDownOutcome::Down) => !up_won,
+                None => {
+                    crate::tee_eprintln!(
+                        "[submit] post-market resolution pos_id={pos_id}: неизвестный \
+                         currency_up_down_outcome_at_open={} — финализируем как loss",
+                        position_snapshot.currency_up_down_outcome_at_open,
+                    );
+                    false
+                }
+            }
+        });
     // Sanity-check: `buy_rep.making_amount` (authoritative от CLOB) должен биться с
     // `position.position_size`, который был применён в `spawn_open_buy_taker`.
     // `buy_rep` берём из того же `position.open_buy_invoke` watch'а, который писал
@@ -537,24 +656,44 @@ pub(crate) async fn close_position_after_submit(
         && (spent_usd - actual_entry_cost).abs() > 1e-6
     {
         crate::tee_eprintln!(
-            "[submit] pnl after sell pos_id={pos_id} reason={reason:?} role={fill_role}: \
+            "[submit] pnl pos_id={pos_id} reason={reason:?} role={fill_role}: \
              buy_rep.making_amount={spent_usd:.6} != position.position_size={actual_entry_cost:.6} \
              — possible WS-fill drift",
         );
     }
 
-    let sell_fill_price = (usd_received / shares_sold).clamp(0.001, 0.999);
+    // Payout от residual: только для resolution path. `residual_shares` уже
+    // посчитан pre-flight'ом выше (`actual_shares_net - shares_sold`). Для
+    // after-sell caller гарантирует residual ≤ TOL → пэйаут считаем как 0
+    // (минимальный шум от <TOL шеров игнорируем, чтобы PNL = сугубо sell-fills).
+    let residual_payout = match token_won_resolution {
+        Some(true) => residual_shares,
+        Some(false) | None => 0.0,
+    };
+
     // Maker (TP) fee = 0; taker (FAK SELL) fee CLOB уже вычел из `taking_amount`
-    // (`making_amount` остаётся валовыми shares). Поэтому здесь всегда 0 — то же
-    // поведение, что и в [`close_position_market_exit`] для voluntary-maker exit.
+    // (`making_amount` остаётся валовыми shares). Resolution-payout — комиссия 0.
+    // Поэтому здесь всегда 0, то же поведение, что и в [`close_position_market_exit`].
     let fee_usdc: f64 = 0.0;
-    let pnl = usd_received - actual_entry_cost;
+    let pnl = usd_received + residual_payout - actual_entry_cost;
+    // exit_price: для after-sell — sell-VWAP; для resolution — blended exit
+    // (продано + payout residual) / total shares. После-sell guard выше
+    // гарантирует `shares_sold > 0`.
+    let exit_price = if token_won_resolution.is_some() {
+        let total_exit_usd = usd_received + residual_payout;
+        if actual_shares_net > 1e-18 {
+            (total_exit_usd / actual_shares_net).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    } else {
+        (usd_received / shares_sold).clamp(0.001, 0.999)
+    };
 
     let interval_kind =
         XFrameIntervalKind::from_i32(position_snapshot.xframe_interval_type_at_open);
-    let side = CurrencyUpDownOutcome::from_i32(position_snapshot.currency_up_down_outcome_at_open);
     let real_sim_state = account.real_sim_state_for_currency(currency).await;
-    match (real_sim_state, interval_kind, side) {
+    match (real_sim_state, interval_kind, our_side) {
         (Some(real_sim_state), Some(interval_kind), Some(side)) => {
             let mut state_guard = real_sim_state.write().await;
             *account.bankroll.write().await += pnl;
@@ -574,26 +713,47 @@ pub(crate) async fn close_position_after_submit(
                 side_stats
                     .closed_trade_entries
                     .push((position_snapshot.raw_pred_at_open, pnl > 0.0));
-                match reason {
-                    CloseReason::TakeProfit => {
+                // Резолюционные счётчики (если path = resolution) либо reason-based
+                // ветка (если path = after-sell). Path однозначно определяется тем,
+                // какая из веток в `(token_won_resolution, reason)` пришла как Some
+                // (выше есть mutually-exclusive проверки).
+                match (token_won_resolution, reason) {
+                    (Some(true), _) => {
+                        side_stats.resolution_win += 1;
+                        side_stats.pnl_resolution_win += pnl;
+                        if pnl >= 0.0 {
+                            side_stats.resolution_win_profit += 1;
+                        } else {
+                            side_stats.resolution_win_loss += 1;
+                        }
+                    }
+                    (Some(false), _) => {
+                        side_stats.resolution_loss += 1;
+                        side_stats.pnl_resolution_loss += pnl;
+                    }
+                    (None, Some(CloseReason::TakeProfit)) => {
                         side_stats.tp_count += 1;
                         side_stats.pnl_tp += pnl;
                     }
-                    CloseReason::StopLoss => {
+                    (None, Some(CloseReason::StopLoss)) => {
                         side_stats.sl_count += 1;
                         side_stats.pnl_sl += pnl;
                     }
-                    CloseReason::Timeout => {
+                    (None, Some(CloseReason::Timeout)) => {
                         side_stats.timeout_count += 1;
                         side_stats.pnl_timeout += pnl;
                     }
-                    CloseReason::EvExitProfit => {
+                    (None, Some(CloseReason::EvExitProfit)) => {
                         side_stats.ev_exit_profit_count += 1;
                         side_stats.pnl_ev_exit_profit += pnl;
                     }
-                    CloseReason::EvExitLoss => {
+                    (None, Some(CloseReason::EvExitLoss)) => {
                         side_stats.ev_exit_loss_count += 1;
                         side_stats.pnl_ev_exit_loss += pnl;
+                    }
+                    (None, None) => {
+                        // unreachable: edge-case guard `!is_post_market_residual
+                        // && reason.is_none()` выше выходит до flag-set'а.
                     }
                 }
             }
@@ -627,23 +787,62 @@ pub(crate) async fn close_position_after_submit(
         .map(|end_ms| (end_ms - crate::util::current_timestamp_ms()).max(0))
         .unwrap_or(0);
 
-    let exit_reason_label = trade_csv_close_reason_label(reason);
-    crate::tee_println!(
-        "[submit] pnl after sell pos_id={pos_id} asset_id={asset_id} market_id={market_id_str} \
-         interval={interval_label} side={side_label} reason={exit_reason_label} role={fill_role} \
-         finalized_via={finalized_via} \
-         planned(USD={planned_entry_cost:.6} shares={planned_shares_held:.6} price={planned_buy_price:.6}) \
-         actual_buy(USD={actual_entry_cost:.6} shares={actual_shares_net:.6} price={actual_buy_price:.6}) \
-         sell(price={sell_fill_price:.6} shares={shares_sold:.6} USD={usd_received:.6}) \
-         shares_remaining={remaining_shares:.6} fee_usdc={fee_usdc:.6} pnl={pnl:+.6}",
-    );
+    // `exit_reason` для CSV/лога: resolution → бинарный лейбл, after-sell →
+    // [`trade_csv_close_reason_label`] от `reason`.
+    let exit_reason_label: &str = match (token_won_resolution, reason) {
+        (Some(true), _) => "ResolutionWin",
+        (Some(false), _) => "ResolutionLoss",
+        (None, Some(reason)) => trade_csv_close_reason_label(reason),
+        (None, None) => "Unknown",
+    };
+    // `price_to_beat` / `final_price` в CSV: для resolution берём свежий снимок
+    // из `MarketResolution` (authoritative, refine следующего окна уже пришёл);
+    // для after-sell — старые значения из `OpenPosition`, выставленные в
+    // `open_position` (могли быть None если на момент открытия PTB не было).
+    let (csv_price_to_beat, csv_final_price) = match market_price_to_beat_and_final_price {
+        Some((ptb, final_price)) => (Some(ptb), Some(final_price)),
+        None => (
+            position_snapshot.price_to_beat,
+            position_snapshot.final_price,
+        ),
+    };
+
+    match token_won_resolution {
+        Some(token_won) => {
+            let (ptb, final_price) = market_price_to_beat_and_final_price.expect(
+                "token_won_resolution=Some ⇒ market_price_to_beat_and_final_price=Some",
+            );
+            crate::tee_println!(
+                "[submit] pnl pos_id={pos_id} asset_id={asset_id} market_id={market_id_str} \
+                 interval={interval_label} side={side_label} reason={exit_reason_label} \
+                 role={fill_role} finalized_via={finalized_via} \
+                 resolution(price_to_beat={ptb:.6} final_price={final_price:.6} token_won={token_won}) \
+                 planned(USD={planned_entry_cost:.6} shares={planned_shares_held:.6} price={planned_buy_price:.6}) \
+                 actual_buy(USD={actual_entry_cost:.6} shares={actual_shares_net:.6} price={actual_buy_price:.6}) \
+                 sold(shares={shares_sold:.6} USD={usd_received:.6}) \
+                 residual(shares={residual_shares:.6} payout={residual_payout:.6}) \
+                 exit_price={exit_price:.6} fee_usdc={fee_usdc:.6} pnl={pnl:+.6}",
+            );
+        }
+        None => {
+            crate::tee_println!(
+                "[submit] pnl pos_id={pos_id} asset_id={asset_id} market_id={market_id_str} \
+                 interval={interval_label} side={side_label} reason={exit_reason_label} \
+                 role={fill_role} finalized_via={finalized_via} \
+                 planned(USD={planned_entry_cost:.6} shares={planned_shares_held:.6} price={planned_buy_price:.6}) \
+                 actual_buy(USD={actual_entry_cost:.6} shares={actual_shares_net:.6} price={actual_buy_price:.6}) \
+                 sell(price={exit_price:.6} shares={shares_sold:.6} USD={usd_received:.6}) \
+                 residual_shares={residual_shares:.6} fee_usdc={fee_usdc:.6} pnl={pnl:+.6}",
+            );
+        }
+    }
 
     let close_order_id_refs: Vec<&str> =
         close_order_ids.iter().map(|s| s.as_str()).collect();
     let trade_row = crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &position_snapshot.polymarket_url,
-        price_to_beat: position_snapshot.price_to_beat,
-        final_price: position_snapshot.final_price,
+        price_to_beat: csv_price_to_beat,
+        final_price: csv_final_price,
         currency,
         interval: interval_label,
         side: side_label,
@@ -656,7 +855,7 @@ pub(crate) async fn close_position_after_submit(
         kelly_f: position_snapshot.kelly_f_at_open,
         position_size: actual_entry_cost,
         shares_held: actual_shares_net,
-        exit_price: sell_fill_price,
+        exit_price,
         fee_usdc,
         pnl,
         frames_held: position_snapshot.frames_held,
@@ -687,3 +886,4 @@ pub(crate) async fn close_position_after_submit(
         );
     }
 }
+
