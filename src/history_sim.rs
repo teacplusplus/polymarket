@@ -23,6 +23,7 @@ use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println};
 
 pub use crate::sim_stats::{print_side_stats, print_sim_stats, SideStats, SimStats};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,7 +32,7 @@ use xgb::{Booster, DMatrix};
 /// Нижний порог raw перед Kelly (`f* > 0`).
 pub const SIM_BUY_THRESHOLD: f32 = 0.60;
 
-/// Max отклонение VWAP от L1 при strict fill; voluntary TP может обойти cap ([`sell_gate`], [`close_position`]).
+/// Max отклонение VWAP от L1 при strict fill; voluntary TP может обойти cap ([`sell_gate`], [`crate::account_close_position::close_position_market_exit`]).
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый банкролл (USDC).
@@ -238,6 +239,10 @@ pub type SharedOpenPosition = std::sync::Arc<tokio::sync::RwLock<OpenPosition>>;
 /// То же для записи закрытия.
 pub type SharedClosingPosition = std::sync::Arc<tokio::sync::RwLock<ClosingPosition>>;
 
+/// Открытые позиции одной лейны в [`crate::account::Account::positions`]; ключ —
+/// [`OpenPosition::id`].
+pub type LanePositions = HashMap<String, SharedOpenPosition>;
+
 /// Разрыв цикла Open ↔ Closing; upgrade если запись ещё жива ([`crate::account_submit`] polling).
 pub type WeakClosingPosition = std::sync::Weak<tokio::sync::RwLock<ClosingPosition>>;
 
@@ -251,18 +256,31 @@ pub struct OpenPosition {
     /// Condition id маркета (Gamma).
     #[allow(dead_code)]
     pub(crate) market_id: String,
-    /// Шеры после fee; submit: WS fills ([`crate::account_ws::apply_buy_fill`]).
+    /// Фактически купленные шеры (after fee). В backtest = `planned_shares_held`
+    /// (виртуальный fill). В submit: при создании = `planned_shares_held`; после
+    /// успешного `buy_rep` обновляется на `buy_rep.taking_amount`
+    /// ([`crate::account_submit::spawn_open_buy_taker`]).
     pub(crate) shares_held: f64,
+    /// План шер: расчётное от Kelly/SIM_*. Никогда не меняется после создания.
+    pub(crate) planned_shares_held: f64,
     /// Prob на входе (legacy); решения по [`Self::buy_price`].
     #[allow(dead_code)]
     pub(crate) entry_prob: f64,
-    /// VWAP входа; submit: из fills; план — [`Self::planned_buy_price`].
+    /// Фактический VWAP входа. В backtest = `planned_buy_price`. В submit: при
+    /// создании = `planned_buy_price`; после `buy_rep` — `buy_rep.making_amount /
+    /// buy_rep.taking_amount`.
     pub(crate) buy_price: f64,
+    /// План: best-ask на момент решения. Никогда не меняется после создания.
+    pub(crate) planned_buy_price: f64,
     /// Ref voluntary sell VWAP на входе (SL vs [`crate::xframe::Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`]).
     pub(crate) sell_vwap_entry: f64,
-    /// Потраченные USDC; submit: аккумуляция WS; план — [`Self::planned_entry_cost`].
+    /// Фактически потраченные USDC (entry cost). В backtest = `planned_entry_cost`.
+    /// В submit: при создании = `planned_entry_cost`; после `buy_rep` —
+    /// `buy_rep.making_amount` (UsdNotional).
     pub(crate) position_size: f64,
-    /// L1 bid на входе (maker TP в [`close_position`]).
+    /// План: целевые USDC от Kelly (входной `amount`). Никогда не меняется после создания.
+    pub(crate) planned_entry_cost: f64,
+    /// L1 bid на входе (maker TP в [`crate::account_close_position::close_position_market_exit`]).
     pub(crate) best_bid_at_entry: Option<f64>,
     /// Кадров удержания ([`POSITION_TIMEOUT_FRAMES`]).
     pub(crate) frames_held: usize,
@@ -304,6 +322,13 @@ pub struct OpenPosition {
     pub(crate) maker_tp_position: Option<WeakClosingPosition>,
     /// Taker FAK SELL: по одной записи на каждый успешный invoke ([`crate::account_submit`]).
     pub(crate) taker_positions: Vec<WeakClosingPosition>,
+    /// Идемпотентность [`crate::account_close_position::close_position_after_submit`]:
+    /// взводится в `true` при первом входе (под `position.write().await`) и блокирует
+    /// повторные вызовы (CSV/SideStats/bankroll/graph должны записаться ровно один раз).
+    /// Maker-TP callback в [`crate::account_submit::spawn_open_buy_taker`] и taker-FAK
+    /// callback в [`crate::account_submit::spawn_sell_taker`] могут гоняться за один и
+    /// тот же fully-closed PNL — флаг гарантирует, что финализирует только победитель.
+    pub(crate) close_after_submit_finalized: bool,
 }
 
 /// Возврат [`OpenPosition::shares_remaining_to_sell`] при не-settled invoke-колбэке:
@@ -708,16 +733,16 @@ async fn simulate_event(
     .await;
 
     if let Some(market_id) = market_id_opt {
-        account
-            .resolve_pending_market_sync(
-                sim_stats,
-                currency,
-                interval_kind,
-                &market_id,
-                up_won,
-                None,
-            )
-            .await;
+        crate::account::Account::resolve_pending_market_sync(
+            &account,
+            sim_stats,
+            currency,
+            interval_kind,
+            &market_id,
+            up_won,
+            None,
+        )
+        .await;
     }
 
 
@@ -798,7 +823,6 @@ pub(crate) async fn run_side_simulation(
                 None,
                 Some(MINPOSITION_FRAMES),
                 crate::account_submit::SubmitMode::None,
-                false,
                 None,
                 account,
             )
@@ -812,7 +836,7 @@ pub(crate) async fn run_side_simulation(
             let mut positions = account.positions.write().await;
             let positions_v = positions.entry(lane_key.clone()).or_default();
             let mut same_side_locked = 0.0;
-            for p in positions_v.iter() {
+            for p in positions_v.values() {
                 same_side_locked += p.read().await.position_size;
             }
             let available = (*bankroll - same_side_locked).max(0.0);
@@ -852,7 +876,7 @@ pub(crate) async fn run_side_simulation(
                 let positions = account.positions.read().await;
                 let mut positions_value = 0.0;
                 if let Some(v) = positions.get(lane_key) {
-                    for p in v {
+                    for p in v.values() {
                         positions_value += p.read().await.shares_held * prob;
                     }
                 }
@@ -1006,7 +1030,7 @@ pub(crate) async fn try_open_position(
     frame: &XFrame<SIZE>,
     pnl_inference: Option<PnlInference>,
     booster_pnl_for_shap: Option<&Booster>,
-    positions: &mut Vec<SharedOpenPosition>,
+    positions: &mut LanePositions,
     stats: &mut SideStats,
     bankroll: f64,
     strict_book: Option<&StrictBook>,
@@ -1061,7 +1085,7 @@ pub(crate) async fn try_open_position(
         BuyGate::Proceed { raw, pred, kelly_f, size } => {
             if BLOCK_SAME_ASSET_OPEN {
                 let mut same_asset_open = false;
-                for p in positions.iter() {
+                for p in positions.values() {
                     if p.read().await.asset_id == frame.asset_id {
                         same_asset_open = true;
                         break;
@@ -1124,8 +1148,9 @@ pub(crate) async fn try_open_position(
                     // Submit: optimistic fill + spawn BUY taker; правки по WS ([`crate::account_ws`]).
                     let decision_price = strict_book.and_then(crate::account_order::best_ask_strict).map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
                     let decision_book = strict_book.cloned();
+                    let pos_id = pos.id.clone();
                     let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
-                    positions.push(pos_arc.clone());
+                    positions.insert(pos_id, pos_arc.clone());
                     crate::account_submit::spawn_open_buy_taker(
                         account.clone(),
                         project_manager.cloned(),
@@ -1151,7 +1176,7 @@ pub(crate) enum SellGate {
     HoldPnl,
     /// Hold-zone: SL + EV; caller записывает `new_p_win_ema` в позицию.
     HoldResolution { new_p_win_ema: Option<f64> },
-    /// Закрыть по VWAP `exit_price` и причине (maker vs taker fee в [`close_position`]).
+    /// Закрыть по VWAP `exit_price` и причине (maker vs taker fee в [`crate::account_close_position::close_position_market_exit`]).
     Close { exit_price: f64, reason: CloseReason },
 }
 
@@ -1338,14 +1363,14 @@ pub(crate) fn sell_gate(
 /// `min_position_frames` — синхронно с одноимённым параметром
 /// [`sell_gate`] / [`manage_positions`]; в [`crate::real_sim`] всегда `None`.
 pub(crate) async fn any_position_would_sell(
-    positions: &[SharedOpenPosition],
+    positions: &LanePositions,
     frame: &XFrame<SIZE>,
     min_position_frames: Option<usize>,
 ) -> bool {
     if positions.is_empty() || frame.event_remaining_ms <= 0 {
         return false;
     }
-    for pos_arc in positions.iter() {
+    for pos_arc in positions.values() {
         let pos = pos_arc.read().await;
         if pos.asset_id != frame.asset_id {
             continue;
@@ -1368,7 +1393,7 @@ pub(crate) async fn any_position_would_sell(
     false
 }
 
-/// Закрытия через [`sell_gate`] / `close_position`; чужой `asset_id` (позиция
+/// Закрытия через [`sell_gate`] / [`crate::account_close_position::close_position_market_exit`]; чужой `asset_id` (позиция
 /// другого маркета той же лейны) — позиция возвращается в `positions` как
 /// «припаркованная» и ждёт [`crate::account::Account::resolve_pending_market_sync`].
 /// `true`, если был хотя бы один успешный close (bankroll обновился).
@@ -1384,14 +1409,14 @@ pub(crate) async fn any_position_would_sell(
 /// явного `apply_user_ws_event`.
 ///
 /// **Hot-path для виртуальной торговли (history_sim/real_sim):** после
-/// успешного [`close_position`] (PnL уже учтён в `bankroll`/`stats`) сюда
+/// успешного [`crate::account_close_position::close_position_market_exit`] (PnL уже учтён в `bankroll`/`stats`) сюда
 /// пушится `ClosingPosition` со статусом [`ClosingPositionStatus::Closed`]
 /// и заполненным `pnl`; `close_order_id` пуст. Это шаблон, который
 /// real-торговля заменит на «push с `PendingClose` + `Some(order_id)`,
 /// без правок `bankroll` — pnl и инкременты сделает WS-колбек».
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn manage_positions(
-    positions: &mut Vec<SharedOpenPosition>,
+    positions: &mut LanePositions,
     frame: &XFrame<SIZE>,
     is_last: bool,
     p_win_now: Option<f64>,
@@ -1400,24 +1425,23 @@ pub(crate) async fn manage_positions(
     strict_book: Option<&StrictBook>,
     min_position_frames: Option<usize>,
     submit_mode: crate::account_submit::SubmitMode,
-    spawn_partial_graph_html_on_close: bool,
     project_manager: Option<&Arc<ProjectManager>>,
     account: &SharedAccount,
 ) -> bool {
-    for pos in positions.iter_mut() {
+    for pos in positions.values_mut() {
         pos.write().await.frames_held += 1;
     }
 
     let mut sold = false;
-    let mut remaining: Vec<SharedOpenPosition> = Vec::new();
-    for pos_arc in positions.drain(..) {
+    let mut remaining: LanePositions = HashMap::new();
+    for (pos_id, pos_arc) in std::mem::take(positions) {
         // Snapshot позиции один раз — все sell_gate / submit-предикаты
         // ниже работают на этом snapshot'е. Нам не нужно держать pos-lock
         // через async-вызовы (CSV / spawn'ы).
         let snapshot = pos_arc.read().await.clone();
 
         if snapshot.asset_id != frame.asset_id {
-            remaining.push(pos_arc);
+            remaining.insert(pos_id, pos_arc);
             continue;
         }
         let close = match sell_gate(
@@ -1446,15 +1470,19 @@ pub(crate) async fn manage_positions(
         };
         if let Some((exit_price, reason)) = close {
             if submit_mode == crate::account_submit::SubmitMode::None {
-                match close_position(&snapshot, exit_price, &reason, frame, stats, strict_book) {
-                    Some(pnl) => {
-                        *bankroll += pnl;
-                        sold = true;                    
-                    }
-                    None => {
-                        stats.kelly_strict_sell_skips += 1;
-                        remaining.push(pos_arc);
-                    }
+                if crate::account_close_position::close_position_market_exit(
+                    bankroll,
+                    &mut remaining,
+                    pos_id,
+                    pos_arc,
+                    &snapshot,
+                    exit_price,
+                    &reason,
+                    frame,
+                    stats,
+                    strict_book,
+                ) {
+                    sold = true;
                 }
             } else {
                 crate::account_submit::spawn_sell_taker(
@@ -1466,24 +1494,16 @@ pub(crate) async fn manage_positions(
                     strict_book.cloned(),
                     submit_mode,
                 );
-                if spawn_partial_graph_html_on_close {
-                    if let Some(project_manager) = project_manager {
-                        crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close(
-                            project_manager.clone(),
-                            &snapshot,
-                        );
-                    }
-                }  
             }         
         } else {
-            remaining.push(pos_arc);
+            remaining.insert(pos_id, pos_arc);
         }
     }
     *positions = remaining;
     sold
 }
 
-/// Доля выигрыша при TP: вход taker по `entry_prob`, выход по TP; maker/taker выхода по `best_bid_at_entry` (как в `close_position`).
+/// Доля выигрыша при TP: вход taker по `entry_prob`, выход по TP; maker/taker выхода по `best_bid_at_entry` (как в [`crate::account_close_position::close_position_market_exit`]).
 fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
     let tp_is_maker = match best_bid_at_entry {
@@ -1494,7 +1514,7 @@ fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     (net - 1.0).max(1e-9)
 }
 
-/// Доля убытка при SL: всегда taker на выходе (как `close_position` на SL).
+/// Доля убытка при SL: всегда taker на выходе (как [`crate::account_close_position::close_position_market_exit`] на SL).
 fn kelly_loss_ratio(entry_prob: f64) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_STOP_LOSS_PP).clamp(0.001, 0.999);
     let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ true);
@@ -1590,10 +1610,13 @@ fn open_position(
         asset_id: frame.asset_id.clone(),
         market_id: frame.market_id.clone(),
         shares_held,
+        planned_shares_held: shares_held,
         entry_prob,
         buy_price,
+        planned_buy_price: buy_price,
         sell_vwap_entry,
         position_size: effective_size,
+        planned_entry_cost: effective_size,
         best_bid_at_entry,
         frames_held: 0,
         p_win_ema: None,
@@ -1615,181 +1638,8 @@ fn open_position(
         open_buy_invoke: None,
         maker_tp_position: None,
         taker_positions: Vec::new(),
+        close_after_submit_finalized: false,
     })
-}
-
-/// Gross USDC при TP: если полный sell-walk даёт порог TP — можно обойти cap к L1 (см. [`sell_gate`]).
-fn gross_usdc_sell_take_profit(
-    frame: &XFrame<SIZE>,
-    pos: &OpenPosition,
-    strict_book: Option<&StrictBook>,
-) -> Option<f64> {
-    let cap = Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT);
-    let meets_tp = |gross: f64| -> bool {
-        if pos.shares_held <= 1e-18 {
-            return false;
-        }
-        let vwap = gross / pos.shares_held;
-        vwap - pos.buy_price >= Y_TRAIN_TAKE_PROFIT_PP
-    };
-
-    match strict_book {
-        Some(book) => {
-            let uncapped = book_fill_sell_strict(book, pos.shares_held, None)?;
-            let capped = book_fill_sell_strict(book, pos.shares_held, cap);
-            if meets_tp(uncapped) {
-                match capped {
-                    Some(g) if meets_tp(g) => Some(g),
-                    Some(_) => Some(uncapped),
-                    None => Some(uncapped),
-                }
-            } else {
-                capped.or(Some(uncapped))
-            }
-        }
-        None => {
-            let uncapped = book_fill_sell(frame, pos.shares_held, None)?;
-            let capped = book_fill_sell(frame, pos.shares_held, cap);
-            if meets_tp(uncapped) {
-                match capped {
-                    Some(g) if meets_tp(g) => Some(g),
-                    Some(_) => Some(uncapped),
-                    None => Some(uncapped),
-                }
-            } else {
-                capped.or(Some(uncapped))
-            }
-        }
-    }
-}
-
-/// Обновляет [`SideStats`] при закрытии: PnL, trades, wins/losses, `closed_trade_entries`, счётчики по [`CloseReason`]. Не трогает `fees_paid`.
-pub(crate) fn apply_close_to_side_stats(
-    stats: &mut SideStats,
-    reason: &CloseReason,
-    pnl: f64,
-    raw_pred_at_open: f32,
-) {
-    stats.pnl_usd += pnl;
-    stats.trades += 1;
-    if pnl >= 0.0 {
-        stats.wins += 1;
-    } else {
-        stats.losses += 1;
-    }
-    stats.closed_trade_entries.push((raw_pred_at_open, pnl > 0.0));
-    match reason {
-        CloseReason::TakeProfit => {
-            stats.tp_count += 1;
-            stats.pnl_tp += pnl;
-        }
-        CloseReason::StopLoss => {
-            stats.sl_count += 1;
-            stats.pnl_sl += pnl;
-        }
-        CloseReason::Timeout => {
-            stats.timeout_count += 1;
-            stats.pnl_timeout += pnl;
-        }
-        CloseReason::EvExitProfit => {
-            stats.ev_exit_profit_count += 1;
-            stats.pnl_ev_exit_profit += pnl;
-        }
-        CloseReason::EvExitLoss => {
-            stats.ev_exit_loss_count += 1;
-            stats.pnl_ev_exit_loss += pnl;
-        }
-    }
-}
-
-/// Рыночный выход (TP/SL/Timeout/EvExit): bid-walk, fee. Резолюция — в [`crate::account::Account`].
-fn close_position(
-    pos: &OpenPosition,
-    exit_price: f64,
-    reason: &CloseReason,
-    frame: &XFrame<SIZE>,
-    stats: &mut SideStats,
-    strict_book: Option<&StrictBook>,
-) -> Option<f64> {
-    let gross_usdc = if reason.is_voluntary_exit() {
-        gross_usdc_sell_take_profit(frame, pos, strict_book)?
-    } else {
-        match strict_book {
-            Some(book) => book_fill_sell_strict(book, pos.shares_held, None)?,
-            None => book_fill_sell(frame, pos.shares_held, None)?,
-        }
-    };
-    let sell_price = if pos.shares_held > 0.0 {
-        (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
-    } else {
-        exit_price.clamp(0.001, 0.999)
-    };
-    // Без taker fee на выходе только если TP исполняется как maker (таргет выше bid на входе).
-    let voluntary_is_maker = match reason {
-        CloseReason::TakeProfit => {
-            let tp_target = (pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
-            match pos.best_bid_at_entry {
-                Some(b) => tp_target > b,
-                None => true,
-            }
-        }
-        _ => false,
-    };
-    let fee_usdc = if voluntary_is_maker {
-        0.0
-    } else {
-        pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price)
-    };
-    stats.fees_paid += fee_usdc;
-    let net_usdc = gross_usdc - fee_usdc;
-
-    let pnl = net_usdc - pos.position_size;
-    apply_close_to_side_stats(stats, reason, pnl, pos.raw_pred_at_open);
-
-    let interval_str = position_interval_label(pos);
-    let side_str = position_side_label(pos);
-    let open_unix_ms = pos.event_end_ms.map(|e| e - pos.event_remaining_ms_at_open);
-    let close_unix_ms = pos.event_end_ms.map(|e| e - frame.event_remaining_ms);
-    let graph_html_file_uri = crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(pos)
-        .map(|p| {
-            crate::xframe_graph_dump::graph_html_trade_file_uri(
-                &p,
-                open_unix_ms,
-                close_unix_ms,
-                Some(side_str),
-            )
-        })
-        .unwrap_or_default();
-    crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
-        polymarket_url: &pos.polymarket_url,
-        price_to_beat: pos.price_to_beat,
-        final_price: pos.final_price,
-        market_id: &pos.market_id,
-        asset_id: &pos.asset_id,
-        side: side_str,
-        interval: interval_str,
-        currency: &pos.currency,
-        exit_reason: trade_csv_close_reason_label(reason),
-        buy_price: pos.buy_price,
-        raw_pred: pos.raw_pred_at_open,
-        cal_pred: pos.cal_pred_at_open,
-        kelly_f: pos.kelly_f_at_open,
-        position_size: pos.position_size,
-        shares_held: pos.shares_held,
-        exit_price: sell_price,
-        fee_usdc,
-        pnl,
-        frames_held: pos.frames_held,
-        p_win_ema_at_close: pos.p_win_ema,
-        event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
-        event_remaining_ms_at_close: frame.event_remaining_ms,
-        open_unix_ms,
-        close_unix_ms,
-        graph_html_file_uri: graph_html_file_uri.as_str(),
-        pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
-    });
-
-    Some(pnl)
 }
 
 /// CSV: `"5m"` / `"15m"` / `"unknown"` через [`crate::real_sim::interval_label`].

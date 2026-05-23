@@ -1,4 +1,5 @@
 pub mod account;
+pub mod account_close_position;
 pub mod account_exit;
 pub mod account_mock_order;
 pub mod account_mock_order_completion;

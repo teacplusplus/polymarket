@@ -302,7 +302,7 @@ impl Calibration {
 
 /// Прогон `run_side_simulation` по val-маркетам с `is_kelly=false` и identity-калибровкой:
 /// возвращает пары `(raw_pred_at_open, won)` со всех **закрытых** трейдов
-/// ([`crate::history_sim::close_position`] + [`crate::account::Account::resolve_pending_market_sync`]).
+/// ([`crate::account_close_position::close_position_market_exit`] + [`crate::account::Account::resolve_pending_market_sync`]).
 ///
 /// # Зачем
 ///
@@ -495,16 +495,16 @@ async fn fit_calibration_via_sim_replay(
         // под нашим `lane_key`. resolve_pending_market_sync закрывает их бинарной
         // выплатой (по `market_id`) и push'ит в closed_trade_entries.
         if let Some(market_id) = market_id_opt {
-            account
-                .resolve_pending_market_sync(
-                    &mut sim_stats,
-                    currency,
-                    interval_kind,
-                    &market_id,
-                    up_won,
-                    None,
-                )
-                .await;
+            crate::account::Account::resolve_pending_market_sync(
+                &account,
+                &mut sim_stats,
+                currency,
+                interval_kind,
+                &market_id,
+                up_won,
+                None,
+            )
+            .await;
         }
 
         let side_stats_ref: &SideStats = match side {
@@ -531,7 +531,7 @@ async fn fit_calibration_via_sim_replay(
         markets_processed += 1;
     }
 
-    // Defensive sweep: `close_position` / `Account::resolve_pending_market_sync`
+    // Defensive sweep: `close_position_market_exit` / `Account::resolve_pending_market_sync`
     // выше клали строки в `TRADE_CSV_PENDING` (in-memory буфер). Для каждого
     // маркета `resolve_pending_market_sync` вызывает `record_market_outcome`,
     // который дренирует свой `market_id` (с writer == None строки уходят в

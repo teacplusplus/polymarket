@@ -332,7 +332,7 @@ pub async fn wait_invoke_settlement(
     if let Some(report) = invoke_settlement_report(watch) {
         return Some(report);
     }
-    match tokio::time::timeout(timeout, async {
+    tokio::time::timeout(timeout, async {
         loop {
             if watch.changed().await.is_err() {
                 return None;
@@ -341,12 +341,7 @@ pub async fn wait_invoke_settlement(
                 return Some(report);
             }
         }
-    })
-    .await
-    {
-        Ok(report) => report,
-        Err(_) => None,
-    }
+    }).await.unwrap_or_else(|_| None)
 }
 
 /// Контекст после успешного HTTP POST для агрегатора invoke.

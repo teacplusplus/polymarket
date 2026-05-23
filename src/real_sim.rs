@@ -225,7 +225,6 @@ pub async fn run_real_sim(
             state.clone(),
             account.clone(),
             project_manager.clone(),
-            true, // real_sim / real_sim_with_submit: партиальный HTML на close
             currency_arc.clone(),
             last_snapshot_by_asset_id.clone(),
             interval_kind,
@@ -245,7 +244,6 @@ fn spawn_side_worker(
     state: Arc<RwLock<RealSimState>>,
     account: SharedAccount,
     project_manager: Arc<ProjectManager>,
-    spawn_partial_graph_html_on_close: bool,
     currency: Arc<String>,
     last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
     interval_kind: XFrameIntervalKind,
@@ -268,7 +266,6 @@ fn spawn_side_worker(
                 &state,
                 &account,
                 &project_manager,
-                spawn_partial_graph_html_on_close,
                 currency.as_str(),
                 &last_snapshot_by_asset_id,
                 interval_kind,
@@ -349,7 +346,6 @@ async fn tick_once(
     state: &Arc<RwLock<RealSimState>>,
     account: &SharedAccount,
     project_manager: &Arc<ProjectManager>,
-    spawn_partial_graph_html_on_close: bool,
     currency: &str,
     last_snapshot_by_asset_id: &Arc<RwLock<HashMap<String, MarketSnapshot>>>,
     interval_kind: XFrameIntervalKind,
@@ -431,7 +427,7 @@ async fn tick_once(
             .expect("Account.positions pre-populated by run_real_sim");
         let mut total_locked = 0.0;
         for v in positions_guard.values() {
-            for p in v.iter() {
+            for p in v.values() {
                 total_locked += p.read().await.position_size;
             }
         }
@@ -565,7 +561,7 @@ async fn tick_once(
                 if k == &lane_key {
                     continue;
                 }
-                for p in v.iter() {
+                for p in v.values() {
                     cross_lanes_locked += p.read().await.position_size;
                 }
             }
@@ -579,7 +575,7 @@ async fn tick_once(
                 CurrencyUpDownOutcome::Down => &mut stats.down,
             };
 
-            let this_positions: &mut Vec<crate::history_sim::SharedOpenPosition> = positions_guard
+            let this_positions: &mut crate::history_sim::LanePositions = positions_guard
                 .get_mut(&lane_key)
                 .expect("Account.positions pre-populated by run_real_sim");
 
@@ -594,7 +590,6 @@ async fn tick_once(
                     strict_book.as_ref(),
                     None,
                     submit_mode,
-                    spawn_partial_graph_html_on_close,
                     Some(project_manager),
                     account,
                 )
@@ -619,7 +614,7 @@ async fn tick_once(
                     );
                 } else {
                     let mut same_locked_post = 0.0;
-                    for p in this_positions.iter() {
+                    for p in this_positions.values() {
                         same_locked_post += p.read().await.position_size;
                     }
                     let available_bankroll_post =
@@ -683,7 +678,7 @@ async fn tick_once(
                 } else {
                     0.5
                 };
-                for p in pos_vec.iter() {
+                for p in pos_vec.values() {
                     active += p.read().await.shares_held * prob;
                 }
             }

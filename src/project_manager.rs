@@ -50,7 +50,7 @@ pub struct LaneFrame {
     /// Gamma `startDate` для URL в [`tick_once`](crate::real_sim::tick_once); `None`, если Gamma ещё не подтянулся.
     pub event_start_ms: Option<i64>,
     /// Gamma `endDate` (момент резолюции маркета, UTC ms) — для CSV-колонок
-    /// `open_unix_ms`/`close_unix_ms` в `OpenPosition` и `close_position`
+    /// `open_unix_ms`/`close_unix_ms` в `OpenPosition` и [`crate::account_close_position`]
     /// (см. [`crate::history_sim::OpenPosition::event_end_ms`]). Без него
     /// в real_sim CSV-колонки времени остаются пустыми. `None`, если Gamma
     /// ещё не подтянулся для этого `market_id`.
@@ -93,6 +93,29 @@ pub struct MarketEventData {
     pub end_ms: Option<i64>,
     pub gamma_question: Option<String>,
 }
+
+/// Цены окна одного маркета: `price_to_beat` известен сразу (быстрый/exact PTB
+/// от Vatic API через [`ProjectManager::merge_market_price_to_beat`]), а
+/// `final_price` — только после refine PTB следующего окна (exact PTB следующего
+/// окна = spot-цена валюты на момент закрытия этого окна, см.
+/// [`spawn_bg_price_to_beat_refine`]). Победитель окна:
+/// `final_price >= price_to_beat` ⇒ UP, иначе DOWN — используется в post-market-end
+/// резолюции submit-позиций ([`crate::account_close_position::close_position_after_submit`]
+/// при [`crate::history_sim::CloseReason::Resolution`]).
+#[derive(Debug, Clone)]
+pub struct MarketWindowPrices {
+    pub market_id: String,
+    pub price_to_beat: f64,
+    pub final_price: Option<f64>,
+}
+
+/// Кэш «последних» окон в [`ProjectManager::market_window_prices_by_window_start_sec`]:
+/// при превышении лимита `BTreeMap::pop_first` удаляет окно с минимальным
+/// `window_start_sec` (самое старое). 10 окон ≈ 50 минут для 5m и ≈ 2.5 часа
+/// для 15m — достаточно, чтобы post-market-end резолюция submit-позиции
+/// нашла своё окно даже при задержке refine следующего окна (по умолчанию
+/// до 30 × 5s = 2.5 мин refine + [`crate::account_submit::POST_MARKET_END_RESOLUTION_DELAY_MS`]).
+pub const MARKET_WINDOW_PRICES_CAP: usize = 10;
 
 pub struct ProjectManager {
     pub currency: Arc<String>,

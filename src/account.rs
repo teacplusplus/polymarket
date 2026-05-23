@@ -5,8 +5,8 @@
 use crate::account_order_completion::TrackerEntry;
 use crate::account_proxy::PolyProxyEnvGuard;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
-use crate::history_sim::{INITIAL_BANKROLL, SharedOpenPosition};
-use crate::real_sim::{RealSimState, interval_label, side_label};
+use crate::history_sim::{INITIAL_BANKROLL, LanePositions, SharedOpenPosition};
+use crate::real_sim::RealSimState;
 use crate::sim_stats::SimStats;
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
@@ -63,7 +63,7 @@ pub struct Account {
     /// Для одной лейны могут сосуществовать позиции разных `market_id` — старые
     /// (с чужим `asset_id` относительно текущего кадра) живут здесь как
     /// «припаркованные» до резолюции; см. [`Self::resolve_pending_market_sync`].
-    pub positions: Arc<RwLock<HashMap<LaneKey, Vec<SharedOpenPosition>>>>,
+    pub positions: Arc<RwLock<HashMap<LaneKey, LanePositions>>>,
     /// Недавно зарезолвленные `market_id`; анти-повтор открытия ([`RECENTLY_RESOLVED_MARKETS_CAP`]).
     pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
     /// HTTP с rustls; тот же `Arc`, что у [`ProjectManager::http`](crate::project_manager::ProjectManager::http).
@@ -162,7 +162,7 @@ impl Account {
     ///
     /// `final_price`: `None` → `pos.final_price`, иначе override для realtime.
     pub async fn resolve_pending_market_sync(
-        &self,
+        account: &SharedAccount,
         sim_stats: &mut SimStats,
         currency: &str,
         interval: XFrameIntervalKind,
@@ -171,7 +171,7 @@ impl Account {
         final_price: Option<f64>,
     ) {
         // bankroll → positions → recently_resolved
-        let mut recently_resolved = self.recently_resolved_markets.write().await;
+        let mut recently_resolved = account.recently_resolved_markets.write().await;
         if recently_resolved.insert(market_id.to_string()) {
             while recently_resolved.len() > RECENTLY_RESOLVED_MARKETS_CAP {
                 recently_resolved.shift_remove_index(0);
@@ -179,10 +179,10 @@ impl Account {
         }
         drop(recently_resolved);
 
-        let mut bankroll = self.bankroll.write().await;
-        let mut positions = self.positions.write().await;
+        let mut positions = account.positions.write().await;
+        let mut to_close: Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)> = Vec::new();
 
-        for ((cur, int_kind, side), vec) in positions.iter_mut() {
+        for ((cur, int_kind, side), lane_positions) in positions.iter_mut() {
             if cur.as_str() != currency || *int_kind != interval {
                 continue;
             }
@@ -190,115 +190,41 @@ impl Account {
                 CurrencyUpDownOutcome::Up => up_won,
                 CurrencyUpDownOutcome::Down => !up_won,
             };
+
+            let pos_ids: Vec<String> = lane_positions.keys().cloned().collect();
+            for pos_id in pos_ids {
+                let Some(pos_arc) = lane_positions.get(&pos_id) else {
+                    continue;
+                };
+                let matches_market = pos_arc.read().await.market_id == market_id;
+                if !matches_market {
+                    continue;
+                }
+
+                let Some(pos_arc) = lane_positions.remove(&pos_id) else {
+                    continue;
+                };
+                to_close.push((pos_arc, token_won, *side));
+            }
+        }
+        drop(positions);
+
+        for (pos_arc, token_won, side) in to_close {
             let side_stats = match side {
                 CurrencyUpDownOutcome::Up => &mut sim_stats.up,
                 CurrencyUpDownOutcome::Down => &mut sim_stats.down,
             };
-
-            let mut i = 0;
-            while i < vec.len() {
-                let matches_market = {
-                    let g = vec[i].read().await;
-                    g.market_id == market_id
-                };
-                if !matches_market {
-                    i += 1;
-                    continue;
-                }
-
-                {
-                    let pos_arc = vec.swap_remove(i);
-                    let pos = pos_arc.read().await.clone();
-                    let pnl = if token_won {
-                        pos.shares_held - pos.position_size
-                    } else {
-                        -pos.position_size
-                    };
-                    *bankroll += pnl;
-                    side_stats.pnl_usd += pnl;
-                    side_stats.trades += 1;
-                    if pnl >= 0.0 {
-                        side_stats.wins += 1;
-                    } else {
-                        side_stats.losses += 1;
-                    }
-                    // Resolution не через close_position — дублируем в closed_trade_entries (replay калибровки).
-                    side_stats
-                        .closed_trade_entries
-                        .push((pos.raw_pred_at_open, pnl > 0.0));
-                    if token_won {
-                        side_stats.resolution_win += 1;
-                        side_stats.pnl_resolution_win += pnl;
-                        if pnl >= 0.0 {
-                            side_stats.resolution_win_profit += 1;
-                        } else {
-                            side_stats.resolution_win_loss += 1;
-                        }
-                    } else {
-                        side_stats.resolution_loss += 1;
-                        side_stats.pnl_resolution_loss += pnl;
-                    }
-
-                    {
-                        let interval_str = interval_label(*int_kind);
-                        let side_str = side_label(*side);
-                        let exit_reason = if token_won {
-                            "ResolutionWin"
-                        } else {
-                            "ResolutionLoss"
-                        };
-                        let open_unix_ms =
-                            pos.event_end_ms.map(|e| e - pos.event_remaining_ms_at_open);
-                        let close_unix_ms = pos.event_end_ms;
-                        let graph_html_file_uri =
-                            crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
-                                .map(|p| {
-                                    crate::xframe_graph_dump::graph_html_trade_file_uri(
-                                        &p,
-                                        open_unix_ms,
-                                        close_unix_ms,
-                                        Some(side_str),
-                                    )
-                                })
-                                .unwrap_or_default();
-                        crate::trade_csv_log::write_trade_csv_row(
-                            crate::trade_csv_log::TradeCsvRow {
-                                polymarket_url: &pos.polymarket_url,
-                                price_to_beat: pos.price_to_beat,
-                                final_price: final_price.or(pos.final_price),
-                                currency: cur,
-                                interval: interval_str,
-                                side: side_str,
-                                market_id,
-                                asset_id: &pos.asset_id,
-                                exit_reason,
-                                buy_price: pos.buy_price,
-                                raw_pred: pos.raw_pred_at_open,
-                                cal_pred: pos.cal_pred_at_open,
-                                kelly_f: pos.kelly_f_at_open,
-                                position_size: pos.position_size,
-                                shares_held: pos.shares_held,
-                                exit_price: if token_won { 1.0 } else { 0.0 },
-                                fee_usdc: 0.0,
-                                pnl,
-                                frames_held: pos.frames_held,
-                                p_win_ema_at_close: pos.p_win_ema,
-                                event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
-                                event_remaining_ms_at_close: 0,
-                                open_unix_ms,
-                                close_unix_ms,
-                                graph_html_file_uri: graph_html_file_uri.as_str(),
-                                pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
-                            },
-                        );
-                    }
-                    let _ = pos_arc;
-                }
-                // После swap_remove на `i` на этом индексе новая позиция — без i += 1.
-            }
+            crate::account_close_position::close_position_resolution(
+                account,
+                pos_arc,
+                token_won,
+                currency,
+                market_id,
+                final_price,
+                side_stats,
+            )
+            .await;
         }
-        drop(positions);
-        drop(bankroll);
 
         crate::trade_csv_log::record_market_outcome(market_id, up_won);
     }
