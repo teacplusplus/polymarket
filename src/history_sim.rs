@@ -774,9 +774,12 @@ async fn simulate_event(
 /// финальный payout по ним делает caller через
 /// [`crate::account::Account::resolve_pending_market_sync`] (см. [`simulate_event`]).
 ///
-/// Equity: `bankroll + Σ(local×prob)` (под `lane_key`); pending-веток нет —
-/// в этом режиме под лейной всегда позиции текущего маркета.
-/// Сайзинг от `bankroll − Σ(entry_cost)` на этой стороне.
+/// Equity: `bankroll + Σ(shares×prob)` по **всем** лейнам в `positions` и
+/// `pending_close_positions` (для текущего `lane_key` — `prob` из кадра, для
+/// остальных — fallback на `account.last_prob` / `0.5`), как в
+/// [`crate::real_sim::tick_once`]. `pending_close_positions` в `SubmitMode::None`
+/// всегда пуст, но читаем его «честно для симметрии».
+/// Сайзинг от `bankroll − Σ(entry_cost across all lanes & pending_close)` на этой стороне.
 ///
 /// `hold_to_end_threshold_sec` — окно, в котором применяется resolution-модель
 /// и собираются точки для её калибровки (см. [`compute_p_win_now`] и
@@ -909,20 +912,36 @@ pub(crate) async fn run_side_simulation(
             .await;
         }
 
-        // MtM equity (как real_sim): без prob на кадре тик пропускаем.
-        // В history_sim/train_mode внутри одного `run_side_simulation` под `lane_key`
-        // живут только позиции текущего маркета (`asset_id` совпадает с кадровым),
-        // поэтому оцениваем их по текущему `prob`. «Припаркованных» с чужим
-        // `asset_id` здесь не бывает — они появлялись бы только в real_sim.
+        // MtM equity (как [`crate::real_sim::tick_once`]): без prob на кадре
+        // тик пропускаем. Суммируем **все** позиции в `positions` и
+        // `pending_close_positions` (по всем lane'ам, кросс-currency/interval/side),
+        // а не только текущую лейну — bankroll один общий и DD должен видеть
+        // всю книгу. Для текущего `lane_key` используем `prob` из кадра, для
+        // остальных — `account.last_prob` (или 0.5 при отсутствии записи, как
+        // в real_sim). В backtest (`SubmitMode::None`) `pending_close_positions`
+        // всегда пуст, но читаем его «честно для симметрии».
+        // Lock-order: bankroll → last_prob → positions → pending_close_positions.
         if let Some(prob) = frame.currency_implied_prob {
             let prob = prob.clamp(0.0, 1.0);
             let equity = {
                 let bankroll = account.bankroll.read().await;
+                let last_prob_guard = account.last_prob.read().await;
                 let positions = account.positions.read().await;
+                let pending_close = account.pending_close_positions.read().await;
                 let mut positions_value = 0.0;
-                if let Some(v) = positions.get(lane_key) {
-                    for p in v.values() {
-                        positions_value += p.read().await.shares_held * prob;
+                for (key, lane_positions) in positions.iter().chain(pending_close.iter()) {
+                    let prob_raw = if key == lane_key {
+                        prob
+                    } else {
+                        last_prob_guard.get(key).copied().unwrap_or(0.5)
+                    };
+                    let prob_use = if prob_raw.is_finite() {
+                        prob_raw.clamp(0.001, 0.999)
+                    } else {
+                        0.5
+                    };
+                    for p in lane_positions.values() {
+                        positions_value += p.read().await.shares_held * prob_use;
                     }
                 }
                 *bankroll + positions_value
