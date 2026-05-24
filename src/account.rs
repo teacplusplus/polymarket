@@ -1,6 +1,6 @@
 //! Капитал и MtM (`bankroll`, peak, max DD); per-lane позиции и CLOB-клиенты.
 //! Один [`SharedAccount`] на процесс: поля под отдельными `RwLock`, auth в [`ArcSwapAny`] (read-mostly).
-//! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `closing` → `recently_resolved_markets` → один inner на позицию.
+//! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_close_positions` → `closing` → `recently_resolved_markets` → один inner на позицию.
 
 use crate::account_order_completion::TrackerEntry;
 use crate::account_proxy::PolyProxyEnvGuard;
@@ -11,7 +11,6 @@ use crate::sim_stats::SimStats;
 use alloy::signers::Signer as _;
 use alloy::signers::local::PrivateKeySigner;
 use arc_swap::ArcSwapAny;
-use indexmap::IndexSet;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::Uuid as ClobUuid;
 use polymarket_client_sdk::auth::state::Authenticated;
@@ -28,9 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::MissedTickBehavior;
-
-/// Лимит [`recently_resolved_markets`]; переполнение — `shift_remove_index(0)`.
-pub const RECENTLY_RESOLVED_MARKETS_CAP: usize = 8;
 
 /// Production CLOB V2 host (cutover 2026-04-28; см.
 /// [docs.polymarket.com/v2-migration](https://docs.polymarket.com/v2-migration)).
@@ -64,8 +60,12 @@ pub struct Account {
     /// (с чужим `asset_id` относительно текущего кадра) живут здесь как
     /// «припаркованные» до резолюции; см. [`Self::resolve_pending_market_sync`].
     pub positions: Arc<RwLock<HashMap<LaneKey, LanePositions>>>,
-    /// Недавно зарезолвленные `market_id`; анти-повтор открытия ([`RECENTLY_RESOLVED_MARKETS_CAP`]).
-    pub recently_resolved_markets: Arc<RwLock<IndexSet<String>>>,
+    /// Submit/Mock-only: позиции, на которых уже сработал
+    /// [`crate::history_sim::sell_gate`] и спавнен
+    /// [`crate::account_submit::spawn_sell_taker`], но
+    /// [`crate::account_close_position::close_position_after_submit`] ещё не
+    /// финализировал PnL (BUY/maker-TP/taker-FAK invoke'ы в полёте).
+    pub pending_close_positions: Arc<RwLock<HashMap<LaneKey, LanePositions>>>,
     /// HTTP с rustls; тот же `Arc`, что у [`ProjectManager::http`](crate::project_manager::ProjectManager::http).
     pub http: Arc<reqwest::Client>,
     /// Общий unauth CLOB SDK-клиент (клоны в PM и др.).
@@ -112,7 +112,7 @@ impl Account {
             max_drawdown_pct: Arc::new(RwLock::new(0.0)),
             last_prob: Arc::new(RwLock::new(HashMap::new())),
             positions: Arc::new(RwLock::new(HashMap::new())),
-            recently_resolved_markets: Arc::new(RwLock::new(IndexSet::new())),
+            pending_close_positions: Arc::new(RwLock::new(HashMap::new())),
             http,
             clob,
             gamma,
@@ -137,15 +137,19 @@ impl Account {
     }
 
     /// Пустые buckets лейнов валюты ([`crate::real_sim::run_real_sim`]); `or_default` идемпотентен.
+    /// Параллельно создаём bucket в [`Self::pending_close_positions`] под тем
+    /// же [`LaneKey`], чтобы `tick_once` мог брать `.read()` без `or_default`.
     pub async fn register_currency_lanes(
         &self,
         currency: &str,
         lanes: &[(XFrameIntervalKind, CurrencyUpDownOutcome)],
     ) {
         let mut positions = self.positions.write().await;
+        let mut pending = self.pending_close_positions.write().await;
         for (interval, side) in lanes {
             let key = (currency.to_string(), *interval, *side);
             positions.entry(key.clone()).or_default();
+            pending.entry(key).or_default();
         }
     }
 
@@ -171,13 +175,6 @@ impl Account {
         final_price: Option<f64>,
     ) {
         // bankroll → positions → recently_resolved
-        let mut recently_resolved = account.recently_resolved_markets.write().await;
-        if recently_resolved.insert(market_id.to_string()) {
-            while recently_resolved.len() > RECENTLY_RESOLVED_MARKETS_CAP {
-                recently_resolved.shift_remove_index(0);
-            }
-        }
-        drop(recently_resolved);
 
         let mut positions = account.positions.write().await;
         let mut to_close: Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)> = Vec::new();

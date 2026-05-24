@@ -636,10 +636,26 @@ pub(crate) fn spawn_open_buy_taker(
         // в lane и `manage_positions` / MtM-учёт будут видеть несуществующий BUY.
         // Идемпотентно (lane_positions::remove(non-existent) — no-op), всегда обходим
         // все lane'ы, т.к. `LaneKey` сюда не пробрасывается.
+        //
+        // Парно дреним `pending_close_positions` (зеркало `close_position_after_submit`):
+        // если manage_positions в next-tick'е уже успела переселить позицию
+        // туда (sell_gate сработал на planned-фрейме до того, как BUY-invoke
+        // вернул fail), её надо вычистить — иначе `position_size` навсегда
+        // зависнет в `available_bankroll`/MtM, ведь `close_position_after_submit`
+        // в BUY-fail сценарии не зовётся (sell_taker сделает early return на
+        // `!buy_rep.success`). Лок-порядок: positions → pending_close.
         let drain_position_from_account = || async {
-            let mut positions_guard = account.positions.write().await;
-            for lane_positions in positions_guard.values_mut() {
-                lane_positions.remove(&pos_id);
+            {
+                let mut positions_guard = account.positions.write().await;
+                for lane_positions in positions_guard.values_mut() {
+                    lane_positions.remove(&pos_id);
+                }
+            }
+            {
+                let mut pending_guard = account.pending_close_positions.write().await;
+                for lane_pending in pending_guard.values_mut() {
+                    lane_pending.remove(&pos_id);
+                }
             }
         };
 

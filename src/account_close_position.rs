@@ -477,6 +477,12 @@ pub(crate) async fn close_position_after_submit(
             lane_positions.remove(&pos_id);
         }
     }
+    {
+        let mut pending_guard = account.pending_close_positions.write().await;
+        for lane_pending in pending_guard.values_mut() {
+            lane_pending.remove(&pos_id);
+        }
+    }
 
     // Sanity-check: `buy_rep.making_amount` (authoritative от CLOB) должен биться с
     // `position.position_size`, который был применён в `spawn_open_buy_taker`.

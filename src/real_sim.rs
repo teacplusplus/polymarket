@@ -367,6 +367,7 @@ async fn tick_once(
     } = lane_frame;
 
     let tick_started = Instant::now();
+    let now_wall_ms = current_timestamp_ms();
 
     let market_changed = last_market_id.as_deref() != Some(market_id.as_str());
 
@@ -409,18 +410,20 @@ async fn tick_once(
         last_prob.insert(lane_key.clone(), currency_implied_prob);
     }
 
+    let market_already_resolved = event_end_ms
+        .is_some_and(|end_ms| now_wall_ms >= end_ms);
+
     let (
         has_positions,
         needs_sell,
         available_bankroll_pre,
         dd_halt_active,
         account_max_dd_pct,
-        market_already_resolved,
     ) = {
         let bankroll_guard = account.bankroll.read().await;
         let max_dd_guard = account.max_drawdown_pct.read().await;
         let positions_guard = account.positions.read().await;
-        let recently_resolved_guard = account.recently_resolved_markets.read().await;
+        let pending_close_guard = account.pending_close_positions.read().await;
 
         let this_positions = positions_guard
             .get(&lane_key)
@@ -431,19 +434,22 @@ async fn tick_once(
                 total_locked += p.read().await.position_size;
             }
         }
+        for v in pending_close_guard.values() {
+            for p in v.values() {
+                total_locked += p.read().await.position_size;
+            }
+        }
         let available = (*bankroll_guard - total_locked).max(0.0);
         let dd_halt = match crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT {
             Some(threshold) => *max_dd_guard >= threshold,
             None => false,
         };
-        let market_resolved = recently_resolved_guard.contains(market_id.as_str());
         (
             !this_positions.is_empty(),
             any_position_would_sell(this_positions, &frame, None).await,
             available,
             dd_halt,
             *max_dd_guard,
-            market_resolved,
         )
     };
 
@@ -467,7 +473,6 @@ async fn tick_once(
     );
     // Submit/Mock: новые BUY только при wall-clock внутри `[event_start_ms, event_end_ms)` от Gamma.
     // Для `SubmitMode::None` (чисто виртуальный fill) window-гейта нет.
-    let now_wall_ms = current_timestamp_ms();
     let submit_market_window_open: bool = match (event_start_ms, event_end_ms) {
         (Some(start_ms), Some(end_ms)) => now_wall_ms >= start_ms && now_wall_ms < end_ms,
         _ => false,
@@ -535,7 +540,6 @@ async fn tick_once(
         let mut max_dd_guard = account.max_drawdown_pct.write().await;
         let mut last_prob_guard = account.last_prob.write().await;
         let mut positions_guard = account.positions.write().await;
-        let recently_resolved_guard = account.recently_resolved_markets.read().await;
 
         last_prob_guard.insert(lane_key.clone(), effective_prob);
 
@@ -550,13 +554,17 @@ async fn tick_once(
                 *max_dd_guard
             );
         }
-        let market_resolved_now = recently_resolved_guard.contains(market_id.as_str());
+
+        let now_after_http_ms = current_timestamp_ms();
+        let market_resolved_now = event_end_ms
+            .is_some_and(|end_ms| now_after_http_ms >= end_ms);
         if !market_already_resolved && market_resolved_now && may_open {
             crate::tee_eprintln!(
-                "[real_sim] {tag}: market={market_id} резолвнулся между snapshot'ом и HTTP — отмена входа"
+                "[real_sim] {tag}: market={market_id} прошёл event_end_ms между snapshot'ом и HTTP \
+                 (now={now_after_http_ms} end={:?}) — отмена входа",
+                event_end_ms,
             );
         }
-        drop(recently_resolved_guard);
         let may_open = may_open && !dd_halt_now && !market_resolved_now;
 
         if has_positions || may_open {
@@ -567,6 +575,18 @@ async fn tick_once(
                 }
                 for p in v.values() {
                     cross_lanes_locked += p.read().await.position_size;
+                }
+            }
+            let mut cross_lanes_pending_locked = 0.0;
+            {
+                let pending_close_guard = account.pending_close_positions.read().await;
+                for (k, v) in pending_close_guard.iter() {
+                    if k == &lane_key {
+                        continue;
+                    }
+                    for p in v.values() {
+                        cross_lanes_pending_locked += p.read().await.position_size;
+                    }
                 }
             }
 
@@ -595,6 +615,7 @@ async fn tick_once(
                     submit_mode,
                     Some(project_manager),
                     account,
+                    &lane_key,
                 )
                 .await;
                 if needs_sell && tick_started.elapsed() > TICK_OPEN_MAX_ELAPSED {
@@ -620,9 +641,23 @@ async fn tick_once(
                     for p in this_positions.values() {
                         same_locked_post += p.read().await.position_size;
                     }
+                    let mut same_lane_pending_locked_post = 0.0;
+                    {
+                        let pending_close_guard =
+                            account.pending_close_positions.read().await;
+                        if let Some(v) = pending_close_guard.get(&lane_key) {
+                            for p in v.values() {
+                                same_lane_pending_locked_post += p.read().await.position_size;
+                            }
+                        }
+                    }
                     let bankroll_post = *account.bankroll.read().await;
-                    let available_bankroll_post =
-                        (bankroll_post - cross_lanes_locked - same_locked_post).max(0.0);
+                    let available_bankroll_post = (bankroll_post
+                        - cross_lanes_locked
+                        - cross_lanes_pending_locked
+                        - same_locked_post
+                        - same_lane_pending_locked_post)
+                        .max(0.0);
                     let polymarket_url =
                         polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
                     let graph_dump_bin_path_str = gamma_question
@@ -668,7 +703,11 @@ async fn tick_once(
 
         let total_value: f64 = {
             let mut active = 0.0;
-            for ((c, i, s), pos_vec) in positions_guard.iter() {
+            let pending_close_guard = account.pending_close_positions.read().await;
+            for ((c, i, s), pos_vec) in positions_guard
+                .iter()
+                .chain(pending_close_guard.iter())
+            {
                 let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
                     effective_prob
                 } else {

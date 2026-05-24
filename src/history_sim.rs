@@ -831,6 +831,7 @@ pub(crate) async fn run_side_simulation(
                 crate::account_submit::SubmitMode::None,
                 None,
                 account,
+                lane_key,
             )
             .await;
         }
@@ -1420,6 +1421,14 @@ pub(crate) async fn any_position_would_sell(
 /// и заполненным `pnl`; `close_order_id` пуст. Это шаблон, который
 /// real-торговля заменит на «push с `PendingClose` + `Some(order_id)`,
 /// без правок `bankroll` — pnl и инкременты сделает WS-колбек».
+///
+/// `lane_key` нужен только для submit-веток ([`spawn_sell_taker`](crate::account_submit::spawn_sell_taker)):
+/// перед спавном продавца мы перекладываем `pos_arc` из `positions` в
+/// [`crate::account::Account::pending_close_positions`] (под тем же ключом),
+/// чтобы `position_size` оставался залоченым в `available_bankroll` и MtM
+/// equity до тех пор, пока [`crate::account_close_position::close_position_after_submit`]
+/// не зачислит выручку в `bankroll`. В `SubmitMode::None` ветке этот ключ
+/// не используется (закрытие синхронное, окна нет).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn manage_positions(
     positions: &mut LanePositions,
@@ -1432,6 +1441,7 @@ pub(crate) async fn manage_positions(
     submit_mode: crate::account_submit::SubmitMode,
     project_manager: Option<&Arc<ProjectManager>>,
     account: &SharedAccount,
+    lane_key: &(String, XFrameIntervalKind, CurrencyUpDownOutcome),
 ) -> bool {
     for pos in positions.values_mut() {
         pos.write().await.frames_held += 1;
@@ -1516,6 +1526,22 @@ pub(crate) async fn manage_positions(
                     }
                 }
             } else {
+                // Перекладываем позицию из `positions` (откуда она уже выпала
+                // через `std::mem::take`) в `pending_close_positions[lane_key]`
+                // ДО спавна продавца. Так `available_bankroll` (см.
+                // [`crate::real_sim::tick_once`]) и MtM equity продолжают
+                // вычитать `position_size` / учитывать `shares_held × prob`,
+                // пока async maker-TP / taker-FAK / post-market-end residual
+                // не приведут к [`crate::account_close_position::close_position_after_submit`],
+                // который вычистит позицию из обоих мапов одним блоком.
+                {
+                    let mut pending_guard =
+                        account.pending_close_positions.write().await;
+                    let lane_pending = pending_guard
+                        .entry(lane_key.clone())
+                        .or_default();
+                    lane_pending.insert(pos_id.clone(), pos_arc.clone());
+                }
                 crate::account_submit::spawn_sell_taker(
                     account.clone(),
                     project_manager.cloned(),
