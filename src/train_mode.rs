@@ -302,7 +302,7 @@ impl Calibration {
 
 /// Прогон `run_side_simulation` по val-маркетам с `is_kelly=false` и identity-калибровкой:
 /// возвращает пары `(raw_pred_at_open, won)` со всех **закрытых** трейдов
-/// ([`crate::account_close_position::close_position_market_exit`] + [`crate::account::Account::resolve_pending_market_sync`]).
+/// ([`crate::account_close_position::close_position`] + [`crate::account::Account::resolve_pending_market_sync`]).
 ///
 /// # Зачем
 ///
@@ -531,7 +531,7 @@ async fn fit_calibration_via_sim_replay(
         markets_processed += 1;
     }
 
-    // Defensive sweep: `close_position_market_exit` / `Account::resolve_pending_market_sync`
+    // Defensive sweep: `close_position` / `Account::resolve_pending_market_sync`
     // выше клали строки в `TRADE_CSV_PENDING` (in-memory буфер). Для каждого
     // маркета `resolve_pending_market_sync` вызывает `record_market_outcome`,
     // который дренирует свой `market_id` (с writer == None строки уходят в

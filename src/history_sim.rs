@@ -32,7 +32,8 @@ use xgb::{Booster, DMatrix};
 /// Нижний порог raw перед Kelly (`f* > 0`).
 pub const SIM_BUY_THRESHOLD: f32 = 0.60;
 
-/// Max отклонение VWAP от L1 при strict fill; voluntary TP может обойти cap ([`sell_gate`], [`crate::account_close_position::close_position_market_exit`]).
+/// Max отклонение VWAP от L1 при strict fill; voluntary TP может обойти cap
+/// ([`sell_gate`], [`crate::account_close_position::gross_usdc_sell_take_profit`]).
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый банкролл (USDC).
@@ -280,7 +281,7 @@ pub struct OpenPosition {
     pub(crate) position_size: f64,
     /// План: целевые USDC от Kelly (входной `amount`). Никогда не меняется после создания.
     pub(crate) planned_entry_cost: f64,
-    /// L1 bid на входе (maker TP в [`crate::account_close_position::close_position_market_exit`]).
+    /// L1 bid на входе (maker TP в [`crate::account_close_position::close_position`]).
     pub(crate) best_bid_at_entry: Option<f64>,
     /// Кадров удержания ([`POSITION_TIMEOUT_FRAMES`]).
     pub(crate) frames_held: usize,
@@ -463,6 +464,12 @@ pub enum CloseReason {
     EvExitProfit,
     /// Hold-zone: продать выгоднее ждать резолюцию, цена ниже входа.
     EvExitLoss,
+    /// Резолюция рынка: наша сторона выиграла ($1/шер payout). Производит
+    /// [`crate::account::Account::resolve_pending_market_sync`].
+    ResolutionWin,
+    /// Резолюция рынка: наша сторона проиграла ($0/шер payout). Производит
+    /// [`crate::account::Account::resolve_pending_market_sync`].
+    ResolutionLoss,
 }
 
 impl CloseReason {
@@ -806,11 +813,11 @@ pub(crate) async fn run_side_simulation(
         }
         let pnl_inference = compute_pnl_inference(frame, booster_pnl, calibration_pnl, is_kelly);
 
-        // Фаза 1: manage_positions. Берём поля Account под отдельными write-локами
-        // в каноническом порядке (`bankroll → positions → closing`),
-        // как в real_sim::tick_once — иначе deadlock с другими потребителями.
+        // Фаза 1: manage_positions. `bankroll` пред-захватывать не нужно —
+        // [`crate::account_close_position::close_position`] сам берёт
+        // `account.bankroll.write().await` под коротким локом для apply'я PNL.
+        // Держим только `account.positions.write()` (drain внутри iter'а).
         {
-            let mut bankroll = account.bankroll.write().await;
             let mut positions = account.positions.write().await;
             let positions_v = positions.entry(lane_key.clone()).or_default();
             manage_positions(
@@ -819,7 +826,6 @@ pub(crate) async fn run_side_simulation(
                 is_last_idx,
                 p_win_now,
                 side_stats,
-                &mut bankroll,
                 None,
                 Some(MINPOSITION_FRAMES),
                 crate::account_submit::SubmitMode::None,
@@ -1176,7 +1182,7 @@ pub(crate) enum SellGate {
     HoldPnl,
     /// Hold-zone: SL + EV; caller записывает `new_p_win_ema` в позицию.
     HoldResolution { new_p_win_ema: Option<f64> },
-    /// Закрыть по VWAP `exit_price` и причине (maker vs taker fee в [`crate::account_close_position::close_position_market_exit`]).
+    /// Закрыть по VWAP `exit_price` и причине (maker vs taker fee в [`crate::account_close_position::close_position`]).
     Close { exit_price: f64, reason: CloseReason },
 }
 
@@ -1393,7 +1399,7 @@ pub(crate) async fn any_position_would_sell(
     false
 }
 
-/// Закрытия через [`sell_gate`] / [`crate::account_close_position::close_position_market_exit`]; чужой `asset_id` (позиция
+/// Закрытия через [`sell_gate`] / [`crate::account_close_position::close_position`]; чужой `asset_id` (позиция
 /// другого маркета той же лейны) — позиция возвращается в `positions` как
 /// «припаркованная» и ждёт [`crate::account::Account::resolve_pending_market_sync`].
 /// `true`, если был хотя бы один успешный close (bankroll обновился).
@@ -1409,7 +1415,7 @@ pub(crate) async fn any_position_would_sell(
 /// явного `apply_user_ws_event`.
 ///
 /// **Hot-path для виртуальной торговли (history_sim/real_sim):** после
-/// успешного [`crate::account_close_position::close_position_market_exit`] (PnL уже учтён в `bankroll`/`stats`) сюда
+/// успешного [`crate::account_close_position::close_position`] (PnL уже учтён в `bankroll`/`stats`) сюда
 /// пушится `ClosingPosition` со статусом [`ClosingPositionStatus::Closed`]
 /// и заполненным `pnl`; `close_order_id` пуст. Это шаблон, который
 /// real-торговля заменит на «push с `PendingClose` + `Some(order_id)`,
@@ -1421,7 +1427,6 @@ pub(crate) async fn manage_positions(
     is_last: bool,
     p_win_now: Option<f64>,
     stats: &mut SideStats,
-    bankroll: &mut f64,
     strict_book: Option<&StrictBook>,
     min_position_frames: Option<usize>,
     submit_mode: crate::account_submit::SubmitMode,
@@ -1470,19 +1475,45 @@ pub(crate) async fn manage_positions(
         };
         if let Some((exit_price, reason)) = close {
             if submit_mode == crate::account_submit::SubmitMode::None {
-                if crate::account_close_position::close_position_market_exit(
-                    bankroll,
-                    &mut remaining,
-                    pos_id,
-                    pos_arc,
-                    &snapshot,
-                    exit_price,
-                    &reason,
-                    frame,
-                    stats,
-                    strict_book,
-                ) {
-                    sold = true;
+                // Bid-walk (voluntary TP может ослабить L1-cap через
+                // [`crate::account_close_position::gross_usdc_sell_take_profit`];
+                // non-voluntary всегда полный
+                // book-fill без cap). Если стакан не дал заполниться — позиция
+                // возвращается в `remaining`, инкремент skip-счётчика.
+                // `exit_price` от `sell_gate` тут не используется: в
+                // [`crate::account_close_position::close_position`] sell-VWAP
+                // вычисляется из `gross_usdc / shares_held` (а в резолюции —
+                // бинарно через `reason`), `exit_price` нужен только
+                // submit-ветке для taker-FAK price-hint'а ниже.
+                let gross_usdc_opt = if reason.is_voluntary_exit() {
+                    crate::account_close_position::gross_usdc_sell_take_profit(
+                        frame,
+                        &snapshot,
+                        strict_book,
+                    )
+                } else {
+                    match strict_book {
+                        Some(book) => book_fill_sell_strict(book, snapshot.shares_held, None),
+                        None => book_fill_sell(frame, snapshot.shares_held, None),
+                    }
+                };
+                match gross_usdc_opt {
+                    Some(gross_usdc) => {
+                        crate::account_close_position::close_position(
+                            account,
+                            &pos_arc,
+                            stats,
+                            &reason,
+                            Some(gross_usdc),
+                            frame.event_remaining_ms,
+                        )
+                        .await;
+                        sold = true;
+                    }
+                    None => {
+                        stats.kelly_strict_sell_skips += 1;
+                        remaining.insert(pos_id, pos_arc);
+                    }
                 }
             } else {
                 crate::account_submit::spawn_sell_taker(
@@ -1503,7 +1534,7 @@ pub(crate) async fn manage_positions(
     sold
 }
 
-/// Доля выигрыша при TP: вход taker по `entry_prob`, выход по TP; maker/taker выхода по `best_bid_at_entry` (как в [`crate::account_close_position::close_position_market_exit`]).
+/// Доля выигрыша при TP: вход taker по `entry_prob`, выход по TP; maker/taker выхода по `best_bid_at_entry` (как в [`crate::account_close_position::close_position`]).
 fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
     let tp_is_maker = match best_bid_at_entry {
@@ -1514,7 +1545,7 @@ fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
     (net - 1.0).max(1e-9)
 }
 
-/// Доля убытка при SL: всегда taker на выходе (как [`crate::account_close_position::close_position_market_exit`] на SL).
+/// Доля убытка при SL: всегда taker на выходе (как [`crate::account_close_position::close_position`] на SL).
 fn kelly_loss_ratio(entry_prob: f64) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_STOP_LOSS_PP).clamp(0.001, 0.999);
     let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ true);
@@ -1666,6 +1697,8 @@ pub(crate) fn trade_csv_close_reason_label(reason: &CloseReason) -> &'static str
         CloseReason::Timeout => "Timeout",
         CloseReason::EvExitProfit => "EvExitProfit",
         CloseReason::EvExitLoss => "EvExitLoss",
+        CloseReason::ResolutionWin => "ResolutionWin",
+        CloseReason::ResolutionLoss => "ResolutionLoss",
     }
 }
 

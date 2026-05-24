@@ -19,6 +19,7 @@ use crate::account_order::{
     SingleOrderClobInvocationReport, invoke_settlement_ready, invoke_settlement_report,
     invoke_settlement_watch, wait_invoke_settlement,
 };
+use crate::constants::CurrencyUpDownOutcome;
 use crate::history_sim::{
     CloseReason, ClosingPosition, SIM_MAX_SLIPPAGE_FROM_L1_PCT, SharedClosingPosition,
     SharedOpenPosition, StrictBook,
@@ -553,8 +554,7 @@ pub(crate) fn spawn_sell_taker(
             &account,
             &position,
             project_manager.as_ref(),
-            Some(&reason),
-            "Taker",
+            &reason,
             "taker_sell_fill",
         )
         .await;
@@ -759,9 +759,9 @@ pub(crate) fn spawn_open_buy_taker(
         // через `OpenPosition::close_after_submit_finalized`. `event_end_ms = None`
         // — не спавним (нет времени, на которое можно ориентироваться).
         if let Some(end_ms) = event_end_ms {
-            let account_post_end = account.clone();
-            let project_manager_post_end = project_manager.clone();
-            let position_post_end = position.clone();
+            let account_cloned = account.clone();
+            let project_manager_cloned = project_manager.clone();
+            let position_cloned = position.clone();
             let pos_id_post_end = pos_id.clone();
             tokio::spawn(async move {
                 let target_ms = end_ms.saturating_add(POST_MARKET_END_RESOLUTION_DELAY_MS as i64);
@@ -770,7 +770,7 @@ pub(crate) fn spawn_open_buy_taker(
                 if wait_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                 }
-                let shares_remaining = match position_post_end
+                let shares_remaining = match position_cloned
                     .read()
                     .await
                     .clone()
@@ -797,19 +797,91 @@ pub(crate) fn spawn_open_buy_taker(
                 if shares_remaining <= CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE {
                     return;
                 }
+                // MarketResolution lookup + UP/DOWN winner определяем здесь
+                // (caller-side), чтобы передать готовый `CloseReason::Resolution*`
+                // в `close_position_after_submit` — внутри метода reason больше
+                // не Option, и разводить логику на лету не приходится.
+                // Если данных нет (project_manager отсутствует / MarketResolution
+                // не положен / final_price=None) — выходим, флаг финализации
+                // НЕ взводим: следующий refine может прийти и нас перевызовут.
+                let Some(project_manager_cloned) = project_manager_cloned.as_ref() else {
+                    crate::tee_eprintln!(
+                        "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                         project_manager=None — финализация невозможна, пропуск",
+                    );
+                    return;
+                };
+                let (market_id, our_side) = {
+                    let position_read = position_cloned.read().await;
+                    (
+                        position_read.market_id.clone(),
+                        CurrencyUpDownOutcome::from_i32(
+                            position_read.currency_up_down_outcome_at_open,
+                        ),
+                    )
+                };
+                let market_resolution = project_manager_cloned
+                    .market_resolution_by_market
+                    .read()
+                    .await
+                    .get(&market_id)
+                    .copied();
+                let Some(market_resolution) = market_resolution else {
+                    crate::tee_eprintln!(
+                        "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                         market_id={market_id}: MarketResolution отсутствует в кэше \
+                         — финализация отложена",
+                    );
+                    return;
+                };
+                let Some(final_price) = market_resolution.final_price else {
+                    crate::tee_eprintln!(
+                        "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                         market_id={market_id}: final_price=None (refine следующего \
+                         окна ещё не пришёл) — финализация отложена",
+                    );
+                    return;
+                };
+                let price_to_beat = market_resolution.price_to_beat;
+                let up_won = final_price >= price_to_beat;
+                let token_won = match our_side {
+                    Some(CurrencyUpDownOutcome::Up) => up_won,
+                    Some(CurrencyUpDownOutcome::Down) => !up_won,
+                    None => {
+                        crate::tee_eprintln!(
+                            "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                             неизвестный currency_up_down_outcome_at_open — \
+                             финализируем как ResolutionLoss",
+                        );
+                        false
+                    }
+                };
+                let reason = if token_won {
+                    CloseReason::ResolutionWin
+                } else {
+                    CloseReason::ResolutionLoss
+                };
+                // Записываем актуальные `price_to_beat` / `final_price` в позицию
+                // ДО вызова close_position_after_submit: CSV-логгер внутри читает
+                // эти поля из `position_snapshot` напрямую (resolution-override
+                // как отдельный аргумент больше не передаём).
+                {
+                    let mut position_write = position_cloned.write().await;
+                    position_write.price_to_beat = Some(price_to_beat);
+                    position_write.final_price = Some(final_price);
+                }
                 crate::tee_println!(
-                    "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
-                     остаток {shares_remaining:.6} шер на счёте после market end + \
-                     {POST_MARKET_END_RESOLUTION_DELAY_MS}ms — финализируем через \
-                     close_position_after_submit с reason=None (residual @ $0/$1 \
-                     по MarketResolution)",
+                    "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                     market_id={market_id}: остаток {shares_remaining:.6} шер после \
+                     market end + {POST_MARKET_END_RESOLUTION_DELAY_MS}ms; \
+                     price_to_beat={price_to_beat:.6} final_price={final_price:.6} \
+                     up_won={up_won} token_won={token_won} → reason={reason:?}",
                 );
                 crate::account_close_position::close_position_after_submit(
-                    &account_post_end,
-                    &position_post_end,
-                    project_manager_post_end.as_ref(),
-                    None,
-                    "Residual",
+                    &account_cloned,
+                    &position_cloned,
+                    Some(project_manager_cloned),
+                    &reason,
                     "post_market_end_residual",
                 )
                 .await;
@@ -947,8 +1019,7 @@ pub(crate) fn spawn_open_buy_taker(
             &account,
             &position,
             project_manager.as_ref(),
-            Some(&CloseReason::TakeProfit),
-            "Maker",
+            &CloseReason::TakeProfit,
             "maker_tp_fill",
         )
         .await;

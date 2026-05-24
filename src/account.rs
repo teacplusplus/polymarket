@@ -5,7 +5,7 @@
 use crate::account_order_completion::TrackerEntry;
 use crate::account_proxy::PolyProxyEnvGuard;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
-use crate::history_sim::{INITIAL_BANKROLL, LanePositions, SharedOpenPosition};
+use crate::history_sim::{CloseReason, INITIAL_BANKROLL, LanePositions, SharedOpenPosition};
 use crate::real_sim::RealSimState;
 use crate::sim_stats::SimStats;
 use alloy::signers::Signer as _;
@@ -214,14 +214,29 @@ impl Account {
                 CurrencyUpDownOutcome::Up => &mut sim_stats.up,
                 CurrencyUpDownOutcome::Down => &mut sim_stats.down,
             };
-            crate::account_close_position::close_position_resolution(
+            // Записываем свежий `final_price` в саму позицию ДО `close_position`:
+            // CSV-логгер внутри читает `pos.final_price` (override-параметра
+            // больше нет). При None — оставляем то, что уже стояло (могло быть
+            // выставлено в `open_position`).
+            if let Some(fp) = final_price {
+                pos_arc.write().await.final_price = Some(fp);
+            }
+            let reason = if token_won {
+                CloseReason::ResolutionWin
+            } else {
+                CloseReason::ResolutionLoss
+            };
+            // `gross_usdc=None` → close_position сам выведет `shares_held` /
+            // `0.0` из `reason` (см. дефолт внутри); `pos_arc`/`account`
+            // разворачиваются под коротким локом ВНУТРИ функции — здесь не
+            // держим ни pos.read, ни bankroll.write.
+            crate::account_close_position::close_position(
                 account,
-                pos_arc,
-                token_won,
-                currency,
-                market_id,
-                final_price,
+                &pos_arc,
                 side_stats,
+                &reason,
+                None,
+                0,
             )
             .await;
         }

@@ -1,5 +1,5 @@
 //! Per-trade CSV-лог симуляции: одна строка на каждую закрытую позицию
-//! (рыночное закрытие через [`crate::account_close_position::close_position_market_exit`] **и**
+//! (рыночное закрытие через [`crate::account_close_position::close_position`] **и**
 //! резолюционное закрытие через [`crate::account::Account::resolve_pending_market_sync`]).
 //!
 //! # Зачем отдельный CSV рядом с `last_history_sim.txt`?
@@ -14,7 +14,7 @@
 //! # Когда пишется
 //!
 //! * **Рыночные закрытия** (TP / SL / Timeout / EvExit*): из
-//!   [`crate::account_close_position::close_position_market_exit`] — после успешного `book_fill_sell*`,
+//!   [`crate::account_close_position::close_position`] — после успешного `book_fill_sell*`,
 //!   когда `pnl` уже посчитан и записан в `SideStats`.
 //! * **Резолюционные закрытия** (бинарная выплата $1/$0): из
 //!   [`crate::account::Account::resolve_pending_market_sync`] — после
@@ -133,8 +133,8 @@ pub fn init_trade_csv_log_file(path: &Path) -> std::io::Result<()> {
 /// Очищает [`TRADE_CSV_PENDING`] **без** записи в файл.
 ///
 /// Нужно для побочных запусков sim'а, которые делают `write_trade_csv_row`
-/// (через [`crate::account_close_position`] — `close_position_market_exit` /
-/// `close_position_resolution` / `close_position_maker_tp`), но
+/// (через [`crate::account_close_position`] — `close_position` для
+/// backtest/real_sim/резолюции, `close_position_after_submit` для submit), но
 /// не должны попасть в финальный CSV — например, sim-replay калибровка
 /// в [`crate::train_mode::fit_calibration_via_sim_replay`]. После каждого
 /// маркета `record_market_outcome` дренирует свои строки из буфера, но
@@ -182,7 +182,7 @@ pub fn finish_trade_csv_log() {
 ///
 /// Поля без значения (например, `p_win_ema_at_close` для резолюционного
 /// закрытия — там EMA не считается) кодируются как пустая строка в CSV
-/// (стандартное поведение для NULL). Submit-only поля (`pos_id`, `fill_role`,
+/// (стандартное поведение для NULL). Submit-only поля (`pos_id`,
 /// `finalized_via`, `planned_*`, `*_order_id`) пишет только submit-CSV
 /// ([`write_submit_trade_csv_row`]); регулярный writer
 /// ([`write_trade_csv_row`]) их молча игнорирует — это позволяет одной и той
@@ -259,12 +259,8 @@ pub struct TradeCsvRow<'a> {
     /// `OpenPosition::id` (локальный uuid логов). Пишется как есть; для не-submit
     /// caller'ов передавайте `&pos.id`, для full-virtual без позиции — `""`.
     pub pos_id: &'a str,
-    /// Каким ордером финализирована позиция (`"Maker"` / `"Taker"`). Пусто для
-    /// не-submit caller'ов.
-    pub fill_role: &'static str,
     /// Терминальный путь закрытия (`"maker_tp_fill"` / `"taker_fak_sell"` /
-    /// `"resolution"` …); удобно как одиночная колонка в анализе вместо пары
-    /// (`exit_reason`, `fill_role`). Пусто для не-submit caller'ов.
+    /// `"post_market_end_residual"` …). Пусто для не-submit caller'ов.
     pub finalized_via: &'static str,
     /// План: VWAP входа на момент построения [`crate::history_sim::OpenPosition`]
     /// (snapshot до WS-fills). `None` → пустая ячейка в CSV.
@@ -477,7 +473,7 @@ fn write_pending_row_to_file(w: &mut BufWriter<File>, row: &PendingTradeRow, fin
 // строку на терминальное событие ордера (taker SELL match SL/Timeout/EvExit*
 // или maker TP fill). По сравнению с базовым `TradeCsvRow`:
 //   * Расширенная структура (plan vs actual цифры, все три order_id'а,
-//     fill_role, finalized_via).
+//     finalized_via).
 //   * Без буфера / `final_outcome` — submit-закрытие происходит до резолюции
 //     маркета, исход `up_won` ещё не известен; если нужен — JOIN с
 //     `last_real_sim_with_submit_trades.csv` по `market_id`.
@@ -491,7 +487,7 @@ pub static SUBMIT_TRADE_CSV_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(Non
 /// CSV-заголовок submit-orders файла. Порядок строго совпадает с
 /// [`write_submit_trade_csv_row_to_file`].
 const SUBMIT_TRADE_CSV_HEADER: &str = "regime,pos_id,polymarket_url,price_to_beat,final_price,\
-currency,interval,side,market_id,asset_id,exit_reason,fill_role,finalized_via,\
+currency,interval,side,market_id,asset_id,exit_reason,finalized_via,\
 planned_buy_price,buy_price,planned_shares_held,shares_held,planned_entry_cost,entry_cost,\
 exit_price,fee_usdc,pnl,\
 open_order_id,tp_order_id,close_order_ids,\
@@ -526,7 +522,7 @@ pub fn finish_submit_trade_csv_log() {
 
 /// Пишет одну строку в submit-orders CSV ([`SUBMIT_TRADE_CSV_LOG`]) из той же
 /// [`TradeCsvRow`], что и [`write_trade_csv_row`] — submit-only поля
-/// (`pos_id`, `fill_role`, `finalized_via`, `planned_*`, `*_order_id`)
+/// (`pos_id`, `finalized_via`, `planned_*`, `*_order_id`)
 /// дополняют общие, см. их комментарии в [`TradeCsvRow`]. Без буфера —
 /// submit-закрытие не зависит от резолюции маркета (см. модульный
 /// комментарий выше у [`SUBMIT_TRADE_CSV_HEADER`]). Если writer не открыт
@@ -543,7 +539,7 @@ pub fn write_submit_trade_csv_row(row: TradeCsvRow<'_>) {
     };
     let _ = writeln!(
         writer,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         regime,
         csv_escape(row.pos_id),
         csv_escape(row.polymarket_url),
@@ -555,7 +551,6 @@ pub fn write_submit_trade_csv_row(row: TradeCsvRow<'_>) {
         csv_escape(row.market_id),
         csv_escape(row.asset_id),
         row.exit_reason,
-        row.fill_role,
         row.finalized_via,
         row.planned_buy_price.map(fmt_f64).unwrap_or_default(),
         fmt_f64(row.buy_price),

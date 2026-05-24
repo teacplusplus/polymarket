@@ -1,21 +1,28 @@
 //! Все ветки закрытия позиций в одном месте; ранее жили по `history_sim` /
-//! `account` / `account_submit`. Каждая ветка обновляет `bankroll` (для submit /
-//! resolution) и [`crate::sim_stats::SideStats`] (`pnl_usd` / `trades` / `wins` /
-//! `losses` / `closed_trade_entries` + специфичные счётчики), пишет
+//! `account` / `account_submit`. Каждая ветка обновляет `bankroll` и
+//! [`crate::sim_stats::SideStats`] (`pnl_usd` / `trades` / `wins` / `losses` /
+//! `closed_trade_entries` + специфичные счётчики), пишет
 //! [`crate::trade_csv_log::TradeCsvRow`]; submit-ветка дополнительно пишет
 //! `SUBMIT_TRADE_CSV_LOG` и спавнит partial-graph HTML.
 //!
-//! * [`close_position_market_exit`] — backtest / real_sim bid-walk выход
-//!   (TP / SL / Timeout / EvExit), вызывается из [`crate::history_sim::manage_positions`].
-//! * [`close_position_resolution`] — бинарный payout $1/$0, вызывается из
-//!   [`crate::account::Account::resolve_pending_market_sync`].
-//! * [`close_position_after_sell`] — успешный SELL-fill в submit/mock (maker-TP
-//!   `resting → fill` или taker-FAK SELL, который выбрал остаток до ~0). Вызывается
-//!   из [`crate::account_submit::spawn_open_buy_taker`] (после settle maker invoke)
-//!   и [`crate::account_submit::spawn_sell_taker`] (после settle taker invoke, если
-//!   `shares_remaining_to_sell ≈ 0`). Гард на `sell_rep.success / !partial` — у
-//!   caller'а (см. соответствующие `if !*_rep.success || *_rep.partial { return; }`
-//!   перед вызовом). Resolution submit — отдельным промтом, сейчас ветки нет.
+//! * [`close_position`] — единая ветка для **non-submit** закрытий:
+//!     * backtest / real_sim рыночный выход (TP / SL / Timeout / EvExit) через
+//!       bid-walk — вызывается из [`crate::history_sim::manage_positions`] после
+//!       того как caller подготовил `gross_usdc` (либо
+//!       [`gross_usdc_sell_take_profit`] для voluntary, либо
+//!       прямого `book_fill_sell*`);
+//!     * резолюция рынка ($1/$0 бинарный payout) — из
+//!       [`crate::account::Account::resolve_pending_market_sync`]; caller
+//!       подставляет `reason = CloseReason::Resolution{Win,Loss}` и
+//!       `gross_usdc = shares_held` (win) / `0` (loss).
+//! * [`close_position_after_submit`] — успешный SELL-fill в submit/mock
+//!   (maker-TP `resting → fill` или taker-FAK SELL, который выбрал остаток до ~0),
+//!   плюс post-market-end residual ($0/$1 через
+//!   [`crate::project_manager::MarketResolution`]). Вызывается из
+//!   [`crate::account_submit::spawn_open_buy_taker`] (после settle maker invoke,
+//!   а также из заспавненного post-market-end таска) и
+//!   [`crate::account_submit::spawn_sell_taker`] (после settle taker invoke, если
+//!   `shares_remaining_to_sell ≈ 0`).
 
 use crate::account::SharedAccount;
 use crate::account_order::{
@@ -24,121 +31,112 @@ use crate::account_order::{
 };
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
-    CloseReason, LanePositions, OpenPosition, POLYMARKET_CRYPTO_TAKER_FEE_RATE,
-    SIM_MAX_SLIPPAGE_FROM_L1_PCT, SharedOpenPosition, StrictBook, book_fill_sell,
-    book_fill_sell_strict, position_interval_label, position_side_label,
-    trade_csv_close_reason_label,
+    CloseReason, OpenPosition, POLYMARKET_CRYPTO_TAKER_FEE_RATE, SharedOpenPosition,
+    SIM_MAX_SLIPPAGE_FROM_L1_PCT, StrictBook, book_fill_sell, book_fill_sell_strict,
+    position_interval_label, position_side_label, trade_csv_close_reason_label,
 };
+use crate::xframe::{SIZE, XFrame};
 use crate::project_manager::ProjectManager;
 use crate::sim_stats::SideStats;
-use crate::xframe::{SIZE, XFrame, Y_TRAIN_TAKE_PROFIT_PP};
+use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
 use std::sync::Arc;
 
-/// Gross USDC при TP: если полный sell-walk даёт порог TP — можно обойти cap к L1 (см. [`crate::history_sim::sell_gate`]).
-fn gross_usdc_sell_take_profit(
-    frame: &XFrame<SIZE>,
-    pos: &OpenPosition,
-    strict_book: Option<&StrictBook>,
-) -> Option<f64> {
-    let cap = Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT);
-    let meets_tp = |gross: f64| -> bool {
-        if pos.shares_held <= 1e-18 {
-            return false;
-        }
-        let vwap = gross / pos.shares_held;
-        vwap - pos.buy_price >= Y_TRAIN_TAKE_PROFIT_PP
-    };
-
-    match strict_book {
-        Some(book) => {
-            let uncapped = book_fill_sell_strict(book, pos.shares_held, None)?;
-            let capped = book_fill_sell_strict(book, pos.shares_held, cap);
-            if meets_tp(uncapped) {
-                match capped {
-                    Some(g) if meets_tp(g) => Some(g),
-                    Some(_) => Some(uncapped),
-                    None => Some(uncapped),
-                }
-            } else {
-                capped.or(Some(uncapped))
-            }
-        }
-        None => {
-            let uncapped = book_fill_sell(frame, pos.shares_held, None)?;
-            let capped = book_fill_sell(frame, pos.shares_held, cap);
-            if meets_tp(uncapped) {
-                match capped {
-                    Some(g) if meets_tp(g) => Some(g),
-                    Some(_) => Some(uncapped),
-                    None => Some(uncapped),
-                }
-            } else {
-                capped.or(Some(uncapped))
-            }
-        }
-    }
-}
-
-/// Рыночный выход backtest / real_sim (TP / SL / Timeout / EvExit): bid-walk по
-/// `frame` / `strict_book`, taker fee если TP не дотягивается до maker.
+/// Единая ветка закрытия для backtest / real_sim (`SubmitMode::None`) и для
+/// резолюции рынка: PnL/bankroll/SideStats/CSV в одном месте. Сама не лезет в
+/// стакан и не дренит [`crate::account::Account::positions`] — caller обязан
+/// (1) посчитать `gross_usdc` (bid-walk для рыночного выхода либо
+/// `shares_held`/`0` для резолюции), (2) убрать позицию из своей структуры
+/// (`remaining` в [`crate::history_sim::manage_positions`] или
+/// `lane_positions.remove(...)` в
+/// [`crate::account::Account::resolve_pending_market_sync`]).
 ///
-/// При успешном close: `*bankroll += pnl`, инкремент `stats.{tp_count,sl_count,...}`,
-/// CSV-строка, возврат `true` (caller использует как `sold = true`). При отказе
-/// (стакан не дал заполнить shares): `stats.kelly_strict_sell_skips += 1`,
-/// позиция возвращается в `remaining` через `(pos_id, pos_arc)` и возврат `false`.
-/// Резолюция и maker-TP-fill — в [`close_position_resolution`] /
-/// [`close_position_maker_tp`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn close_position_market_exit(
-    bankroll: &mut f64,
-    remaining: &mut LanePositions,
-    pos_id: String,
-    pos_arc: SharedOpenPosition,
-    pos: &OpenPosition,
-    exit_price: f64,
-    reason: &CloseReason,
-    frame: &XFrame<SIZE>,
+/// Производные величины (`sell_price`, `fee_usdc`) вычисляются здесь по
+/// `reason`, чтобы caller'у не приходилось дублировать формулы:
+///
+/// * `sell_price`:
+///     * `ResolutionWin` → `1.0`, `ResolutionLoss` → `0.0`;
+///     * иначе `(gross_usdc / shares_held).clamp(0.001, 0.999)`
+///       (sell-VWAP по факту bid-walk'а).
+/// * `fee_usdc`:
+///     * `Resolution{Win,Loss}` → `0.0`;
+///     * `TakeProfit` если `tp_target > best_bid_at_entry` (maker-сценарий) → `0.0`;
+///     * иначе taker:
+///       `shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1 - sell_price)`.
+///
+/// `event_remaining_ms_at_close` для CSV: для backtest/real_sim `manage_positions`
+/// — `frame.event_remaining_ms` (текущий шаг симуляции); для резолюции — `0`
+/// (рынок уже завершился, `close_unix_ms == event_end_ms`).
+///
+/// `SideStats`-ветки совпадают с `match reason` (см. ниже). `pos.final_price`
+/// в CSV — то, что caller записал в позицию ДО вызова (для резолюции из
+/// [`crate::account::Account::resolve_pending_market_sync`] это означает
+/// `pos_arc.write().await.final_price = Some(...)` перед `close_position`).
+///
+/// **Локи (async).** Внутри читаем `pos_arc.read().await` (snapshot для CSV /
+/// формул), потом берём `account.bankroll.write().await` для applies — caller
+/// НЕ должен пред-захватывать ни тот, ни другой (иначе deadlock).
+pub(crate) async fn close_position(
+    account: &SharedAccount,
+    pos_arc: &SharedOpenPosition,
     stats: &mut SideStats,
-    strict_book: Option<&StrictBook>,
-) -> bool {
-    let gross_usdc_opt = if reason.is_voluntary_exit() {
-        gross_usdc_sell_take_profit(frame, pos, strict_book)
-    } else {
-        match strict_book {
-            Some(book) => book_fill_sell_strict(book, pos.shares_held, None),
-            None => book_fill_sell(frame, pos.shares_held, None),
+    reason: &CloseReason,
+    gross_usdc: Option<f64>,
+    event_remaining_ms_at_close: i64,
+) {
+    let pos = pos_arc.read().await;
+    // `gross_usdc`:
+    //   * `Some(g)` — рыночный выход (`manage_positions` уже посчитал bid-walk);
+    //   * `None`   — резолюция: gross механически выводится из `reason`
+    //     (`ResolutionWin → shares_held`, `ResolutionLoss → 0`), чтобы
+    //     resolve_pending_market_sync не дублировал чтение `pos.shares_held`.
+    let gross_usdc = gross_usdc.unwrap_or_else(|| match reason {
+        CloseReason::ResolutionWin => pos.shares_held,
+        CloseReason::ResolutionLoss => 0.0,
+        _ => {
+            debug_assert!(
+                false,
+                "gross_usdc=None требует resolution-reason, получили {reason:?}"
+            );
+            0.0
         }
+    });
+    let sell_price = match reason {
+        CloseReason::ResolutionWin => 1.0,
+        CloseReason::ResolutionLoss => 0.0,
+        _ if pos.shares_held > 0.0 => {
+            (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
+        }
+        _ => 0.0,
     };
-    let Some(gross_usdc) = gross_usdc_opt else {
-        stats.kelly_strict_sell_skips += 1;
-        remaining.insert(pos_id, pos_arc);
-        return false;
-    };
-    let sell_price = if pos.shares_held > 0.0 {
-        (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
-    } else {
-        exit_price.clamp(0.001, 0.999)
-    };
-    // Без taker fee на выходе только если TP исполняется как maker (таргет выше bid на входе).
+    // Maker fee = 0 только если TP-таргет лежит выше bid на входе (выставляемся
+    // как `resting → fill`); таргета нет (best_bid_at_entry=None) — оптимистично
+    // считаем maker'ом (то же поведение, что и раньше в `close_position_market_exit`).
     let voluntary_is_maker = match reason {
         CloseReason::TakeProfit => {
             let tp_target = (pos.buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
             match pos.best_bid_at_entry {
-                Some(b) => tp_target > b,
+                Some(best_bid) => tp_target > best_bid,
                 None => true,
             }
         }
         _ => false,
     };
-    let fee_usdc = if voluntary_is_maker {
-        0.0
-    } else {
-        pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price)
+    let fee_usdc = match reason {
+        CloseReason::ResolutionWin | CloseReason::ResolutionLoss => 0.0,
+        _ if voluntary_is_maker => 0.0,
+        _ => pos.shares_held
+            * POLYMARKET_CRYPTO_TAKER_FEE_RATE
+            * sell_price
+            * (1.0 - sell_price),
     };
-    stats.fees_paid += fee_usdc;
-    let net_usdc = gross_usdc - fee_usdc;
 
+    let net_usdc = gross_usdc - fee_usdc;
     let pnl = net_usdc - pos.position_size;
+    // Bankroll write берём ВНУТРИ функции под коротким локом — caller не должен
+    // держать `account.bankroll.write().await` (deadlock). Лок-порядок в обоих
+    // call-site (manage_positions / resolve_pending_market_sync) совпадает с
+    // [`crate::real_sim::tick_once`]: `pos → bankroll`.
+    *account.bankroll.write().await += pnl;
     stats.pnl_usd += pnl;
     stats.trades += 1;
     if pnl >= 0.0 {
@@ -146,6 +144,9 @@ pub(crate) fn close_position_market_exit(
     } else {
         stats.losses += 1;
     }
+    stats.fees_paid += fee_usdc;
+    // Резолюция тоже попадает в `closed_trade_entries` — replay'ю калибровки
+    // нужен и pnl-знак на резолюционных закрытиях.
     stats
         .closed_trade_entries
         .push((pos.raw_pred_at_open, pnl > 0.0));
@@ -170,33 +171,49 @@ pub(crate) fn close_position_market_exit(
             stats.ev_exit_loss_count += 1;
             stats.pnl_ev_exit_loss += pnl;
         }
+        CloseReason::ResolutionWin => {
+            stats.resolution_win += 1;
+            stats.pnl_resolution_win += pnl;
+            if pnl >= 0.0 {
+                stats.resolution_win_profit += 1;
+            } else {
+                stats.resolution_win_loss += 1;
+            }
+        }
+        CloseReason::ResolutionLoss => {
+            stats.resolution_loss += 1;
+            stats.pnl_resolution_loss += pnl;
+        }
     }
 
-    let close_unix_ms = pos.event_end_ms.map(|end_ms| end_ms - frame.event_remaining_ms);
-    let interval_str = position_interval_label(pos);
-    let side_str = position_side_label(pos);
+    let close_unix_ms = pos
+        .event_end_ms
+        .map(|end_ms| end_ms - event_remaining_ms_at_close);
+    let interval_label = position_interval_label(&pos);
+    let side_label = position_side_label(&pos);
     let open_unix_ms = pos
         .event_end_ms
         .map(|end_ms| end_ms - pos.event_remaining_ms_at_open);
-    let graph_html_file_uri = crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(pos)
-        .map(|bin_path| {
-            crate::xframe_graph_dump::graph_html_trade_file_uri(
-                &bin_path,
-                open_unix_ms,
-                close_unix_ms,
-                Some(side_str),
-            )
-        })
-        .unwrap_or_default();
+    let graph_html_file_uri =
+        crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
+            .map(|bin_path| {
+                crate::xframe_graph_dump::graph_html_trade_file_uri(
+                    &bin_path,
+                    open_unix_ms,
+                    close_unix_ms,
+                    Some(side_label),
+                )
+            })
+            .unwrap_or_default();
     crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &pos.polymarket_url,
         price_to_beat: pos.price_to_beat,
         final_price: pos.final_price,
+        currency: &pos.currency,
+        interval: interval_label,
+        side: side_label,
         market_id: &pos.market_id,
         asset_id: &pos.asset_id,
-        side: side_str,
-        interval: interval_str,
-        currency: &pos.currency,
         exit_reason: trade_csv_close_reason_label(reason),
         buy_price: pos.buy_price,
         raw_pred: pos.raw_pred_at_open,
@@ -210,124 +227,12 @@ pub(crate) fn close_position_market_exit(
         frames_held: pos.frames_held,
         p_win_ema_at_close: pos.p_win_ema,
         event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
-        event_remaining_ms_at_close: frame.event_remaining_ms,
+        event_remaining_ms_at_close,
         open_unix_ms,
         close_unix_ms,
         graph_html_file_uri: graph_html_file_uri.as_str(),
         pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
         pos_id: pos.id.as_str(),
-        fill_role: "",
-        finalized_via: "",
-        planned_buy_price: None,
-        planned_shares_held: None,
-        planned_entry_cost: None,
-        open_order_id: None,
-        tp_order_id: None,
-        close_order_ids: &[],
-    });
-
-    *bankroll += pnl;
-    // pos_arc намеренно не вставляем обратно в `remaining` — позиция закрыта.
-    let _ = pos_arc;
-    true
-}
-
-/// Резолюционное закрытие одной позиции внутри
-/// [`crate::account::Account::resolve_pending_market_sync`]: бинарный payout
-/// ($1/$0), обновление `bankroll`, [`SideStats`] (`trades` / `wins` / `losses` /
-/// `closed_trade_entries` / `resolution_*` / `pnl_resolution_*`), CSV-строка
-/// `ResolutionWin` / `ResolutionLoss`. Комиссия на резолюции `= 0.0`.
-pub(crate) async fn close_position_resolution(
-    account: &SharedAccount,
-    pos_arc: SharedOpenPosition,
-    token_won: bool,
-    currency: &str,
-    market_id: &str,
-    final_price: Option<f64>,
-    side_stats: &mut SideStats,
-) {
-    let pos = pos_arc.read().await;
-    let pnl = if token_won {
-        pos.shares_held - pos.position_size
-    } else {
-        -pos.position_size
-    };
-    *account.bankroll.write().await += pnl;
-    side_stats.pnl_usd += pnl;
-    side_stats.trades += 1;
-    if pnl >= 0.0 {
-        side_stats.wins += 1;
-    } else {
-        side_stats.losses += 1;
-    }
-    // Resolution не через рыночное закрытие — дублируем в closed_trade_entries (replay калибровки).
-    side_stats
-        .closed_trade_entries
-        .push((pos.raw_pred_at_open, pnl > 0.0));
-    if token_won {
-        side_stats.resolution_win += 1;
-        side_stats.pnl_resolution_win += pnl;
-        if pnl >= 0.0 {
-            side_stats.resolution_win_profit += 1;
-        } else {
-            side_stats.resolution_win_loss += 1;
-        }
-    } else {
-        side_stats.resolution_loss += 1;
-        side_stats.pnl_resolution_loss += pnl;
-    }
-
-    let exit_reason = if token_won {
-        "ResolutionWin"
-    } else {
-        "ResolutionLoss"
-    };
-    let close_unix_ms = pos.event_end_ms;
-    let interval_str = position_interval_label(&pos);
-    let side_str = position_side_label(&pos);
-    let open_unix_ms = pos
-        .event_end_ms
-        .map(|end_ms| end_ms - pos.event_remaining_ms_at_open);
-    let graph_html_file_uri =
-        crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
-        .map(|bin_path| {
-            crate::xframe_graph_dump::graph_html_trade_file_uri(
-                &bin_path,
-                open_unix_ms,
-                close_unix_ms,
-                Some(side_str),
-            )
-        })
-        .unwrap_or_default();
-    crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
-        polymarket_url: &pos.polymarket_url,
-        price_to_beat: pos.price_to_beat,
-        final_price: final_price.or(pos.final_price),
-        currency,
-        interval: interval_str,
-        side: side_str,
-        market_id,
-        asset_id: &pos.asset_id,
-        exit_reason,
-        buy_price: pos.buy_price,
-        raw_pred: pos.raw_pred_at_open,
-        cal_pred: pos.cal_pred_at_open,
-        kelly_f: pos.kelly_f_at_open,
-        position_size: pos.position_size,
-        shares_held: pos.shares_held,
-        exit_price: if token_won { 1.0 } else { 0.0 },
-        fee_usdc: 0.0,
-        pnl,
-        frames_held: pos.frames_held,
-        p_win_ema_at_close: pos.p_win_ema,
-        event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
-        event_remaining_ms_at_close: 0,
-        open_unix_ms,
-        close_unix_ms,
-        graph_html_file_uri: graph_html_file_uri.as_str(),
-        pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
-        pos_id: pos.id.as_str(),
-        fill_role: "",
         finalized_via: "",
         planned_buy_price: None,
         planned_shares_held: None,
@@ -342,13 +247,13 @@ pub(crate) async fn close_position_resolution(
 /// двух caller'ов:
 /// * [`crate::account_submit::spawn_open_buy_taker`] — после settle maker-TP
 ///   invoke с `success && !partial` (целиком закрылись на maker'е);
-///   `reason = CloseReason::TakeProfit`, `fill_role = "Maker"`,
+///   `reason = CloseReason::TakeProfit`,
 ///   `finalized_via = "maker_tp_fill"`.
 /// * [`crate::account_submit::spawn_sell_taker`] — после settle taker-FAK invoke,
 ///   когда `shares_remaining_to_sell ≤
 ///   [`crate::account_submit::CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE`]`
 ///   (taker дошёл до ~0, возможно вместе с partial-maker'ом); `reason` —
-///   фактический (TP / SL / Timeout / EvExit), `fill_role = "Taker"`,
+///   фактический (TP / SL / Timeout / EvExit),
 ///   `finalized_via = "taker_sell_fill"`.
 ///
 /// Сам метод вытаскивает все SELL-fills и order-id'шники из
@@ -364,7 +269,7 @@ pub(crate) async fn close_position_resolution(
 ///
 /// Из аргументов остаются только то, что НЕ выводится из позиции: `buy_rep`
 /// (для sanity-check vs `position.position_size`) и метаданные ветки
-/// (`reason / fill_role / finalized_via`).
+/// (`reason / finalized_via`).
 ///
 /// Удаляет позицию из [`crate::account::Account::positions`], считает PnL/fee
 /// (`fee_usdc = 0` — maker всегда `0`, taker-fee CLOB уже вычел из
@@ -383,29 +288,29 @@ pub(crate) async fn close_position_resolution(
 /// Решение «пора закрывать» — у caller'а (`maker_rep.success && !maker_rep.partial`
 /// для maker-сайта; `shares_remaining_to_sell ≤ TOL` для taker-сайта; либо
 /// `event_end_ms + POST_MARKET_END_RESOLUTION_DELAY_MS` для post-market
-/// residual).
+/// residual). Caller post-market-residual'а сам подымает
+/// [`crate::project_manager::MarketResolution`], определяет UP/DOWN-победителя
+/// и нашу сторону, прописывает свежие `price_to_beat` / `final_price` в позицию
+/// и передаёт сюда уже готовый [`CloseReason::ResolutionWin`] /
+/// [`CloseReason::ResolutionLoss`].
 ///
-/// **Path detection (внутри функции — НЕ по `reason.is_none()`):**
+/// **Path detection — по `reason`:**
 ///
-/// «Post-market residual» путь триггерится если **рынок завершился**
-/// (`now > event_end_ms`) **И** на счёте остался residual для оценки
-/// (`actual_shares_net - shares_sold > CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE`).
-/// В этом режиме residual оценивается бинарно через
-/// [`crate::project_manager::MarketResolution`]: `$1`/шер если наша сторона
-/// выиграла (`final_price >= price_to_beat` для UP, обратное для DOWN), иначе
-/// `$0`. PNL = `usd_received + residual_payout - actual_entry_cost`; SideStats
-/// апдейтит `resolution_win` / `resolution_loss` / `pnl_resolution_*`;
-/// `exit_reason` в CSV — `"ResolutionWin"` / `"ResolutionLoss"`. Если
-/// `MarketResolution` отсутствует или `final_price = None` — выходим БЕЗ
-/// взвода `close_after_submit_finalized` (флаг сохраняем для будущего триггера).
-///
-/// Иначе («after-sell» путь): позиция полностью распродана через maker TP /
-/// taker FAK. PNL = `usd_received - actual_entry_cost`; SideStats апдейтит
-/// ветку по `reason` (`tp_count` / `sl_count` / `timeout_count` / `ev_exit_*`);
-/// `exit_reason` в CSV — [`trade_csv_close_reason_label`]. Bail если SELL-fills
-/// нулевые. Post-market caller передаёт `reason = None`; если до flag-set'а
-/// другой callback успел добить позицию (residual ≈ 0) — выходим тихо (никаких
-/// данных для логирования нет).
+/// * [`CloseReason::ResolutionWin`] / [`CloseReason::ResolutionLoss`] —
+///   post-market-end резолюция. Residual = `actual_shares_net - shares_sold`
+///   оценивается бинарно: `$1`/шер при `ResolutionWin`, `$0` при
+///   `ResolutionLoss`. PNL = `usd_received + residual_payout -
+///   actual_entry_cost`; SideStats апдейтит `resolution_win` /
+///   `resolution_loss` / `pnl_resolution_*`. `exit_reason` в CSV — лейбл
+///   `"ResolutionWin"` / `"ResolutionLoss"` через
+///   [`trade_csv_close_reason_label`].
+/// * Остальные ([`CloseReason::TakeProfit`] / [`CloseReason::StopLoss`] /
+///   [`CloseReason::Timeout`] / [`CloseReason::EvExitProfit`] /
+///   [`CloseReason::EvExitLoss`]) — after-sell: позиция полностью распродана
+///   через maker TP / taker FAK. PNL = `usd_received - actual_entry_cost`;
+///   SideStats апдейтит соответствующую ветку (`tp_count` / `sl_count` /
+///   `timeout_count` / `ev_exit_*`). Bail если SELL-fills нулевые
+///   (флаг НЕ взводим — пусть future-callback попробует).
 ///
 /// **Идемпотентность.** Maker-TP callback в `spawn_open_buy_taker`, taker-FAK
 /// callback в `spawn_sell_taker` и post-market-end task могут параллельно
@@ -421,18 +326,15 @@ pub(crate) async fn close_position_after_submit(
     account: &SharedAccount,
     position: &SharedOpenPosition,
     project_manager: Option<&Arc<ProjectManager>>,
-    reason: Option<&CloseReason>,
-    fill_role: &'static str,
+    reason: &CloseReason,
     finalized_via: &'static str,
 ) {
     // Pre-flight snapshot: все reads + aggregation БЕЗ установки idempotency
-    // флага. Path detection ниже требует `residual_shares` (а значит и
-    // `actual_shares_net` + sums), поэтому делаем агрегацию заранее.
-    // Параллельные callers могут продублировать это — безопасно, нет write'ов.
+    // флага. Параллельные callers могут продублировать read+агрегацию — это
+    // безопасно (нет write'ов); flag-set ниже гарантирует, что финализирует
+    // только победитель гонки.
     let position_snapshot = position.read().await.clone();
     let pos_id = position_snapshot.id.clone();
-    let market_id = position_snapshot.market_id.clone();
-    let event_end_ms = position_snapshot.event_end_ms;
     let asset_id = position_snapshot.asset_id.as_str();
     let currency = position_snapshot.currency.as_str();
     let planned_buy_price = position_snapshot.planned_buy_price;
@@ -440,6 +342,20 @@ pub(crate) async fn close_position_after_submit(
     let planned_entry_cost = position_snapshot.planned_entry_cost;
     let actual_buy_price = position_snapshot.buy_price;
     let actual_entry_cost = position_snapshot.position_size;
+
+    // Path detection — по `reason`: Resolution-варианты приходят только от
+    // post-market-end caller'а, который уже подтянул [`MarketResolution`] и
+    // вычислил UP/DOWN-победителя. `token_won_resolution.is_some()`
+    // эквивалентно «residual считаем как $1 / $0».
+    let token_won_resolution: Option<bool> = match reason {
+        CloseReason::ResolutionWin => Some(true),
+        CloseReason::ResolutionLoss => Some(false),
+        CloseReason::TakeProfit
+        | CloseReason::StopLoss
+        | CloseReason::Timeout
+        | CloseReason::EvExitProfit
+        | CloseReason::EvExitLoss => None,
+    };
 
     // `actual_shares_net` берём напрямую из BUY-invoke watch'а
     // ([`crate::history_sim::OpenPosition::open_buy_invoke`]) — authoritative от
@@ -526,79 +442,18 @@ pub(crate) async fn close_position_after_submit(
 
     let residual_shares = (actual_shares_net - shares_sold).max(0.0);
 
-    // Path detection: post-market-residual ИФФ (1) рынок завершился
-    // (`now > event_end_ms`) И (2) остался непроданный residual выше
-    // tolerance. НЕ полагаемся на `reason.is_none()`: post-market caller может
-    // передать `None`, но если до нашего входа другой callback успел добить
-    // позицию (residual ≈ 0) — этот вызов уйдёт в after-sell ветку и тихо
-    // выйдет ниже (нет `reason` и нет residual для resolution).
-    let now_ms = crate::util::current_timestamp_ms();
-    let market_ended = event_end_ms.is_some_and(|end_ms| now_ms > end_ms);
-    let is_post_market_residual = market_ended
-        && residual_shares > crate::account_submit::CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE;
-
-    // Resolution-path: lookup MarketResolution ДО взвода флага idempotency
-    // (если данных нет — выходим, флаг сохраняем для будущего триггера).
-    let market_price_to_beat_and_final_price: Option<(f64, f64)> = if is_post_market_residual {
-        let Some(pm) = project_manager else {
-            crate::tee_eprintln!(
-                "[submit] post-market resolution pos_id={pos_id}: \
-                 project_manager=None — финализация невозможна, пропуск",
-            );
-            return;
-        };
-        let lookup: Option<crate::project_manager::MarketResolution> = pm
-            .market_resolution_by_market
-            .read()
-            .await
-            .get(&market_id)
-            .copied();
-        let Some(market_resolution) = lookup else {
-            crate::tee_eprintln!(
-                "[submit] post-market resolution pos_id={pos_id} \
-                 market_id={market_id}: MarketResolution отсутствует в кэше \
-                 — финализация отложена (флаг НЕ взводим)",
-            );
-            return;
-        };
-        let Some(final_price) = market_resolution.final_price else {
-            crate::tee_eprintln!(
-                "[submit] post-market resolution pos_id={pos_id} \
-                 market_id={market_id}: final_price=None (refine следующего \
-                 окна ещё не пришёл) — финализация отложена (флаг НЕ взводим)",
-            );
-            return;
-        };
-        Some((market_resolution.price_to_beat, final_price))
-    } else {
-        None
-    };
-
     // After-sell path требует ненулевых SELL-fills (`pnl = usd_received - entry`
-    // даст шум если 0); resolution path допускает 0 (residual подберёт всё).
+    // даст шум если 0); resolution-path допускает 0 (residual подберёт всё).
     // Бэйлим ДО взвода флага idempotency, чтобы не блокировать future-триггеры.
     let has_valid_sell_fills = shares_sold.is_finite()
         && shares_sold > 0.0
         && usd_received.is_finite()
         && usd_received > 0.0;
-    if !(is_post_market_residual || has_valid_sell_fills) {
+    if token_won_resolution.is_none() && !has_valid_sell_fills {
         crate::tee_eprintln!(
-            "[submit] pnl pos_id={pos_id} reason={reason:?} role={fill_role}: \
+            "[submit] pnl pos_id={pos_id} reason={reason:?}: \
              сумма SELL-fills нулевая/невалидная (shares={shares_sold:.6} USD={usd_received:.6}) — \
              лог пропускаем (флаг НЕ взводим)",
-        );
-        return;
-    }
-
-    // Edge case: caller — post-market spawn (`reason = None`), но между его
-    // pre-check (residual > TOL) и нашим pre-flight другой callback успел
-    // добить позицию (residual ≤ TOL → `is_post_market_residual = false`).
-    // SideStats-ветка для `(None, None)` не определена; флаг не трогаем —
-    // финализирует тот callback, что захватит флаг первым.
-    if !is_post_market_residual && reason.is_none() {
-        crate::tee_println!(
-            "[submit] pnl pos_id={pos_id} role={fill_role}: reason=None и \
-             residual≤TOL ⇒ финализация уже идёт через другой callback, пропуск",
         );
         return;
     }
@@ -609,7 +464,7 @@ pub(crate) async fn close_position_after_submit(
         let mut open_position = position.write().await;
         if open_position.close_after_submit_finalized {
             crate::tee_println!(
-                "[submit] pnl pos_id={pos_id} reason={reason:?} role={fill_role}: \
+                "[submit] pnl pos_id={pos_id} reason={reason:?}: \
                  close_after_submit_finalized=true — повторный вызов пропускаем",
             );
             return;
@@ -623,27 +478,6 @@ pub(crate) async fn close_position_after_submit(
         }
     }
 
-    // Resolution-path: `token_won` из `(price_to_beat, final_price)` + нашей
-    // стороны UP/DOWN. Неизвестная сторона → loss (consistency с
-    // `close_position_resolution`).
-    let our_side =
-        CurrencyUpDownOutcome::from_i32(position_snapshot.currency_up_down_outcome_at_open);
-    let token_won_resolution: Option<bool> =
-        market_price_to_beat_and_final_price.map(|(ptb, final_price)| {
-            let up_won = final_price >= ptb;
-            match our_side {
-                Some(CurrencyUpDownOutcome::Up) => up_won,
-                Some(CurrencyUpDownOutcome::Down) => !up_won,
-                None => {
-                    crate::tee_eprintln!(
-                        "[submit] post-market resolution pos_id={pos_id}: неизвестный \
-                         currency_up_down_outcome_at_open={} — финализируем как loss",
-                        position_snapshot.currency_up_down_outcome_at_open,
-                    );
-                    false
-                }
-            }
-        });
     // Sanity-check: `buy_rep.making_amount` (authoritative от CLOB) должен биться с
     // `position.position_size`, который был применён в `spawn_open_buy_taker`.
     // `buy_rep` берём из того же `position.open_buy_invoke` watch'а, который писал
@@ -656,7 +490,7 @@ pub(crate) async fn close_position_after_submit(
         && (spent_usd - actual_entry_cost).abs() > 1e-6
     {
         crate::tee_eprintln!(
-            "[submit] pnl pos_id={pos_id} reason={reason:?} role={fill_role}: \
+            "[submit] pnl pos_id={pos_id} reason={reason:?}: \
              buy_rep.making_amount={spent_usd:.6} != position.position_size={actual_entry_cost:.6} \
              — possible WS-fill drift",
         );
@@ -692,6 +526,8 @@ pub(crate) async fn close_position_after_submit(
 
     let interval_kind =
         XFrameIntervalKind::from_i32(position_snapshot.xframe_interval_type_at_open);
+    let our_side =
+        CurrencyUpDownOutcome::from_i32(position_snapshot.currency_up_down_outcome_at_open);
     let real_sim_state = account.real_sim_state_for_currency(currency).await;
     match (real_sim_state, interval_kind, our_side) {
         (Some(real_sim_state), Some(interval_kind), Some(side)) => {
@@ -713,12 +549,30 @@ pub(crate) async fn close_position_after_submit(
                 side_stats
                     .closed_trade_entries
                     .push((position_snapshot.raw_pred_at_open, pnl > 0.0));
-                // Резолюционные счётчики (если path = resolution) либо reason-based
-                // ветка (если path = after-sell). Path однозначно определяется тем,
-                // какая из веток в `(token_won_resolution, reason)` пришла как Some
-                // (выше есть mutually-exclusive проверки).
-                match (token_won_resolution, reason) {
-                    (Some(true), _) => {
+                // Reason carries path: ResolutionWin/Loss → резолюционные
+                // счётчики; остальные → reason-based ветка (после-sell).
+                match reason {
+                    CloseReason::TakeProfit => {
+                        side_stats.tp_count += 1;
+                        side_stats.pnl_tp += pnl;
+                    }
+                    CloseReason::StopLoss => {
+                        side_stats.sl_count += 1;
+                        side_stats.pnl_sl += pnl;
+                    }
+                    CloseReason::Timeout => {
+                        side_stats.timeout_count += 1;
+                        side_stats.pnl_timeout += pnl;
+                    }
+                    CloseReason::EvExitProfit => {
+                        side_stats.ev_exit_profit_count += 1;
+                        side_stats.pnl_ev_exit_profit += pnl;
+                    }
+                    CloseReason::EvExitLoss => {
+                        side_stats.ev_exit_loss_count += 1;
+                        side_stats.pnl_ev_exit_loss += pnl;
+                    }
+                    CloseReason::ResolutionWin => {
                         side_stats.resolution_win += 1;
                         side_stats.pnl_resolution_win += pnl;
                         if pnl >= 0.0 {
@@ -727,33 +581,9 @@ pub(crate) async fn close_position_after_submit(
                             side_stats.resolution_win_loss += 1;
                         }
                     }
-                    (Some(false), _) => {
+                    CloseReason::ResolutionLoss => {
                         side_stats.resolution_loss += 1;
                         side_stats.pnl_resolution_loss += pnl;
-                    }
-                    (None, Some(CloseReason::TakeProfit)) => {
-                        side_stats.tp_count += 1;
-                        side_stats.pnl_tp += pnl;
-                    }
-                    (None, Some(CloseReason::StopLoss)) => {
-                        side_stats.sl_count += 1;
-                        side_stats.pnl_sl += pnl;
-                    }
-                    (None, Some(CloseReason::Timeout)) => {
-                        side_stats.timeout_count += 1;
-                        side_stats.pnl_timeout += pnl;
-                    }
-                    (None, Some(CloseReason::EvExitProfit)) => {
-                        side_stats.ev_exit_profit_count += 1;
-                        side_stats.pnl_ev_exit_profit += pnl;
-                    }
-                    (None, Some(CloseReason::EvExitLoss)) => {
-                        side_stats.ev_exit_loss_count += 1;
-                        side_stats.pnl_ev_exit_loss += pnl;
-                    }
-                    (None, None) => {
-                        // unreachable: edge-case guard `!is_post_market_residual
-                        // && reason.is_none()` выше выходит до flag-set'а.
                     }
                 }
             }
@@ -787,48 +617,33 @@ pub(crate) async fn close_position_after_submit(
         .map(|end_ms| (end_ms - crate::util::current_timestamp_ms()).max(0))
         .unwrap_or(0);
 
-    // `exit_reason` для CSV/лога: resolution → бинарный лейбл, after-sell →
-    // [`trade_csv_close_reason_label`] от `reason`.
-    let exit_reason_label: &str = match (token_won_resolution, reason) {
-        (Some(true), _) => "ResolutionWin",
-        (Some(false), _) => "ResolutionLoss",
-        (None, Some(reason)) => trade_csv_close_reason_label(reason),
-        (None, None) => "Unknown",
-    };
-    // `price_to_beat` / `final_price` в CSV: для resolution берём свежий снимок
-    // из `MarketResolution` (authoritative, refine следующего окна уже пришёл);
-    // для after-sell — старые значения из `OpenPosition`, выставленные в
-    // `open_position` (могли быть None если на момент открытия PTB не было).
-    let (csv_price_to_beat, csv_final_price) = match market_price_to_beat_and_final_price {
-        Some((ptb, final_price)) => (Some(ptb), Some(final_price)),
-        None => (
-            position_snapshot.price_to_beat,
-            position_snapshot.final_price,
-        ),
-    };
-
+    let exit_reason_label = trade_csv_close_reason_label(reason);
+    // `price_to_beat` / `final_price` берём напрямую из позиции: post-market
+    // caller прописал свежие значения из [`crate::project_manager::MarketResolution`]
+    // через `position.write()` ДО вызова этой функции; для after-sell — те,
+    // что выставил `crate::history_sim::open_position` (могут быть None если
+    // на момент открытия PTB не было).
     match token_won_resolution {
         Some(token_won) => {
-            let (ptb, final_price) = market_price_to_beat_and_final_price.expect(
-                "token_won_resolution=Some ⇒ market_price_to_beat_and_final_price=Some",
-            );
             crate::tee_println!(
                 "[submit] pnl pos_id={pos_id} asset_id={asset_id} market_id={market_id_str} \
                  interval={interval_label} side={side_label} reason={exit_reason_label} \
-                 role={fill_role} finalized_via={finalized_via} \
-                 resolution(price_to_beat={ptb:.6} final_price={final_price:.6} token_won={token_won}) \
+                 finalized_via={finalized_via} \
+                 resolution(price_to_beat={:?} final_price={:?} token_won={token_won}) \
                  planned(USD={planned_entry_cost:.6} shares={planned_shares_held:.6} price={planned_buy_price:.6}) \
                  actual_buy(USD={actual_entry_cost:.6} shares={actual_shares_net:.6} price={actual_buy_price:.6}) \
                  sold(shares={shares_sold:.6} USD={usd_received:.6}) \
                  residual(shares={residual_shares:.6} payout={residual_payout:.6}) \
                  exit_price={exit_price:.6} fee_usdc={fee_usdc:.6} pnl={pnl:+.6}",
+                position_snapshot.price_to_beat,
+                position_snapshot.final_price,
             );
         }
         None => {
             crate::tee_println!(
                 "[submit] pnl pos_id={pos_id} asset_id={asset_id} market_id={market_id_str} \
                  interval={interval_label} side={side_label} reason={exit_reason_label} \
-                 role={fill_role} finalized_via={finalized_via} \
+                 finalized_via={finalized_via} \
                  planned(USD={planned_entry_cost:.6} shares={planned_shares_held:.6} price={planned_buy_price:.6}) \
                  actual_buy(USD={actual_entry_cost:.6} shares={actual_shares_net:.6} price={actual_buy_price:.6}) \
                  sell(price={exit_price:.6} shares={shares_sold:.6} USD={usd_received:.6}) \
@@ -841,8 +656,8 @@ pub(crate) async fn close_position_after_submit(
         close_order_ids.iter().map(|s| s.as_str()).collect();
     let trade_row = crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &position_snapshot.polymarket_url,
-        price_to_beat: csv_price_to_beat,
-        final_price: csv_final_price,
+        price_to_beat: position_snapshot.price_to_beat,
+        final_price: position_snapshot.final_price,
         currency,
         interval: interval_label,
         side: side_label,
@@ -867,7 +682,6 @@ pub(crate) async fn close_position_after_submit(
         graph_html_file_uri: graph_html_file_uri.as_str(),
         pnl_top5_shap: position_snapshot.pnl_top5_shap_at_open.as_str(),
         pos_id: position_snapshot.id.as_str(),
-        fill_role,
         finalized_via,
         planned_buy_price: Some(planned_buy_price),
         planned_shares_held: Some(planned_shares_held),
@@ -887,3 +701,51 @@ pub(crate) async fn close_position_after_submit(
     }
 }
 
+/// Gross USDC при TP: если полный sell-walk даёт порог TP — можно обойти cap к
+/// L1 (см. [`crate::history_sim::sell_gate`]). Используется только
+/// [`crate::history_sim::manage_positions`] → [`close_position`] при
+/// voluntary-exit (`reason.is_voluntary_exit()`) с целью разрешить более глубокий
+/// уход за L1, если итоговый VWAP всё ещё ≥ TP-таргета.
+pub(crate) fn gross_usdc_sell_take_profit(
+    frame: &XFrame<SIZE>,
+    pos: &OpenPosition,
+    strict_book: Option<&StrictBook>,
+) -> Option<f64> {
+    let cap = Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT);
+    let meets_tp = |gross: f64| -> bool {
+        if pos.shares_held <= 1e-18 {
+            return false;
+        }
+        let vwap = gross / pos.shares_held;
+        vwap - pos.buy_price >= Y_TRAIN_TAKE_PROFIT_PP
+    };
+
+    match strict_book {
+        Some(book) => {
+            let uncapped = book_fill_sell_strict(book, pos.shares_held, None)?;
+            let capped = book_fill_sell_strict(book, pos.shares_held, cap);
+            if meets_tp(uncapped) {
+                match capped {
+                    Some(g) if meets_tp(g) => Some(g),
+                    Some(_) => Some(uncapped),
+                    None => Some(uncapped),
+                }
+            } else {
+                capped.or(Some(uncapped))
+            }
+        }
+        None => {
+            let uncapped = book_fill_sell(frame, pos.shares_held, None)?;
+            let capped = book_fill_sell(frame, pos.shares_held, cap);
+            if meets_tp(uncapped) {
+                match capped {
+                    Some(g) if meets_tp(g) => Some(g),
+                    Some(_) => Some(uncapped),
+                    None => Some(uncapped),
+                }
+            } else {
+                capped.or(Some(uncapped))
+            }
+        }
+    }
+}

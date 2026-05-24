@@ -526,7 +526,11 @@ async fn tick_once(
         .unwrap_or(currency_implied_prob);
     {
         let mut state_guard = state.write().await;
-        let mut bankroll_guard = account.bankroll.write().await;
+        // `account.bankroll` write пред-захватывать НЕ нужно:
+        // [`crate::account_close_position::close_position`] (внутри
+        // `manage_positions`) берёт его сам коротким локом для apply'я PNL;
+        // try_open_position bankroll не пишет (только positions). Чтения для
+        // `available_bankroll_post` / `equity` ниже берём отдельным read'ом.
         let mut peak_guard = account.peak_bankroll.write().await;
         let mut max_dd_guard = account.max_drawdown_pct.write().await;
         let mut last_prob_guard = account.last_prob.write().await;
@@ -586,7 +590,6 @@ async fn tick_once(
                     false,
                     p_win_now,
                     side_stats,
-                    &mut bankroll_guard,
                     strict_book.as_ref(),
                     None,
                     submit_mode,
@@ -617,8 +620,9 @@ async fn tick_once(
                     for p in this_positions.values() {
                         same_locked_post += p.read().await.position_size;
                     }
+                    let bankroll_post = *account.bankroll.read().await;
                     let available_bankroll_post =
-                        (*bankroll_guard - cross_lanes_locked - same_locked_post).max(0.0);
+                        (bankroll_post - cross_lanes_locked - same_locked_post).max(0.0);
                     let polymarket_url =
                         polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
                     let graph_dump_bin_path_str = gamma_question
@@ -684,7 +688,7 @@ async fn tick_once(
             }
             active
         };
-        let equity = *bankroll_guard + total_value;
+        let equity = *account.bankroll.read().await + total_value;
         if equity > *peak_guard {
             *peak_guard = equity;
         }

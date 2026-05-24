@@ -1039,14 +1039,14 @@ struct WalkSellResult {
     /// Эквивалент того, что получил бы **maker**, чья resting-лимитка
     /// была бы хитнута таker-ом: maker fee = 0, поэтому брутто = нетто.
     /// Используется в TP-детекции / max-progress y-разметки и в
-    /// [`crate::account_close_position::close_position_market_exit`] для voluntary-exit-ов (TP / EvExitProfit).
+    /// [`crate::account_close_position::close_position`] для voluntary-exit-ов (TP / EvExitProfit).
     gross_usdc: f64,
     /// Чистая выручка **taker-варианта**: `gross_usdc − fee_usdc_taker`,
     /// где `fee_usdc_taker = Σ level_shares × rate × p × (1 − p)`
     /// (per-level, не на VWAP'е). Эквивалент urgent-выхода через
     /// bid-walk: пересекаем спред, реально платим taker-fee. Используется
     /// в SL-детекции / drawdown-проверке y-разметки и в принудительных
-    /// закрытиях [`crate::account_close_position::close_position_market_exit`] (SL / Timeout / EvExitLoss).
+    /// закрытиях [`crate::account_close_position::close_position`] (SL / Timeout / EvExitLoss).
     net_usdc: f64,
     /// VWAP на проданных шерсах: `gross_usdc / shares`. Для slippage-чека.
     #[allow(dead_code)]
