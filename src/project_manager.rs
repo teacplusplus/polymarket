@@ -124,14 +124,6 @@ pub struct ProjectManager {
     pub ws_stream_by_asset_id: Arc<RwLock<HashMap<String, Vec<WsStreamEntry>>>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub slug_to_market_id: Arc<RwLock<HashMap<String, String>>>,
-    /// Резолюционные данные по `market_id`: `price_to_beat` (порог) + `final_price`
-    /// (спот в конце окна, известен с задержкой через `current_exact` следующего
-    /// окна). `BTreeMap` с capacity-cap [`MARKET_RESOLUTION_RETENTION`] —
-    /// backstop поверх явного [`Self::cleanup_stale_market_data`]: даже если
-    /// cleanup пропустил, старые записи будут вытеснены `pop_first` на следующем
-    /// `merge_*`. Используется post-market-end финализацией submit-режима
-    /// ([`crate::account_close_position::close_position_submit_resolution`])
-    /// для расчёта residual-payout (`1.0` если наша сторона выиграла, `0.0` иначе).
     pub market_resolution_by_market: Arc<RwLock<BTreeMap<String, MarketResolution>>>,
     pub currency_up_down_by_asset_id: Arc<RwLock<HashMap<String, CurrencyUpDownOutcome>>>,
     pub ws_connect_wall_ms_by_asset_id: Arc<RwLock<HashMap<String, i64>>>,

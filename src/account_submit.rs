@@ -576,14 +576,29 @@ pub(crate) fn spawn_open_buy_taker(
     tokio::spawn(async move {
         // `planned_*` живут в `OpenPosition` (выставлены в `open_position`) и более не
         // меняются — для submit-CSV их читает `close_position_maker_tp` из позиции.
-        // Локально снимаем только то, что нужно ДО POST.
-        let (asset_id, amount, event_end_ms, pos_id) = {
+        // Локально снимаем только то, что нужно ДО POST. `currency/interval/side`
+        // тоже иммутабельные после создания и нужны post-settle для коррекции
+        // `stats.fees_paid` дельтой `actual − planned`.
+        let (
+            asset_id,
+            amount,
+            event_end_ms,
+            pos_id,
+            planned_entry_fee,
+            currency_str,
+            interval_kind,
+            side,
+        ) = {
             let p = position.read().await;
             (
                 p.asset_id.clone(),
                 p.planned_entry_cost,
                 p.event_end_ms,
                 p.id.clone(),
+                p.planned_fee_usdc,
+                p.currency.clone(),
+                crate::constants::XFrameIntervalKind::from_i32(p.xframe_interval_type_at_open),
+                CurrencyUpDownOutcome::from_i32(p.currency_up_down_outcome_at_open),
             )
         };
 
@@ -753,14 +768,48 @@ pub(crate) fn spawn_open_buy_taker(
         };
         // Применяем actual из `buy_rep` к позиции. `planned_*` остаются неизменными
         // (они выставлены в `crate::history_sim::open_position` и нужны для plan-vs-actual
-        // колонок submit-CSV). После этого `OpenPosition.{shares_held,buy_price,position_size}`
-        // консистентны с фактическим BUY-fill и корректны для MtM/locked-капитала в
-        // `tick_once`, и для будущих SL/Timeout/EvExit/Resolution submit-веток.
+        // колонок submit-CSV). После этого `OpenPosition.{shares_held,buy_price,position_size,
+        // entry_fee_usdc}` консистентны с фактическим BUY-fill и корректны для
+        // MtM/locked-капитала в `tick_once`, и для будущих SL/Timeout/EvExit/Resolution
+        // submit-веток.
+        //
+        // Параллельно фиксируем фактическую entry-fee. `open_position` записал в
+        // `stats.fees_paid` плановую fee (по историческому стакану кадра); фактический
+        // mock/CLOB fill может удержать другую (другая глубина / другой VWAP). Берём
+        // авторитативную fee из `buy_rep.fee_paid_usdc` — mock считает её явно через
+        // `polymarket_taker_fee_usd(gross, vwap)`, real CLOB-агрегатор аккумулирует
+        // `Σ trade.size × trade.price × trade.fee_rate_bps / 10_000` по on-chain
+        // settled trades. Дельту `actual − planned` применяем к нужному
+        // `SideStats.fees_paid` через `real_sim_state_for_currency` (как
+        // `close_position_after_submit`).
+        let actual_entry_fee = buy_rep.fee_paid_usdc;
         {
             let mut p = position.write().await;
             p.shares_held = shares_net;
             p.buy_price = implied_buy_price;
             p.position_size = usd_spent_on_buy;
+            p.entry_fee_usdc = actual_entry_fee;
+        }
+        let entry_fee_delta = actual_entry_fee - planned_entry_fee;
+        if entry_fee_delta.abs() > 1e-9
+            && let Some(real_sim_state) = account
+                .real_sim_state_for_currency(currency_str.as_str())
+                .await
+            && let (Some(interval_kind), Some(side)) = (interval_kind, side)
+        {
+            let mut state_guard = real_sim_state.write().await;
+            if let Some(sim_stats) = state_guard.stats.get_mut(&interval_kind) {
+                let side_stats = match side {
+                    CurrencyUpDownOutcome::Up => &mut sim_stats.up,
+                    CurrencyUpDownOutcome::Down => &mut sim_stats.down,
+                };
+                side_stats.fees_paid += entry_fee_delta;
+            }
+            crate::tee_println!(
+                "[submit] open BUY taker pos_id={pos_id}: entry_fee planned={planned_entry_fee:.6} \
+                 actual={actual_entry_fee:.6} delta={entry_fee_delta:+.6} \
+                 (fees_paid corrected)",
+            );
         }
 
         // Post-market-end safety-net: через `event_end_ms +

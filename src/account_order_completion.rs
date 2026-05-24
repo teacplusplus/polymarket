@@ -129,6 +129,7 @@ pub(crate) fn fire_failed_invocation_for_side(
             success: false,
             partial: false,
             error_msg,
+            fee_paid_usdc: 0.0,
         },
     );
 }
@@ -170,6 +171,16 @@ struct LegAgg {
     making_amount: OrderAmount,
     /// Условный объём (**`Shares`**).
     taking_amount: OrderAmount,
+    /// Удержанная CLOB'ом fee в USDC, накопленная по тем же трейдам, что и
+    /// `making/taking`. Источник — per-trade `fee_rate_bps` из [`TradeResponse`]
+    /// / WS user-channel `trade.fee_rate_bps`: `fee_usd = size × price ×
+    /// fee_rate_bps / 10_000` (= `quote × (1 − fee_factor)`). Формула одинакова для
+    /// BUY и SELL — `fee` в USDC всегда, независимо от того, с какой taking-стороны
+    /// её удержали (BUY → меньше shares, SELL → меньше USDC). При seed'ах от POST
+    /// без trades-данных и при fallback `size_matched × price` `fee = 0`
+    /// (неизвестно), потом перезатирается полным агрегатом trades. См.
+    /// [`SingleOrderClobInvocationReport::fee_paid_usdc`].
+    fee_usdc: f64,
 }
 
 impl Default for LegAgg {
@@ -177,6 +188,7 @@ impl Default for LegAgg {
         Self {
             making_amount: OrderAmount::UsdNotional(0.0),
             taking_amount: OrderAmount::Shares(0.0),
+            fee_usdc: 0.0,
         }
     }
 }
@@ -185,10 +197,11 @@ impl LegAgg {
     fn sanitize_mut(&mut self) {
         self.making_amount = sanitize_order_amount(self.making_amount);
         self.taking_amount = sanitize_order_amount(self.taking_amount);
+        self.fee_usdc = sanitize_nonneg_f64(self.fee_usdc);
     }
 }
 
-fn leg_agg_add_trade_fill(leg_agg: LegAgg, size: f64, quote: f64) -> LegAgg {
+fn leg_agg_add_trade_fill(leg_agg: LegAgg, size: f64, quote: f64, fee_usd: f64) -> LegAgg {
     if !size.is_finite() || size <= 0.0 || !quote.is_finite() || quote < 0.0 {
         return leg_agg;
     }
@@ -197,6 +210,9 @@ fn leg_agg_add_trade_fill(leg_agg: LegAgg, size: f64, quote: f64) -> LegAgg {
     let usd = order_amount_usd_scalar(out_leg_agg.making_amount) + quote;
     out_leg_agg.taking_amount = OrderAmount::Shares(shares);
     out_leg_agg.making_amount = OrderAmount::UsdNotional(usd);
+    if fee_usd.is_finite() && fee_usd >= 0.0 {
+        out_leg_agg.fee_usdc += fee_usd;
+    }
     out_leg_agg.sanitize_mut();
     out_leg_agg
 }
@@ -209,6 +225,7 @@ fn leg_agg_max_normalized(a: LegAgg, b: LegAgg) -> LegAgg {
     let mut leg = LegAgg {
         taking_amount: OrderAmount::Shares(sanitize_nonneg_f64(sh_a.max(sh_b))),
         making_amount: OrderAmount::UsdNotional(sanitize_nonneg_f64(usd_a.max(usd_b))),
+        fee_usdc: sanitize_nonneg_f64(a.fee_usdc.max(b.fee_usdc)),
     };
     leg.sanitize_mut();
     leg
@@ -294,6 +311,17 @@ pub struct SingleOrderClobInvocationReport {
     /// валидация, отсутствие auth/signer, build/sign-сбой, дедлайн без исполнения, отмена до исполнения).
     /// `None` для всех «нормальных» исходов (полная или частичная сделка).
     pub error_msg: Option<String>,
+    /// Удержанная CLOB'ом fee в USDC за этот ордер.
+    ///
+    /// * `0.0` — maker (Polymarket maker fee = 0), fail / zero-fill.
+    /// * `x > 0.0` — реально удержанная fee, посчитанная как
+    ///   `Σ trade.size × trade.price × trade.fee_rate_bps / 10_000` по on-chain
+    ///   settled trades. Источник: REST `client.trades(...)` и/или WS user-channel
+    ///   `trade.fee_rate_bps` (mock — `polymarket_taker_fee_usd(gross, vwap)`).
+    ///
+    /// Используется в `stats.fees_paid` real_sim'а (Mock и Submit) — точная
+    /// per-trade fee вместо приближения по «плановому стакану кадра».
+    pub fee_paid_usdc: f64,
 }
 
 #[inline]
@@ -511,24 +539,17 @@ fn update_size_matched_observed(state: &mut InvokeAggInner, observed: f64) {
 /// Компактная строка для observability: shares/USDC по обеим ногам и флаги терминала.
 /// Используется в `[order_invoke/ws]`, `[order_invoke/poll]`, `[order_invoke/final]`.
 fn leg_summary_for_log(state: &InvokeAggInner) -> String {
-    let book_shares = order_amount_shares_scalar(
-        leg_agg_max_normalized(state.filled_ws, state.filled_http).taking_amount,
-    );
-    let book_usd = order_amount_usd_scalar(
-        leg_agg_max_normalized(state.filled_ws, state.filled_http).making_amount,
-    );
-    let settled_shares = order_amount_shares_scalar(
-        leg_agg_max_normalized(state.settled_ws, state.settled_http).taking_amount,
-    );
-    let settled_usd = order_amount_usd_scalar(
-        leg_agg_max_normalized(state.settled_ws, state.settled_http).making_amount,
-    );
-    let failed_shares = order_amount_shares_scalar(
-        leg_agg_max_normalized(state.failed_ws, state.failed_http).taking_amount,
-    );
-    let failed_usd = order_amount_usd_scalar(
-        leg_agg_max_normalized(state.failed_ws, state.failed_http).making_amount,
-    );
+    let book_leg = leg_agg_max_normalized(state.filled_ws, state.filled_http);
+    let settled_leg = leg_agg_max_normalized(state.settled_ws, state.settled_http);
+    let failed_leg = leg_agg_max_normalized(state.failed_ws, state.failed_http);
+    let book_shares = order_amount_shares_scalar(book_leg.taking_amount);
+    let book_usd = order_amount_usd_scalar(book_leg.making_amount);
+    let book_fee = book_leg.fee_usdc;
+    let settled_shares = order_amount_shares_scalar(settled_leg.taking_amount);
+    let settled_usd = order_amount_usd_scalar(settled_leg.making_amount);
+    let settled_fee = settled_leg.fee_usdc;
+    let failed_shares = order_amount_shares_scalar(failed_leg.taking_amount);
+    let failed_usd = order_amount_usd_scalar(failed_leg.making_amount);
     let f_ws_sh = order_amount_shares_scalar(state.filled_ws.taking_amount);
     let f_ws_us = order_amount_usd_scalar(state.filled_ws.making_amount);
     let f_ht_sh = order_amount_shares_scalar(state.filled_http.taking_amount);
@@ -542,8 +563,9 @@ fn leg_summary_for_log(state: &InvokeAggInner) -> String {
     let fa_ht_sh = order_amount_shares_scalar(state.failed_http.taking_amount);
     let fa_ht_us = order_amount_usd_scalar(state.failed_http.making_amount);
     format!(
-        "book={book_shares:.6}sh/{book_usd:.6}$ (ws={f_ws_sh:.6}/{f_ws_us:.6}, \
-         http={f_ht_sh:.6}/{f_ht_us:.6}) settled={settled_shares:.6}sh/{settled_usd:.6}$ \
+        "book={book_shares:.6}sh/{book_usd:.6}$/fee={book_fee:.6}$ \
+         (ws={f_ws_sh:.6}/{f_ws_us:.6}, http={f_ht_sh:.6}/{f_ht_us:.6}) \
+         settled={settled_shares:.6}sh/{settled_usd:.6}$/fee={settled_fee:.6}$ \
          (ws={s_ws_sh:.6}/{s_ws_us:.6}, http={s_ht_sh:.6}/{s_ht_us:.6}) \
          failed={failed_shares:.6}sh/{failed_usd:.6}$ \
          (ws={fa_ws_sh:.6}/{fa_ws_us:.6}, http={fa_ht_sh:.6}/{fa_ht_us:.6}) \
@@ -635,6 +657,7 @@ fn aggregate_trades_into_leg<'a>(
 ) -> LegAgg {
     let mut total_shares = 0.0_f64;
     let mut total_usdc = 0.0_f64;
+    let mut total_fee_usdc = 0.0_f64;
     for trade in trades {
         let Some(size) = decimal_snap_f64(&trade.size) else {
             continue;
@@ -656,10 +679,21 @@ fn aggregate_trades_into_leg<'a>(
         }
         total_shares += size_net;
         total_usdc += quote_net;
+        // `fee_usd = quote × (1 − fee_factor)`. Эквивалентно `size × price ×
+        // fee_rate_bps / 10_000`. Формула одна для BUY и SELL: на BUY fee удержана
+        // в shares (`size_net = size × fee_factor`, недополученный USDC-эквивалент
+        // = `(size − size_net) × price = quote × (1 − fee_factor)`); на SELL fee
+        // удержана в USDC (`quote_net = quote × fee_factor`, недополученный
+        // USDC = `quote − quote_net = quote × (1 − fee_factor)`).
+        let fee_usd = quote * (1.0 - fee_factor);
+        if fee_usd.is_finite() && fee_usd >= 0.0 {
+            total_fee_usdc += fee_usd;
+        }
     }
     let mut leg = LegAgg {
         making_amount: OrderAmount::UsdNotional(sanitize_nonneg_f64(total_usdc)),
         taking_amount: OrderAmount::Shares(sanitize_nonneg_f64(total_shares)),
+        fee_usdc: sanitize_nonneg_f64(total_fee_usdc),
     };
     leg.sanitize_mut();
     leg
@@ -726,9 +760,13 @@ fn apply_polled_snapshot(
                 // Trades ещё не подтянулись до `size_matched` — gross fallback через max-merge.
                 let making_quote = size_matched * order_price;
                 if making_quote.is_finite() {
+                    // `fee_usdc=0` — нет per-trade `fee_rate_bps`, не оцениваем fee оценочно.
+                    // Когда trades подтянутся, `inner.filled_http` будет **перезаписан**
+                    // полным `aggregate_trades_into_leg` (включая `fee_usdc`).
                     let fallback_leg = LegAgg {
                         making_amount: OrderAmount::UsdNotional(sanitize_nonneg_f64(making_quote)),
                         taking_amount: OrderAmount::Shares(sanitize_nonneg_f64(size_matched)),
+                        fee_usdc: 0.0,
                     };
                     inner.filled_http = leg_agg_max_normalized(inner.filled_http, fallback_leg);
                 }
@@ -760,6 +798,7 @@ fn apply_polled_snapshot(
                     let fallback_leg = LegAgg {
                         making_amount: OrderAmount::UsdNotional(sanitize_nonneg_f64(making_quote)),
                         taking_amount: OrderAmount::Shares(sanitize_nonneg_f64(size_matched)),
+                        fee_usdc: 0.0,
                     };
                     inner.filled_http = leg_agg_max_normalized(inner.filled_http, fallback_leg);
                 }
@@ -948,33 +987,64 @@ impl PostOrderInvokeAggregator {
             if !size_net.is_finite() || !quote_net.is_finite() {
                 return;
             }
+            // Fee per-trade в USDC: `quote × (1 − fee_factor)`. Формула одна для BUY/SELL
+            // (см. `aggregate_trades_into_leg`); накапливаем в `LegAgg.fee_usdc` параллельно
+            // с `(size_net, quote_net)`. `failed_*` не попадает в `fee_usdc` (релайер сдался,
+            // on-chain ничего не движется), но трекается в `failed_ws.fee_usdc=0` через тот же
+            // `leg_agg_add_trade_fill` — `fee_usd=0.0` оставляет fee нетронутым.
+            let fee_usd_per_trade = quote * (1.0 - fee_factor);
             if trade_id.is_empty() {
                 // Без trade_id дедуплицировать не можем. Чтобы не плодить тройной счёт по
                 // лифсайклу — игнорируем не-терминальные статусы; для терминальных (settled или
                 // failed) контрибьютим в book + соответствующую settlement-ось ровно один раз.
                 // Это безопасный no-op для аномальных событий.
                 if is_settled_on_chain {
-                    state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
-                    state.settled_ws =
-                        leg_agg_add_trade_fill(state.settled_ws, size_net, quote_net);
+                    state.filled_ws = leg_agg_add_trade_fill(
+                        state.filled_ws,
+                        size_net,
+                        quote_net,
+                        fee_usd_per_trade,
+                    );
+                    state.settled_ws = leg_agg_add_trade_fill(
+                        state.settled_ws,
+                        size_net,
+                        quote_net,
+                        fee_usd_per_trade,
+                    );
                     state_changed = true;
                 } else if is_terminal_failed {
-                    state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
-                    state.failed_ws = leg_agg_add_trade_fill(state.failed_ws, size_net, quote_net);
+                    state.filled_ws = leg_agg_add_trade_fill(
+                        state.filled_ws,
+                        size_net,
+                        quote_net,
+                        fee_usd_per_trade,
+                    );
+                    state.failed_ws =
+                        leg_agg_add_trade_fill(state.failed_ws, size_net, quote_net, 0.0);
                     state_changed = true;
                 }
             } else {
                 if state.seen_ws_trade_ids.insert(trade_id.clone()) {
-                    state.filled_ws = leg_agg_add_trade_fill(state.filled_ws, size_net, quote_net);
+                    state.filled_ws = leg_agg_add_trade_fill(
+                        state.filled_ws,
+                        size_net,
+                        quote_net,
+                        fee_usd_per_trade,
+                    );
                     state_changed = true;
                 }
                 if is_settled_on_chain && state.settled_seen_ws_trade_ids.insert(trade_id.clone()) {
-                    state.settled_ws =
-                        leg_agg_add_trade_fill(state.settled_ws, size_net, quote_net);
+                    state.settled_ws = leg_agg_add_trade_fill(
+                        state.settled_ws,
+                        size_net,
+                        quote_net,
+                        fee_usd_per_trade,
+                    );
                     state_changed = true;
                 }
                 if is_terminal_failed && state.failed_seen_ws_trade_ids.insert(trade_id) {
-                    state.failed_ws = leg_agg_add_trade_fill(state.failed_ws, size_net, quote_net);
+                    state.failed_ws =
+                        leg_agg_add_trade_fill(state.failed_ws, size_net, quote_net, 0.0);
                     state_changed = true;
                 }
             }
@@ -1288,6 +1358,17 @@ impl PostOrderInvokeAggregator {
             None
         };
 
+        // Fee — из settled-leg'а: накопленная сумма USDC, удержанная CLOB'ом по
+        // фактически зачисленным on-chain trades (per-trade `fee_rate_bps` из REST
+        // `client.trades(...)` и WS user-channel `trade.fee_rate_bps`). Если ни
+        // одного settled-trade ещё не пришло (`settled_leg` пустой), fee = 0 —
+        // консистентно с тем, что в отчёте `making/taking` тоже нули.
+        let fee_paid_usdc = if has_settled_fill {
+            sanitize_nonneg_f64(settled_leg.fee_usdc)
+        } else {
+            0.0
+        };
+
         SingleOrderClobInvocationReport {
             order_id: None,
             making_amount,
@@ -1295,6 +1376,7 @@ impl PostOrderInvokeAggregator {
             success: report_success,
             partial: report_partial,
             error_msg,
+            fee_paid_usdc,
         }
     }
 
@@ -1731,6 +1813,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                 success: false,
                 partial: false,
                 error_msg: server_error,
+                fee_paid_usdc: 0.0,
             },
         );
         let _ = take_tracker_entry(&trackers, &cloned_order_id).await;
@@ -1751,6 +1834,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                     "after_post_order_maybe_track_invoke: invoke_ctx=None при success=true (defensive)"
                         .to_string(),
                 ),
+                fee_paid_usdc: 0.0,
             },
         );
         return;
@@ -1769,6 +1853,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                 success: false,
                 partial: false,
                 error_msg: Some("CLOB вернул пустой order_id при success=true".to_string()),
+                fee_paid_usdc: 0.0,
             },
         );
         return;
@@ -1808,18 +1893,25 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
     let order_role = invoke_aggregator.role;
     {
         let mut invoke_state = invoke_aggregator.inner.write().await;
+        // POST-сид book-leg'а: на этом этапе у нас только итоговые making/taking от
+        // CLOB, без per-trade `fee_rate_bps`. Не оцениваем fee, оставляем 0 — на
+        // финал будет точное значение из `aggregate_trades_into_leg` (REST `trades`)
+        // или WS-агрегата с per-trade fee.
         let mut leg = match invoke_state.side {
             Side::Buy => LegAgg {
                 making_amount,
                 taking_amount,
+                fee_usdc: 0.0,
             },
             Side::Sell => LegAgg {
                 making_amount: taking_amount,
                 taking_amount: making_amount,
+                fee_usdc: 0.0,
             },
             _ => LegAgg {
                 making_amount,
                 taking_amount,
+                fee_usdc: 0.0,
             },
         };
         leg.sanitize_mut();

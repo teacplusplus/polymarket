@@ -174,19 +174,24 @@ fn polymarket_taker_fee_usd(shares: f64, price: f64) -> f64 {
     safe_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * bounded_price * (1.0 - bounded_price)
 }
 
-/// `(making, taking)` для taker BUY от USDC-нотанала: `making=UsdNotional(gross)`, `taking=Shares(net)`.
-fn taker_buy_legs_from_usd(usd_notional: f64, gross_shares: f64, vwap: f64) -> (OrderAmount, OrderAmount) {
+/// `(making, taking, fee_usd)` для taker BUY от USDC-нотанала: `making=UsdNotional(gross)`, `taking=Shares(net)`.
+fn taker_buy_legs_from_usd(
+    usd_notional: f64,
+    gross_shares: f64,
+    vwap: f64,
+) -> (OrderAmount, OrderAmount, f64) {
     let fee_usd = polymarket_taker_fee_usd(gross_shares, vwap);
     let fee_shares = if vwap > 0.0 { fee_usd / vwap } else { 0.0 };
     let net_shares = (gross_shares - fee_shares).max(0.0);
     (
         OrderAmount::UsdNotional(usd_notional),
         OrderAmount::Shares(net_shares),
+        fee_usd,
     )
 }
 
-/// `(making, taking)` для taker BUY от целевого числа shares.
-fn taker_buy_legs_from_shares(target_shares: f64, vwap: f64) -> (OrderAmount, OrderAmount) {
+/// `(making, taking, fee_usd)` для taker BUY от целевого числа shares.
+fn taker_buy_legs_from_shares(target_shares: f64, vwap: f64) -> (OrderAmount, OrderAmount, f64) {
     let gross_usd = target_shares * vwap;
     let fee_usd = polymarket_taker_fee_usd(target_shares, vwap);
     let net_shares = if vwap > 0.0 {
@@ -197,27 +202,34 @@ fn taker_buy_legs_from_shares(target_shares: f64, vwap: f64) -> (OrderAmount, Or
     (
         OrderAmount::UsdNotional(gross_usd),
         OrderAmount::Shares(net_shares),
+        fee_usd,
     )
 }
 
-/// `(making, taking)` для taker SELL: `making=Shares(gross)`, `taking=UsdNotional(net)`.
-fn taker_sell_legs(shares: f64, gross_usd: f64, vwap: f64) -> (OrderAmount, OrderAmount) {
+/// `(making, taking, fee_usd)` для taker SELL: `making=Shares(gross)`, `taking=UsdNotional(net)`.
+fn taker_sell_legs(shares: f64, gross_usd: f64, vwap: f64) -> (OrderAmount, OrderAmount, f64) {
     let fee_usd = polymarket_taker_fee_usd(shares, vwap);
     let net_usd = (gross_usd - fee_usd).max(0.0);
     (
         OrderAmount::Shares(shares),
         OrderAmount::UsdNotional(net_usd),
+        fee_usd,
     )
 }
 
-/// Maker — без fee, ровно `shares × limit_price` USDC.
-fn maker_legs_no_fee(side: Side, shares: f64, limit_price: f64) -> (OrderAmount, OrderAmount) {
+/// Maker — без fee, ровно `shares × limit_price` USDC. `fee_usd = 0`.
+fn maker_legs_no_fee(
+    side: Side,
+    shares: f64,
+    limit_price: f64,
+) -> (OrderAmount, OrderAmount, f64) {
     let usd = shares * limit_price;
-    match side {
+    let (making, taking) = match side {
         Side::Buy => (OrderAmount::UsdNotional(usd), OrderAmount::Shares(shares)),
         Side::Sell => (OrderAmount::Shares(shares), OrderAmount::UsdNotional(usd)),
         _ => (OrderAmount::UsdNotional(usd), OrderAmount::Shares(shares)),
-    }
+    };
+    (making, taking, 0.0)
 }
 
 fn fire_mock_success_report(
@@ -225,6 +237,7 @@ fn fire_mock_success_report(
     order_id: String,
     making_amount: OrderAmount,
     taking_amount: OrderAmount,
+    fee_paid_usdc: f64,
 ) {
     spawn_fire_invocation_report(
         slot,
@@ -235,6 +248,7 @@ fn fire_mock_success_report(
             success: true,
             partial: false,
             error_msg: None,
+            fee_paid_usdc,
         },
     );
 }
@@ -255,6 +269,7 @@ fn fire_mock_failed_report(
             success: false,
             partial: false,
             error_msg,
+            fee_paid_usdc: 0.0,
         },
     );
 }
@@ -279,7 +294,14 @@ pub(crate) fn spawn_mock_order_processor(
             MockFillOutcome::Filled {
                 making_amount,
                 taking_amount,
-            } => fire_mock_success_report(&slot, order_id.clone(), making_amount, taking_amount),
+                fee_paid_usdc,
+            } => fire_mock_success_report(
+                &slot,
+                order_id.clone(),
+                making_amount,
+                taking_amount,
+                fee_paid_usdc,
+            ),
             MockFillOutcome::Failed { error_msg } => {
                 fire_mock_failed_report(&slot, Some(order_id.clone()), request.side, Some(error_msg));
             }
@@ -299,6 +321,7 @@ enum MockFillOutcome {
     Filled {
         making_amount: OrderAmount,
         taking_amount: OrderAmount,
+        fee_paid_usdc: f64,
     },
     Failed {
         error_msg: String,
@@ -341,11 +364,12 @@ async fn run_taker_fill(
                     error_msg: cap_violation,
                 };
             }
-            let (making_amount, taking_amount) =
+            let (making_amount, taking_amount, fee_paid_usdc) =
                 taker_buy_legs_from_usd(usd_notional, gross_shares, vwap);
             MockFillOutcome::Filled {
                 making_amount,
                 taking_amount,
+                fee_paid_usdc,
             }
         }
         (Side::Buy, OrderAmount::Shares(target_shares)) => {
@@ -364,10 +388,12 @@ async fn run_taker_fill(
                     error_msg: cap_violation,
                 };
             }
-            let (making_amount, taking_amount) = taker_buy_legs_from_shares(target_shares, vwap);
+            let (making_amount, taking_amount, fee_paid_usdc) =
+                taker_buy_legs_from_shares(target_shares, vwap);
             MockFillOutcome::Filled {
                 making_amount,
                 taking_amount,
+                fee_paid_usdc,
             }
         }
         (Side::Sell, OrderAmount::Shares(shares)) => {
@@ -385,10 +411,12 @@ async fn run_taker_fill(
                     error_msg: cap_violation,
                 };
             }
-            let (making_amount, taking_amount) = taker_sell_legs(shares, gross_usd, vwap);
+            let (making_amount, taking_amount, fee_paid_usdc) =
+                taker_sell_legs(shares, gross_usd, vwap);
             MockFillOutcome::Filled {
                 making_amount,
                 taking_amount,
+                fee_paid_usdc,
             }
         }
         (Side::Sell, OrderAmount::UsdNotional(_)) => MockFillOutcome::Failed {
@@ -500,10 +528,12 @@ async fn run_maker_wait_for_fill(
             None => false,
         };
         if condition_met {
-            let (making_amount, taking_amount) = maker_legs_no_fee(request.side, shares, limit_price);
+            let (making_amount, taking_amount, fee_paid_usdc) =
+                maker_legs_no_fee(request.side, shares, limit_price);
             return MockFillOutcome::Filled {
                 making_amount,
                 taking_amount,
+                fee_paid_usdc,
             };
         }
 

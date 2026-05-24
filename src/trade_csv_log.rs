@@ -271,6 +271,13 @@ pub struct TradeCsvRow<'a> {
     /// План: размер позиции в USDC на POST BUY (после `ceil` до центов).
     /// `None` → пусто.
     pub planned_entry_cost: Option<f64>,
+    /// План: BUY-fee в USDC по историческому/strict-book стакану на момент входа
+    /// (`nominal_shares × rate × buy_price × (1 − buy_price)`). `None` → пусто.
+    pub planned_fee_usdc: Option<f64>,
+    /// Фактическая BUY-fee в USDC после settle BUY-invoke (для submit/Mock — из
+    /// [`crate::account_order::SingleOrderClobInvocationReport::fee_paid_usdc`];
+    /// для backtest идентична [`Self::planned_fee_usdc`]). `None` → пусто.
+    pub entry_fee_usdc: Option<f64>,
     /// CLOB order_id BUY-ордера. `None` → пусто.
     pub open_order_id: Option<&'a str>,
     /// CLOB order_id maker TP-ордера. `None` → пусто.
@@ -489,7 +496,7 @@ pub static SUBMIT_TRADE_CSV_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(Non
 const SUBMIT_TRADE_CSV_HEADER: &str = "regime,pos_id,polymarket_url,price_to_beat,final_price,\
 currency,interval,side,market_id,asset_id,exit_reason,finalized_via,\
 planned_buy_price,buy_price,planned_shares_held,shares_held,planned_entry_cost,entry_cost,\
-exit_price,fee_usdc,pnl,\
+planned_fee_usdc,entry_fee_usdc,exit_price,fee_usdc,pnl,\
 open_order_id,tp_order_id,close_order_ids,\
 raw_pred,cal_pred,kelly_f,p_win_ema_at_close,frames_held,\
 event_remaining_ms_at_open,event_remaining_ms_at_close,open_unix_ms,close_unix_ms,\
@@ -539,7 +546,7 @@ pub fn write_submit_trade_csv_row(row: TradeCsvRow<'_>) {
     };
     let _ = writeln!(
         writer,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         regime,
         csv_escape(row.pos_id),
         csv_escape(row.polymarket_url),
@@ -558,6 +565,8 @@ pub fn write_submit_trade_csv_row(row: TradeCsvRow<'_>) {
         fmt_f64(row.shares_held),
         row.planned_entry_cost.map(fmt_f64).unwrap_or_default(),
         fmt_f64(row.position_size),
+        row.planned_fee_usdc.map(fmt_f64).unwrap_or_default(),
+        row.entry_fee_usdc.map(fmt_f64).unwrap_or_default(),
         fmt_f64(row.exit_price),
         fmt_f64(row.fee_usdc),
         fmt_f64(row.pnl),

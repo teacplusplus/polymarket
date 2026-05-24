@@ -330,6 +330,20 @@ pub struct OpenPosition {
     /// callback в [`crate::account_submit::spawn_sell_taker`] могут гоняться за один и
     /// тот же fully-closed PNL — флаг гарантирует, что финализирует только победитель.
     pub(crate) close_after_submit_finalized: bool,
+    /// Фактически удержанная BUY-fee в USDC, которая уже учтена в
+    /// [`crate::sim_stats::SideStats::fees_paid`] лейна. В backtest (`SubmitMode::None`)
+    /// = [`Self::planned_fee_usdc`] (виртуальный fill идентичен плану). При первом
+    /// создании позиции (real_sim) — тоже план; после settle BUY
+    /// [`crate::account_submit::spawn_open_buy_taker`] заменяет его на actual из
+    /// mock/CLOB-fill (через
+    /// [`crate::account_order::SingleOrderClobInvocationReport::fee_paid_usdc`]):
+    /// `delta = actual − stored` → правка `stats.fees_paid`, новое значение
+    /// перезаписывает поле. Гарантирует, что суммарный entry-fee в SideStats бьётся
+    /// с реально удержанной CLOB'ом fee (а не с «плановым стаканом кадра», по
+    /// которому делалось решение).
+    pub(crate) entry_fee_usdc: f64,
+    /// Плановая BUY-fee в USDC: посчитана [`crate::history_sim::open_position`] по
+    pub(crate) planned_fee_usdc: f64,
 }
 
 /// Возврат [`OpenPosition::shares_remaining_to_sell`] при не-settled invoke-колбэке:
@@ -836,22 +850,46 @@ pub(crate) async fn run_side_simulation(
             .await;
         }
 
-        // Фаза 2: try_open_position. available считается на тех же live-позициях
-        // (в данном лейне same_side_locked). Порядок: bankroll → positions.
+        // Фаза 2: try_open_position. `available` — bankroll минус **весь**
+        // locked-капитал по всем lane'ам в `positions` и `pending_close_positions`
+        // (как в [`crate::real_sim::tick_once`]). Bankroll один общий, поэтому
+        // и кросс-lane (другие currency/interval/side в той же сессии), и
+        // pending-close-bucket тоже тратят его. В backtest (`SubmitMode::None`)
+        // `pending_close_positions` всегда пуст, но честно читаем для
+        // симметрии. Lock-order: bankroll → positions → pending_close_positions.
+        // Передаём оба HashMap'а под взятыми lock'ами — гейты
+        // [`MAX_OPEN_POSITIONS`] / [`BLOCK_SAME_ASSET_OPEN`] считаются внутри
+        // [`try_open_position`].
         {
             let bankroll = account.bankroll.read().await;
             let mut positions = account.positions.write().await;
-            let positions_v = positions.entry(lane_key.clone()).or_default();
-            let mut same_side_locked = 0.0;
-            for p in positions_v.values() {
-                same_side_locked += p.read().await.position_size;
-            }
-            let available = (*bankroll - same_side_locked).max(0.0);
+            let pending_close = account.pending_close_positions.read().await;
+            // Гарантируем существование bucket'а текущей lane до подсчёта,
+            // чтобы [`try_open_position`] могла вставить позицию через
+            // `entry(...).or_default()` без расхождения counts.
+            positions.entry(lane_key.clone()).or_default();
+            let total_locked = {
+                let mut sum = 0.0;
+                for lane_positions in positions.values() {
+                    for p in lane_positions.values() {
+                        sum += p.read().await.position_size;
+                    }
+                }
+                for lane_pending in pending_close.values() {
+                    for p in lane_pending.values() {
+                        sum += p.read().await.position_size;
+                    }
+                }
+                sum
+            };
+            let available = (*bankroll - total_locked).max(0.0);
             try_open_position(
                 frame,
                 pnl_inference,
                 Some(booster_pnl),
-                positions_v,
+                &mut *positions,
+                &*pending_close,
+                lane_key,
                 side_stats,
                 available,
                 None,
@@ -1031,13 +1069,31 @@ pub(crate) fn buy_gate(
     BuyGate::Proceed { raw, pred, kelly_f, size }
 }
 
-/// `true` если позиция открыта и добавлена в `positions`; иначе skip-счётчики ([`buy_gate`], same-asset).
+/// `true` если позиция открыта и вставлена в `positions_by_lane[lane_key]`;
+/// иначе skip-счётчики ([`buy_gate`], same-asset, max-open).
+///
+/// Принимает write-guard на **весь** `account.positions` HashMap и read-guard
+/// на **весь** `account.pending_close_positions` HashMap (оба caller'а держат
+/// эти lock'и уже сейчас, lock-order `positions → pending_close_positions`
+/// см. в [`crate::account`]). Это нужно, чтобы гейты учитывали суммарную
+/// картину по обоим bucket'ам, а функция была без неявных lock-acquire'ов.
+///
+/// Гейты:
+///   - [`BLOCK_SAME_ASSET_OPEN`] — проверяем live `positions_by_lane[lane_key]`
+///     и `pending_close_positions[lane_key]` (та же lane). Иначе позиция,
+///     перекочевавшая в pending-close на время async-SELL'а, не «защищала» бы
+///     от повторного входа.
+///   - [`MAX_OPEN_POSITIONS`] — суммарный count по **всем** lane'ам как в
+///     live, так и в pending-close. Лимит интерпретируется как глобальный
+///     потолок одновременно открытых позиций процесса.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_open_position(
     frame: &XFrame<SIZE>,
     pnl_inference: Option<PnlInference>,
     booster_pnl_for_shap: Option<&Booster>,
-    positions: &mut LanePositions,
+    positions_by_lane: &mut HashMap<crate::account::LaneKey, LanePositions>,
+    pending_close_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
+    lane_key: &crate::account::LaneKey,
     stats: &mut SideStats,
     bankroll: f64,
     strict_book: Option<&StrictBook>,
@@ -1092,10 +1148,22 @@ pub(crate) async fn try_open_position(
         BuyGate::Proceed { raw, pred, kelly_f, size } => {
             if BLOCK_SAME_ASSET_OPEN {
                 let mut same_asset_open = false;
-                for p in positions.values() {
-                    if p.read().await.asset_id == frame.asset_id {
-                        same_asset_open = true;
-                        break;
+                if let Some(lane_positions) = positions_by_lane.get(lane_key) {
+                    for p in lane_positions.values() {
+                        if p.read().await.asset_id == frame.asset_id {
+                            same_asset_open = true;
+                            break;
+                        }
+                    }
+                }
+                if !same_asset_open
+                    && let Some(lane_pending) = pending_close_by_lane.get(lane_key)
+                {
+                    for p in lane_pending.values() {
+                        if p.read().await.asset_id == frame.asset_id {
+                            same_asset_open = true;
+                            break;
+                        }
                     }
                 }
                 if same_asset_open {
@@ -1104,7 +1172,10 @@ pub(crate) async fn try_open_position(
                 }
             }
             if let Some(max_open) = MAX_OPEN_POSITIONS {
-                if positions.len() >= max_open {
+                let live_total: usize = positions_by_lane.values().map(|m| m.len()).sum();
+                let pending_total: usize =
+                    pending_close_by_lane.values().map(|m| m.len()).sum();
+                if live_total + pending_total >= max_open {
                     stats.max_open_positions_skips += 1;
                     return false;
                 }
@@ -1157,7 +1228,10 @@ pub(crate) async fn try_open_position(
                     let decision_book = strict_book.cloned();
                     let pos_id = pos.id.clone();
                     let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
-                    positions.insert(pos_id, pos_arc.clone());
+                    positions_by_lane
+                        .entry(lane_key.clone())
+                        .or_default()
+                        .insert(pos_id, pos_arc.clone());
                     crate::account_submit::spawn_open_buy_taker(
                         account.clone(),
                         project_manager.cloned(),
@@ -1696,6 +1770,8 @@ fn open_position(
         maker_tp_position: None,
         taker_positions: Vec::new(),
         close_after_submit_finalized: false,
+        entry_fee_usdc: fee_usdc,
+        planned_fee_usdc: fee_usdc,
     })
 }
 

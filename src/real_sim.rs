@@ -568,28 +568,6 @@ async fn tick_once(
         let may_open = may_open && !dd_halt_now && !market_resolved_now;
 
         if has_positions || may_open {
-            let mut cross_lanes_locked = 0.0;
-            for (k, v) in positions_guard.iter() {
-                if k == &lane_key {
-                    continue;
-                }
-                for p in v.values() {
-                    cross_lanes_locked += p.read().await.position_size;
-                }
-            }
-            let mut cross_lanes_pending_locked = 0.0;
-            {
-                let pending_close_guard = account.pending_close_positions.read().await;
-                for (k, v) in pending_close_guard.iter() {
-                    if k == &lane_key {
-                        continue;
-                    }
-                    for p in v.values() {
-                        cross_lanes_pending_locked += p.read().await.position_size;
-                    }
-                }
-            }
-
             let stats: &mut SimStats = state_guard
                 .stats
                 .get_mut(&interval_kind)
@@ -599,11 +577,10 @@ async fn tick_once(
                 CurrencyUpDownOutcome::Down => &mut stats.down,
             };
 
-            let this_positions: &mut crate::history_sim::LanePositions = positions_guard
-                .get_mut(&lane_key)
-                .expect("Account.positions pre-populated by run_real_sim");
-
             if has_positions {
+                let this_positions: &mut crate::history_sim::LanePositions = positions_guard
+                    .get_mut(&lane_key)
+                    .expect("Account.positions pre-populated by run_real_sim");
                 sold = manage_positions(
                     this_positions,
                     &frame,
@@ -637,27 +614,27 @@ async fn tick_once(
                         TICK_OPEN_MAX_ELAPSED.as_millis(),
                     );
                 } else {
-                    let mut same_locked_post = 0.0;
-                    for p in this_positions.values() {
-                        same_locked_post += p.read().await.position_size;
+                    // `available_bankroll_post` = bankroll − **весь** locked
+                    // капитал по всем lane'ам в обоих HashMap'ах (как в
+                    // [`crate::history_sim::run_side_simulation`]). Один
+                    // read-guard на `pending_close_positions` под этим scope'ом
+                    // также пробрасывается в [`try_open_position`] для гейтов
+                    // [`MAX_OPEN_POSITIONS`] / [`BLOCK_SAME_ASSET_OPEN`].
+                    // Lock-order соблюдён: positions write → pending_close read.
+                    let pending_close_guard = account.pending_close_positions.read().await;
+                    let mut total_locked = 0.0;
+                    for lane_positions in positions_guard.values() {
+                        for p in lane_positions.values() {
+                            total_locked += p.read().await.position_size;
+                        }
                     }
-                    let mut same_lane_pending_locked_post = 0.0;
-                    {
-                        let pending_close_guard =
-                            account.pending_close_positions.read().await;
-                        if let Some(v) = pending_close_guard.get(&lane_key) {
-                            for p in v.values() {
-                                same_lane_pending_locked_post += p.read().await.position_size;
-                            }
+                    for lane_pending in pending_close_guard.values() {
+                        for p in lane_pending.values() {
+                            total_locked += p.read().await.position_size;
                         }
                     }
                     let bankroll_post = *account.bankroll.read().await;
-                    let available_bankroll_post = (bankroll_post
-                        - cross_lanes_locked
-                        - cross_lanes_pending_locked
-                        - same_locked_post
-                        - same_lane_pending_locked_post)
-                        .max(0.0);
+                    let available_bankroll_post = (bankroll_post - total_locked).max(0.0);
                     let polymarket_url =
                         polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
                     let graph_dump_bin_path_str = gamma_question
@@ -677,7 +654,9 @@ async fn tick_once(
                         &frame,
                         pnl_inference,
                         Some(&models.booster_pnl),
-                        this_positions,
+                        &mut *positions_guard,
+                        &*pending_close_guard,
+                        &lane_key,
                         side_stats,
                         available_bankroll_post,
                         strict_book.as_ref(),

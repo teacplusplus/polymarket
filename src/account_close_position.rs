@@ -237,6 +237,8 @@ pub(crate) async fn close_position(
         planned_buy_price: None,
         planned_shares_held: None,
         planned_entry_cost: None,
+        planned_fee_usdc: None,
+        entry_fee_usdc: None,
         open_order_id: None,
         tp_order_id: None,
         close_order_ids: &[],
@@ -383,12 +385,19 @@ pub(crate) async fn close_position_after_submit(
     // гарантирует консистентность `shares_sold + residual ≈ actual_shares_net`.
     let mut shares_sold = 0.0_f64;
     let mut usd_received = 0.0_f64;
+    let mut sell_fee_usdc = 0.0_f64;
     let mut tp_order_id: Option<String> = None;
     let mut close_order_ids: Vec<String> = Vec::new();
 
+    // Maker (TP) у Polymarket всегда 0; taker (FAK SELL) — `report.fee_paid_usdc`
+    // от mock'а (`polymarket_taker_fee_usd(gross, vwap)`) или real CLOB-агрегатора
+    // (`Σ trade.size × trade.price × trade.fee_rate_bps / 10_000` по on-chain
+    // settled trades). В обоих случаях это уже корректный USD-значок, складываем
+    // напрямую в `sell_fee_usdc` для общего `side_stats.fees_paid += fee_usdc` ниже.
     let accumulate = |report: &SingleOrderClobInvocationReport,
                       shares_acc: &mut f64,
-                      usd_acc: &mut f64| {
+                      usd_acc: &mut f64,
+                      fee_acc: &mut f64| {
         if !report.success {
             return;
         }
@@ -401,6 +410,10 @@ pub(crate) async fn close_position_after_submit(
         {
             *shares_acc += s;
             *usd_acc += u;
+            let fee = report.fee_paid_usdc;
+            if fee.is_finite() && fee >= 0.0 {
+                *fee_acc += fee;
+            }
         }
     };
 
@@ -416,7 +429,12 @@ pub(crate) async fn close_position_after_submit(
             && invoke_settlement_ready(watch)
             && let Some(report) = invoke_settlement_report(watch)
         {
-            accumulate(&report, &mut shares_sold, &mut usd_received);
+            accumulate(
+                &report,
+                &mut shares_sold,
+                &mut usd_received,
+                &mut sell_fee_usdc,
+            );
         }
     }
 
@@ -436,7 +454,12 @@ pub(crate) async fn close_position_after_submit(
             && invoke_settlement_ready(watch)
             && let Some(report) = invoke_settlement_report(watch)
         {
-            accumulate(&report, &mut shares_sold, &mut usd_received);
+            accumulate(
+                &report,
+                &mut shares_sold,
+                &mut usd_received,
+                &mut sell_fee_usdc,
+            );
         }
     }
 
@@ -511,10 +534,20 @@ pub(crate) async fn close_position_after_submit(
         Some(false) | None => 0.0,
     };
 
-    // Maker (TP) fee = 0; taker (FAK SELL) fee CLOB уже вычел из `taking_amount`
-    // (`making_amount` остаётся валовыми shares). Resolution-payout — комиссия 0.
-    // Поэтому здесь всегда 0, то же поведение, что и в [`close_position_market_exit`].
-    let fee_usdc: f64 = 0.0;
+    // Сумма SELL-fee для `SideStats.fees_paid` лейна. Maker (TP) — fee = 0;
+    // taker (FAK SELL) — Polymarket вычитает fee из `taking_amount` (USDC),
+    // оставляя `making_amount` (gross shares) нетронутым. Источник —
+    // [`SingleOrderClobInvocationReport::fee_paid_usdc`] (mock считает явно через
+    // `polymarket_taker_fee_usd`; real CLOB — `Σ trade.size × trade.price ×
+    // trade.fee_rate_bps / 10_000` по on-chain settled trades).
+    //
+    // Для resolution-пути занулять fee нельзя: `sell_fee_usdc` накапливается
+    // **только** по успешно settled SELL invoke'ам (см. `accumulate` выше), а
+    // residual-payout ($1/$0 за непроданные shares) идёт мимо CLOB — за него и
+    // так ничего не считается. Если до маркет-энда часть позиции уже
+    // распродалась через maker TP / taker FAK — комиссия с тех fill'ов
+    // реальная и должна остаться в `fees_paid`.
+    let fee_usdc: f64 = sell_fee_usdc;
     let pnl = usd_received + residual_payout - actual_entry_cost;
     // exit_price: для after-sell — sell-VWAP; для resolution — blended exit
     // (продано + payout residual) / total shares. После-sell guard выше
@@ -692,6 +725,8 @@ pub(crate) async fn close_position_after_submit(
         planned_buy_price: Some(planned_buy_price),
         planned_shares_held: Some(planned_shares_held),
         planned_entry_cost: Some(planned_entry_cost),
+        planned_fee_usdc: Some(position_snapshot.planned_fee_usdc),
+        entry_fee_usdc: Some(position_snapshot.entry_fee_usdc),
         open_order_id: position_snapshot.open_order_id.as_deref(),
         tp_order_id: tp_order_id.as_deref(),
         close_order_ids: &close_order_id_refs,
