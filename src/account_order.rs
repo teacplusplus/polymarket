@@ -1,6 +1,6 @@
 //! CLOB: [`post_order_on_clob`] ([POST /order](https://docs.polymarket.com/api-reference/trade/post-a-new-order)),
 //! [`cancel_order_on_clob`](https://docs.polymarket.com/api-reference/trade/cancel-single-order).
-//! `clob_authed` / `clob_signer` — из [`crate::account::Account`] ([`crate::account::try_authenticate_clob_for_heartbeats`]).
+//! `clob_authed` / `clob_signer` — из [`crate::account::Account`] ([`crate::authenticate::try_authenticate_clob_for_heartbeats`]).
 //! Шаги shutdown: [`cancel_all_orders_on_clob`], [`sell_all_positions_on_clob`] ([`crate::account_exit::graceful_exit`]).
 
 use crate::account::{POLY_PRIVATE_KEY_ENV, SharedAccount};
@@ -114,7 +114,7 @@ pub async fn post_order_on_clob(
     request: PostOrderRequest,
     invoke: SingleOrderInvokeCb,
 ) -> Result<Option<String>> {
-    // panic!("post_order_on_clob is forbidden");
+    panic!("post_order_on_clob is forbidden");
     let _ = project_manager;
     let invoke_slot = wrap_post_order_cb(invoke);
 

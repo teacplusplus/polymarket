@@ -1,6 +1,26 @@
 //! Агрегаты симуляции по стороне и версии: [`SideStats`], [`SimStats`], лог-печать.
 
-use crate::tee_println;
+use crate::account::SharedAccount;
+use crate::constants::XFrameIntervalKind;
+use crate::history_sim::INITIAL_BANKROLL;
+
+/// Куда пишут [`print_side_stats`] / [`print_sim_stats`]: консоль+[`TEE_LOG`] или только `last_sim_stats.txt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimStatsLogSink {
+    /// [`tee_println!`] — stdout и основной tee-файл режима.
+    Tee,
+    /// [`sim_stats_tee_println!`] — только [`SIM_STATS_TEE_LOG`] (`xframes/last_sim_stats.txt`).
+    SimStatsFile,
+}
+
+macro_rules! sim_stats_log {
+    ($sink:expr, $($arg:tt)*) => {
+        match $sink {
+            SimStatsLogSink::Tee => $crate::tee_println!($($arg)*),
+            SimStatsLogSink::SimStatsFile => $crate::sim_stats_tee_println!($($arg)*),
+        }
+    };
+}
 
 /// Статистика по одной стороне (UP/DOWN).
 #[derive(Debug, Default)]
@@ -23,7 +43,7 @@ pub struct SideStats {
     pub(crate) resolution_win: usize,
     /// Из них сделки с PnL ≥ 0.
     pub(crate) resolution_win_profit: usize,
-    /// Из них с PnL < 0 при верном исходе.
+    /// Из них сделки с PnL < 0 при верном исходе.
     pub(crate) resolution_win_loss: usize,
     /// Резолюция: токен проиграл (убыток ~ −entry).
     pub(crate) resolution_loss: usize,
@@ -138,7 +158,13 @@ impl SimStats {
     }
 }
 
-pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bool) {
+pub fn print_side_stats(
+    tag: &str,
+    side_label: &str,
+    s: &SideStats,
+    is_kelly: bool,
+    sink: SimStatsLogSink,
+) {
     let n = s.raw_above_threshold.max(1) as f64;
     let diag = if is_kelly {
         format!(
@@ -169,15 +195,16 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
             s.kelly_strict_sell_skips,
         )
     };
-    tee_println!("[sim] {tag} [{side_label}]   {diag}");
+    sim_stats_log!(sink, "[sim] {tag} [{side_label}]   {diag}");
 
     if s.trades == 0 {
-        tee_println!("[sim] {tag} [{side_label}]: нет сделок");
+        sim_stats_log!(sink, "[sim] {tag} [{side_label}]: нет сделок");
         return;
     }
     let win_rate = s.wins as f64 / s.trades as f64 * 100.0;
     let avg_pnl = s.pnl_usd / s.trades as f64;
-    tee_println!(
+    sim_stats_log!(
+        sink,
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
@@ -202,7 +229,8 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
         s.max_open_positions_skips,
     );
 
-    tee_println!(
+    sim_stats_log!(
+        sink,
         "[sim] {tag} [{side_label}] entry_prob hist (0..0.2 / 0.2..0.4 / 0.4..0.6 / 0.6..0.8 / 0.8..1): {} / {} / {} / {} / {}",
         s.histogram_entry_prob[0],
         s.histogram_entry_prob[1],
@@ -211,7 +239,8 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
         s.histogram_entry_prob[4],
     );
     if is_kelly {
-        tee_println!(
+        sim_stats_log!(
+            sink,
             "[sim] {tag} [{side_label}] cal_pred  hist (0..0.2 / 0.2..0.4 / 0.4..0.6 / 0.6..0.8 / 0.8..1): {} / {} / {} / {} / {}",
             s.histogram_cal_pred[0],
             s.histogram_cal_pred[1],
@@ -222,7 +251,8 @@ pub fn print_side_stats(tag: &str, side_label: &str, s: &SideStats, is_kelly: bo
     }
 
     let avg = |sum: f64, cnt: usize| if cnt == 0 { 0.0 } else { sum / cnt as f64 };
-    tee_println!(
+    sim_stats_log!(
+        sink,
         "[sim] {tag} [{side_label}] pnl_by_reason: \
          TP={tp_pnl:+.2}$(avg={tp_avg:+.4}) SL={sl_pnl:+.2}$(avg={sl_avg:+.4}) \
          Timeout={to_pnl:+.2}$(avg={to_avg:+.4}) \
@@ -253,11 +283,13 @@ pub fn print_sim_stats(
     max_drawdown_pct_now: f64,
     is_kelly: bool,
     initial_bankroll: f64,
+    sink: SimStatsLogSink,
 ) {
     let total_trades = sim_stats.total_trades();
     if total_trades == 0 {
         if is_kelly {
-            tee_println!(
+            sim_stats_log!(
+                sink,
                 "[sim] {tag}: нет сделок ({} событий, kelly_skips={} entry_prob_skips={} same_asset_open_skips={} max_open_positions_skips={} kelly_strict_buy_skips={} kelly_strict_sell_skips={})",
                 sim_stats.events,
                 sim_stats.total_kelly_skips(),
@@ -268,7 +300,8 @@ pub fn print_sim_stats(
                 sim_stats.total_kelly_strict_sell_skips(),
             );
         } else {
-            tee_println!(
+            sim_stats_log!(
+                sink,
                 "[sim] {tag}: нет сделок ({} событий, entry_prob_skips={} same_asset_open_skips={} max_open_positions_skips={} bankroll_too_small_skips={})",
                 sim_stats.events,
                 sim_stats.total_entry_prob_skips(),
@@ -277,8 +310,8 @@ pub fn print_sim_stats(
                 sim_stats.total_kelly_skips(),
             );
         }
-        print_side_stats(tag, "UP", &sim_stats.up, is_kelly);
-        print_side_stats(tag, "DOWN", &sim_stats.down, is_kelly);
+        print_side_stats(tag, "UP", &sim_stats.up, is_kelly, sink);
+        print_side_stats(tag, "DOWN", &sim_stats.down, is_kelly, sink);
         return;
     }
 
@@ -291,7 +324,8 @@ pub fn print_sim_stats(
 
     let total_losses = sim_stats.total_losses();
     if is_kelly {
-        tee_println!(
+        sim_stats_log!(
+            sink,
             "[sim] {tag} \
              | events={} trades={} win={:.1}% \
              | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
@@ -311,7 +345,8 @@ pub fn print_sim_stats(
             kss = sim_stats.total_kelly_strict_sell_skips(),
         );
     } else {
-        tee_println!(
+        sim_stats_log!(
+            sink,
             "[sim] {tag} \
              | events={} trades={} win={:.1}% \
              | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
@@ -329,13 +364,66 @@ pub fn print_sim_stats(
             bts = sim_stats.total_kelly_skips(),
         );
     }
-    tee_println!(
+    sim_stats_log!(
+        sink,
         "[sim]   bankroll: {:.2}$ (start={initial_bankroll}$) ROI={:+.2}% max_drawdown={:.2}%",
         bankroll_now,
         roi_pct,
         max_drawdown_pct_now,
     );
 
-    print_side_stats(tag, "UP", &sim_stats.up, is_kelly);
-    print_side_stats(tag, "DOWN", &sim_stats.down, is_kelly);
+    print_side_stats(tag, "UP", &sim_stats.up, is_kelly, sink);
+    print_side_stats(tag, "DOWN", &sim_stats.down, is_kelly, sink);
+}
+
+/// Печатает [`SimStats`] по **всем** валютам из [`crate::account::Account::real_sim_state_by_currency`]
+/// (для каждой — 5m и 15m). Вызывается после [`crate::account_close_position::close_position_after_submit`].
+pub async fn print_all_real_sim_state_stats(
+    account: &SharedAccount,
+    header: &str,
+    sink: SimStatsLogSink,
+) {
+    if sink == SimStatsLogSink::SimStatsFile && !crate::tee_log::sim_stats_tee_log_is_open() {
+        return;
+    }
+    match sink {
+        SimStatsLogSink::Tee => {
+            crate::tee_println!("---");
+            crate::tee_println!("{header}");
+        }
+        SimStatsLogSink::SimStatsFile => {
+            crate::tee_log::sim_stats_tee_log_write("---");
+            crate::tee_log::sim_stats_tee_log_write(header);
+        }
+    }
+
+    let bankroll_now = *account.bankroll.read().await;
+    let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
+    let states = account.real_sim_state_by_currency.read().await;
+    let mut currencies: Vec<String> = states.keys().cloned().collect();
+    currencies.sort();
+    for currency in currencies {
+        let Some(state_arc) = states.get(&currency) else {
+            continue;
+        };
+        let state_guard = state_arc.read().await;
+        for kind in [XFrameIntervalKind::FiveMin, XFrameIntervalKind::FifteenMin] {
+            let Some(stats) = state_guard.stats.get(&kind) else {
+                continue;
+            };
+            let tag = format!(
+                "{currency}/{} @ close",
+                crate::real_sim::interval_label(kind),
+            );
+            print_sim_stats(
+                &tag,
+                stats,
+                bankroll_now,
+                max_drawdown_pct_now,
+                true,
+                INITIAL_BANKROLL,
+                sink,
+            );
+        }
+    }
 }

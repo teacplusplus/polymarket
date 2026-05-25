@@ -734,7 +734,23 @@ pub(crate) async fn close_position_after_submit(
     crate::trade_csv_log::write_trade_csv_row(trade_row);
     crate::trade_csv_log::write_submit_trade_csv_row(trade_row);
 
-    if let Some(project_manager) = project_manager {
+    let sim_snapshot_header = format!(
+        "[sim-snapshot] pos_id={pos_id} market_id={market_id_str} side={side_label} \
+         reason={exit_reason_label} pnl={pnl:+.6} finalized_via={finalized_via}",
+    );
+    crate::sim_stats::print_all_real_sim_state_stats(
+        account,
+        &sim_snapshot_header,
+        crate::sim_stats::SimStatsLogSink::SimStatsFile,
+    )
+    .await;
+
+    // Partial HTML только пока рынок ещё идёт; после `event_end_ms` кадры в PM уже не
+    // дополняются — график бессмысленен (полный дамп делается при резолюции маркета).
+    let market_still_live = position_snapshot.event_end_ms.is_none_or(|end_ms| {
+        close_unix_ms.is_some_and(|now_ms| now_ms < end_ms)
+    });
+    if market_still_live && let Some(project_manager) = project_manager {
         crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close(
             project_manager.clone(),
             &position_snapshot,

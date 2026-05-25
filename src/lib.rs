@@ -1,4 +1,5 @@
 pub mod account;
+pub mod authenticate;
 pub mod account_close_position;
 pub mod account_exit;
 pub mod account_mock_order;

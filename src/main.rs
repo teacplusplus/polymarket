@@ -120,6 +120,10 @@ async fn main() -> Result<()> {
                 std::path::Path::new("xframes/last_real_sim.txt"),
                 "real_sim",
             )?;
+            tee_log::init_sim_stats_tee_log_file(
+                std::path::Path::new("xframes/last_sim_stats.txt"),
+                "real_sim",
+            )?;
 
             trade_csv_log::init_trade_csv_log_file(std::path::Path::new(
                 "xframes/last_real_sim_trades.csv",
@@ -148,6 +152,14 @@ async fn main() -> Result<()> {
             )?;
             tee_log::init_stream_tee_log_file(
                 std::path::Path::new("xframes/last_stream.txt"),
+                "real_sim_with_submit",
+            )?;
+            tee_log::init_user_stream_tee_log_file(
+                std::path::Path::new("xframes/last_user_stream.txt"),
+                "real_sim_with_submit",
+            )?;
+            tee_log::init_sim_stats_tee_log_file(
+                std::path::Path::new("xframes/last_sim_stats.txt"),
                 "real_sim_with_submit",
             )?;
             trade_csv_log::init_submit_trade_csv_log_file(std::path::Path::new(

@@ -22,7 +22,9 @@ use crate::xframe::{
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println};
 
-pub use crate::sim_stats::{print_side_stats, print_sim_stats, SideStats, SimStats};
+pub use crate::sim_stats::{
+    print_side_stats, print_sim_stats, SideStats, SimStats, SimStatsLogSink,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -670,6 +672,7 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     max_drawdown_pct_now,
                     is_kelly,
                     INITIAL_BANKROLL,
+                    SimStatsLogSink::Tee,
                 );
             }
         }

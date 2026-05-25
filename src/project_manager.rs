@@ -153,7 +153,7 @@ impl ProjectManager {
     ///
     /// CLOB-клиент создаётся ровно в [`crate::account::Account::new`] и
     /// переиспользуется: один пул соединений / DNS-кэш на все валюты плюс
-    /// [`crate::account::spawn_heartbeat`].
+    /// [`crate::authenticate::spawn_heartbeat`].
     pub fn new(currency: String, account: SharedAccount) -> Arc<Self> {
         let (ws, mut ws_snapshot_receiver) = make_ws_channel();
 

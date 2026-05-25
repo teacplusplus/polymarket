@@ -96,6 +96,11 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         stream_log_path,
         "live_taker_roundtrip_btc_updown_5m",
     )?;
+    let user_stream_log_path = std::path::Path::new("xframes/last_user_stream.txt");
+    poly::tee_log::init_user_stream_tee_log_file(
+        user_stream_log_path,
+        "live_taker_roundtrip_btc_updown_5m",
+    )?;
 
     let account = Account::new_shared();
     let country_and_ip = detect_country_and_ip(account.http.as_ref())
@@ -132,6 +137,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         );
         poly::tee_log::finish_test_tee_log();
         poly::tee_log::finish_stream_tee_log();
+        poly::tee_log::finish_user_stream_tee_log();
         return Ok(());
     }
     let slug = current_btc_updown_5m_slug(current_timestamp_ms());
@@ -356,6 +362,7 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         sell_single_order_clob_invocation_report.order_id,
     );
     poly::tee_log::finish_stream_tee_log();
+    poly::tee_log::finish_user_stream_tee_log();
     poly::tee_log::finish_test_tee_log();
     Ok(())
 }

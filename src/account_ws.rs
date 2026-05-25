@@ -1,5 +1,5 @@
 //! User-WebSocket CLOB (`POLYMARKET_USER_WS_URL`): `order`/`trade` → статусы позиций и fills.
-//! Креды из `Account.clob_authed` ([`crate::account::try_authenticate_clob_for_heartbeats`] перед спавном).
+//! Креды из `Account.clob_authed` ([`crate::authenticate::try_authenticate_clob_for_heartbeats`] перед спавном).
 //! Каркас как у interval/market WS: PING ([`USER_WS_PING_INTERVAL_SECS`]), watchdog ([`USER_WS_STALE_MAX_AGE_MS`]), reconnect ([`USER_WS_RECONNECT_DELAY_SECS`]).
 use crate::account::SharedAccount;
 use crate::account_order_completion::{
@@ -43,7 +43,7 @@ const USER_WS_WAIT_AUTH_MAX_SECS: u64 = 30;
 pub fn spawn_user_ws_listener(account: SharedAccount) {
     tokio::spawn(async move {
         // Первая итерация: долго ждём `clob_authed`, иначе panic (мисконфиг); дальше — короткий poll + re-auth из heartbeat без panic.
-        crate::tee_println!("[user_ws] стартую: connect {POLYMARKET_USER_WS_URL}",);
+        crate::user_stream_tee_println!("[user_ws] стартую: connect {POLYMARKET_USER_WS_URL}",);
         let mut first_iteration = true;
         loop {
             // На каждом reconnect заново берём ключи из ArcSwap (force-reauth).
@@ -51,14 +51,14 @@ pub fn spawn_user_ws_listener(account: SharedAccount) {
                 Some(creds) => creds,
                 None => {
                     if first_iteration {
-                        crate::tee_eprintln!(
+                        crate::user_stream_tee_eprintln!(
                             "[user_ws] auth не появился за {USER_WS_WAIT_AUTH_MAX_SECS}s — паникую: проверьте POLY_PRIVATE_KEY и [heartbeat] CLOB authenticate в логах",
                         );
                         panic!(
                             "[user_ws] CLOB auth не поднялся за {USER_WS_WAIT_AUTH_MAX_SECS}s — user-канал не запускается"
                         );
                     } else {
-                        crate::tee_eprintln!(
+                        crate::user_stream_tee_eprintln!(
                             "[user_ws] reconnect-итерация: clob_authed=None в момент wait_for_clob_credentials \
                              — ждём re-auth (sleep {USER_WS_RECONNECT_DELAY_SECS}s)"
                         );
@@ -69,9 +69,9 @@ pub fn spawn_user_ws_listener(account: SharedAccount) {
             };
             first_iteration = false;
             if let Err(err) = run_user_ws_session(&account, &credentials).await {
-                crate::tee_eprintln!("[user_ws] сессия упала: {err:#}");
+                crate::user_stream_tee_eprintln!("[user_ws] сессия упала: {err:#}");
             } else {
-                crate::tee_eprintln!("[user_ws] сессия закрылась — реконнектимся");
+                crate::user_stream_tee_eprintln!("[user_ws] сессия закрылась — реконнектимся");
             }
             sleep(Duration::from_secs(USER_WS_RECONNECT_DELAY_SECS)).await;
         }
@@ -115,7 +115,7 @@ async fn run_user_ws_session(
         .send(Message::Text(subscribe_payload.to_string()))
         .await?;
 
-    crate::tee_println!(
+    crate::user_stream_tee_println!(
         "[user_ws] подписан (apiKey={}); ждём order/trade events",
         credentials.key(),
     );
@@ -137,14 +137,14 @@ async fn run_user_ws_session(
             _ = ping_tick.tick() => {
                 // Текстовый PING (не WS frame ping).
                 if write.send(Message::Text("PING".into())).await.is_err() {
-                    crate::tee_eprintln!("[user_ws] PING send упал — реконнект");
+                    crate::user_stream_tee_eprintln!("[user_ws] PING send упал — реконнект");
                     return Ok(());
                 }
             }
             _ = watchdog.tick() => {
                 let age_ms = current_timestamp_ms() - last_message_wall_ms;
                 if age_ms > USER_WS_STALE_MAX_AGE_MS {
-                    crate::tee_eprintln!(
+                    crate::user_stream_tee_eprintln!(
                         "[user_ws] watchdog: тишина {age_ms}ms — форсирую реконнект",
                     );
                     return Ok(());
@@ -153,11 +153,11 @@ async fn run_user_ws_session(
             msg = read.next() => {
                 match msg {
                     None => {
-                        crate::tee_eprintln!("[user_ws] стрим завершён — реконнект");
+                        crate::user_stream_tee_eprintln!("[user_ws] стрим завершён — реконнект");
                         return Ok(());
                     }
                     Some(Err(err)) => {
-                        crate::tee_eprintln!("[user_ws] read error: {err} — реконнект");
+                        crate::user_stream_tee_eprintln!("[user_ws] read error: {err} — реконнект");
                         return Ok(());
                     }
                     Some(Ok(Message::Text(text))) => {
@@ -185,7 +185,7 @@ async fn run_user_ws_session(
                         last_message_wall_ms = current_timestamp_ms();
                     }
                     Some(Ok(Message::Close(_))) => {
-                        crate::tee_eprintln!("[user_ws] сервер закрыл соединение");
+                        crate::user_stream_tee_eprintln!("[user_ws] сервер закрыл соединение");
                         return Ok(());
                     }
                     Some(Ok(_)) => {
@@ -200,7 +200,7 @@ async fn run_user_ws_session(
 /// Один объект или массив JSON из user-WS → каждое событие в [`apply_user_ws_event_value`].
 async fn ingest_user_ws_payload(account: &SharedAccount, raw: &str) {
     let Ok(value) = serde_json::from_str::<Value>(raw) else {
-        crate::tee_eprintln!("[user_ws] не-JSON payload: {raw}");
+        crate::user_stream_tee_eprintln!("[user_ws] не-JSON payload: {raw}");
         return;
     };
     if let Some(arr) = value.as_array() {
@@ -236,7 +236,7 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             // Polymarket не выстрелил колбэк прематурно для partial maker'а.
             let original_size = parse_decimal_str(value.get("original_size"));
             let size_matched = parse_decimal_str(value.get("size_matched"));
-            crate::tee_println!(
+            crate::user_stream_tee_println!(
                 "[user_ws] order: id={order_id} side={side} type={order_kind} status={order_status} \
                  original_size={original_size:?} size_matched={size_matched:?}",
             );
@@ -264,7 +264,7 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
                 .and_then(Value::as_str)
                 .unwrap_or("?");
             let side = value.get("side").and_then(Value::as_str).unwrap_or("?");
-            crate::tee_println!(
+            crate::user_stream_tee_println!(
                 "[user_ws] trade: id={trade_id} taker={taker_order_id} side={side} status={trade_status} trader_side={trader_side}",
             );
             // Сначала taker-статусы (чтобы SELL уже `Closed` к fill); затем partial/full fill; maker_orders — возможный наш TP.
@@ -332,7 +332,7 @@ async fn apply_user_ws_event_value(account: &SharedAccount, value: &Value) {
             }
         }
         _ => {
-            crate::tee_eprintln!("[user_ws] unknown event_type={event_type}");
+            crate::user_stream_tee_eprintln!("[user_ws] unknown event_type={event_type}");
         }
     }
 }

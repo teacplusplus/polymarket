@@ -788,10 +788,16 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         stream_log_path,
         "live_duel_up_down_maker_race_tp10",
     )?;
+    let user_stream_log_path = std::path::Path::new("xframes/last_user_stream.txt");
+    poly::tee_log::init_user_stream_tee_log_file(
+        user_stream_log_path,
+        "live_duel_up_down_maker_race_tp10",
+    )?;
     let (dt, wall) = evt_ms!(last_evt, t0);
     poly::test_tee_println!(
-        "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: `[order_invoke/...]` tee → {}",
+        "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: `[order_invoke/...]` tee → {}; `[user_ws]` tee → {}",
         stream_log_path.display(),
+        user_stream_log_path.display(),
     );
 
     let account = Account::new_shared();
@@ -828,6 +834,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         );
         poly::tee_log::finish_test_tee_log();
         poly::tee_log::finish_stream_tee_log();
+        poly::tee_log::finish_user_stream_tee_log();
         return Ok(());
     }
 
@@ -918,6 +925,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
             prep_down.min_order_size_shares,
         );
         poly::tee_log::finish_stream_tee_log();
+        poly::tee_log::finish_user_stream_tee_log();
         poly::tee_log::finish_test_tee_log();
         return Ok(());
     }
@@ -974,6 +982,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
     );
 
     poly::tee_log::finish_stream_tee_log();
+    poly::tee_log::finish_user_stream_tee_log();
     poly::tee_log::finish_test_tee_log();
     Ok(())
 }

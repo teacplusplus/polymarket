@@ -8,8 +8,9 @@
 //! Если [`TEE_LOG`] ещё не инициализирован (`None`) — [`tee_println!`]/[`tee_eprintln!`]
 //! работают как обычный `println!`/`eprintln!`, просто без файловой копии.
 //!
-//! Если [`STREAM_TEE_LOG`] или [`TEST_TEE_LOG`] не открыты через `init_*` — соответствующие
-//! макросы не пишут в файл (форматирование строки всё равно выполняется).
+//! Если [`STREAM_TEE_LOG`], [`USER_STREAM_TEE_LOG`], [`SIM_STATS_TEE_LOG`] или [`TEST_TEE_LOG`]
+//! не открыты через `init_*` — соответствующие макросы не пишут в файл (форматирование
+//! строки всё равно выполняется).
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -160,6 +161,126 @@ macro_rules! stream_tee_eprintln {
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
         $crate::tee_log::stream_tee_log_write(&__line);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Отдельный «user-stream» tee-канал для user-WS и CLOB heartbeat
+// ([`crate::account_ws`] `[user_ws] …`, [`crate::account`] `[heartbeat] …`):
+// только файл, без stdout/stderr — как [`STREAM_TEE_LOG`], но свой путь
+// (`xframes/last_user_stream.txt` в live/submit-режимах).
+// ---------------------------------------------------------------------------
+
+/// Параллельный файловый писатель для user-WS логов; не пересекается с [`TEE_LOG`] и [`STREAM_TEE_LOG`].
+pub static USER_STREAM_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// Пишет одну строку в [`USER_STREAM_TEE_LOG`] (если файл инициализирован) и сразу флашит.
+pub fn user_stream_tee_log_write(line: &str) {
+    if let Ok(mut guard) = USER_STREAM_TEE_LOG.lock() {
+        if let Some(w) = guard.as_mut() {
+            let _ = writeln!(w, "{}", line);
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Аналог [`init_stream_tee_log_file`] для [`USER_STREAM_TEE_LOG`]: маркер
+/// «[<tag>] user-stream-log пишется в …».
+pub fn init_user_stream_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = File::create(path)?;
+    {
+        let mut guard = USER_STREAM_TEE_LOG.lock().expect("USER_STREAM_TEE_LOG poisoned");
+        *guard = Some(BufWriter::new(file));
+    }
+    crate::user_stream_tee_println!("[{tag}] user-stream-log пишется в {}", path.display());
+    Ok(())
+}
+
+/// Флашит и закрывает писатель в [`USER_STREAM_TEE_LOG`], если он был открыт.
+pub fn finish_user_stream_tee_log() {
+    if let Ok(mut guard) = USER_STREAM_TEE_LOG.lock() {
+        if let Some(mut w) = guard.take() {
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Записывает строку **только** в [`USER_STREAM_TEE_LOG`] (если открыт); в stdout не пишет.
+#[macro_export]
+macro_rules! user_stream_tee_println {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::user_stream_tee_log_write(&__line);
+    }};
+}
+
+/// Записывает строку **только** в [`USER_STREAM_TEE_LOG`] (если открыт); в stderr не пишет.
+#[macro_export]
+macro_rules! user_stream_tee_eprintln {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::user_stream_tee_log_write(&__line);
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// Отдельный «sim-stats» tee-канал: снимки [`crate::sim_stats::SimStats`] при закрытии
+// позиций в real_sim / real_sim_with_submit (`xframes/last_sim_stats.txt`).
+// ---------------------------------------------------------------------------
+
+/// Файловый писатель для sim-stats снимков; не пересекается с другими tee-каналами.
+pub static SIM_STATS_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+
+/// Пишет одну строку в [`SIM_STATS_TEE_LOG`] (если файл инициализирован) и сразу флашит.
+pub fn sim_stats_tee_log_write(line: &str) {
+    if let Ok(mut guard) = SIM_STATS_TEE_LOG.lock() {
+        if let Some(w) = guard.as_mut() {
+            let _ = writeln!(w, "{}", line);
+            let _ = w.flush();
+        }
+    }
+}
+
+/// `true`, если [`SIM_STATS_TEE_LOG`] открыт (real_sim / real_sim_with_submit).
+pub fn sim_stats_tee_log_is_open() -> bool {
+    SIM_STATS_TEE_LOG
+        .lock()
+        .ok()
+        .is_some_and(|g| g.is_some())
+}
+
+/// Аналог [`init_stream_tee_log_file`] для [`SIM_STATS_TEE_LOG`]: маркер
+/// «[<tag>] sim-stats-log пишется в …».
+pub fn init_sim_stats_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = File::create(path)?;
+    {
+        let mut guard = SIM_STATS_TEE_LOG.lock().expect("SIM_STATS_TEE_LOG poisoned");
+        *guard = Some(BufWriter::new(file));
+    }
+    Ok(())
+}
+
+/// Флашит и закрывает писатель в [`SIM_STATS_TEE_LOG`], если он был открыт.
+pub fn finish_sim_stats_tee_log() {
+    if let Ok(mut guard) = SIM_STATS_TEE_LOG.lock() {
+        if let Some(mut w) = guard.take() {
+            let _ = w.flush();
+        }
+    }
+}
+
+/// Записывает строку **только** в [`SIM_STATS_TEE_LOG`] (если открыт); в stdout не пишет.
+#[macro_export]
+macro_rules! sim_stats_tee_println {
+    ($($arg:tt)*) => {{
+        let __line = format!($($arg)*);
+        $crate::tee_log::sim_stats_tee_log_write(&__line);
     }};
 }
 

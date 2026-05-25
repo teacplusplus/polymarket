@@ -11,7 +11,7 @@ use crate::history_sim::{
 };
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
-use crate::sim_stats::{SimStats, print_sim_stats};
+use crate::sim_stats::{SimStats, SimStatsLogSink, print_sim_stats};
 use crate::train_mode::{Calibration, load_calibration};
 use crate::util::current_timestamp_ms;
 use crate::xframe::BookLevel;
@@ -322,6 +322,7 @@ fn spawn_stats_snapshot(
                     max_drawdown_pct_now,
                     true,
                     INITIAL_BANKROLL,
+                    SimStatsLogSink::Tee,
                 );
             }
         }
@@ -744,6 +745,7 @@ async fn tick_once(
             max_drawdown_pct_now,
             true,
             INITIAL_BANKROLL,
+            SimStatsLogSink::Tee,
         );
     }
 
