@@ -134,7 +134,7 @@ pub(crate) fn interval_label(kind: XFrameIntervalKind) -> &'static str {
     }
 }
 
-/// `https://polymarket.com/event/...` из [`LaneFrame::event_start_ms`] (Gamma); пустая строка если `None`.
+/// `https://polymarket.com/event/...` из Gamma `start_ms` ([`ProjectManager::event_data_by_market`]); пустая строка если `None`.
 fn polymarket_event_url_from_frame(
     currency: &str,
     interval_kind: XFrameIntervalKind,
@@ -180,7 +180,6 @@ pub async fn run_real_sim(
     );
 
     let account = project_manager.account.clone();
-    let last_snapshot_by_asset_id = project_manager.last_snapshot_by_asset_id.clone();
 
     let state = Arc::new(RwLock::new(RealSimState::new()));
     {
@@ -201,7 +200,7 @@ pub async fn run_real_sim(
         });
     }
 
-    spawn_stats_snapshot(state.clone(), account.clone(), tag_prefix.clone());
+    spawn_stats_snapshot(state.clone(), account.clone());
 
     for (interval_kind, side) in LANE_FRAME_ROUTES {
         let label = interval_label(interval_kind);
@@ -226,11 +225,7 @@ pub async fn run_real_sim(
             account.clone(),
             project_manager.clone(),
             currency_arc.clone(),
-            last_snapshot_by_asset_id.clone(),
-            interval_kind,
-            side,
             models,
-            tag_prefix.clone(),
             rx,
             submit_mode,
         );
@@ -245,20 +240,11 @@ fn spawn_side_worker(
     account: SharedAccount,
     project_manager: Arc<ProjectManager>,
     currency: Arc<String>,
-    last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
-    interval_kind: XFrameIntervalKind,
-    side: CurrencyUpDownOutcome,
     models: SideModels,
-    tag_prefix: String,
     mut rx: mpsc::Receiver<LaneFrame>,
     submit_mode: crate::account_submit::SubmitMode,
 ) {
     tokio::spawn(async move {
-        let tag = format!(
-            "{tag_prefix}/{}/{}",
-            interval_label(interval_kind),
-            side_label(side),
-        );
         let mut last_market_id: Option<String> = None;
         while let Some(lane_frame) = rx.recv().await {
             let result = AssertUnwindSafe(tick_once(
@@ -267,11 +253,7 @@ fn spawn_side_worker(
                 &account,
                 &project_manager,
                 currency.as_str(),
-                &last_snapshot_by_asset_id,
-                interval_kind,
-                side,
                 &models,
-                &tag,
                 &mut last_market_id,
                 lane_frame,
                 submit_mode,
@@ -281,26 +263,22 @@ fn spawn_side_worker(
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
-                    crate::tee_eprintln!("[real_sim] {tag}: tick error: {err:#}");
+                    crate::tee_eprintln!("[real_sim] tick error: {err:#}");
                 }
                 Err(payload) => {
                     let msg = panic_payload_message(&payload);
                     crate::tee_eprintln!(
-                        "[real_sim] {tag}: tick PANIC ({msg}) — кадр пропущен, воркер живой"
+                        "[real_sim] tick PANIC ({msg}) — кадр пропущен, воркер живой"
                     );
                 }
             }
         }
-        crate::tee_eprintln!("[real_sim] {tag}: канал закрыт — воркер завершён");
+        crate::tee_eprintln!("[real_sim] канал закрыт — воркер завершён");
     });
 }
 
 /// Периодическая печать [`print_sim_stats`] по интервалам + bankroll/dd ([`STATS_HEARTBEAT_INTERVAL_SEC`]).
-fn spawn_stats_snapshot(
-    state: Arc<RwLock<RealSimState>>,
-    account: SharedAccount,
-    tag_prefix: String,
-) {
+fn spawn_stats_snapshot(state: Arc<RwLock<RealSimState>>, account: SharedAccount) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(STATS_HEARTBEAT_INTERVAL_SEC));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -314,9 +292,9 @@ fn spawn_stats_snapshot(
                 let Some(stats) = state_guard.stats.get(&kind) else {
                     continue;
                 };
-                let tag = format!("{tag_prefix}/{} [heartbeat]", interval_label(kind));
+                let stats_tag = format!("[real_sim] {} [heartbeat]", interval_label(kind));
                 print_sim_stats(
-                    &tag,
+                    &stats_tag,
                     stats,
                     bankroll_now,
                     max_drawdown_pct_now,
@@ -348,29 +326,37 @@ async fn tick_once(
     account: &SharedAccount,
     project_manager: &Arc<ProjectManager>,
     currency: &str,
-    last_snapshot_by_asset_id: &Arc<RwLock<HashMap<String, MarketSnapshot>>>,
-    interval_kind: XFrameIntervalKind,
-    side: CurrencyUpDownOutcome,
     models: &SideModels,
-    tag: &str,
     last_market_id: &mut Option<String>,
     lane_frame: LaneFrame,
     submit_mode: crate::account_submit::SubmitMode,
 ) -> Result<()> {
     let LaneFrame {
-        market_id,
-        asset_id,
-        event_start_ms,
-        event_end_ms,
         price_to_beat,
         gamma_question,
         frame,
     } = lane_frame;
 
+    let market_id = frame.market_id.as_str();
+    let asset_id = frame.asset_id.as_str();
+    let Some(interval_kind) = XFrameIntervalKind::from_i32(frame.xframe_interval_type) else {
+        return Ok(());
+    };
+    let Some(side) = CurrencyUpDownOutcome::from_i32(frame.currency_up_down_outcome) else {
+        return Ok(());
+    };
+    let (event_start_ms, event_end_ms) = {
+        let guard = project_manager.event_data_by_market.read().await;
+        guard
+            .get(market_id)
+            .map(|e| (e.start_ms, e.end_ms))
+            .unwrap_or((None, None))
+    };
+
     let tick_started = Instant::now();
     let now_wall_ms = current_timestamp_ms();
 
-    let market_changed = last_market_id.as_deref() != Some(market_id.as_str());
+    let market_changed = last_market_id.as_deref() != Some(market_id);
 
     if market_changed {
         let mut state_guard = state.write().await;
@@ -380,7 +366,7 @@ async fn tick_once(
             ..
         } = &mut *state_guard;
         let seen = seen_market_ids.entry(interval_kind).or_default();
-        if seen.insert(market_id.clone()) {
+        if seen.insert(market_id.to_string()) {
             while seen.len() > SEEN_MARKET_IDS_CAP {
                 seen.shift_remove_index(0);
             }
@@ -396,10 +382,10 @@ async fn tick_once(
     };
     if !raw_prob.is_finite() || raw_prob <= 0.0 || raw_prob >= 1.0 {
         crate::tee_eprintln!(
-            "[real_sim] {tag}: bogus currency_implied_prob={raw_prob} \
+            "[real_sim] bogus currency_implied_prob={raw_prob} \
              (market={market_id}) — кадр пропущен"
         );
-        *last_market_id = Some(market_id);
+        *last_market_id = Some(market_id.to_string());
         return Ok(());
     }
     let currency_implied_prob = raw_prob.clamp(0.001, 0.999);
@@ -482,7 +468,7 @@ async fn tick_once(
     
     if buy_gate_proceed && dd_halt_active {
         crate::tee_eprintln!(
-            "[real_sim] {tag}: halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
+            "[real_sim] halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
             crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT,
             account_max_dd_pct
         );
@@ -491,9 +477,9 @@ async fn tick_once(
     let needs_http = needs_sell || may_open;
 
     let strict_book: Option<StrictBook> = if needs_http {
-        match try_fresh_ws_strict_book(last_snapshot_by_asset_id, &asset_id, now_wall_ms).await {
+        match try_fresh_ws_strict_book(project_manager, asset_id, now_wall_ms).await {
             Some(book) => Some(book),
-            None => fetch_http_strict_book(book_tx, &asset_id, tag).await,
+            None => fetch_http_strict_book(book_tx, asset_id).await,
         }
     } else {
         None
@@ -504,7 +490,7 @@ async fn tick_once(
             let lagging = is_ws_lagging(book, &frame);
             if lagging {
                 crate::tee_eprintln!(
-                    "[real_sim] {tag}: WS отстаёт — ордербук по HTTP расходится с last XFrame (market={market_id} asset={asset_id}); новые позиции пропускаем, ведём только закрытия"
+                    "[real_sim] WS отстаёт — ордербук по HTTP расходится с last XFrame (market={market_id} asset={asset_id}); новые позиции пропускаем, ведём только закрытия"
                 );
             }
             lagging
@@ -550,7 +536,7 @@ async fn tick_once(
         };
         if !dd_halt_active && dd_halt_now && may_open {
             crate::tee_eprintln!(
-                "[real_sim] {tag}: halt by drawdown сработал между snapshot'ом и HTTP — \
+                "[real_sim] halt by drawdown сработал между snapshot'ом и HTTP — \
                  новый вход отменяем (max_dd_pct={:.2}%)",
                 *max_dd_guard
             );
@@ -561,7 +547,7 @@ async fn tick_once(
             .is_some_and(|end_ms| now_after_http_ms >= end_ms);
         if !market_already_resolved && market_resolved_now && may_open {
             crate::tee_eprintln!(
-                "[real_sim] {tag}: market={market_id} прошёл event_end_ms между snapshot'ом и HTTP \
+                "[real_sim] market={market_id} прошёл event_end_ms между snapshot'ом и HTTP \
                  (now={now_after_http_ms} end={:?}) — отмена входа",
                 event_end_ms,
             );
@@ -598,7 +584,7 @@ async fn tick_once(
                 .await;
                 if needs_sell && tick_started.elapsed() > TICK_OPEN_MAX_ELAPSED {
                     crate::tee_eprintln!(
-                        "[real_sim] {tag}: tick elapsed {:.0}ms > {}ms \
+                        "[real_sim] tick elapsed {:.0}ms > {}ms \
                          (market={market_id}) — закрытие позиции обработано с лагом",
                         tick_started.elapsed().as_secs_f64() * 1000.0,
                         TICK_OPEN_MAX_ELAPSED.as_millis(),
@@ -609,7 +595,7 @@ async fn tick_once(
             if may_open && !ws_lagging {
                 if tick_started.elapsed() > TICK_OPEN_MAX_ELAPSED {
                     crate::tee_eprintln!(
-                        "[real_sim] {tag}: tick elapsed {:.0}ms > {}ms \
+                        "[real_sim] tick elapsed {:.0}ms > {}ms \
                          (market={market_id}) — новый вход пропущен",
                         tick_started.elapsed().as_secs_f64() * 1000.0,
                         TICK_OPEN_MAX_ELAPSED.as_millis(),
@@ -734,12 +720,17 @@ async fn tick_once(
         } else {
             "sell"
         };
+        let stats_tag = format!(
+            "[real_sim] {}/{}",
+            interval_label(interval_kind),
+            side_label(side),
+        );
         crate::tee_println!(
-            "[real_sim] {tag}: {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
+            "[real_sim] {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
             current_timestamp_ms(),
         );
         print_sim_stats(
-            tag,
+            &stats_tag,
             stats,
             bankroll_now,
             max_drawdown_pct_now,
@@ -749,7 +740,7 @@ async fn tick_once(
         );
     }
 
-    *last_market_id = Some(market_id);
+    *last_market_id = Some(market_id.to_string());
     Ok(())
 }
 
@@ -765,7 +756,6 @@ struct BookRequest {
 async fn fetch_http_strict_book(
     book_tx: &mpsc::Sender<BookRequest>,
     asset_id: &str,
-    tag: &str,
 ) -> Option<StrictBook> {
     let (reply_tx, reply_rx) = oneshot::channel();
     let req = BookRequest {
@@ -774,7 +764,7 @@ async fn fetch_http_strict_book(
     };
     if book_tx.send(req).await.is_err() {
         crate::tee_eprintln!(
-            "[real_sim] {tag}: book-coord канал закрыт — strict-fill выключен на тик"
+            "[real_sim] book-coord канал закрыт — strict-fill выключен на тик"
         );
         return None;
     }
@@ -782,13 +772,13 @@ async fn fetch_http_strict_book(
         Ok(Ok(book)) => book,
         Ok(Err(_)) => {
             crate::tee_eprintln!(
-                "[real_sim] {tag}: book-coord уронил oneshot до ответа — strict-fill выключен на тик"
+                "[real_sim] book-coord уронил oneshot до ответа — strict-fill выключен на тик"
             );
             None
         }
         Err(_) => {
             crate::tee_eprintln!(
-                "[real_sim] {tag}: ожидание ответа book-coord > {BOOK_REPLY_TIMEOUT_MS}ms — strict-fill выключен на тик"
+                "[real_sim] ожидание ответа book-coord > {BOOK_REPLY_TIMEOUT_MS}ms — strict-fill выключен на тик"
             );
             None
         }
@@ -812,11 +802,11 @@ fn strict_book_from_snapshot(snapshot: &MarketSnapshot) -> Option<StrictBook> {
 
 /// Свежий снимок (`≤` [`WS_STRICT_BOOK_MAX_AGE_MS`]) + полные лестницы → book; иначе `None`.
 async fn try_fresh_ws_strict_book(
-    last_snapshot_by_asset_id: &Arc<RwLock<HashMap<String, MarketSnapshot>>>,
+    project_manager: &ProjectManager,
     asset_id: &str,
     now_ms: i64,
 ) -> Option<StrictBook> {
-    let guard = last_snapshot_by_asset_id.read().await;
+    let guard = project_manager.last_snapshot_by_asset_id.read().await;
     let snapshot = guard.get(asset_id)?;
     if now_ms.saturating_sub(snapshot.timestamp_ms) > WS_STRICT_BOOK_MAX_AGE_MS {
         return None;

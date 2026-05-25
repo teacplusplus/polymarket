@@ -502,7 +502,7 @@ pub async fn run_sim_mode() -> anyhow::Result<()> {
         anyhow::bail!("Папка xframes/ не найдена — сначала соберите данные (STATUS=default)");
     }
 
-    crate::tee_log::init_tee_log_file(&xframes_root.join("last_history_sim.txt"), "sim")?;
+    crate::tee_log::init_tee_log_file(&xframes_root.join("last_history_sim.txt"))?;
     crate::trade_csv_log::init_trade_csv_log_file(
         &xframes_root.join("last_history_sim_trades.csv"),
     )?;

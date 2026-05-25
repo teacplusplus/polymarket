@@ -43,7 +43,7 @@ pub fn tee_log_write(line: &str) {
 /// и сам флашнется. На практике вызывается один раз на процесс — в
 /// точке входа конкретного режима (`run_sim_mode` для history_sim,
 /// `AppMode::RealSim` ветка `main` для real_sim).
-pub fn init_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+pub fn init_tee_log_file(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -52,7 +52,6 @@ pub fn init_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
         let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
         *guard = Some(BufWriter::new(file));
     }
-    crate::tee_println!("[{tag}] лог пишется в {}", path.display());
     Ok(())
 }
 
@@ -119,7 +118,7 @@ pub fn stream_tee_log_write(line: &str) {
 /// перезаписывает) `path`, кладёт его `BufWriter` в [`STREAM_TEE_LOG`] и пишет
 /// первую строку-маркер «[<tag>] stream-log пишется в …». Тот же контракт «последний
 /// победил»; на практике вызывается один раз перед размещением ордеров.
-pub fn init_stream_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+pub fn init_stream_tee_log_file(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -128,7 +127,6 @@ pub fn init_stream_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
         let mut guard = STREAM_TEE_LOG.lock().expect("STREAM_TEE_LOG poisoned");
         *guard = Some(BufWriter::new(file));
     }
-    crate::stream_tee_println!("[{tag}] stream-log пишется в {}", path.display());
     Ok(())
 }
 
@@ -186,7 +184,7 @@ pub fn user_stream_tee_log_write(line: &str) {
 
 /// Аналог [`init_stream_tee_log_file`] для [`USER_STREAM_TEE_LOG`]: маркер
 /// «[<tag>] user-stream-log пишется в …».
-pub fn init_user_stream_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+pub fn init_user_stream_tee_log_file(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -195,7 +193,6 @@ pub fn init_user_stream_tee_log_file(path: &Path, tag: &str) -> std::io::Result<
         let mut guard = USER_STREAM_TEE_LOG.lock().expect("USER_STREAM_TEE_LOG poisoned");
         *guard = Some(BufWriter::new(file));
     }
-    crate::user_stream_tee_println!("[{tag}] user-stream-log пишется в {}", path.display());
     Ok(())
 }
 
@@ -254,7 +251,7 @@ pub fn sim_stats_tee_log_is_open() -> bool {
 
 /// Аналог [`init_stream_tee_log_file`] для [`SIM_STATS_TEE_LOG`]: маркер
 /// «[<tag>] sim-stats-log пишется в …».
-pub fn init_sim_stats_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
+pub fn init_sim_stats_tee_log_file(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

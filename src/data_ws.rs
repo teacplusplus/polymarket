@@ -52,7 +52,7 @@ pub enum WsCommand {
     /// Предзагруженные asset_ids будущего окна — подписать заранее, без переконнекта.
     PrefetchSubscribe { asset_ids: Vec<String> },
     /// Окно завершилось — отписаться от устаревших asset_ids.
-    PruneStaleIds { stale_ids: Vec<String> },
+    PruneStaleIds { asset_ids: Vec<String> },
 }
 
 pub struct Ws {
@@ -321,8 +321,8 @@ async fn run_persistent_interval_market_ws_inner(
                                 project_manager.record_ws_connect_wall_ms_for_asset_ids(&ids).await;
                             }
                         }
-                        WsCommand::PruneStaleIds { stale_ids } => {
-                            let to_remove: Vec<String> = stale_ids.iter()
+                        WsCommand::PruneStaleIds { asset_ids } => {
+                            let to_remove: Vec<String> = asset_ids.iter()
                                 .filter(|id| active_asset_ids.contains(*id))
                                 .cloned()
                                 .collect();
@@ -362,8 +362,8 @@ async fn run_persistent_interval_market_ws_inner(
                         active_asset_ids.insert(id);
                     }
                 }
-                WsCommand::PruneStaleIds { stale_ids } => {
-                    for id in &stale_ids {
+                WsCommand::PruneStaleIds { asset_ids } => {
+                    for id in &asset_ids {
                         active_asset_ids.remove(id);
                     }
                 }

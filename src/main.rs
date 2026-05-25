@@ -101,8 +101,7 @@ async fn main() -> Result<()> {
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
             tee_log::init_tee_log_file(
-                std::path::Path::new("xframes/last_default.txt"),
-                "default",
+                std::path::Path::new("xframes/last_default.txt")
             )?;
 
             for currency in CURRENCIES {
@@ -117,12 +116,10 @@ async fn main() -> Result<()> {
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
             tee_log::init_tee_log_file(
-                std::path::Path::new("xframes/last_real_sim.txt"),
-                "real_sim",
+                std::path::Path::new("xframes/last_real_sim.txt")
             )?;
             tee_log::init_sim_stats_tee_log_file(
-                std::path::Path::new("xframes/last_sim_stats.txt"),
-                "real_sim",
+                std::path::Path::new("xframes/last_sim_stats.txt")
             )?;
 
             trade_csv_log::init_trade_csv_log_file(std::path::Path::new(
@@ -147,20 +144,16 @@ async fn main() -> Result<()> {
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
             tee_log::init_tee_log_file(
-                std::path::Path::new("xframes/last_real_sim_with_submit.txt"),
-                "real_sim_with_submit",
+                std::path::Path::new("xframes/last_real_sim_with_submit.txt")
             )?;
             tee_log::init_stream_tee_log_file(
-                std::path::Path::new("xframes/last_stream.txt"),
-                "real_sim_with_submit",
+                std::path::Path::new("xframes/last_stream.txt")
             )?;
             tee_log::init_user_stream_tee_log_file(
-                std::path::Path::new("xframes/last_user_stream.txt"),
-                "real_sim_with_submit",
+                std::path::Path::new("xframes/last_user_stream.txt")
             )?;
             tee_log::init_sim_stats_tee_log_file(
-                std::path::Path::new("xframes/last_sim_stats.txt"),
-                "real_sim_with_submit",
+                std::path::Path::new("xframes/last_sim_stats.txt")
             )?;
             trade_csv_log::init_submit_trade_csv_log_file(std::path::Path::new(
                 "xframes/last_real_sim_with_submit_trades.csv",
