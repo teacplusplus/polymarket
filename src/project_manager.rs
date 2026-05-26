@@ -426,8 +426,7 @@ impl ProjectManager {
     pub async fn update_last_snapshot(&self, snapshot: &MarketSnapshot) {
         let mut last_snapshot_by_asset_id = self.last_snapshot_by_asset_id.write().await;
         let merged = match last_snapshot_by_asset_id.remove(&snapshot.asset_id) {
-            Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms)
-                .unwrap_or_else(|| snapshot.clone()),
+            Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms).unwrap_or_else(|| snapshot.clone()),
             None => snapshot.clone(),
         };
         last_snapshot_by_asset_id.insert(snapshot.asset_id.clone(), merged);
@@ -547,6 +546,24 @@ impl ProjectManager {
             );
         };
         snapshot.currency_up_down_outcome = currency_up_down_outcome;
+
+        // Prefetched markets (окно ещё не началось, `event_start_ms > now_ms`):
+        // WS-подписка для них активна заранее, но snapshot'ы из «будущего» нам
+        // в buffer не нужны — иначе frame-builder построит для них xframes
+        // без PTB (start окна не наступил, цена-якорь неизвестна) и забьёт
+        // diag-лог. Дропаем на входе.
+        let event_start_ms = self
+            .event_data_by_market
+            .read()
+            .await
+            .get(&snapshot.market_id)
+            .and_then(|d| d.start_ms);
+        if let Some(start_ms) = event_start_ms
+            && start_ms > current_timestamp_ms()
+        {
+            return Ok(());
+        }
+
         for ws_buffer_by_market in &self.ws_buffer_by_market {
             let mut ws_buffer_by_market_lock = ws_buffer_by_market.write().await;
             ws_buffer_by_market_lock.push_snapshot(snapshot.clone());
@@ -583,19 +600,20 @@ impl ProjectManager {
 
         let interval_secs = FRAME_BUILD_INTERVALS_SEC[lane];
 
-        let mut by_bucket: HashMap<(String, String, i64), Vec<MarketSnapshot>> = HashMap::new();
+        let mut by_asset_group: HashMap<(String, String), Vec<MarketSnapshot>> = HashMap::new();
         for (market_id, by_asset) in drained {
             for (asset_id, events) in by_asset {
-                for snapshot in events {
-                    let aligned_ts =
-                        align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
-                    let key = (market_id.clone(), asset_id.clone(), aligned_ts);
-                    by_bucket.entry(key).or_default().push(snapshot);
+                if events.is_empty() {
+                    continue;
                 }
+                by_asset_group
+                    .entry((market_id.clone(), asset_id))
+                    .or_default()
+                    .extend(events);
             }
         }
 
-        if by_bucket.is_empty() {
+        if by_asset_group.is_empty() {
             return;
         }
 
@@ -631,10 +649,12 @@ impl ProjectManager {
 
         let mut built_xframes: Vec<BuiltXframeEntry> = Vec::new();
 
-        for ((market_id, asset_id, aligned_ts), group) in by_bucket {
-            let Some(snapshot) = aggregate_events(group, aligned_ts) else {
+        for ((market_id, asset_id), group) in by_asset_group {
+            let Some(snapshot) = aggregate_events(group, 0) else {
                 continue;
             };
+            let aligned_ts =
+                align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
             let frames_history = {
                 let xframes_by_market_read_lock = self.xframes_by_market[lane].read().await;
                 let history = xframes_by_market_read_lock
@@ -690,6 +710,32 @@ impl ProjectManager {
                 stable,
             );
 
+            let last_stored_aligned_ts_for_asset: Option<i64> = {
+                let lock = self.xframes_by_market[lane].read().await;
+                lock.get(&market_id)
+                    .and_then(|by_asset| by_asset.get(&asset_id))
+                    .and_then(|m| m.keys().next_back().copied())
+            };
+
+            // if frame.stable {
+            //     println!(
+            //         "[diag][builder] xframe lane={} mkt={} asset={} aligned_ts={} hist_len={} last_stored_ts={:?} delta_to_last={:?} spot={:?} z={:?} ptb={:?} vs_beat={:?} stable={}",
+            //         lane,
+            //         market_id,
+            //         asset_id,
+            //         aligned_ts,
+            //         frames_history.len(),
+            //         last_stored_aligned_ts_for_asset,
+            //         last_stored_aligned_ts_for_asset.map(|t| aligned_ts - t),
+            //         currency_spot_usd,
+            //         currency_price_z_score,
+            //         price_to_beat,
+            //         currency_price_vs_beat_pct,
+            //         frame.stable,
+            //     );
+            // }
+
+
             built_xframes.push(BuiltXframeEntry {
                 market_id,
                 asset_id,
@@ -705,15 +751,11 @@ impl ProjectManager {
                 .or_default()
                 .insert(entry.asset_id.clone());
         }
-        let batch_frame_by_bucket: HashMap<(String, String, i64), XFrame<SIZE>> = built_xframes
+        let batch_frame_by_asset: HashMap<(String, String), XFrame<SIZE>> = built_xframes
             .iter()
             .map(|entry| {
                 (
-                    (
-                        entry.market_id.clone(),
-                        entry.asset_id.clone(),
-                        entry.aligned_ts,
-                    ),
+                    (entry.market_id.clone(), entry.asset_id.clone()),
                     entry.frame.clone(),
                 )
             })
@@ -729,8 +771,7 @@ impl ProjectManager {
             let market_asset_ids = self.market_asset_ids_by_market.read().await;
             let sibling_market_by_market: HashMap<String, String> = {
                 let mut sibling_market_lookup = HashMap::new();
-                if let Some((five_market_id, fifteen_market_id)) =
-                    sibling_state.paired_five_and_fifteen_market_ids()
+                if let Some((five_market_id, fifteen_market_id)) = sibling_state.paired_five_and_fifteen_market_ids()
                 {
                     sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
                     sibling_market_lookup.insert(fifteen_market_id, five_market_id);
@@ -749,27 +790,33 @@ impl ProjectManager {
                     candidate_asset_ids.extend(by_asset.keys().cloned());
                 }
 
-                let other_asset_id = match find_opposite_asset_id(
+                match find_opposite_asset_id(
                     &entry.asset_id,
                     &currency_up_down_by_asset_id,
                     &candidate_asset_ids,
                 ) {
-                    Ok(id) => id,
+                    Ok(other_asset_id) => match lookup_frame_for_leg_merge(
+                        &entry.market_id,
+                        &other_asset_id,
+                        &batch_frame_by_asset,
+                        &xframes_stored_lane,
+                    ) {
+                        Some(other_frame) => {
+                            entry.frame.merge_other_leg_features_from(other_frame)
+                        }
+                        None => {
+                            if entry.frame.stable {
+                                eprintln!(
+                                    "[diag][builder] other-leg frame missing market={} asset={} other_asset={}",
+                                    entry.market_id, entry.asset_id, other_asset_id
+                                );
+                            }
+                        }
+                    },
                     Err(err) => {
                         eprintln!("{} find_opposite_asset_id: {err:#}", current_timestamp_ms());
-                        continue;
                     }
-                };
-                let Some(other_frame) = lookup_frame_for_leg_merge(
-                    &entry.market_id,
-                    &other_asset_id,
-                    entry.aligned_ts,
-                    &batch_frame_by_bucket,
-                    &xframes_stored_lane,
-                ) else {
-                    continue;
-                };
-                entry.frame.merge_other_leg_features_from(other_frame);
+                }
             }
 
             for entry in &mut built_xframes {
@@ -783,13 +830,33 @@ impl ProjectManager {
                 if let Some(ids) = market_asset_ids.get(sibling_market_id) {
                     sibling_candidates.extend(ids.iter().cloned());
                 }
-                let sibling_asset_id = match find_same_outcome_sibling_asset_id(
+                match find_same_outcome_sibling_asset_id(
                     &entry.asset_id,
                     sibling_market_id.as_str(),
                     &currency_up_down_by_asset_id,
                     &sibling_candidates,
                 ) {
-                    Ok(id) => id,
+                    Ok(sibling_asset_id) => match lookup_frame_for_leg_merge(
+                        sibling_market_id.as_str(),
+                        &sibling_asset_id,
+                        &batch_frame_by_asset,
+                        &xframes_stored_lane,
+                    ) {
+                        Some(sibling_frame) => entry
+                            .frame
+                            .merge_sibling_market_features_from(sibling_frame),
+                        None => {
+                            if entry.frame.stable {
+                                eprintln!(
+                                    "[diag][builder] sibling frame missing market={} sibling_market={} asset={} sibling_asset={}",
+                                    entry.market_id,
+                                    sibling_market_id,
+                                    entry.asset_id,
+                                    sibling_asset_id
+                                );
+                            }
+                        }
+                    },
                     Err(err) => {
                         if entry.frame.stable {
                             eprintln!(
@@ -797,21 +864,8 @@ impl ProjectManager {
                                 current_timestamp_ms()
                             );
                         }
-                        continue;
                     }
-                };
-                let Some(sibling_frame) = lookup_frame_for_leg_merge(
-                    sibling_market_id.as_str(),
-                    &sibling_asset_id,
-                    entry.aligned_ts,
-                    &batch_frame_by_bucket,
-                    &xframes_stored_lane,
-                ) else {
-                    continue;
-                };
-                entry
-                    .frame
-                    .merge_sibling_market_features_from(sibling_frame);
+                }
             }
         }
 
@@ -846,10 +900,8 @@ impl ProjectManager {
             }
 
             if lane == 0
-                && entry.frame.stable
                 && let Some(kind) = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type)
-                && let Some(side) =
-                    CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
+                && let Some(side) = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
                 && let Some(state_arc) = self
                     .account
                     .real_sim_state_for_currency(self.currency.as_str())
@@ -1269,26 +1321,24 @@ async fn retry_fetch_exact_price_to_beat(
     None
 }
 
-/// Кадр другой ноги: батч → хранилище того же ts → последний ≤ ts.
+/// Кадр другой ноги: батч текущего тика → последний известный из хранилища.
+/// После Scenario A в `batch` гарантированно ≤ 1 запись на `(market, asset)`,
+/// а в `stored` берём самый свежий кадр без ограничения по `aligned_ts` —
+/// это и есть «пустышка с прошлых итераций», если asset молчал > 1 сек.
 fn lookup_frame_for_leg_merge<'a>(
     market_id: &str,
     asset_id: &str,
-    aligned_ts: i64,
-    batch: &'a HashMap<(String, String, i64), XFrame<SIZE>>,
+    batch: &'a HashMap<(String, String), XFrame<SIZE>>,
     stored: &'a MarketFrames,
 ) -> Option<&'a XFrame<SIZE>> {
-    if let Some(frame) = batch.get(&(market_id.to_string(), asset_id.to_string(), aligned_ts)) {
+    if let Some(frame) = batch.get(&(market_id.to_string(), asset_id.to_string())) {
         return Some(frame);
     }
-    let by_asset = stored.get(market_id)?;
-    let by_ts = by_asset.get(asset_id)?;
-    if let Some(frame) = by_ts.get(&aligned_ts) {
-        return Some(frame);
-    }
-    by_ts
-        .range(..=aligned_ts)
+    stored
+        .get(market_id)?
+        .get(asset_id)?
+        .values()
         .next_back()
-        .map(|(_, frame)| frame)
 }
 
 /// `(beat - spot) / beat * 100`; положительно, если spot ниже beat.

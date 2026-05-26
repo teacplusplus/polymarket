@@ -1039,6 +1039,7 @@ pub(crate) fn buy_gate(
     bankroll: f64,
     strict_book: Option<&StrictBook>,
     is_kelly: bool,
+    _booster_pnl_for_shap: Option<&Booster>,
 ) -> BuyGate {
     if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return BuyGate::LateEntry;
@@ -1053,7 +1054,27 @@ pub(crate) fn buy_gate(
         return BuyGate::BelowThreshold;
     };
 
-    if raw < SIM_BUY_THRESHOLD {
+    // if frame.stable {
+    //     println!("raw {}", raw);
+    //     // if let Some(booster) = booster_pnl_for_shap {
+    //     //     let shap = pnl_top5_shap_csv_cell(booster, frame);
+    //     //     if !shap.is_empty() {
+    //     //         println!("shap top5:\n{shap}");
+    //     //     }
+    //     // }
+    //     // println!("frame {:?}", frame);
+    //     if raw > 0.1 {
+    //         if let Some(booster) = booster_pnl_for_shap {
+    //             let shap = pnl_top5_shap_csv_cell(booster, frame);
+    //             if !shap.is_empty() {
+    //                 println!("shap top5:\n{shap}");
+    //             }
+    //         }
+    //         println!("frame {:?}", frame);
+    //     }
+    // }
+
+    if raw < 0.3 { //SIM_BUY_THRESHOLD
         return BuyGate::BelowThreshold;
     }
 
@@ -1139,7 +1160,14 @@ pub(crate) async fn try_open_position(
     let Some(entry_prob) = effective_implied_prob(frame, strict_book) else {
         return false;
     };
-    match buy_gate(frame, pnl_inference, bankroll, strict_book, is_kelly) {
+    match buy_gate(
+        frame,
+        pnl_inference,
+        bankroll,
+        strict_book,
+        is_kelly,
+        booster_pnl_for_shap,
+    ) {
         BuyGate::LateEntry => {
             stats.late_entry_skips += 1;
             false
@@ -1960,6 +1988,17 @@ fn frame_to_prediction_dmatrix(frame: &XFrame<SIZE>, max_lag: Option<usize>) -> 
         return None;
     }
     DMatrix::from_dense(&features, 1).ok()
+}
+
+/// Обёртка над [`top_pnl_shap_features_csv_cell`] с глобальным skip-флагом
+/// [`HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS`] и стандартными параметрами
+/// (`max_lag=PNL_MAX_LAG`, `top_n=5`). Используется из [`crate::real_sim::tick_once`]
+/// (precompute до trade-lock) и из [`buy_gate`] для диагностического println.
+pub(crate) fn pnl_top5_shap_csv_cell(booster: &Booster, frame: &XFrame<SIZE>) -> String {
+    if HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS {
+        return String::new();
+    }
+    top_pnl_shap_features_csv_cell(booster, frame, crate::train_mode::PNL_MAX_LAG, 5)
 }
 
 /// Топ-|SHAP| признаков в одну CSV-ячейку (`\n`). `pub(crate)` для вызова из [`crate::real_sim::tick_once`] до trade-lock.

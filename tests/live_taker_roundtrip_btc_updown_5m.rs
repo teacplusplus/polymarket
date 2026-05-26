@@ -94,12 +94,10 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
     let stream_log_path = std::path::Path::new("xframes/last_stream.txt");
     poly::tee_log::init_stream_tee_log_file(
         stream_log_path,
-        "live_taker_roundtrip_btc_updown_5m",
     )?;
     let user_stream_log_path = std::path::Path::new("xframes/last_user_stream.txt");
     poly::tee_log::init_user_stream_tee_log_file(
         user_stream_log_path,
-        "live_taker_roundtrip_btc_updown_5m",
     )?;
 
     let account = Account::new_shared();

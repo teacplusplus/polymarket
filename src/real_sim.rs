@@ -30,7 +30,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio::time::MissedTickBehavior;
 use xgb::Booster;
 
 /// Размер `mpsc` для [`LaneFrame`] на лейн.
@@ -49,7 +48,7 @@ const BOOK_BATCH_MAX_MS: u64 = 50;
 const BOOK_HTTP_TIMEOUT_MS: u64 = 2000;
 
 /// Макс. возраст WS-снимка (мс), чтобы собрать [`StrictBook`] без HTTP ([`ProjectManager::last_snapshot_by_asset_id`]).
-pub(crate) const WS_STRICT_BOOK_MAX_AGE_MS: i64 = 1_000;
+pub(crate) const WS_STRICT_BOOK_MAX_AGE_MS: i64 = 45_000;
 
 /// Таймаут ответа координатора в [`fetch_http_strict_book`] (~3× HTTP).
 const BOOK_REPLY_TIMEOUT_MS: u64 = BOOK_HTTP_TIMEOUT_MS * 3;
@@ -60,9 +59,6 @@ const TICK_OPEN_MAX_ELAPSED: Duration = Duration::from_millis(500);
 
 /// Лимит FIFO [`RealSimState::seen_market_ids`] на интервал.
 const SEEN_MARKET_IDS_CAP: usize = 8;
-
-/// Интервал heartbeat-печати [`print_sim_stats`] при отсутствии сделок (сек).
-const STATS_HEARTBEAT_INTERVAL_SEC: u64 = 5 * 60;
 
 /// Четыре лейна фанаута 1s: `(interval, side)`.
 const LANE_FRAME_ROUTES: [(XFrameIntervalKind, CurrencyUpDownOutcome); 4] = [
@@ -200,8 +196,6 @@ pub async fn run_real_sim(
         });
     }
 
-    spawn_stats_snapshot(state.clone(), account.clone());
-
     for (interval_kind, side) in LANE_FRAME_ROUTES {
         let label = interval_label(interval_kind);
         let side_lbl = side_label(side);
@@ -246,6 +240,7 @@ fn spawn_side_worker(
 ) {
     tokio::spawn(async move {
         let mut last_market_id: Option<String> = None;
+        let mut last_tick_wall_ms_by_asset_id: HashMap<String, i64> = HashMap::new();
         while let Some(lane_frame) = rx.recv().await {
             let result = AssertUnwindSafe(tick_once(
                 &book_tx,
@@ -255,6 +250,7 @@ fn spawn_side_worker(
                 currency.as_str(),
                 &models,
                 &mut last_market_id,
+                &mut last_tick_wall_ms_by_asset_id,
                 lane_frame,
                 submit_mode,
             ))
@@ -274,36 +270,6 @@ fn spawn_side_worker(
             }
         }
         crate::tee_eprintln!("[real_sim] канал закрыт — воркер завершён");
-    });
-}
-
-/// Периодическая печать [`print_sim_stats`] по интервалам + bankroll/dd ([`STATS_HEARTBEAT_INTERVAL_SEC`]).
-fn spawn_stats_snapshot(state: Arc<RwLock<RealSimState>>, account: SharedAccount) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(STATS_HEARTBEAT_INTERVAL_SEC));
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        tick.tick().await;
-        loop {
-            tick.tick().await;
-            let state_guard = state.read().await;
-            let bankroll_now = *account.bankroll.read().await;
-            let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
-            for kind in [XFrameIntervalKind::FiveMin, XFrameIntervalKind::FifteenMin] {
-                let Some(stats) = state_guard.stats.get(&kind) else {
-                    continue;
-                };
-                let stats_tag = format!("[real_sim] {} [heartbeat]", interval_label(kind));
-                print_sim_stats(
-                    &stats_tag,
-                    stats,
-                    bankroll_now,
-                    max_drawdown_pct_now,
-                    true,
-                    INITIAL_BANKROLL,
-                    SimStatsLogSink::Tee,
-                );
-            }
-        }
     });
 }
 
@@ -328,6 +294,7 @@ async fn tick_once(
     currency: &str,
     models: &SideModels,
     last_market_id: &mut Option<String>,
+    last_tick_wall_ms_by_asset_id: &mut HashMap<String, i64>,
     lane_frame: LaneFrame,
     submit_mode: crate::account_submit::SubmitMode,
 ) -> Result<()> {
@@ -352,9 +319,30 @@ async fn tick_once(
             .map(|e| (e.start_ms, e.end_ms))
             .unwrap_or((None, None))
     };
+    let direction = match side {
+        CurrencyUpDownOutcome::Up => "UP",
+        CurrencyUpDownOutcome::Down => "DOWN",
+    };
+    let polymarket_url = polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
+    let now_wall_ms = current_timestamp_ms();
+    let since_prev_ms_opt = last_tick_wall_ms_by_asset_id
+        .get(asset_id)
+        .map(|prev_ms| now_wall_ms.saturating_sub(*prev_ms));
+    let since_prev_s = since_prev_ms_opt.map(|d| d as f64 / 1000.0);
+    last_tick_wall_ms_by_asset_id.insert(asset_id.to_string(), now_wall_ms);
+
+    // let ws_event_lag_ms: Option<i64> = {
+    //     let guard = project_manager.last_snapshot_by_asset_id.read().await;
+    //     guard
+    //         .get(asset_id)
+    //         .map(|snapshot| now_wall_ms.saturating_sub(snapshot.timestamp_ms))
+    // };
+    // println!(
+    //     "[diag][worker] recv {direction} market={market_id} asset={asset_id} \
+    //      ws_event_lag_ms={ws_event_lag_ms:?} since_prev_s={since_prev_s:?} recv_wall_ms={now_wall_ms} url={polymarket_url}",
+    // );
 
     let tick_started = Instant::now();
-    let now_wall_ms = current_timestamp_ms();
 
     let market_changed = last_market_id.as_deref() != Some(market_id);
 
@@ -397,8 +385,7 @@ async fn tick_once(
         last_prob.insert(lane_key.clone(), currency_implied_prob);
     }
 
-    let market_already_resolved = event_end_ms
-        .is_some_and(|end_ms| now_wall_ms >= end_ms);
+    let market_already_resolved = event_end_ms.is_some_and(|end_ms| now_wall_ms >= end_ms);
 
     let (
         has_positions,
@@ -455,7 +442,14 @@ async fn tick_once(
     );
 
     let buy_gate_proceed = matches!(
-        buy_gate(&frame, pnl_inference, available_bankroll_pre, None, true),
+        buy_gate(
+            &frame,
+            pnl_inference,
+            available_bankroll_pre,
+            None,
+            true,
+            Some(&models.booster_pnl),
+        ),
         BuyGate::Proceed { .. }
     );
     // Submit/Mock: новые BUY только при wall-clock внутри `[event_start_ms, event_end_ms)` от Gamma.
@@ -498,15 +492,10 @@ async fn tick_once(
         None => false,
     };
 
-    let pnl_top5_shap_at_open_precomputed: Option<String> = if may_open
-        && !ws_lagging
-        && !crate::history_sim::HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS
-    {
-        Some(crate::history_sim::top_pnl_shap_features_csv_cell(
+    let pnl_top5_shap_at_open_precomputed: Option<String> = if may_open && !ws_lagging {
+        Some(crate::history_sim::pnl_top5_shap_csv_cell(
             &models.booster_pnl,
             &frame,
-            crate::train_mode::PNL_MAX_LAG,
-            5,
         ))
     } else {
         Some(String::new())

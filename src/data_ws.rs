@@ -405,6 +405,34 @@ async fn ingest_single(
         &interval_by_asset,
         &currency_up_down_by_asset_id,
     );
+
+    // Prefetched market (`event_start_ms > now_ms`): WS-подписка активна заранее
+    // для прогрева, но snapshots до start окна отбрасываем здесь, не доводя ни до
+    // `ws_stream_by_asset_id`, ни до `market_snapshot_sender`. Иначе frame-builder
+    // клепает бесполезные xframes с `ptb=None` (PTB определяется ценой на start,
+    // которая ещё не наступила). Если `start_ms` ещё неизвестен (гонка между WS connect
+    // и Gamma fetch) — snapshot пропускаем дальше, иначе потеряем данные «известного»
+    // маркета.
+    let snapshots = {
+        let event_data_lock = project_manager.event_data_by_market.read().await;
+        let now_ms = current_timestamp_ms();
+        snapshots
+            .into_iter()
+            .filter(|snapshot| {
+                match event_data_lock
+                    .get(&snapshot.market_id)
+                    .and_then(|d| d.start_ms)
+                {
+                    Some(start_ms) => start_ms <= now_ms,
+                    None => true,
+                }
+            })
+            .collect::<Vec<MarketSnapshot>>()
+    };
+    for snapshot in snapshots.iter() {
+        project_manager.update_last_snapshot(&snapshot).await;
+    }
+
     if !snapshots.is_empty() {
         let ingest_wall_ms = current_timestamp_ms();
         let entries: Vec<WsStreamEntry> = snapshots
@@ -421,7 +449,6 @@ async fn ingest_single(
         project_manager.append_ws_stream_entries(entries).await;
     }
     for snapshot in snapshots {
-        project_manager.update_last_snapshot(&snapshot).await;
         project_manager
             .ws
             .market_snapshot_sender

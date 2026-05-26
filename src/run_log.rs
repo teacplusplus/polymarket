@@ -3,7 +3,7 @@
 //! [`crate::tee_log::init_tee_log_file`]; иначе — как обычный `eprintln!`.
 
 pub const WS_LOG_ENABLED: bool = true;
-pub const XFRAME_LOG_ENABLED: bool = true;
+pub const XFRAME_LOG_ENABLED: bool = false;
 pub const RTDS_CURRENCY_SEC_BAR_LOG_ENABLED: bool = false;
 pub const XFRAME_DUMP_LOG_ENABLED: bool = false;
 pub const CURRENCY_UP_DOWN_SIBLING_SLOTS_LOG_ENABLED: bool = false;
