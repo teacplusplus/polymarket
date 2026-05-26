@@ -5,13 +5,13 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, HOLD_TO_END_THRESHOLD_SEC, INITIAL_BANKROLL, StrictBook, any_position_would_sell,
+    BuyGate, HOLD_TO_END_THRESHOLD_SEC, StrictBook, any_position_would_sell,
     buy_gate, compute_p_win_now, compute_pnl_inference, load_booster, manage_positions,
     try_open_position,
 };
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
-use crate::sim_stats::{SimStats, SimStatsLogSink, print_sim_stats};
+use crate::sim_stats::{SimStats};
 use crate::train_mode::{Calibration, load_calibration};
 use crate::util::current_timestamp_ms;
 use crate::xframe::BookLevel;
@@ -319,18 +319,18 @@ async fn tick_once(
             .map(|e| (e.start_ms, e.end_ms))
             .unwrap_or((None, None))
     };
-    let direction = match side {
-        CurrencyUpDownOutcome::Up => "UP",
-        CurrencyUpDownOutcome::Down => "DOWN",
-    };
-    let polymarket_url = polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
+    // let direction = match side {
+    //     CurrencyUpDownOutcome::Up => "UP",
+    //     CurrencyUpDownOutcome::Down => "DOWN",
+    // };
+    // let polymarket_url = polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
     let now_wall_ms = current_timestamp_ms();
-    let since_prev_ms_opt = last_tick_wall_ms_by_asset_id
-        .get(asset_id)
-        .map(|prev_ms| now_wall_ms.saturating_sub(*prev_ms));
-    let since_prev_s = since_prev_ms_opt.map(|d| d as f64 / 1000.0);
+    // let since_prev_ms_opt = last_tick_wall_ms_by_asset_id
+    //     .get(asset_id)
+    //     .map(|prev_ms| now_wall_ms.saturating_sub(*prev_ms));
+    // let since_prev_s = since_prev_ms_opt.map(|d| d as f64 / 1000.0);
     last_tick_wall_ms_by_asset_id.insert(asset_id.to_string(), now_wall_ms);
-
+    // 
     // let ws_event_lag_ms: Option<i64> = {
     //     let guard = project_manager.last_snapshot_by_asset_id.read().await;
     //     guard
@@ -501,8 +501,6 @@ async fn tick_once(
         Some(String::new())
     };
 
-    let mut sold = false;
-    let mut bought = false;
     let effective_prob = crate::history_sim::effective_implied_prob(&frame, strict_book.as_ref())
         .unwrap_or(currency_implied_prob);
     {
@@ -557,7 +555,7 @@ async fn tick_once(
                 let this_positions: &mut crate::history_sim::LanePositions = positions_guard
                     .get_mut(&lane_key)
                     .expect("Account.positions pre-populated by run_real_sim");
-                sold = manage_positions(
+                manage_positions(
                     this_positions,
                     &frame,
                     false,
@@ -626,7 +624,7 @@ async fn tick_once(
                         .flatten()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    bought = try_open_position(
+                    try_open_position(
                         &frame,
                         pnl_inference,
                         Some(&models.booster_pnl),
@@ -694,41 +692,6 @@ async fn tick_once(
         }
     }
 
-    if bought || sold {
-        let state_guard = state.read().await;
-        let bankroll_now = *account.bankroll.read().await;
-        let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
-        let stats = state_guard
-            .stats
-            .get(&interval_kind)
-            .expect("stats map initialized for both intervals");
-        let action = if bought && sold {
-            "buy+sell"
-        } else if bought {
-            "buy"
-        } else {
-            "sell"
-        };
-        let stats_tag = format!(
-            "[real_sim] {}/{}",
-            interval_label(interval_kind),
-            side_label(side),
-        );
-        crate::tee_println!(
-            "[real_sim] {action} @ t={} market={market_id} prob={currency_implied_prob:.4}",
-            current_timestamp_ms(),
-        );
-        print_sim_stats(
-            &stats_tag,
-            stats,
-            bankroll_now,
-            max_drawdown_pct_now,
-            true,
-            INITIAL_BANKROLL,
-            SimStatsLogSink::Tee,
-        );
-    }
-
     *last_market_id = Some(market_id.to_string());
     Ok(())
 }
@@ -774,7 +737,7 @@ async fn fetch_http_strict_book(
     }
 }
 
-/// [`StrictBook`] из WS-снимка при непустых `book_bids`/`book_asks`; `min_order_size`: `None`.
+/// [`StrictBook`] из WS-снимка при непустых `book_bids`/`book_asks`.
 fn strict_book_from_snapshot(snapshot: &MarketSnapshot) -> Option<StrictBook> {
     let bids = snapshot.book_bids.clone()?;
     let asks = snapshot.book_asks.clone()?;
@@ -785,7 +748,7 @@ fn strict_book_from_snapshot(snapshot: &MarketSnapshot) -> Option<StrictBook> {
         bids,
         asks,
         last_trade_price: snapshot.last_trade_price,
-        min_order_size: None,
+        min_order_size: snapshot.min_order_size,
     })
 }
 

@@ -78,7 +78,7 @@ pub const MINPOSITION_FRAMES: usize = 2;
 pub const BLOCK_SAME_ASSET_OPEN: bool = false;
 
 /// Max одновременных позиций в лейне (`positions.len()`); `None` — без лимита.
-pub const MAX_OPEN_POSITIONS: Option<usize> = None;
+pub const MAX_OPEN_POSITIONS: Option<usize> = Some(1);
 
 /// Запас к CLOB `min_order_size` при расчёте BUY notional: `min_shares × price_cap × (1 + pct)`.
 pub const MIN_ORDER_SIZE_BUY_HEADROOM_PCT: f64 = 0.05;
@@ -240,14 +240,17 @@ pub(crate) fn book_fill_sell_strict(
 pub type SharedOpenPosition = std::sync::Arc<tokio::sync::RwLock<OpenPosition>>;
 
 /// То же для записи закрытия.
+///
+/// `OpenPosition` держит **сильные** [`SharedClosingPosition`]
+/// ([`OpenPosition::maker_tp_position`] / [`OpenPosition::taker_positions`]) —
+/// `ClosingPosition` **не** хранит обратной ссылки на [`SharedOpenPosition`],
+/// поэтому цикла strong↔strong нет; запись закрытия живёт ровно столько,
+/// сколько жива сама `OpenPosition`.
 pub type SharedClosingPosition = std::sync::Arc<tokio::sync::RwLock<ClosingPosition>>;
 
 /// Открытые позиции одной лейны в [`crate::account::Account::positions`]; ключ —
 /// [`OpenPosition::id`].
 pub type LanePositions = HashMap<String, SharedOpenPosition>;
-
-/// Разрыв цикла Open ↔ Closing; upgrade если запись ещё жива ([`crate::account_submit`] polling).
-pub type WeakClosingPosition = std::sync::Weak<tokio::sync::RwLock<ClosingPosition>>;
 
 /// Открытая позиция; в real_sim фильтр `asset_id == frame.asset_id`.
 #[derive(Debug, Clone)]
@@ -322,9 +325,9 @@ pub struct OpenPosition {
     pub(crate) open_order_id: Option<String>,
     /// Taker BUY invoke: `None` до POST; затем [`InvokeSettlementWatch`] (`Some(report)` после колбэка).
     pub(crate) open_buy_invoke: Option<InvokeSettlementWatch>,
-    pub(crate) maker_tp_position: Option<WeakClosingPosition>,
+    pub(crate) maker_tp_position: Option<SharedClosingPosition>,
     /// Taker FAK SELL: по одной записи на каждый успешный invoke ([`crate::account_submit`]).
-    pub(crate) taker_positions: Vec<WeakClosingPosition>,
+    pub(crate) taker_positions: Vec<SharedClosingPosition>,
     /// Идемпотентность [`crate::account_close_position::close_position_after_submit`]:
     /// взводится в `true` при первом входе (под `position.write().await`) и блокирует
     /// повторные вызовы (CSV/SideStats/bankroll/graph должны записаться ровно один раз).
@@ -406,18 +409,16 @@ impl OpenPosition {
         let mut shares_sold = 0.0_f64;
 
         // maker TP (если есть): settled+success → making_amount как shares.
-        if let Some(weak) = self.maker_tp_position.as_ref() {
-            if let Some(arc) = weak.upgrade() {
-                let watch_opt = {
-                    let closing = arc.read().await;
-                    closing.invoke_settle.clone()
-                };
-                if let Some(report) = resolve_report(watch_opt, "maker_tp").await? {
-                    if report.success {
-                        if let OrderAmount::Shares(s) = report.making_amount {
-                            if s.is_finite() && s > 0.0 {
-                                shares_sold += s;
-                            }
+        if let Some(arc) = self.maker_tp_position.as_ref() {
+            let watch_opt = {
+                let closing = arc.read().await;
+                closing.invoke_settle.clone()
+            };
+            if let Some(report) = resolve_report(watch_opt, "maker_tp").await? {
+                if report.success {
+                    if let OrderAmount::Shares(s) = report.making_amount {
+                        if s.is_finite() && s > 0.0 {
+                            shares_sold += s;
                         }
                     }
                 }
@@ -425,10 +426,7 @@ impl OpenPosition {
         }
 
         // taker FAK SELL'ы: сумма making_amount по settled+success invoke'ам.
-        for weak in &self.taker_positions {
-            let Some(arc) = weak.upgrade() else {
-                continue;
-            };
+        for arc in &self.taker_positions {
             let watch_opt = {
                 let closing = arc.read().await;
                 closing.invoke_settle.clone()
@@ -451,10 +449,13 @@ impl OpenPosition {
 }
 
 /// Запись закрытия для WS/polling ([`manage_positions`], [`crate::account::apply_user_ws_event`]).
+///
+/// Не хранит ссылку на [`SharedOpenPosition`]: parent `OpenPosition` сам держит
+/// сильные [`SharedClosingPosition`] в своих полях
+/// ([`OpenPosition::maker_tp_position`] / [`OpenPosition::taker_positions`]) —
+/// обратная ссылка дала бы strong-cycle.
 #[derive(Debug, Clone)]
 pub struct ClosingPosition {
-    /// Та же позиция, что в `Account.positions` (актуальный entry после partial BUY).
-    pub position: SharedOpenPosition,
     /// Причина (как в CSV).
     pub reason: CloseReason,
     /// ID SELL на CLOB; `None` в sim или пока не создан.

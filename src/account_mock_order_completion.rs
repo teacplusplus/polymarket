@@ -32,8 +32,6 @@ use tokio::sync::{Mutex, oneshot};
 
 /// Период опроса WS-снапшота в режиме maker (ждём пересечения лимит-цены).
 const MOCK_MAKER_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Максимальный возраст WS-снапшота, при котором считаем книгу актуальной для исполнения.
-const MOCK_WS_BOOK_MAX_AGE_MS: i64 = 1_000;
 /// Допуск для сравнения цен (`f64` к концу floor/clamp может терять биты в последнем знаке).
 const PRICE_COMPARE_EPS: f64 = 1e-9;
 /// Допуск, чтобы taker не отказывал на цифровом шуме при обходе книги до цели.
@@ -67,7 +65,7 @@ async fn forget_mock_order_cancel_channel(order_id: &str) {
     let _ = cancel_registry().lock().await.remove(order_id);
 }
 
-/// Свежий book-снимок из WS (`bids`/`asks` уже отсортированы лучшим уровнем первым).
+/// Book-снимок из WS (`bids`/`asks` уже отсортированы лучшим уровнем первым).
 struct MockBookSnapshot {
     bids: Vec<BookLevel>,
     asks: Vec<BookLevel>,
@@ -98,17 +96,93 @@ fn first_live_level(levels: &[BookLevel]) -> Option<&BookLevel> {
         .find(|level| level.price > 0.0 && level.size > 0.0)
 }
 
-async fn load_recent_mock_book(
+async fn load_mock_book(
     project_manager: &Arc<ProjectManager>,
     asset_id: &str,
-    now_ms: i64,
 ) -> Option<MockBookSnapshot> {
     let guard = project_manager.last_snapshot_by_asset_id.read().await;
     let snapshot = guard.get(asset_id)?;
-    if now_ms.saturating_sub(snapshot.timestamp_ms) > MOCK_WS_BOOK_MAX_AGE_MS {
-        return None;
-    }
     MockBookSnapshot::from_snapshot(snapshot)
+}
+
+/// Краткая запись топ-N уровней книги для лога.
+/// Формат `[price@size, ...]`; пустая лестница → `empty`; уровни уже идут лучшим первым.
+fn format_book_levels_preview(levels: &[BookLevel], top_n: usize) -> String {
+    if levels.is_empty() {
+        return "empty".to_string();
+    }
+    let preview: Vec<String> = levels
+        .iter()
+        .take(top_n)
+        .map(|lvl| format!("{:.4}@{:.2}", lvl.price, lvl.size))
+        .collect();
+    let suffix = if levels.len() > top_n {
+        format!(",…+{}", levels.len() - top_n)
+    } else {
+        String::new()
+    };
+    format!("[{}{suffix}]", preview.join(","))
+}
+
+/// Снимок состояния WS для `asset_id` на момент `now_ms`: есть ли snapshot, возраст в мс,
+/// top-3 bid/ask. Используется только в диагностических сообщениях фейлов mock-taker'а.
+async fn describe_ws_snapshot_state(
+    project_manager: &Arc<ProjectManager>,
+    asset_id: &str,
+    now_ms: i64,
+) -> String {
+    let guard = project_manager.last_snapshot_by_asset_id.read().await;
+    let Some(snapshot) = guard.get(asset_id) else {
+        return "ws_snapshot=none".to_string();
+    };
+    let age_ms = now_ms.saturating_sub(snapshot.timestamp_ms);
+    let empty_levels: Vec<BookLevel> = Vec::new();
+    let bids: &[BookLevel] = snapshot.book_bids.as_deref().unwrap_or(&empty_levels);
+    let asks: &[BookLevel] = snapshot.book_asks.as_deref().unwrap_or(&empty_levels);
+    format!(
+        "ws_snapshot[ts_ms={ts} age_ms={age_ms} bids({nb})={bids_str} asks({na})={asks_str} last_trade_price={ltp:?}]",
+        ts = snapshot.timestamp_ms,
+        nb = bids.len(),
+        na = asks.len(),
+        bids_str = format_book_levels_preview(bids, 3),
+        asks_str = format_book_levels_preview(asks, 3),
+        ltp = snapshot.last_trade_price,
+    )
+}
+
+/// «Что мы хотели купить/продать» одной строкой: сторона, объём, ценовой cap и slip-cap.
+/// Берётся из самого [`PostOrderRequest`] (никаких локов).
+fn describe_taker_request(request: &PostOrderRequest) -> String {
+    let amount_str = match request.amount {
+        OrderAmount::UsdNotional(usd) => format!("usd_notional={usd:.4}"),
+        OrderAmount::Shares(s) => format!("shares={s:.4}"),
+    };
+    let price_str = match request.price {
+        Some(p) => format!("{p:.6}"),
+        None => "none".to_string(),
+    };
+    let slip_str = match request.max_slippage_pp {
+        Some(s) => format!("{s:.6}"),
+        None => "none".to_string(),
+    };
+    format!(
+        "want[side={:?} {amount_str} price_cap={price_str} max_slippage_pp={slip_str}]",
+        request.side,
+    )
+}
+
+/// Полное состояние книги, по которой пытались исполниться (best bid/ask + top-3 уровни).
+/// Используется в `no_depth`/`above_cap`/`slip_exceeded` фейлах: видно, чего именно не хватило.
+fn describe_in_hand_book(book: &MockBookSnapshot) -> String {
+    format!(
+        "book[best_bid={bb:?} best_ask={ba:?} bids({nb})={bids_str} asks({na})={asks_str}]",
+        bb = book.best_bid_price(),
+        ba = book.best_ask_price(),
+        nb = book.bids.len(),
+        na = book.asks.len(),
+        bids_str = format_book_levels_preview(&book.bids, 3),
+        asks_str = format_book_levels_preview(&book.asks, 3),
+    )
 }
 
 /// Walk по уровням до набора `target_shares` — возвращает `(vwap, total_usd)` при полном фи.
@@ -339,14 +413,19 @@ async fn run_taker_fill(
     }
 
     let now_ms = crate::util::current_timestamp_ms();
-    let Some(book) = load_recent_mock_book(project_manager, &request.asset_id, now_ms).await else {
+    let Some(book) = load_mock_book(project_manager, &request.asset_id).await else {
+        let ws_state = describe_ws_snapshot_state(project_manager, &request.asset_id, now_ms).await;
+        let want = describe_taker_request(request);
         return MockFillOutcome::Failed {
             error_msg: format!(
-                "mock_taker_no_fresh_ws_book: asset_id={} max_age_ms={MOCK_WS_BOOK_MAX_AGE_MS}",
+                "mock_taker_no_ws_book: asset_id={} {ws_state} {want}",
                 request.asset_id,
             ),
         };
     };
+
+    let book_state = describe_in_hand_book(&book);
+    let want = describe_taker_request(request);
 
     match (request.side, request.amount) {
         (Side::Buy, OrderAmount::UsdNotional(usd_notional)) => {
@@ -354,14 +433,14 @@ async fn run_taker_fill(
             else {
                 return MockFillOutcome::Failed {
                     error_msg: format!(
-                        "mock_taker_buy_no_depth: usd={usd_notional:.4} asset_id={}",
+                        "mock_taker_buy_no_depth: usd={usd_notional:.4} asset_id={} {book_state} {want}",
                         request.asset_id,
                     ),
                 };
             };
             if let Some(cap_violation) = taker_cap_violation_message(request, &book, vwap) {
                 return MockFillOutcome::Failed {
-                    error_msg: cap_violation,
+                    error_msg: format!("{cap_violation} {book_state} {want}"),
                 };
             }
             let (making_amount, taking_amount, fee_paid_usdc) =
@@ -378,14 +457,14 @@ async fn run_taker_fill(
             else {
                 return MockFillOutcome::Failed {
                     error_msg: format!(
-                        "mock_taker_buy_shares_no_depth: shares={target_shares:.4} asset_id={}",
+                        "mock_taker_buy_shares_no_depth: shares={target_shares:.4} asset_id={} {book_state} {want}",
                         request.asset_id,
                     ),
                 };
             };
             if let Some(cap_violation) = taker_cap_violation_message(request, &book, vwap) {
                 return MockFillOutcome::Failed {
-                    error_msg: cap_violation,
+                    error_msg: format!("{cap_violation} {book_state} {want}"),
                 };
             }
             let (making_amount, taking_amount, fee_paid_usdc) =
@@ -401,14 +480,14 @@ async fn run_taker_fill(
             else {
                 return MockFillOutcome::Failed {
                     error_msg: format!(
-                        "mock_taker_sell_no_depth: shares={shares:.4} asset_id={}",
+                        "mock_taker_sell_no_depth: shares={shares:.4} asset_id={} {book_state} {want}",
                         request.asset_id,
                     ),
                 };
             };
             if let Some(cap_violation) = taker_cap_violation_message(request, &book, vwap) {
                 return MockFillOutcome::Failed {
-                    error_msg: cap_violation,
+                    error_msg: format!("{cap_violation} {book_state} {want}"),
                 };
             }
             let (making_amount, taking_amount, fee_paid_usdc) =
@@ -420,10 +499,14 @@ async fn run_taker_fill(
             }
         }
         (Side::Sell, OrderAmount::UsdNotional(_)) => MockFillOutcome::Failed {
-            error_msg: "mock_taker_sell_unsupported_amount: SELL ожидает Shares".to_string(),
+            error_msg: format!(
+                "mock_taker_sell_unsupported_amount: SELL ожидает Shares {book_state} {want}"
+            ),
         },
         (other_side, _) => MockFillOutcome::Failed {
-            error_msg: format!("mock_taker_side_unsupported: side={other_side:?}"),
+            error_msg: format!(
+                "mock_taker_side_unsupported: side={other_side:?} {book_state} {want}"
+            ),
         },
     }
 }
@@ -508,13 +591,7 @@ async fn run_maker_wait_for_fill(
             };
         }
 
-        let now_ms = crate::util::current_timestamp_ms();
-        let condition_met = match load_recent_mock_book(
-            project_manager,
-            &request.asset_id,
-            now_ms,
-        )
-        .await
+        let condition_met = match load_mock_book(project_manager, &request.asset_id).await
         {
             Some(book) => match request.side {
                 Side::Buy => book

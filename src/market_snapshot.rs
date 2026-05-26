@@ -25,6 +25,7 @@ pub struct MarketSnapshot {
     pub book_bids: Option<Vec<BookLevel>>,
     pub book_asks: Option<Vec<BookLevel>>,
     pub tick_size: Option<f64>,
+    pub min_order_size: Option<f64>,
     pub spread: Option<f64>,
     pub last_trade_price: Option<f64>,
     pub last_trade_size: Option<f64>,
@@ -67,6 +68,7 @@ pub fn aggregate_events(
         book_bids: None,
         book_asks: None,
         tick_size: None,
+        min_order_size: first_event_snapshot.min_order_size,
         spread: None,
         last_trade_price: None,
         last_trade_size: None,
@@ -127,6 +129,9 @@ pub fn aggregate_events(
         }
         if event_market_snapshot.tick_size.is_some() {
             aggregated_market_snapshot.tick_size = event_market_snapshot.tick_size;
+        }
+        if event_market_snapshot.min_order_size.is_some() {
+            aggregated_market_snapshot.min_order_size = event_market_snapshot.min_order_size;
         }
         if event_market_snapshot.spread.is_some() {
             aggregated_market_snapshot.spread = event_market_snapshot.spread;

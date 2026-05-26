@@ -56,10 +56,14 @@ pub fn encode_path_as_file_uri(abs_path: &str) -> String {
 pub struct CurrencyEventSlugData {
     /// Исход токена по `asset_id`: Up / Down.
     pub currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
-    /// Старт окна по `conditionId` (`eventStartTime` / fallback из Gamma).
-    pub market_event_start_ms: HashMap<String, Option<i64>>,
-    /// Конец окна по `conditionId` (`endDate`, не `umaEndDate`).
-    pub market_event_end_ms: HashMap<String, Option<i64>>,
+    /// `conditionId` маркета (`0x…`).
+    pub market_id: Option<String>,
+    /// Старт окна (`eventStartTime` / fallback из Gamma).
+    pub event_start_ms: Option<i64>,
+    /// Конец окна (`endDate`, не `umaEndDate`).
+    pub event_end_ms: Option<i64>,
+    /// CLOB `orderMinSize` из Gamma (`order_min_size` в SDK).
+    pub min_order_size: Option<f64>,
     /// Поле `question` маркета Gamma.
     pub gamma_question: Option<String>,
 }
@@ -135,6 +139,14 @@ fn gamma_datetime_to_epoch_ms(dt: Option<chrono::DateTime<chrono::Utc>>) -> Opti
     dt.map(|d| d.timestamp_millis())
 }
 
+#[inline]
+fn gamma_decimal_to_f64(d: polymarket_client_sdk::types::Decimal) -> Option<f64> {
+    d.to_string()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+}
+
 /// Собирает [`CurrencyEventSlugData`] из ответа Gamma SDK [`Market`].
 /// Цепочка fallback для старта окна близка к прежнему разбору JSON:
 /// `event_start_time` маркета → `events[0].start_time` → `start_date` маркета → `events[0].start_date`;
@@ -160,11 +172,9 @@ pub fn currency_event_slug_data_from_gamma_market(
         .context("outcomes vs clobTokenIds")?;
 
     let gamma_question = m.question.clone();
+    let min_order_size = m.order_min_size.and_then(gamma_decimal_to_f64);
 
-    let mut market_event_start_ms = HashMap::new();
-    let mut market_event_end_ms = HashMap::new();
-
-    if let Some(cid_b256) = m.condition_id {
+    let (market_id, event_start_ms, event_end_ms) = if let Some(cid_b256) = m.condition_id {
         let cid = format!("{cid_b256:#x}");
         let event0 = m.events.as_ref().and_then(|ev| ev.first());
 
@@ -173,17 +183,20 @@ pub fn currency_event_slug_data_from_gamma_market(
             .or_else(|| gamma_datetime_to_epoch_ms(m.start_date))
             .or_else(|| event0.and_then(|e| gamma_datetime_to_epoch_ms(e.start_date)));
 
-        market_event_start_ms.insert(cid.clone(), start_ms);
-
         let end_ms = gamma_datetime_to_epoch_ms(m.end_date)
             .or_else(|| event0.and_then(|e| gamma_datetime_to_epoch_ms(e.end_date)));
-        market_event_end_ms.insert(cid, end_ms);
-    }
+
+        (Some(cid), start_ms, end_ms)
+    } else {
+        (None, None, None)
+    };
 
     Ok(CurrencyEventSlugData {
         currency_up_down_by_asset_id,
-        market_event_start_ms,
-        market_event_end_ms,
+        market_id,
+        event_start_ms,
+        event_end_ms,
+        min_order_size,
         gamma_question,
     })
 }

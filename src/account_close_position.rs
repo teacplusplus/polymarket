@@ -417,9 +417,7 @@ pub(crate) async fn close_position_after_submit(
         }
     };
 
-    if let Some(weak) = position_snapshot.maker_tp_position.as_ref()
-        && let Some(arc) = weak.upgrade()
-    {
+    if let Some(arc) = position_snapshot.maker_tp_position.as_ref() {
         let closing = arc.read().await;
         tp_order_id = closing
             .order_id
@@ -438,10 +436,7 @@ pub(crate) async fn close_position_after_submit(
         }
     }
 
-    for weak in &position_snapshot.taker_positions {
-        let Some(arc) = weak.upgrade() else {
-            continue;
-        };
+    for arc in &position_snapshot.taker_positions {
         let closing = arc.read().await;
         if let Some(order_id) = closing
             .order_id

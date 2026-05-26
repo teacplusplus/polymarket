@@ -114,7 +114,6 @@ pub async fn post_order_on_clob(
     request: PostOrderRequest,
     invoke: SingleOrderInvokeCb,
 ) -> Result<Option<String>> {
-    panic!("post_order_on_clob is forbidden");
     let _ = project_manager;
     let invoke_slot = wrap_post_order_cb(invoke);
 

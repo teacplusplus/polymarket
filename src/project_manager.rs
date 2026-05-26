@@ -83,6 +83,7 @@ const MARKET_WS_SUBSCRIPTION_CHANNEL_CAP: usize = 8;
 pub struct MarketEventData {
     pub start_ms: Option<i64>,
     pub end_ms: Option<i64>,
+    pub min_order_size: Option<f64>,
     pub gamma_question: Option<String>,
 }
 
@@ -223,60 +224,41 @@ impl ProjectManager {
         project_manager
     }
 
-    pub async fn merge_market_event_data(
-        &self,
-        starts: &HashMap<String, Option<i64>>,
-        ends: &HashMap<String, Option<i64>>,
-        gamma_question: Option<String>,
-        currency_up_down_by_asset_id: &HashMap<String, CurrencyUpDownOutcome>,
-        slug: Option<&str>,
-    ) {
-        let mut market_ids_touched: HashSet<String> = HashSet::new();
-        market_ids_touched.extend(starts.keys().cloned());
-        market_ids_touched.extend(ends.keys().cloned());
-
-        let mut event_data_by_market_lock = self.event_data_by_market.write().await;
-        for (market_id, start_ms) in starts {
+    pub async fn merge_market_event_data(&self, data: &CurrencyEventSlugData, slug: &str) {
+        if let Some(market_id) = &data.market_id {
+            let mut event_data_by_market_lock = self.event_data_by_market.write().await;
             let entry = event_data_by_market_lock
                 .entry(market_id.clone())
                 .or_default();
-            entry.start_ms = *start_ms;
-            if let Some(ref q) = gamma_question {
+            entry.start_ms = data.event_start_ms;
+            entry.end_ms = data.event_end_ms;
+            entry.min_order_size = data.min_order_size;
+            if let Some(ref q) = data.gamma_question {
                 entry.gamma_question = Some(q.clone());
             }
-        }
+            drop(event_data_by_market_lock);
 
-        for (market_id, end_ms) in ends {
-            let entry = event_data_by_market_lock
-                .entry(market_id.clone())
-                .or_default();
-            entry.end_ms = *end_ms;
-            if let Some(ref q) = gamma_question {
-                entry.gamma_question = Some(q.clone());
+            let mut slug_to_market_id_lock = self.slug_to_market_id.write().await;
+            slug_to_market_id_lock.insert(slug.to_string(), market_id.clone());
+
+            if !data.currency_up_down_by_asset_id.is_empty() {
+                let mut currency_up_down_by_asset_id_lock =
+                    self.currency_up_down_by_asset_id.write().await;
+                for (asset_id, code) in data.currency_up_down_by_asset_id.iter() {
+                    currency_up_down_by_asset_id_lock.insert(asset_id.clone(), *code);
+                }
+                drop(currency_up_down_by_asset_id_lock);
+                let mut market_asset_ids_lock = self.market_asset_ids_by_market.write().await;
+                market_asset_ids_lock
+                    .entry(market_id.clone())
+                    .or_default()
+                    .extend(data.currency_up_down_by_asset_id.keys().cloned());
             }
-        }
-        drop(event_data_by_market_lock);
-
-        if let Some(slug) = slug {
-            if let Some(market_id) = market_ids_touched.iter().min().cloned() {
-                let mut slug_to_market_id_lock = self.slug_to_market_id.write().await;
-                slug_to_market_id_lock.insert(slug.to_string(), market_id);
-            }
-        }
-
-        if !currency_up_down_by_asset_id.is_empty() {
+        } else if !data.currency_up_down_by_asset_id.is_empty() {
             let mut currency_up_down_by_asset_id_lock =
                 self.currency_up_down_by_asset_id.write().await;
-            for (asset_id, code) in currency_up_down_by_asset_id.iter() {
+            for (asset_id, code) in data.currency_up_down_by_asset_id.iter() {
                 currency_up_down_by_asset_id_lock.insert(asset_id.clone(), *code);
-            }
-            drop(currency_up_down_by_asset_id_lock);
-            let mut market_asset_ids_lock = self.market_asset_ids_by_market.write().await;
-            for market_id_touched in market_ids_touched {
-                market_asset_ids_lock
-                    .entry(market_id_touched)
-                    .or_default()
-                    .extend(currency_up_down_by_asset_id.keys().cloned());
             }
         }
     }
@@ -285,12 +267,7 @@ impl ProjectManager {
     async fn try_restore_currency_event_from_slug_cache(
         &self,
         slug: &str,
-    ) -> Option<(
-        HashMap<String, Option<i64>>,
-        HashMap<String, Option<i64>>,
-        Option<String>,
-        HashMap<String, CurrencyUpDownOutcome>,
-    )> {
+    ) -> Option<CurrencyEventSlugData> {
         let market_id = self.slug_to_market_id.read().await.get(slug).cloned()?;
         let event_data = self
             .event_data_by_market
@@ -315,17 +292,14 @@ impl ProjectManager {
         }
         drop(currency_up_down_by_asset_id_lock);
 
-        let mut market_event_start_ms = HashMap::new();
-        market_event_start_ms.insert(market_id.clone(), event_data.start_ms);
-        let mut market_event_end_ms = HashMap::new();
-        market_event_end_ms.insert(market_id.clone(), event_data.end_ms);
-
-        Some((
-            market_event_start_ms,
-            market_event_end_ms,
-            event_data.gamma_question,
+        Some(CurrencyEventSlugData {
             currency_up_down_by_asset_id,
-        ))
+            market_id: Some(market_id),
+            event_start_ms: event_data.start_ms,
+            event_end_ms: event_data.end_ms,
+            min_order_size: event_data.min_order_size,
+            gamma_question: event_data.gamma_question,
+        })
     }
 
     /// Те же условия, что [`Self::try_restore_currency_event_from_slug_cache`], без сборки мап в память.
@@ -424,9 +398,19 @@ impl ProjectManager {
     /// последующие `price_change`-события не имеют bids/asks и StrictBook
     /// собрать было бы нельзя.
     pub async fn update_last_snapshot(&self, snapshot: &MarketSnapshot) {
+        let mut snapshot = snapshot.clone();
+        if let Some(event_data) = self
+            .event_data_by_market
+            .read()
+            .await
+            .get(&snapshot.market_id)
+        {
+            snapshot.min_order_size = event_data.min_order_size;
+        }
         let mut last_snapshot_by_asset_id = self.last_snapshot_by_asset_id.write().await;
         let merged = match last_snapshot_by_asset_id.remove(&snapshot.asset_id) {
-            Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms).unwrap_or_else(|| snapshot.clone()),
+            Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms)
+                .unwrap_or_else(|| snapshot.clone()),
             None => snapshot.clone(),
         };
         last_snapshot_by_asset_id.insert(snapshot.asset_id.clone(), merged);
@@ -450,38 +434,17 @@ impl ProjectManager {
         &self,
         slug: &str,
         period: &'static str,
-    ) -> Option<(
-        HashMap<String, Option<i64>>,
-        HashMap<String, Option<i64>>,
-        Option<String>,
-        HashMap<String, CurrencyUpDownOutcome>,
-    )> {
-        let CurrencyEventSlugData {
-            currency_up_down_by_asset_id,
-            market_event_start_ms,
-            market_event_end_ms,
-            gamma_question,
-        } = match fetch_gamma_event_data_for_gamma_client(self.gamma.as_ref(), slug).await {
+    ) -> Option<CurrencyEventSlugData> {
+        let data = match fetch_gamma_event_data_for_gamma_client(self.gamma.as_ref(), slug).await
+        {
             Ok(d) => d,
             Err(e) => {
                 run_log::gamma_fetch_err(period, slug, &e);
                 return None;
             }
         };
-        self.merge_market_event_data(
-            &market_event_start_ms,
-            &market_event_end_ms,
-            gamma_question.clone(),
-            &currency_up_down_by_asset_id,
-            Some(slug),
-        )
-        .await;
-        Some((
-            market_event_start_ms,
-            market_event_end_ms,
-            gamma_question,
-            currency_up_down_by_asset_id,
-        ))
+        self.merge_market_event_data(&data, slug).await;
+        Some(data)
     }
 
     /// Один `market_id` на окно up/down — одно значение PTB в кэше. Сохраняет
@@ -552,17 +515,16 @@ impl ProjectManager {
         // в buffer не нужны — иначе frame-builder построит для них xframes
         // без PTB (start окна не наступил, цена-якорь неизвестна) и забьёт
         // diag-лог. Дропаем на входе.
-        let event_start_ms = self
-            .event_data_by_market
-            .read()
-            .await
-            .get(&snapshot.market_id)
-            .and_then(|d| d.start_ms);
-        if let Some(start_ms) = event_start_ms
-            && start_ms > current_timestamp_ms()
-        {
-            return Ok(());
+        let event_data_guard = self.event_data_by_market.read().await;
+        if let Some(event_data) = event_data_guard.get(&snapshot.market_id) {
+            snapshot.min_order_size = event_data.min_order_size;
+            if let Some(start_ms) = event_data.start_ms
+                && start_ms > current_timestamp_ms()
+            {
+                return Ok(());
+            }
         }
+        drop(event_data_guard);
 
         for ws_buffer_by_market in &self.ws_buffer_by_market {
             let mut ws_buffer_by_market_lock = ws_buffer_by_market.write().await;
@@ -710,12 +672,12 @@ impl ProjectManager {
                 stable,
             );
 
-            let last_stored_aligned_ts_for_asset: Option<i64> = {
-                let lock = self.xframes_by_market[lane].read().await;
-                lock.get(&market_id)
-                    .and_then(|by_asset| by_asset.get(&asset_id))
-                    .and_then(|m| m.keys().next_back().copied())
-            };
+            // let last_stored_aligned_ts_for_asset: Option<i64> = {
+            //     let lock = self.xframes_by_market[lane].read().await;
+            //     lock.get(&market_id)
+            //         .and_then(|by_asset| by_asset.get(&asset_id))
+            //         .and_then(|m| m.keys().next_back().copied())
+            // };
 
             // if frame.stable {
             //     println!(
@@ -964,12 +926,8 @@ impl ProjectManager {
                 self.currency.to_lowercase()
             );
 
-            let (
-                market_event_start_ms,
-                market_event_end_ms,
-                gamma_question,
-                currency_up_down_by_asset_id,
-            ) = if let Some(restored) = self.try_restore_currency_event_from_slug_cache(&slug).await
+            let slug_data = if let Some(restored) =
+                self.try_restore_currency_event_from_slug_cache(&slug).await
             {
                 run_log::gamma_event_data_from_cache(period, &slug);
                 restored
@@ -981,6 +939,14 @@ impl ProjectManager {
             } else {
                 continue;
             };
+
+            let currency_up_down_by_asset_id = &slug_data.currency_up_down_by_asset_id;
+            let gamma_question = &slug_data.gamma_question;
+            let market_end_ms = slug_data
+                .event_end_ms
+                .unwrap_or(ws_end_sec * 1000);
+            let market_id = slug_data.market_id.clone();
+            let market_start_ms = slug_data.event_start_ms;
 
             {
                 let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
@@ -1011,10 +977,9 @@ impl ProjectManager {
                         {
                             continue;
                         }
-                        if let Some((_, _, _, ref currency_up_down_by_asset_id)) =
-                            project_manager_cloned
-                                .fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period)
-                                .await
+                        if let Some(prefetched) = project_manager_cloned
+                            .fetch_currency_event_from_gamma_and_merge(&prefetch_slug, period)
+                            .await
                         {
                             run_log::gamma_event_prefetch_fetched(period, &prefetch_slug);
 
@@ -1024,13 +989,16 @@ impl ProjectManager {
                                         .xframe_interval_kind_by_asset_id
                                         .write()
                                         .await;
-                                for asset_id in currency_up_down_by_asset_id.keys() {
+                                for asset_id in prefetched.currency_up_down_by_asset_id.keys() {
                                     xframe_interval_kind_by_asset_id_lock
                                         .insert(asset_id.clone(), prefetch_interval_kind);
                                 }
                             }
-                            let mut asset_ids: Vec<String> =
-                                currency_up_down_by_asset_id.keys().cloned().collect();
+                            let mut asset_ids: Vec<String> = prefetched
+                                .currency_up_down_by_asset_id
+                                .keys()
+                                .cloned()
+                                .collect();
                             asset_ids.sort_unstable();
                             match project_manager_cloned
                                 .market_ws_tx
@@ -1051,17 +1019,6 @@ impl ProjectManager {
 
             let mut ids: Vec<String> = currency_up_down_by_asset_id.keys().cloned().collect();
             ids.sort_unstable();
-
-            let market_end_ms = market_event_end_ms
-                .values()
-                .copied()
-                .flatten()
-                .max()
-                .unwrap_or(ws_end_sec * 1000);
-
-            let market_id: Option<String> = market_event_end_ms.keys().next().cloned();
-
-            let market_start_ms = market_event_start_ms.values().copied().flatten().min();
 
             let project_manager_cloned = self.clone();
             let currency = self.currency.clone();

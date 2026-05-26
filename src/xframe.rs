@@ -1773,6 +1773,7 @@ mod tests {
             book_bids: None,
             book_asks: None,
             tick_size: None,
+            min_order_size: None,
             spread: None,
             last_trade_price: None,
             last_trade_size: None,

@@ -150,8 +150,12 @@ pub(crate) fn spawn_cancel_order(
                 open_position.maker_tp_position.clone(),
             )
         };
+        crate::tee_eprintln!(
+            "[submit/{submit_mode:?}] cancel order pos_id={position_id}: отменяю maker TP на CLOB \
+             (cancel лимитного sell) — снимаем висящий TP перед taker FAK SELL",
+        );
 
-        let Some(maker_tp_position) = maker_tp_position.and_then(|weak| weak.upgrade()) else {
+        let Some(maker_tp_position) = maker_tp_position else {
             return;
         };
         let (maker_tp_order_id, maker_already_canceled) = {
@@ -222,6 +226,12 @@ pub(crate) fn spawn_sell_taker(
         return;
     }
     tokio::spawn(async move {
+        crate::tee_eprintln!(
+            "[submit/{submit_mode:?}] sell taker reason={reason:?}: ждём settle BUY-invoke; \
+             при TakeProfit/EvExitProfit и активном maker TP — выход без taker; иначе cancel maker TP, \
+             до {TAKER_SELL_ATTEMPTS} FAK SELL (exit≈{exit_price:.4}), затем close_position_after_submit \
+             (пропуск после event_end — post-market-end resolution)",
+        );
         let open_position = position.read().await;
         let position_id = open_position.id.clone();
         let asset_id = open_position.asset_id.clone();
@@ -281,24 +291,23 @@ pub(crate) fn spawn_sell_taker(
         }
         
         if reason == CloseReason::TakeProfit || reason == CloseReason::EvExitProfit {
-            if let Some(maker_tp_weak) = maker_tp_position.as_ref() {
-                if let Some(maker_tp_arc) = maker_tp_weak.upgrade() {
-                    let maker_closing = maker_tp_arc.read().await;
-                    let active_maker_tp = maker_closing
-                        .order_id
+            if let Some(maker_tp_arc) = maker_tp_position.as_ref() {
+                let maker_closing = maker_tp_arc.read().await;
+                let active_maker_tp = maker_closing
+                    .order_id
+                    .as_ref()
+                    .is_some_and(|id| !id.trim().is_empty())
+                    && !maker_closing.canceled
+                    && maker_closing
+                        .invoke_settle
                         .as_ref()
-                        .is_some_and(|id| !id.trim().is_empty())
-                        && !maker_closing.canceled
-                        && maker_closing.invoke_settle.as_ref().is_some_and(|watch| {
-                            !invoke_settlement_ready(watch)
-                        });
-                    if active_maker_tp {
-                        crate::tee_println!(
-                            "[submit] sell taker pos_id={position_id}: TakeProfit — maker TP на CLOB \
-                             (order_id есть, invoke не settled) — пропуск cancel/taker",
-                        );
-                        return;
-                    }
+                        .is_some_and(|watch| !invoke_settlement_ready(watch));
+                if active_maker_tp {
+                    crate::tee_println!(
+                        "[submit] sell taker pos_id={position_id}: TakeProfit — maker TP на CLOB \
+                         (order_id есть, invoke не settled) — пропуск cancel/taker",
+                    );
+                    return;
                 }
             }
         }
@@ -401,21 +410,16 @@ pub(crate) fn spawn_sell_taker(
 
             let (sell_invoke_tx, mut sell_invoke_rx) = invoke_settlement_watch();
 
-            let taker_closing = {
+            let taker_closing: SharedClosingPosition = {
                 let mut open_position = position.write().await;
-                let taker_closing: SharedClosingPosition =
-                    Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-                        position: position.clone(),
-                        reason: reason.clone(),
-                        order_id: None,
-                        invoke_settle: Some(sell_invoke_rx.clone()),
-                        canceled: false,
-                        created_unix_ms: crate::util::current_timestamp_ms(),
-                    }));
-
-                open_position
-                    .taker_positions
-                    .push(Arc::downgrade(&taker_closing));
+                let taker_closing = Arc::new(tokio::sync::RwLock::new(ClosingPosition {
+                    reason: reason.clone(),
+                    order_id: None,
+                    invoke_settle: Some(sell_invoke_rx.clone()),
+                    canceled: false,
+                    created_unix_ms: crate::util::current_timestamp_ms(),
+                }));
+                open_position.taker_positions.push(taker_closing.clone());
                 taker_closing
             };
 
@@ -574,6 +578,11 @@ pub(crate) fn spawn_open_buy_taker(
         return;
     }
     tokio::spawn(async move {
+        crate::tee_eprintln!(
+            "[submit/{submit_mode:?}] open BUY taker: POST taker BUY по planned_entry_cost \
+             (cap price={price:?}), invoke settle → actual shares/fee в позицию и stats; \
+             при успехе — выставляем maker TP; после event_end — post-market-end resolution",
+        );
         // `planned_*` живут в `OpenPosition` (выставлены в `open_position`) и более не
         // меняются — для submit-CSV их читает `close_position_maker_tp` из позиции.
         // Локально снимаем только то, что нужно ДО POST. `currency/interval/side`
@@ -829,6 +838,14 @@ pub(crate) fn spawn_open_buy_taker(
             let position_cloned = position.clone();
             let pos_id_post_end = pos_id.clone();
             tokio::spawn(async move {
+                crate::tee_eprintln!(
+                    "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                     ждём event_end_ms={end_ms} + {POST_MARKET_END_RESOLUTION_DELAY_MS}ms, \
+                     затем проверим residual shares; при остатке — MarketResolution \
+                     (price_to_beat/final_price) и close_position_after_submit \
+                     (ResolutionWin/Loss); если final_price ещё не пришёл — \
+                     повторяем проверку каждые {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
+                );
                 let target_ms = end_ms.saturating_add(POST_MARKET_END_RESOLUTION_DELAY_MS as i64);
                 let now_ms = crate::util::current_timestamp_ms();
                 let wait_ms = (target_ms - now_ms).max(0) as u64;
@@ -862,13 +879,6 @@ pub(crate) fn spawn_open_buy_taker(
                 if shares_remaining <= CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE {
                     return;
                 }
-                // MarketResolution lookup + UP/DOWN winner определяем здесь
-                // (caller-side), чтобы передать готовый `CloseReason::Resolution*`
-                // в `close_position_after_submit` — внутри метода reason больше
-                // не Option, и разводить логику на лету не приходится.
-                // Если данных нет (project_manager отсутствует / MarketResolution
-                // не положен / final_price=None) — выходим, флаг финализации
-                // НЕ взводим: следующий refine может прийти и нас перевызовут.
                 let Some(project_manager_cloned) = project_manager_cloned.as_ref() else {
                     crate::tee_eprintln!(
                         "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
@@ -885,29 +895,43 @@ pub(crate) fn spawn_open_buy_taker(
                         ),
                     )
                 };
-                let market_resolution = project_manager_cloned
-                    .market_resolution_by_market
-                    .read()
-                    .await
-                    .get(&market_id)
-                    .copied();
-                let Some(market_resolution) = market_resolution else {
-                    crate::tee_eprintln!(
-                        "[submit] post-market-end resolution pos_id={pos_id_post_end} \
-                         market_id={market_id}: MarketResolution отсутствует в кэше \
-                         — финализация отложена",
-                    );
-                    return;
+                // Бесконечный retry-loop с шагом `POST_MARKET_END_RESOLUTION_DELAY_MS`:
+                // ждём, пока `MarketResolution` появится в кэше и `final_price` будет
+                // выставлен (refine следующего окна). Раньше это был one-shot — если
+                // на момент пробуждения `final_price=None`, позиция оставалась незакрытой
+                // и не попадала в CSV.
+                let (price_to_beat, final_price) = loop {
+                    let market_resolution = project_manager_cloned
+                        .market_resolution_by_market
+                        .read()
+                        .await
+                        .get(&market_id)
+                        .copied();
+                    match market_resolution {
+                        Some(mr) => match mr.final_price {
+                            Some(final_price) => break (mr.price_to_beat, final_price),
+                            None => {
+                                crate::tee_eprintln!(
+                                    "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                                     market_id={market_id}: final_price=None (refine следующего \
+                                     окна ещё не пришёл) — повтор через \
+                                     {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
+                                );
+                            }
+                        },
+                        None => {
+                            crate::tee_eprintln!(
+                                "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                                 market_id={market_id}: MarketResolution отсутствует в кэше — \
+                                 повтор через {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
+                            );
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(
+                        POST_MARKET_END_RESOLUTION_DELAY_MS,
+                    ))
+                    .await;
                 };
-                let Some(final_price) = market_resolution.final_price else {
-                    crate::tee_eprintln!(
-                        "[submit] post-market-end resolution pos_id={pos_id_post_end} \
-                         market_id={market_id}: final_price=None (refine следующего \
-                         окна ещё не пришёл) — финализация отложена",
-                    );
-                    return;
-                };
-                let price_to_beat = market_resolution.price_to_beat;
                 let up_won = final_price >= price_to_beat;
                 let token_won = match our_side {
                     Some(CurrencyUpDownOutcome::Up) => up_won,
@@ -973,18 +997,18 @@ pub(crate) fn spawn_open_buy_taker(
         );
 
         let (mk_invoke_tx, mut mk_invoke_rx) = invoke_settlement_watch();
-        let closing_arc: SharedClosingPosition = Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-            position: position.clone(),
-            reason: CloseReason::TakeProfit,
-            order_id: None,
-            invoke_settle: Some(mk_invoke_rx.clone()),
-            canceled: false,
-            created_unix_ms: crate::util::current_timestamp_ms(),
-        }));
-        {
+        let closing_arc: SharedClosingPosition = {
             let mut p = position.write().await;
-            p.maker_tp_position = Some(Arc::downgrade(&closing_arc));
-        }
+            let closing_arc = Arc::new(tokio::sync::RwLock::new(ClosingPosition {
+                reason: CloseReason::TakeProfit,
+                order_id: None,
+                invoke_settle: Some(mk_invoke_rx.clone()),
+                canceled: false,
+                created_unix_ms: crate::util::current_timestamp_ms(),
+            }));
+            p.maker_tp_position = Some(closing_arc.clone());
+            closing_arc
+        };
 
         let maker_post_request = PostOrderRequest {
             asset_id: asset_id.clone(),

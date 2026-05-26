@@ -544,6 +544,7 @@ fn parse_single_snapshot(
         book_bids: book.book_bids,
         book_asks: book.book_asks,
         tick_size: parse_f64(value.get("new_tick_size")).or(parse_f64(value.get("tick_size"))),
+        min_order_size: None,
         spread: parse_f64(value.get("spread")),
         // WS trade event uses `price` for last trade value.
         last_trade_price: parse_f64(value.get("price"))
@@ -613,6 +614,7 @@ fn parse_price_change_snapshots(
             book_bids: None,
             book_asks: None,
             tick_size: None,
+            min_order_size: None,
             spread: None,
             last_trade_price: None,
             last_trade_size: None,
@@ -675,6 +677,7 @@ fn parse_new_market_snapshots(
             book_bids: None,
             book_asks: None,
             tick_size,
+            min_order_size: None,
             spread: None,
             last_trade_price: None,
             last_trade_size: None,
