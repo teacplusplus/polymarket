@@ -49,6 +49,7 @@ pub fn spawn_dump_market_xframes_binary(
     price_to_beat: f64,
     final_price: f64,
     slug: String,
+    event_end_ms: i64,
 ) {
     tokio::spawn(async move {
         let interval_kind = XFrameIntervalKind::from_period_sec(period_sec);
@@ -71,6 +72,7 @@ pub fn spawn_dump_market_xframes_binary(
                 lane,
                 price_to_beat,
                 final_price,
+                event_end_ms,
             )
             .await
             {
@@ -84,6 +86,7 @@ pub fn spawn_dump_market_xframes_binary(
                 lane,
                 price_to_beat,
                 final_price,
+                event_end_ms,
             )
             .await
             {
@@ -106,6 +109,11 @@ pub fn spawn_dump_market_xframes_binary(
     });
 }
 
+/// `event_end_ms` — Unix-мс конца окна Polymarket; используется как
+/// детерминированный суффикс `__{ms}.bin` в имени файла, чтобы партиал-HTML
+/// ([`crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close`])
+/// и финальный `.bin` / HTML по одному рынку лежали по совпадающим путям, и
+/// финальный дамп перезаписывал партиал.
 pub async fn dump_market_xframes_binary_lane(
     project_manager: Arc<ProjectManager>,
     market_id: String,
@@ -114,6 +122,7 @@ pub async fn dump_market_xframes_binary_lane(
     lane: usize,
     price_to_beat: f64,
     final_price: f64,
+    event_end_ms: i64,
 ) -> anyhow::Result<()> {
     let by_asset = {
         let xframes_by_market_lock = project_manager.xframes_by_market[lane].read().await;
@@ -176,7 +185,7 @@ pub async fn dump_market_xframes_binary_lane(
     tokio::fs::create_dir_all(&base).await?;
 
     let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
-    let fname = format!("{stem}__{}.bin", current_timestamp_ms());
+    let fname = format!("{stem}__{event_end_ms}.bin");
     let path = base.join(&fname);
     let bytes = bincode::serialize(&dump)?;
     let byte_len = bytes.len();
@@ -186,12 +195,26 @@ pub async fn dump_market_xframes_binary_lane(
 }
 
 /// Собирает ожидаемый относительный путь `.bin` под `xframes/…` в том же виде, что [`dump_market_xframes_binary_lane`],
-/// **без обращения к диску** — файл может появиться позже или иметь другой суффикс `__{ts}` у дампера.
-/// Нужен только для колонки графика в CSV ([`crate::real_sim`], fallback в [`crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri`]).
+/// **без обращения к диску** — файл может появиться позже у дампера.
+///
+/// Суффикс `__{ts}` детерминирован: это `event_end_ms` (Unix-мс конца окна
+/// Polymarket). Тот же суффикс используют [`dump_market_xframes_binary_lane`]
+/// (финальный `.bin`) и [`crate::xframe_graph_dump::dump_market_graph_html_lane`]
+/// (финальный HTML), а также [`crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close`]
+/// (партиал-HTML, путь которого выводится из этого `.bin`-пути через
+/// [`crate::xframe_graph_dump::graph_html_path_from_bin`]). Благодаря общему
+/// суффиксу финальный дамп при резолюции рынка перезаписывает партиал, а
+/// несколько закрытий по одному рынку обновляют один и тот же HTML.
+///
+/// `event_end_ms == None` — fallback на `current_timestamp_ms()` (старое
+/// поведение); файл тогда будет уникальным и не перезатрётся финалом, но
+/// CSV-ссылка по крайней мере не пустая. Нужен только для колонки графика в
+/// CSV ([`crate::real_sim`], fallback в [`crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri`]).
 pub(crate) fn synthetic_xframes_dump_bin_path_for_csv_link(
     currency: &str,
     interval_kind: XFrameIntervalKind,
     stem: &str,
+    event_end_ms: Option<i64>,
 ) -> Option<PathBuf> {
     if stem.is_empty() {
         return None;
@@ -203,7 +226,8 @@ pub(crate) fn synthetic_xframes_dump_bin_path_for_csv_link(
     let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
     let step_secs = *FRAME_BUILD_INTERVALS_SEC.first().unwrap_or(&1);
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let fname = format!("{stem}__{}.bin", current_timestamp_ms());
+    let ts_suffix = event_end_ms.unwrap_or_else(current_timestamp_ms);
+    let fname = format!("{stem}__{ts_suffix}.bin");
     Some(
         Path::new("xframes")
             .join(currency)

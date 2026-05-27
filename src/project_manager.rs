@@ -40,6 +40,8 @@ struct PrevMarket {
     window_start_sec: i64,
     /// Exact PTB от refine этой итерации; следующий refine ждёт для пары в дампе.
     exact_price_to_beat_rx: oneshot::Receiver<f64>,
+    /// `event_end_ms` маркета от Gamma (`endDate` через
+    event_end_ms: Option<i64>,
 }
 
 /// Стабильный кадр лейна 1s → [`real_sim`](crate::real_sim) по каналам (без поллинга `xframes_by_market`).
@@ -1116,6 +1118,7 @@ impl ProjectManager {
                     gamma_question: gamma_question.clone(),
                     window_start_sec,
                     exact_price_to_beat_rx: current_exact_rx,
+                    event_end_ms: slug_data.event_end_ms,
                 });
             }
 
@@ -1245,6 +1248,23 @@ fn spawn_bg_price_to_beat_refine(
             currency.to_lowercase(),
             prev.window_start_sec
         );
+        let prev_event_end_ms = match prev.event_end_ms {
+            Some(ms) => ms,
+            None => {
+                let fallback = prev
+                    .window_start_sec
+                    .saturating_add(period_sec)
+                    .saturating_mul(1000);
+                eprintln!(
+                    "xframe_dump: market_id={prev_market_id}: у Gamma не было \
+                     event_end_ms (endDate), использую fallback \
+                     (window_start_sec + period_sec) * 1000 = {fallback}; \
+                     имя файла дампа может разойтись с синтетическим CSV-путём \
+                     и партиал-HTML по этому рынку"
+                );
+                fallback
+            }
+        };
         xframe_dump::spawn_dump_market_xframes_binary(
             project_manager.clone(),
             prev_market_id,
@@ -1253,6 +1273,7 @@ fn spawn_bg_price_to_beat_refine(
             prev_exact,
             current_exact,
             prev_slug,
+            prev_event_end_ms,
         );
     });
 }

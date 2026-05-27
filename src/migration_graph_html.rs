@@ -41,12 +41,20 @@ pub fn run_graph_html_migration() -> Result<()> {
 
         let bins = collect_bin_files_under_currency(&cur_root)
             .with_context(|| format!("обход {}", cur_root.display()))?;
-        println!(
-            "[migration_graph_html] {currency}: найдено {} .bin",
-            bins.len()
-        );
+        let total = bins.len();
+        println!("[migration_graph_html] {currency}: найдено {total} .bin");
 
-        for (path, interval_kind) in bins {
+        // Шаг прогресса: ~каждые 1% от объёма, но не реже чем раз в 100 файлов
+        // и не чаще чем раз в 10 файлов (для маленьких наборов).
+        let progress_step = (total / 100).clamp(10, 100).max(1);
+        let started = std::time::Instant::now();
+        let cur_wrote_start = wrote;
+        let cur_skip_bounds_start = skip_bounds;
+        let cur_skip_empty_start = skip_empty;
+        let cur_err_bin_start = err_bin;
+        let cur_err_write_start = err_write;
+
+        for (idx, (path, interval_kind)) in bins.into_iter().enumerate() {
             let bytes = match fs::read(&path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -77,6 +85,21 @@ pub fn run_graph_html_migration() -> Result<()> {
                     err_write += 1;
                     eprintln!("[migration_graph_html] {}: {e:#}", path.display());
                 }
+            }
+
+            let done = idx + 1;
+            if done % progress_step == 0 || done == total {
+                let elapsed = started.elapsed().as_secs_f64();
+                let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let pct = (done as f64 / total.max(1) as f64) * 100.0;
+                println!(
+                    "[migration_graph_html] {currency}: {done}/{total} ({pct:.1}%), {rate:.1} файл/с, wrote={} skip_no_bounds={} skip_no_stable={} err_bin={} err_write={}",
+                    wrote - cur_wrote_start,
+                    skip_bounds - cur_skip_bounds_start,
+                    skip_empty - cur_skip_empty_start,
+                    err_bin - cur_err_bin_start,
+                    err_write - cur_err_write_start,
+                );
             }
         }
     }

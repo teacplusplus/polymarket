@@ -619,6 +619,7 @@ async fn tick_once(
                                 currency,
                                 interval_kind,
                                 &stem,
+                                event_end_ms,
                             )
                         })
                         .flatten()

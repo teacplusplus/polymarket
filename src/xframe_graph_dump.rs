@@ -6,7 +6,7 @@ use crate::history_sim::{
     book_fill_sell,
 };
 use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager, XFRAMES_LANE_1S};
-use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
+use crate::util::sanitized_filename_from_gamma_question;
 use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::Context as _;
@@ -22,7 +22,12 @@ pub(crate) fn graph_dump_bin_path_for_trade_csv_uri(pos: &OpenPosition) -> Optio
     let ik = XFrameIntervalKind::from_i32(pos.xframe_interval_type_at_open)?;
     let gq = pos.gamma_question_at_open.as_deref()?;
     let stem = sanitized_filename_from_gamma_question(Some(gq));
-    crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(&pos.currency, ik, &stem)
+    crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(
+        &pos.currency,
+        ik,
+        &stem,
+        pos.event_end_ms,
+    )
 }
 
 /// Результат [`try_write_graph_html_from_bin_dump`].
@@ -477,6 +482,7 @@ pub async fn dump_market_graph_html_lane(
     lane: usize,
     price_to_beat: f64,
     final_price: f64,
+    event_end_ms: i64,
 ) -> anyhow::Result<()> {
     let by_asset = {
         let xframes_by_market_lock = project_manager.xframes_by_market[lane].read().await;
@@ -528,7 +534,7 @@ pub async fn dump_market_graph_html_lane(
     tokio::fs::create_dir_all(&base).await?;
 
     let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
-    let fname = format!("{stem}__{}.html", current_timestamp_ms());
+    let fname = format!("{stem}__{event_end_ms}.html");
     let path = base.join(&fname);
 
     let interval_ms = interval_kind.interval_ms();
