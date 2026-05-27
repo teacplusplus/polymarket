@@ -10,7 +10,7 @@ use crate::history_sim::{
 };
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::sim_stats::{SideStats, SimStats};
-use crate::tee_log::TEE_LOG;
+use crate::tee_log;
 use crate::xframe::{
     SIZE, XFrame, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_STOP_LOSS_PP, Y_TRAIN_TAKE_PROFIT_PP,
     apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution,
@@ -531,17 +531,6 @@ async fn fit_calibration_via_sim_replay(
         markets_processed += 1;
     }
 
-    // Defensive sweep: `close_position` / `Account::resolve_pending_market_sync`
-    // выше клали строки в `TRADE_CSV_PENDING` (in-memory буфер). Для каждого
-    // маркета `resolve_pending_market_sync` вызывает `record_market_outcome`,
-    // который дренирует свой `market_id` (с writer == None строки уходят в
-    // drop, см. `trade_csv_log::record_market_outcome`). Но если в каком-то
-    // маркете `market_id_opt = None` (пустой dump), `record_market_outcome`
-    // не дёрнется и его строки останутся висеть. Чистим буфер до того, как
-    // `run_sim_mode` откроет writer и эти orphan-строки попадут в финальный
-    // CSV под чужим `regime`.
-    crate::trade_csv_log::clear_pending_buffer();
-
     let n_won = entries.iter().filter(|(_, w)| *w).count();
     let n_lost = entries.len() - n_won;
     let mean_raw_won: f64 = if n_won > 0 {
@@ -972,11 +961,7 @@ pub async fn run_train_mode() -> anyhow::Result<()> {
     }
 
     let log_path = xframes_root.join("last_train_mode.txt");
-    {
-        let file = fs::File::create(&log_path)?;
-        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
+    tee_log::init_tee_log_file(&log_path)?;
     tee_println!("[train] лог пишется в {}", log_path.display());
 
     for currency_path in fs_read_dirs(xframes_root)? {
@@ -1066,13 +1051,7 @@ pub async fn run_train_mode() -> anyhow::Result<()> {
         }
     }
 
-    {
-        use std::io::Write;
-        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
-        }
-    }
+    tee_log::finish_tee_log();
 
     Ok(())
 }

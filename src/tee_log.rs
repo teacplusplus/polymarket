@@ -1,74 +1,271 @@
 //! Универсальный «tee»-лог: дублирует консольный вывод в файл.
 //!
 //! Макросы [`tee_println!`] и [`tee_eprintln!`] форматируют строку один раз,
-//! выводят её в `stdout`/`stderr` и пишут ту же строку в файл, на который
-//! указывает [`TEE_LOG`]. Инициализация и закрытие файла — ответственность
-//! вызывающего кода (обычно в точке входа режима).
+//! выводят её в `stdout`/`stderr` и ставят ту же строку в очередь на запись
+//! в файл, на который указывает соответствующий канал. Инициализация и закрытие
+//! файла — ответственность вызывающего кода (обычно в точке входа режима).
 //!
-//! Если [`TEE_LOG`] ещё не инициализирован (`None`) — [`tee_println!`]/[`tee_eprintln!`]
-//! работают как обычный `println!`/`eprintln!`, просто без файловой копии.
+//! Запись на диск выполняется фоновой задачей (`tokio::spawn`): продюсеры
+//! только отправляют строки в `mpsc`, писатель при появлении данных хотя бы в
+//! одном канале сливает **все** накопившиеся строки из **всех** активных каналов
+//! в соответствующие файлы.
 //!
-//! Если [`STREAM_TEE_LOG`], [`USER_STREAM_TEE_LOG`], [`SIM_STATS_TEE_LOG`] или [`TEST_TEE_LOG`]
-//! не открыты через `init_*` — соответствующие макросы не пишут в файл (форматирование
-//! строки всё равно выполняется).
+//! Если канал ещё не инициализирован — [`tee_println!`]/[`tee_eprintln!`]
+//! работают как обычный `println!`/`eprintln!`, без файловой копии.
+//! Stream/user/sim-stats/test макросы без `init_*` — no-op на запись в файл.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
-/// Файловый писатель для дублирования консольного вывода.
-/// `const`-инициализация через [`Mutex::new`] — без внешних крейтов.
-pub static TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
+use tokio::sync::mpsc;
 
-/// Пишет одну строку в [`TEE_LOG`] (если файл инициализирован) и сразу флашит.
-/// Используется внутри [`tee_println!`]/[`tee_eprintln!`].
-pub fn tee_log_write(line: &str) {
-    if let Ok(mut guard) = TEE_LOG.lock() {
-        if let Some(w) = guard.as_mut() {
-            let _ = writeln!(w, "{}", line);
-            let _ = w.flush();
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum TeeKind {
+    Main,
+    Stream,
+    UserStream,
+    SimStats,
+    Test,
+    TradeCsv,
+    SubmitTradeCsv,
+}
+
+enum WriterMsg {
+    Register {
+        kind: TeeKind,
+        rx: mpsc::UnboundedReceiver<String>,
+        path: PathBuf,
+        ack: std::sync::mpsc::Sender<()>,
+    },
+    Close {
+        kind: TeeKind,
+        ack: std::sync::mpsc::Sender<()>,
+    },
+}
+
+struct ChannelSlot {
+    kind: TeeKind,
+    rx: mpsc::UnboundedReceiver<String>,
+    writer: BufWriter<File>,
+}
+
+struct TeeChannel {
+    sender: Mutex<Option<mpsc::UnboundedSender<String>>>,
+}
+
+impl TeeChannel {
+    const fn new() -> Self {
+        Self {
+            sender: Mutex::new(None),
         }
+    }
+
+    fn send_line(&self, line: &str) {
+        let tx = match self.sender.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return,
+        };
+        if let Some(tx) = tx {
+            if tx.send(line.to_owned()).is_ok() {
+                writer_wake();
+            }
+        }
+    }
+
+    fn set_sender(&self, tx: mpsc::UnboundedSender<String>) {
+        if let Ok(mut guard) = self.sender.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    fn take_sender(&self) -> Option<mpsc::UnboundedSender<String>> {
+        self.sender.lock().ok().and_then(|mut g| g.take())
     }
 }
 
-/// Открывает (или перезаписывает) файл `path`, кладёт его `BufWriter` в
-/// [`TEE_LOG`] и пишет первую строку-маркер `«[<tag>] лог пишется в …»`.
-/// Возвращает ошибку только если не удалось создать сам файл; директорию
-/// создаём best-effort (`create_dir_all` без bail на ошибке — точно так же
-/// раньше работал inline-код в точках входа режимов).
-///
-/// Идемпотентен в смысле «последний победил»: повторный вызов заменит
-/// предыдущий писатель в `TEE_LOG`, prev `BufWriter` сдропается на месте
-/// и сам флашнется. На практике вызывается один раз на процесс — в
-/// точке входа конкретного режима (`run_sim_mode` для history_sim,
-/// `AppMode::RealSim` ветка `main` для real_sim).
-pub fn init_tee_log_file(path: &Path) -> std::io::Result<()> {
+static WRITER_CMD_TX: OnceLock<mpsc::UnboundedSender<WriterMsg>> = OnceLock::new();
+static WRITER_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+static TEE_CHANNEL: TeeChannel = TeeChannel::new();
+static STREAM_CHANNEL: TeeChannel = TeeChannel::new();
+static USER_STREAM_CHANNEL: TeeChannel = TeeChannel::new();
+static SIM_STATS_CHANNEL: TeeChannel = TeeChannel::new();
+static TEST_CHANNEL: TeeChannel = TeeChannel::new();
+static TRADE_CSV_CHANNEL: TeeChannel = TeeChannel::new();
+static SUBMIT_TRADE_CSV_CHANNEL: TeeChannel = TeeChannel::new();
+
+fn writer_wake() {
+    if let Some(n) = WRITER_WAKE.get() {
+        n.notify_one();
+    }
+}
+
+fn channel_for(kind: TeeKind) -> &'static TeeChannel {
+    match kind {
+        TeeKind::Main => &TEE_CHANNEL,
+        TeeKind::Stream => &STREAM_CHANNEL,
+        TeeKind::UserStream => &USER_STREAM_CHANNEL,
+        TeeKind::SimStats => &SIM_STATS_CHANNEL,
+        TeeKind::Test => &TEST_CHANNEL,
+        TeeKind::TradeCsv => &TRADE_CSV_CHANNEL,
+        TeeKind::SubmitTradeCsv => &SUBMIT_TRADE_CSV_CHANNEL,
+    }
+}
+
+fn ensure_writer() {
+    WRITER_CMD_TX.get_or_init(|| {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let _ = WRITER_WAKE.set(tokio::sync::Notify::new());
+        tokio::spawn(tee_log_writer_loop(cmd_rx));
+        cmd_tx
+    });
+}
+
+fn writer_cmd() -> &'static mpsc::UnboundedSender<WriterMsg> {
+    ensure_writer();
+    WRITER_CMD_TX.get().expect("tee_log writer cmd_tx")
+}
+
+fn register_channel(kind: TeeKind, path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let file = File::create(path)?;
-    {
-        let mut guard = TEE_LOG.lock().expect("TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
+    File::create(path)?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    writer_cmd()
+        .send(WriterMsg::Register {
+            kind,
+            rx,
+            path: path.to_path_buf(),
+            ack: ack_tx,
+        })
+        .map_err(|_| std::io::Error::other("tee_log writer task stopped"))?;
+    ack_rx
+        .recv_timeout(Duration::from_secs(30))
+        .map_err(|_| std::io::Error::other("tee_log writer register timeout"))?;
+    channel_for(kind).set_sender(tx);
     Ok(())
 }
 
-/// Флашит и закрывает писатель в [`TEE_LOG`], если он был открыт.
-/// Используется в финале однократных режимов (history_sim), где
-/// контролируемое закрытие даёт гарантию, что хвост лога ушёл на диск
-/// до выхода из `main`. Для долгоживущих режимов (real_sim) не нужен —
-/// `BufWriter` флашится в Drop статика при штатном выходе процесса.
-pub fn finish_tee_log() {
-    if let Ok(mut guard) = TEE_LOG.lock() {
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
+fn close_channel(kind: TeeKind) {
+    if channel_for(kind).take_sender().is_none() {
+        return;
+    }
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    let _ = writer_cmd().send(WriterMsg::Close {
+        kind,
+        ack: ack_tx,
+    });
+    let _ = ack_rx.recv_timeout(Duration::from_secs(30));
+}
+
+fn drain_slot(slot: &mut ChannelSlot) {
+    while let Ok(line) = slot.rx.try_recv() {
+        let _ = writeln!(slot.writer, "{}", line);
+    }
+}
+
+fn flush_slot(slot: &mut ChannelSlot) {
+    let _ = slot.writer.flush();
+}
+
+async fn tee_log_writer_loop(mut cmd_rx: mpsc::UnboundedReceiver<WriterMsg>) {
+    let mut channels: Vec<ChannelSlot> = Vec::new();
+    let wake = WRITER_WAKE.get().expect("WRITER_WAKE");
+
+    loop {
+        while let Ok(msg) = cmd_rx.try_recv() {
+            match msg {
+                WriterMsg::Register { kind, rx, path, ack } => {
+                    channels.retain(|slot| slot.kind != kind);
+                    match File::create(&path) {
+                        Ok(file) => {
+                            channels.push(ChannelSlot {
+                                kind,
+                                rx,
+                                writer: BufWriter::new(file),
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("tee_log: не удалось открыть {}: {e}", path.display());
+                        }
+                    }
+                    let _ = ack.send(());
+                }
+                WriterMsg::Close { kind, ack } => {
+                    if let Some(idx) = channels.iter().position(|s| s.kind == kind) {
+                        let mut slot = channels.remove(idx);
+                        drain_slot(&mut slot);
+                        flush_slot(&mut slot);
+                    }
+                    let _ = ack.send(());
+                }
+            }
+        }
+
+        let mut wrote_any = false;
+        for slot in &mut channels {
+            while let Ok(line) = slot.rx.try_recv() {
+                let _ = writeln!(slot.writer, "{}", line);
+                wrote_any = true;
+            }
+        }
+        if wrote_any {
+            for slot in &mut channels {
+                flush_slot(slot);
+            }
+            continue;
+        }
+
+        tokio::select! {
+            msg = cmd_rx.recv() => {
+                if let Some(msg) = msg {
+                    match msg {
+                        WriterMsg::Register { kind, rx, path, ack } => {
+                            channels.retain(|slot| slot.kind != kind);
+                            if let Ok(file) = File::create(&path) {
+                                channels.push(ChannelSlot { kind, rx, writer: BufWriter::new(file) });
+                            }
+                            let _ = ack.send(());
+                        }
+                        WriterMsg::Close { kind, ack } => {
+                            if let Some(idx) = channels.iter().position(|s| s.kind == kind) {
+                                let mut slot = channels.remove(idx);
+                                drain_slot(&mut slot);
+                                flush_slot(&mut slot);
+                            }
+                            let _ = ack.send(());
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            () = wake.notified() => {}
         }
     }
 }
 
-/// `println!`, который дополнительно пишет ту же строку в [`TEE_LOG`].
+/// Пишет одну строку в очередь основного tee-канала (если инициализирован).
+pub fn tee_log_write(line: &str) {
+    TEE_CHANNEL.send_line(line);
+}
+
+/// Открывает (или перезаписывает) файл `path` и регистрирует основной tee-канал.
+pub fn init_tee_log_file(path: &Path) -> std::io::Result<()> {
+    register_channel(TeeKind::Main, path)
+}
+
+/// Сливает очередь и закрывает основной tee-канал.
+pub fn finish_tee_log() {
+    close_channel(TeeKind::Main);
+}
+
+/// `println!`, который дополнительно пишет ту же строку в tee-файл.
 #[macro_export]
 macro_rules! tee_println {
     ($($arg:tt)*) => {{
@@ -78,7 +275,7 @@ macro_rules! tee_println {
     }};
 }
 
-/// `eprintln!`, который дополнительно пишет ту же строку в [`TEE_LOG`].
+/// `eprintln!`, который дополнительно пишет ту же строку в tee-файл.
 #[macro_export]
 macro_rules! tee_eprintln {
     ($($arg:tt)*) => {{
@@ -89,60 +286,21 @@ macro_rules! tee_eprintln {
 }
 
 // ---------------------------------------------------------------------------
-// Отдельный «stream» tee-канал для observability-логов (live-тесты и т.п.).
-//
-// Идея — параллельный писатель, который **не** дублирует вывод в stdout/stderr
-// и **не** шарится с основным [`TEE_LOG`]: подробные `[order_invoke/...]`
-// логи пишутся ТОЛЬКО в файл, заданный [`init_stream_tee_log_file`]. Это держит
-// прод-вывод чистым и одновременно даёт полный sequence событий для разбора.
+// Stream tee (observability, без stdout/stderr)
 // ---------------------------------------------------------------------------
 
-/// Параллельный файловый писатель для stream-логов; не пересекается с [`TEE_LOG`].
-/// Семантика идентична: `Mutex<Option<BufWriter<File>>>`, `None` = «не инициализирован,
-/// все записи через [`stream_tee_log_write`] становятся no-op».
-pub static STREAM_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
-
-/// Пишет одну строку в [`STREAM_TEE_LOG`] (если файл инициализирован) и сразу флашит.
-/// Используется внутри [`stream_tee_println!`]/[`stream_tee_eprintln!`]; в stdout/stderr
-/// **не** дублирует (в отличие от [`tee_log_write`]) — это отдельный stream-канал.
 pub fn stream_tee_log_write(line: &str) {
-    if let Ok(mut guard) = STREAM_TEE_LOG.lock() {
-        if let Some(w) = guard.as_mut() {
-            let _ = writeln!(w, "{}", line);
-            let _ = w.flush();
-        }
-    }
+    STREAM_CHANNEL.send_line(line);
 }
 
-/// Аналог [`init_tee_log_file`] для [`STREAM_TEE_LOG`]: открывает (или
-/// перезаписывает) `path`, кладёт его `BufWriter` в [`STREAM_TEE_LOG`] и пишет
-/// первую строку-маркер «[<tag>] stream-log пишется в …». Тот же контракт «последний
-/// победил»; на практике вызывается один раз перед размещением ордеров.
 pub fn init_stream_tee_log_file(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let file = File::create(path)?;
-    {
-        let mut guard = STREAM_TEE_LOG.lock().expect("STREAM_TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
-    Ok(())
+    register_channel(TeeKind::Stream, path)
 }
 
-/// Флашит и закрывает писатель в [`STREAM_TEE_LOG`], если он был открыт. Полезно в
-/// конце прогона, чтобы гарантировать, что хвост лога ушёл на диск до выхода.
 pub fn finish_stream_tee_log() {
-    if let Ok(mut guard) = STREAM_TEE_LOG.lock() {
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
-        }
-    }
+    close_channel(TeeKind::Stream);
 }
 
-/// Записывает форматированную строку **только** в [`STREAM_TEE_LOG`] (если открыт);
-/// в stdout не пишет — в отличие от [`tee_println!`]. Если файл не инициализирован,
-/// макрос становится почти no-op (формат строки выполнится, запись будет проглочена).
 #[macro_export]
 macro_rules! stream_tee_println {
     ($($arg:tt)*) => {{
@@ -151,9 +309,6 @@ macro_rules! stream_tee_println {
     }};
 }
 
-/// Записывает форматированную строку **только** в [`STREAM_TEE_LOG`] (если открыт);
-/// в stderr не пишет — в отличие от [`tee_eprintln!`]. Используется для отметки
-/// неуспешных WS/HTTP веток внутри stream-трассы.
 #[macro_export]
 macro_rules! stream_tee_eprintln {
     ($($arg:tt)*) => {{
@@ -163,49 +318,21 @@ macro_rules! stream_tee_eprintln {
 }
 
 // ---------------------------------------------------------------------------
-// Отдельный «user-stream» tee-канал для user-WS и CLOB heartbeat
-// ([`crate::account_ws`] `[user_ws] …`, [`crate::account`] `[heartbeat] …`):
-// только файл, без stdout/stderr — как [`STREAM_TEE_LOG`], но свой путь
-// (`xframes/last_user_stream.txt` в live/submit-режимах).
+// User-stream tee
 // ---------------------------------------------------------------------------
 
-/// Параллельный файловый писатель для user-WS логов; не пересекается с [`TEE_LOG`] и [`STREAM_TEE_LOG`].
-pub static USER_STREAM_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
-
-/// Пишет одну строку в [`USER_STREAM_TEE_LOG`] (если файл инициализирован) и сразу флашит.
 pub fn user_stream_tee_log_write(line: &str) {
-    if let Ok(mut guard) = USER_STREAM_TEE_LOG.lock() {
-        if let Some(w) = guard.as_mut() {
-            let _ = writeln!(w, "{}", line);
-            let _ = w.flush();
-        }
-    }
+    USER_STREAM_CHANNEL.send_line(line);
 }
 
-/// Аналог [`init_stream_tee_log_file`] для [`USER_STREAM_TEE_LOG`]: маркер
-/// «[<tag>] user-stream-log пишется в …».
 pub fn init_user_stream_tee_log_file(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let file = File::create(path)?;
-    {
-        let mut guard = USER_STREAM_TEE_LOG.lock().expect("USER_STREAM_TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
-    Ok(())
+    register_channel(TeeKind::UserStream, path)
 }
 
-/// Флашит и закрывает писатель в [`USER_STREAM_TEE_LOG`], если он был открыт.
 pub fn finish_user_stream_tee_log() {
-    if let Ok(mut guard) = USER_STREAM_TEE_LOG.lock() {
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
-        }
-    }
+    close_channel(TeeKind::UserStream);
 }
 
-/// Записывает строку **только** в [`USER_STREAM_TEE_LOG`] (если открыт); в stdout не пишет.
 #[macro_export]
 macro_rules! user_stream_tee_println {
     ($($arg:tt)*) => {{
@@ -214,7 +341,6 @@ macro_rules! user_stream_tee_println {
     }};
 }
 
-/// Записывает строку **только** в [`USER_STREAM_TEE_LOG`] (если открыт); в stderr не пишет.
 #[macro_export]
 macro_rules! user_stream_tee_eprintln {
     ($($arg:tt)*) => {{
@@ -224,55 +350,21 @@ macro_rules! user_stream_tee_eprintln {
 }
 
 // ---------------------------------------------------------------------------
-// Отдельный «sim-stats» tee-канал: снимки [`crate::sim_stats::SimStats`] при закрытии
-// позиций в real_sim / real_sim_with_submit (`xframes/last_sim_stats.txt`).
+// Sim-stats tee
 // ---------------------------------------------------------------------------
 
-/// Файловый писатель для sim-stats снимков; не пересекается с другими tee-каналами.
-pub static SIM_STATS_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
-
-/// Пишет одну строку в [`SIM_STATS_TEE_LOG`] (если файл инициализирован) и сразу флашит.
 pub fn sim_stats_tee_log_write(line: &str) {
-    if let Ok(mut guard) = SIM_STATS_TEE_LOG.lock() {
-        if let Some(w) = guard.as_mut() {
-            let _ = writeln!(w, "{}", line);
-            let _ = w.flush();
-        }
-    }
+    SIM_STATS_CHANNEL.send_line(line);
 }
 
-/// `true`, если [`SIM_STATS_TEE_LOG`] открыт (real_sim / real_sim_with_submit).
-pub fn sim_stats_tee_log_is_open() -> bool {
-    SIM_STATS_TEE_LOG
-        .lock()
-        .ok()
-        .is_some_and(|g| g.is_some())
-}
-
-/// Аналог [`init_stream_tee_log_file`] для [`SIM_STATS_TEE_LOG`]: маркер
-/// «[<tag>] sim-stats-log пишется в …».
 pub fn init_sim_stats_tee_log_file(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let file = File::create(path)?;
-    {
-        let mut guard = SIM_STATS_TEE_LOG.lock().expect("SIM_STATS_TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
-    Ok(())
+    register_channel(TeeKind::SimStats, path)
 }
 
-/// Флашит и закрывает писатель в [`SIM_STATS_TEE_LOG`], если он был открыт.
 pub fn finish_sim_stats_tee_log() {
-    if let Ok(mut guard) = SIM_STATS_TEE_LOG.lock() {
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
-        }
-    }
+    close_channel(TeeKind::SimStats);
 }
 
-/// Записывает строку **только** в [`SIM_STATS_TEE_LOG`] (если открыт); в stdout не пишет.
 #[macro_export]
 macro_rules! sim_stats_tee_println {
     ($($arg:tt)*) => {{
@@ -282,47 +374,23 @@ macro_rules! sim_stats_tee_println {
 }
 
 // ---------------------------------------------------------------------------
-// Отдельный «test» tee-канал (unit / интеграционные сценарии): только файл,
-// без stdout/stderr — как [`STREAM_TEE_LOG`], но с собственным файлом и маркером.
+// Test tee
 // ---------------------------------------------------------------------------
 
-/// Файловый писатель для test-only логов; не пересекается с [`TEE_LOG`] и [`STREAM_TEE_LOG`].
-pub static TEST_TEE_LOG: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
-
-/// Пишет одну строку в [`TEST_TEE_LOG`] (если файл инициализирован) и сразу флашит.
 pub fn test_tee_log_write(line: &str) {
-    if let Ok(mut guard) = TEST_TEE_LOG.lock() {
-        if let Some(w) = guard.as_mut() {
-            let _ = writeln!(w, "{}", line);
-            let _ = w.flush();
-        }
-    }
+    TEST_CHANNEL.send_line(line);
 }
 
-/// Аналог [`init_stream_tee_log_file`] для [`TEST_TEE_LOG`]: маркер «[<tag>] test-log пишется в …».
 pub fn init_test_tee_log_file(path: &Path, tag: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let file = File::create(path)?;
-    {
-        let mut guard = TEST_TEE_LOG.lock().expect("TEST_TEE_LOG poisoned");
-        *guard = Some(BufWriter::new(file));
-    }
+    register_channel(TeeKind::Test, path)?;
     crate::test_tee_println!("[{tag}] test-log пишется в {}", path.display());
     Ok(())
 }
 
-/// Закрывает писатель [`TEST_TEE_LOG`], флаш перед снятием.
 pub fn finish_test_tee_log() {
-    if let Ok(mut guard) = TEST_TEE_LOG.lock() {
-        if let Some(mut w) = guard.take() {
-            let _ = w.flush();
-        }
-    }
+    close_channel(TeeKind::Test);
 }
 
-/// Записывает строку **только** в [`TEST_TEE_LOG`] (если открыт); в stdout не пишет.
 #[macro_export]
 macro_rules! test_tee_println {
     ($($arg:tt)*) => {{
@@ -331,11 +399,48 @@ macro_rules! test_tee_println {
     }};
 }
 
-/// Записывает строку **только** в [`TEST_TEE_LOG`] (если открыт); в stderr не пишет.
 #[macro_export]
 macro_rules! test_tee_eprintln {
     ($($arg:tt)*) => {{
         let __line = format!($($arg)*);
         $crate::tee_log::test_tee_log_write(&__line);
     }};
+}
+
+// ---------------------------------------------------------------------------
+// Per-trade CSV (history_sim / real_sim)
+// ---------------------------------------------------------------------------
+
+/// Ставит готовую CSV-строку в очередь `last_*_trades.csv` (если канал открыт).
+pub fn trade_csv_log_write(line: &str) {
+    TRADE_CSV_CHANNEL.send_line(line);
+}
+
+/// Открывает (или перезаписывает) trade-CSV файл.
+pub fn init_trade_csv_log_file(path: &Path) -> std::io::Result<()> {
+    register_channel(TeeKind::TradeCsv, path)
+}
+
+/// Сливает очередь и закрывает trade-CSV канал.
+pub fn finish_trade_csv_log() {
+    close_channel(TeeKind::TradeCsv);
+}
+
+// ---------------------------------------------------------------------------
+// Submit-orders CSV (real_sim_with_submit)
+// ---------------------------------------------------------------------------
+
+/// Ставит готовую CSV-строку в очередь submit-CSV (если канал открыт).
+pub fn submit_trade_csv_log_write(line: &str) {
+    SUBMIT_TRADE_CSV_CHANNEL.send_line(line);
+}
+
+/// Открывает (или перезаписывает) submit-CSV файл.
+pub fn init_submit_trade_csv_log_file(path: &Path) -> std::io::Result<()> {
+    register_channel(TeeKind::SubmitTradeCsv, path)
+}
+
+/// Сливает очередь и закрывает submit-CSV канал.
+pub fn finish_submit_trade_csv_log() {
+    close_channel(TeeKind::SubmitTradeCsv);
 }

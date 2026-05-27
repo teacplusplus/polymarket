@@ -838,6 +838,12 @@ pub(crate) fn spawn_open_buy_taker(
             let position_cloned = position.clone();
             let pos_id_post_end = pos_id.clone();
             tokio::spawn(async move {
+                let target_ms = end_ms.saturating_add(POST_MARKET_END_RESOLUTION_DELAY_MS as i64);
+                let now_ms = crate::util::current_timestamp_ms();
+                let wait_ms = (target_ms - now_ms).max(0) as u64;
+                if wait_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                }
                 crate::tee_eprintln!(
                     "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
                      ждём event_end_ms={end_ms} + {POST_MARKET_END_RESOLUTION_DELAY_MS}ms, \
@@ -846,12 +852,6 @@ pub(crate) fn spawn_open_buy_taker(
                      (ResolutionWin/Loss); если final_price ещё не пришёл — \
                      повторяем проверку каждые {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
                 );
-                let target_ms = end_ms.saturating_add(POST_MARKET_END_RESOLUTION_DELAY_MS as i64);
-                let now_ms = crate::util::current_timestamp_ms();
-                let wait_ms = (target_ms - now_ms).max(0) as u64;
-                if wait_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-                }
                 let shares_remaining = match position_cloned
                     .read()
                     .await

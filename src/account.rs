@@ -147,7 +147,7 @@ impl Account {
 
     /// Ядро: дренирует `positions[lane]` по `market_id` (включая «припаркованные» с чужим
     /// `asset_id` текущего тика), считает бинарный payout, обновляет `bankroll`/`SimStats`,
-    /// пишет CSV + [`crate::trade_csv_log::record_market_outcome`].
+    /// пишет CSV через [`crate::trade_csv_log::write_trade_csv_row`].
     ///
     /// **Drain stale-маркетов:** позиции той же лейны (`currency`+`interval`), но с
     /// **другим** `market_id` (хвост от прошлого маркета, для которого resolution-событие
@@ -229,8 +229,6 @@ impl Account {
             )
             .await;
         }
-
-        crate::trade_csv_log::record_market_outcome(market_id, up_won);
     }
 
     /// `Arc::new(Account::new())` для `main` и PM.

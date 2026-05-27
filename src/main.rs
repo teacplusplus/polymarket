@@ -121,9 +121,8 @@ async fn main() -> Result<()> {
             tee_log::init_sim_stats_tee_log_file(
                 std::path::Path::new("xframes/last_sim_stats.txt")
             )?;
-
-            trade_csv_log::init_trade_csv_log_file(std::path::Path::new(
-                "xframes/last_real_sim_trades.csv",
+            trade_csv_log::init_submit_trade_csv_log_file(std::path::Path::new(
+                "xframes/last_real_sim_submit_trades.csv",
             ))?;
             trade_csv_log::set_current_regime("real_sim");
 

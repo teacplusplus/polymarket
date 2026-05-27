@@ -9,7 +9,7 @@ use crate::history_sim::INITIAL_BANKROLL;
 pub enum SimStatsLogSink {
     /// [`tee_println!`] — stdout и основной tee-файл режима.
     Tee,
-    /// [`sim_stats_tee_println!`] — только [`SIM_STATS_TEE_LOG`] (`xframes/last_sim_stats.txt`).
+    /// [`sim_stats_tee_println!`] — только `xframes/last_sim_stats.txt` (если вызван `init_sim_stats_tee_log_file`).
     SimStatsFile,
 }
 
@@ -383,19 +383,8 @@ pub async fn print_all_real_sim_state_stats(
     header: &str,
     sink: SimStatsLogSink,
 ) {
-    if sink == SimStatsLogSink::SimStatsFile && !crate::tee_log::sim_stats_tee_log_is_open() {
-        return;
-    }
-    match sink {
-        SimStatsLogSink::Tee => {
-            crate::tee_println!("---");
-            crate::tee_println!("{header}");
-        }
-        SimStatsLogSink::SimStatsFile => {
-            crate::tee_log::sim_stats_tee_log_write("---");
-            crate::tee_log::sim_stats_tee_log_write(header);
-        }
-    }
+    sim_stats_log!(sink, "---");
+    sim_stats_log!(sink, "{header}");
 
     let bankroll_now = *account.bankroll.read().await;
     let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;

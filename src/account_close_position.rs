@@ -3,7 +3,7 @@
 //! [`crate::sim_stats::SideStats`] (`pnl_usd` / `trades` / `wins` / `losses` /
 //! `closed_trade_entries` + специфичные счётчики), пишет
 //! [`crate::trade_csv_log::TradeCsvRow`]; submit-ветка дополнительно пишет
-//! `SUBMIT_TRADE_CSV_LOG` и спавнит partial-graph HTML.
+//! submit-CSV (`tee_log`) и спавнит partial-graph HTML.
 //!
 //! * [`close_position`] — единая ветка для **non-submit** закрытий:
 //!     * backtest / real_sim рыночный выход (TP / SL / Timeout / EvExit) через
@@ -726,7 +726,6 @@ pub(crate) async fn close_position_after_submit(
         tp_order_id: tp_order_id.as_deref(),
         close_order_ids: &close_order_id_refs,
     };
-    crate::trade_csv_log::write_trade_csv_row(trade_row);
     crate::trade_csv_log::write_submit_trade_csv_row(trade_row);
 
     let sim_snapshot_header = format!(

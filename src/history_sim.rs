@@ -54,7 +54,7 @@ pub const MAX_POSITION_USD: f64 = 300.0;
 pub const NO_KELLY_POSITION_SIZE_USD: f64 = 30.0;
 
 /// `true` — не считать SHAP-топ5 для CSV (экономия CPU).
-pub const HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS: bool = false;
+pub const HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS: bool = true;
 
 /// Множитель в crypto taker fee: `fee ∝ rate × p × (1−p)` ([Fees](https://docs.polymarket.com/trading/fees)).
 pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.07;
