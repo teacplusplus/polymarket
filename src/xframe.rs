@@ -1584,6 +1584,7 @@ pub fn calc_y_train_resolution(
     index: usize,
     price_to_beat: f64,
     final_price: f64,
+    max_slippage_from_l1_pct: f64,
 ) -> Option<f32> {
     let up_won = final_price >= price_to_beat;
     let current = x_frames.get(index)?;
@@ -1594,9 +1595,9 @@ pub fn calc_y_train_resolution(
         Some(buy) => buy,
     };
 
-    // if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
-    //     return Some(0.0);
-    // }
+    if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
+        return Some(0.0);
+    }
 
     let actual_shares = buy.actual_shares;
     // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.

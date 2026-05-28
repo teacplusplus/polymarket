@@ -61,11 +61,18 @@ pub const HISTORY_SIM_SKIP_TRADE_SHAP_CONTRIBUTIONS: bool = true;
 pub const POLYMARKET_CRYPTO_TAKER_FEE_RATE: f64 = 0.07;
 
 /// Порог секунд до конца окна = hold-zone. PnL-модель имеет приоритет: если в
-/// hold-zone её гейт даёт `Proceed`, открываем обычную PnL-позицию (taker BUY,
-/// TP/SL/Timeout). Только если PnL не сработал, входим через Resolution-канал
-/// (maker BUY, TP/Timeout off, SL on, ждём резолюцию). Позиции, открытые ВНЕ
-/// hold-zone по PnL, сохраняют PnL-правила выхода и после захода в hold-zone.
+/// hold-zone её гейт даёт `Proceed`, открываем обычную PnL-позицию (TP/SL/Timeout).
+/// Только если PnL не сработал, входим через Resolution-канал (TP/Timeout off,
+/// SL on, ждём резолюцию). Позиции, открытые ВНЕ hold-zone по PnL, сохраняют
+/// PnL-правила выхода и после захода в hold-zone. BUY-ордер на CLOB в обоих
+/// каналах одинаковый — taker FAK с slippage cap; различие только в exit-режиме.
 pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 60;
+
+/// Глобальный тумблер Resolution-канала для всех симуляций: [`run_sim_mode`]
+/// и [`crate::real_sim`] (Mock и Submit). `false` — Resolution-бустеры и
+/// калибровки не грузятся (трактуются как отсутствующие), hold-zone fallback
+/// не активируется; работает только PnL-канал на всём диапазоне рынка.
+pub const ENABLE_RESOLUTION: bool = false;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -292,12 +299,12 @@ pub struct OpenPosition {
     /// `true` — позиция открыта через Resolution-канал (`buy_gate` дал
     /// Resolution-`Proceed` как fallback после того, как PnL-канал не сработал;
     /// возможно только внутри hold-zone). Для такой позиции в [`sell_gate`]
-    /// TP/Timeout отключены, выход только по SL или резолюции; BUY идёт maker
-    /// post-only с GTD до конца рынка, maker TP в
+    /// TP/Timeout отключены — выход только по SL или резолюции; maker TP в
     /// [`crate::account_submit::spawn_open_buy_taker`] не выставляется.
     /// Калибровочные точки идут в [`crate::sim_stats::SideStats::closed_resolution_trade_entries`].
-    /// `false` — PnL-канал (taker BUY + TP/SL/Timeout) на любом диапазоне рынка,
-    /// **включая** кадры внутри hold-zone, где PnL получает приоритет.
+    /// `false` — PnL-канал (TP/SL/Timeout) на любом диапазоне рынка,
+    /// **включая** кадры внутри hold-zone, где PnL получает приоритет. BUY-ордер
+    /// в обоих случаях одинаковый — taker FAK с slippage cap.
     pub(crate) opened_in_hold_zone: bool,
     /// CSV: raw pred на входе.
     pub(crate) raw_pred_at_open: f32,
@@ -561,10 +568,23 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 let calibration_up = load_calibration(&model_up_path).ok();
                 let calibration_down = load_calibration(&model_down_path).ok();
 
-                let booster_resolution_up = load_booster(&model_resolution_up_path);
-                let booster_resolution_down = load_booster(&model_resolution_down_path);
-                let calibration_resolution_up   = load_calibration(&model_resolution_up_path).ok();
-                let calibration_resolution_down = load_calibration(&model_resolution_down_path).ok();
+                // Resolution-канал грузим только если включён флагом; иначе все
+                // четыре значения → `None`, и hold-zone fallback не активируется.
+                let (
+                    booster_resolution_up,
+                    booster_resolution_down,
+                    calibration_resolution_up,
+                    calibration_resolution_down,
+                ) = if ENABLE_RESOLUTION {
+                    (
+                        load_booster(&model_resolution_up_path),
+                        load_booster(&model_resolution_down_path),
+                        load_calibration(&model_resolution_up_path).ok(),
+                        load_calibration(&model_resolution_down_path).ok(),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
 
                 if booster_up.is_none()
                     && booster_down.is_none()
@@ -1035,9 +1055,10 @@ pub enum BuyGate {
     /// (доступно только внутри hold-zone, и только если PnL-канал не дал
     /// `Proceed` — PnL приоритетен; см. [`buy_gate`]). Для таких позиций в
     /// [`sell_gate`] / [`crate::account_submit`] действует
-    /// «hold-to-resolution»-режим (TP/Timeout off, SL on, maker BUY,
-    /// maker TP не выставляется). `false` — PnL-канал: классический
-    /// TP/SL/Timeout + taker BUY, даже если кадр оказался в hold-zone.
+    /// «hold-to-resolution»-режим: TP/Timeout off, SL on, maker TP не
+    /// выставляется. `false` — PnL-канал: классический TP/SL/Timeout
+    /// (даже если кадр оказался в hold-zone). BUY-ордер в обоих каналах
+    /// одинаковый — taker FAK; различаются только exit-правила и Kelly-payout.
     Proceed {
         raw: f32,
         pred: f32,
@@ -1052,12 +1073,13 @@ pub enum BuyGate {
 /// **Маршрутизация каналов.** PnL-модель работает на всём диапазоне рынка и
 /// имеет приоритет: сначала пробуем PnL-канал ([`compute_pnl_inference`]),
 /// и если он даёт `Proceed` — открываем PnL-позицию (`opened_in_hold_zone=false`,
-/// классический TP/SL/Timeout, taker BUY). В hold-zone
+/// классический TP/SL/Timeout). В hold-zone
 /// (`0 < event_remaining_ms ≤ HOLD_TO_END_THRESHOLD_SEC * 1000`) дополнительно
 /// оцениваем Resolution-канал ([`compute_resolution_inference`]) как fallback:
 /// если PnL не дал `Proceed`, но Resolution дал — открываем Resolution-позицию
-/// (`opened_in_hold_zone=true`, hold-to-resolution, maker BUY, $1/шер payout).
-/// Если оба не дали `Proceed` — возвращаем диагностику PnL (приоритетного канала).
+/// (`opened_in_hold_zone=true`, hold-to-resolution, $1/шер payout). Если оба
+/// не дали `Proceed` — возвращаем диагностику PnL (приоритетного канала).
+/// BUY-ордер на CLOB в обоих каналах одинаковый: taker FAK с slippage cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn buy_gate(
     frame: &XFrame<SIZE>,
@@ -1078,17 +1100,11 @@ pub(crate) fn buy_gate(
         return BuyGate::BelowThreshold;
     };
 
-    let best_bid_at_entry = match strict_book {
-        Some(book) => book.bids.first().map(|lvl| lvl.price),
-        None => frame.book_bid_l1_price,
-    };
-
     // PnL — приоритетный канал, активен на всём диапазоне рынка.
     let pnl_decision = buy_gate_for_channel(
         pnl_inference,
         false, // opened_in_hold_zone: PnL-канал
         entry_prob,
-        best_bid_at_entry,
         bankroll,
         is_kelly,
     );
@@ -1104,7 +1120,6 @@ pub(crate) fn buy_gate(
             resolution_inference,
             true, // opened_in_hold_zone: Resolution-канал
             entry_prob,
-            best_bid_at_entry,
             bankroll,
             is_kelly,
         );
@@ -1124,7 +1139,6 @@ fn buy_gate_for_channel(
     inference: Option<PnlInference>,
     opened_in_hold_zone: bool,
     entry_prob: f64,
-    best_bid_at_entry: Option<f64>,
     bankroll: f64,
     is_kelly: bool,
 ) -> BuyGate {
@@ -1144,7 +1158,7 @@ fn buy_gate_for_channel(
         )
     } else {
         (
-            kelly_gain_ratio(entry_prob, best_bid_at_entry),
+            kelly_gain_ratio(entry_prob),
             kelly_loss_ratio(entry_prob, Y_TRAIN_PNL_STOP_LOSS_PP),
         )
     };
@@ -1388,27 +1402,17 @@ pub(crate) enum SellGate {
     Close { exit_price: f64, reason: CloseReason },
 }
 
-/// Один bid-walk для гейта: VWAP цены продажи (0.001..0.999) после walk по книге.
-#[derive(Clone, Copy)]
-struct CappedSellFill {
-    /// VWAP цены продажи, доли вероятности на один share (0–1), после walk по книге.
-    sell_vwap: f64,
-    /// Чистая выручка USDC в выбранном режиме `exit_as_maker`
-    /// (maker = без taker-fee, taker = с taker-fee). Сейчас не читается
-    /// гейтами напрямую, но считается под флаг, чтобы PnL-аккаунтинг внешних
-    /// потребителей оставался корректен.
-    #[allow(dead_code)]
-    net_usdc: f64,
-}
-
+/// VWAP цены продажи (0.001..0.999) после bid-walk по книге; единственная
+/// величина, которую читает [`sell_gate`] для триггеров TP/SL/Timeout.
+/// Учёт fee (всегда taker для SL/Timeout, maker-если-возможно для TP) и
+/// итоговый PnL вынесены в [`crate::account_close_position::close_position`].
 fn capped_sell_fill_for_gate(
     frame: &XFrame<SIZE>,
     strict_book: Option<&StrictBook>,
     shares_held: f64,
     slippage_cap: Option<f64>,
-    exit_as_maker: bool,
     current_prob: f64,
-) -> Option<CappedSellFill> {
+) -> Option<f64> {
     let gross_usdc = match strict_book {
         Some(book) => book_fill_sell_strict(book, shares_held, slippage_cap),
         None => book_fill_sell(frame, shares_held, slippage_cap),
@@ -1418,16 +1422,7 @@ fn capped_sell_fill_for_gate(
     } else {
         current_prob.clamp(0.001, 0.999)
     };
-    let net_usdc = if exit_as_maker {
-        gross_usdc
-    } else {
-        let fee_usdc = shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_vwap * (1.0 - sell_vwap);
-        gross_usdc - fee_usdc
-    };
-    Some(CappedSellFill {
-        sell_vwap,
-        net_usdc,
-    })
+    Some(sell_vwap)
 }
 
 /// Urgent sell VWAP просел относительно входного ref (со slippage cap) не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`].
@@ -1476,79 +1471,75 @@ pub(crate) fn sell_gate(
 
     if pos.opened_in_hold_zone {
         // Resolution-канал: только SL (urgent walk, без cap), без TP/Timeout —
-        // ждём резолюцию рынка. Выход по мейкеру (без taker-fee).
-        let Some(fill_u) = capped_sell_fill_for_gate(
+        // ждём резолюцию рынка. Порог как в [`calc_y_train_resolution`]:
+        // `net_ret_taker ≤ Y_TRAIN_RESOLUTION_STOP_LOSS_PP`.
+        let Some(sell_vwap_u) = capped_sell_fill_for_gate(
             frame,
             strict_book,
             pos.shares_held,
             None,
-            true,
             current_prob,
         ) else {
             return SellGate::Hold;
         };
-        let delta_sl = fill_u.sell_vwap - pos.buy_price;
-        if delta_sl <= Y_TRAIN_RESOLUTION_STOP_LOSS_PP
-            && stop_loss_sell_deteriorated_vs_entry_ref(pos, fill_u.sell_vwap)
+        let net_ret_u = net_ret_after_exit(pos.buy_price, sell_vwap_u, true);
+        if net_ret_u <= Y_TRAIN_RESOLUTION_STOP_LOSS_PP
+            && stop_loss_sell_deteriorated_vs_entry_ref(pos, sell_vwap_u)
         {
             return SellGate::Close {
-                exit_price: fill_u.sell_vwap,
+                exit_price: sell_vwap_u,
                 reason: CloseReason::StopLoss,
             };
         }
         return SellGate::Hold;
     }
 
-    // PnL-канал: TP (voluntary cap + полный walk fallback) / SL (urgent) / Timeout.
-    // `fill_v` — кандидат на voluntary TP, выход по мейкеру (без taker-fee).
-    // `fill_u` — urgent walk для SL / Timeout, выход по тейкеру (с taker-fee).
-    let fill_v = capped_sell_fill_for_gate(
+    let sell_vwap_v = capped_sell_fill_for_gate(
         frame,
         strict_book,
         pos.shares_held,
         Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
-        true,
         current_prob,
     );
-    let Some(fill_u) = capped_sell_fill_for_gate(
+    if let Some(sell_vwap_v) = sell_vwap_v {
+        let net_ret_v = net_ret_after_exit(pos.buy_price, sell_vwap_v, false);
+        if net_ret_v >= Y_TRAIN_TAKE_PROFIT_PP {
+            return SellGate::Close {
+                exit_price: sell_vwap_v,
+                reason: CloseReason::TakeProfit,
+            };
+        }
+    }
+
+
+    let Some(sell_vwap_u) = capped_sell_fill_for_gate(
         frame,
         strict_book,
         pos.shares_held,
         None,
-        false,
         current_prob,
     ) else {
         return SellGate::Hold;
     };
 
-    let delta_sl = fill_u.sell_vwap - pos.buy_price;
-
-    if let Some(fill_v) = fill_v {
-        let delta_tp = fill_v.sell_vwap - pos.buy_price;
-        if delta_tp >= Y_TRAIN_TAKE_PROFIT_PP {
-            return SellGate::Close {
-                exit_price: fill_v.sell_vwap,
-                reason: CloseReason::TakeProfit,
-            };
-        }
-    }
-    if delta_sl >= Y_TRAIN_TAKE_PROFIT_PP {
+    let net_ret_u = net_ret_after_exit(pos.buy_price, sell_vwap_u, true);
+    if net_ret_u >= Y_TRAIN_TAKE_PROFIT_PP {
         return SellGate::Close {
-            exit_price: fill_u.sell_vwap,
+            exit_price: sell_vwap_u,
             reason: CloseReason::TakeProfit,
         };
     }
-    if delta_sl <= Y_TRAIN_PNL_STOP_LOSS_PP
-        && stop_loss_sell_deteriorated_vs_entry_ref(pos, fill_u.sell_vwap)
+
+    if net_ret_u <= Y_TRAIN_PNL_STOP_LOSS_PP && stop_loss_sell_deteriorated_vs_entry_ref(pos, sell_vwap_u)
     {
         return SellGate::Close {
-            exit_price: fill_u.sell_vwap,
+            exit_price: sell_vwap_u,
             reason: CloseReason::StopLoss,
         };
     }
     if frames_held >= POSITION_TIMEOUT_FRAMES {
         return SellGate::Close {
-            exit_price: fill_u.sell_vwap,
+            exit_price: sell_vwap_u,
             reason: CloseReason::Timeout,
         };
     }
@@ -1735,14 +1726,12 @@ pub(crate) async fn manage_positions(
     sold
 }
 
-/// Доля выигрыша при TP: вход taker по `entry_prob`, выход по TP; maker/taker выхода по `best_bid_at_entry` (как в [`crate::account_close_position::close_position`]).
-fn kelly_gain_ratio(entry_prob: f64, best_bid_at_entry: Option<f64>) -> f64 {
+/// Доля выигрыша при TP: вход taker по `entry_prob`, voluntary TP — выход по
+/// мейкеру (resting-лимитка, без taker-fee). Совпадает с maker-веткой
+/// voluntary TP в [`sell_gate`] и [`crate::xframe::calc_y_train_pnl`].
+fn kelly_gain_ratio(entry_prob: f64) -> f64 {
     let sell_price = (entry_prob + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
-    let tp_is_maker = match best_bid_at_entry {
-        Some(best_bid) => sell_price > best_bid,
-        None => true,
-    };
-    let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ !tp_is_maker);
+    let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ false);
     (net - 1.0).max(1e-9)
 }
 
@@ -1775,6 +1764,15 @@ fn net_round_trip(buy: f64, sell: f64, sell_is_taker: bool) -> f64 {
         0.0
     };
     gross - sell_fee
+}
+
+/// Относительная доходность round-trip (net_usdc − entry) / entry на $1 notional.
+/// Семантика совпадает с [`crate::xframe::calc_y_train_pnl`] /
+/// [`crate::xframe::calc_y_train_resolution`]: `net_ret_taker` /
+/// `net_ret_maker` vs [`Y_TRAIN_TAKE_PROFIT_PP`] / [`Y_TRAIN_PNL_STOP_LOSS_PP`] /
+/// [`Y_TRAIN_RESOLUTION_STOP_LOSS_PP`].
+fn net_ret_after_exit(buy_price: f64, sell_vwap: f64, sell_is_taker: bool) -> f64 {
+    net_round_trip(buy_price, sell_vwap, sell_is_taker) - 1.0
 }
 
 /// Kelly `f* = p/l − q/g`; может быть >1 — caller режет по [`MAX_BET_FRACTION`] / USD-cap.

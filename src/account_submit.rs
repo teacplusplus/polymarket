@@ -26,7 +26,6 @@ use crate::history_sim::{
 };
 use crate::project_manager::ProjectManager;
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
-use chrono::{DateTime, Utc};
 use polymarket_client_sdk::clob::types::Side;
 use std::sync::Arc;
 use std::time::Duration;
@@ -633,26 +632,19 @@ pub(crate) fn spawn_open_buy_taker(
             let mut open_position = position.write().await;
             open_position.open_buy_invoke = Some(invoke_rx.clone());
         }
-        // Канал входа определяется флагом позиции: hold-zone → maker post-only
-        // (GTD до конца рынка), вне hold-zone → taker FAK.
-        let role = if opened_in_hold_zone {
-            OrderRole::Maker
-        } else {
-            OrderRole::Taker
-        };
-        let buy_expiration = if opened_in_hold_zone {
-            event_end_ms.and_then(DateTime::<Utc>::from_timestamp_millis)
-        } else {
-            None
-        };
+        // Вход всегда taker FAK (`market_order` с `price` как worst-case cap).
+        // Resolution-канал (opened_in_hold_zone=true) сохраняет специфический
+        // exit-режим в [`sell_gate`] / `close_position` (TP/Timeout off, SL only)
+        // и пропуск maker TP ниже, но сам BUY идёт таким же тейкер-FAK,
+        // как и для PnL-канала.
         let buy_post_request = PostOrderRequest {
             asset_id: asset_id.clone(),
             side: Side::Buy,
-            role,
+            role: OrderRole::Taker,
             amount: OrderAmount::UsdNotional(amount),
             price,
             max_slippage_pp: None,
-            expiration: buy_expiration,
+            expiration: None,
             market_end_unix_ms: event_end_ms,
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
             strict_book,
@@ -1007,7 +999,7 @@ pub(crate) fn spawn_open_buy_taker(
         }
         if opened_in_hold_zone {
             crate::tee_println!(
-                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: resolution-channel entry (maker BUY, hold-to-resolution) — maker TP не выставляем",
+                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: resolution-channel entry (hold-to-resolution) — maker TP не выставляем",
             );
             return;
         }

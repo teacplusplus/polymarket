@@ -370,6 +370,7 @@ async fn fit_calibration_via_sim_replay(
 
     let mut markets_processed: usize = 0;
     let mut markets_skipped: usize = 0;
+    let mut markets_with_entries: usize = 0;
     let mut total_frames: usize = 0;
 
     for path in val_paths {
@@ -453,16 +454,16 @@ async fn fit_calibration_via_sim_replay(
             FrameSide::Up => &sim_stats.up,
             FrameSide::Down => &sim_stats.down,
         };
-        match model_type {
-            ModelType::Pnl => {
-                entries.extend_from_slice(&side_stats_ref.closed_trade_entries);
-            }
-            ModelType::Resolution => {
-                // Точки идут от закрытых hold-zone-позиций (resolution-канал):
-                // `(raw_resolution_at_open, pnl > 0)`. SL до резолюции пометит
-                // позицию как `won=false`, выигравшая резолюция — `won=true`.
-                entries.extend_from_slice(&side_stats_ref.closed_resolution_trade_entries);
-            }
+        let market_entries: &[(f32, bool)] = match model_type {
+            ModelType::Pnl => &side_stats_ref.closed_trade_entries,
+            // Точки идут от закрытых hold-zone-позиций (resolution-канал):
+            // `(raw_resolution_at_open, pnl > 0)`. SL до резолюции пометит
+            // позицию как `won=false`, выигравшая резолюция — `won=true`.
+            ModelType::Resolution => &side_stats_ref.closed_resolution_trade_entries,
+        };
+        entries.extend_from_slice(market_entries);
+        if !market_entries.is_empty() {
+            markets_with_entries += 1;
         }
         markets_processed += 1;
         // up_won доступен в логе на следующих итерациях — пометка не нужна, метку
@@ -497,9 +498,18 @@ async fn fit_calibration_via_sim_replay(
     } else {
         0.0
     };
+    // Покрытие: доля обработанных маркетов, давших ≥1 калибровочную точку.
+    // Для Resolution критично — hold-zone узкий (~60 кадров/маркет), и при
+    // малом покрытии PAV-калибровка скатывается в per-frame fallback.
+    let markets_with_entries_pct = if markets_processed > 0 {
+        100.0 * markets_with_entries as f64 / markets_processed as f64
+    } else {
+        0.0
+    };
     tee_println!(
         "[calibration-sim] {tag} ({model_type:?} is_kelly={is_kelly}): \
          обработано {markets_processed}/{} маркетов ({} пропущено, {} кадров) | \
+         маркетов с точками {markets_with_entries}/{markets_processed} ({markets_with_entries_pct:.1}%) | \
          trades={} won={n_won} lost={n_lost} win_rate={win_rate:.3} \
          mean_raw_won={mean_raw_won:.4} mean_raw_lost={mean_raw_lost:.4}",
         val_paths.len(),
@@ -1303,6 +1313,7 @@ fn append_frames(
                 index,
                 price_to_beat,
                 final_price,
+                Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT,
             ),
         };
         let Some(label) = label else {
