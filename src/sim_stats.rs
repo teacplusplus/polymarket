@@ -49,10 +49,6 @@ pub struct SideStats {
     pub(crate) resolution_loss: usize,
     /// Закрытия по таймауту ([`crate::history_sim::POSITION_TIMEOUT_FRAMES`]).
     pub(crate) timeout_count: usize,
-    /// Счётчик [`crate::history_sim::CloseReason::EvExitProfit`].
-    pub(crate) ev_exit_profit_count: usize,
-    /// Счётчик [`crate::history_sim::CloseReason::EvExitLoss`].
-    pub(crate) ev_exit_loss_count: usize,
     /// Пропуск входа: мало времени до резолюции ([`crate::history_sim::MIN_ENTRY_REMAINING_MS`]).
     pub(crate) late_entry_skips: usize,
     /// Пропуск входа: нестабильный кадр; закрытие открытых не блокируется.
@@ -89,18 +85,16 @@ pub struct SideStats {
     pub(crate) pnl_sl: f64,
     /// Сумма PnL закрытий по таймауту.
     pub(crate) pnl_timeout: f64,
-    /// Сумма PnL при [`crate::history_sim::CloseReason::EvExitProfit`].
-    pub(crate) pnl_ev_exit_profit: f64,
-    /// Сумма PnL при [`crate::history_sim::CloseReason::EvExitLoss`].
-    pub(crate) pnl_ev_exit_loss: f64,
     /// Сумма PnL резолюций с выигравшим токеном.
     pub(crate) pnl_resolution_win: f64,
     /// Сумма PnL резолюций с проигравшим токеном (≤ 0).
     pub(crate) pnl_resolution_loss: f64,
-    /// Для replay-калибровки: (raw на открытии, won); в обычном sim пусто.
+    /// Replay-калибровка PnL-канала: `(raw_pnl_at_open, won)` по позициям,
+    /// открытым ВНЕ hold-zone ([`crate::history_sim::OpenPosition::opened_in_hold_zone`]=false).
     pub(crate) closed_trade_entries: Vec<(f32, bool)>,
-    /// Сырые preds resolution в hold-zone (train-калибровка без cal_resolution).
-    pub(crate) hold_zone_resolution_predictions: Vec<f32>,
+    /// Replay-калибровка Resolution-канала: `(raw_resolution_at_open, won)` по
+    /// позициям, открытым В hold-zone (`opened_in_hold_zone=true`).
+    pub(crate) closed_resolution_trade_entries: Vec<(f32, bool)>,
 }
 
 /// Агрегаты симуляции по версии; банк и DD — в [`crate::account::Account`].
@@ -208,7 +202,7 @@ pub fn print_side_stats(
         "[sim] {tag} [{side_label}] \
          | trades={} win={:.1}% \
          | pnl={:+.2}$ avg={:+.4}$/trade fees={:.2}$ \
-         | TP={} SL={} Timeout={} EvExit✓={} EvExit✗={} Res✓={}(profit={}/loss={}) Res✗={} late_skips={} unstable_skips={} same_asset_open_skips={} max_open_positions_skips={}",
+         | TP={} SL={} Timeout={} Res✓={}(profit={}/loss={}) Res✗={} late_skips={} unstable_skips={} same_asset_open_skips={} max_open_positions_skips={}",
         s.trades,
         win_rate,
         s.pnl_usd,
@@ -217,8 +211,6 @@ pub fn print_side_stats(
         s.tp_count,
         s.sl_count,
         s.timeout_count,
-        s.ev_exit_profit_count,
-        s.ev_exit_loss_count,
         s.resolution_win,
         s.resolution_win_profit,
         s.resolution_win_loss,
@@ -256,7 +248,6 @@ pub fn print_side_stats(
         "[sim] {tag} [{side_label}] pnl_by_reason: \
          TP={tp_pnl:+.2}$(avg={tp_avg:+.4}) SL={sl_pnl:+.2}$(avg={sl_avg:+.4}) \
          Timeout={to_pnl:+.2}$(avg={to_avg:+.4}) \
-         EvExit✓={evp_pnl:+.2}$(avg={evp_avg:+.4}) EvExit✗={evl_pnl:+.2}$(avg={evl_avg:+.4}) \
          Res✓={rw_pnl:+.2}$(avg={rw_avg:+.4}) Res✗={rl_pnl:+.2}$(avg={rl_avg:+.4})",
         tp_pnl = s.pnl_tp,
         tp_avg = avg(s.pnl_tp, s.tp_count),
@@ -264,10 +255,6 @@ pub fn print_side_stats(
         sl_avg = avg(s.pnl_sl, s.sl_count),
         to_pnl = s.pnl_timeout,
         to_avg = avg(s.pnl_timeout, s.timeout_count),
-        evp_pnl = s.pnl_ev_exit_profit,
-        evp_avg = avg(s.pnl_ev_exit_profit, s.ev_exit_profit_count),
-        evl_pnl = s.pnl_ev_exit_loss,
-        evl_avg = avg(s.pnl_ev_exit_loss, s.ev_exit_loss_count),
         rw_pnl = s.pnl_resolution_win,
         rw_avg = avg(s.pnl_resolution_win, s.resolution_win),
         rl_pnl = s.pnl_resolution_loss,

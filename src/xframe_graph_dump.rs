@@ -50,12 +50,18 @@ struct GraphHtmlRow {
     er: i64,
     /// Рыночная оценка вероятности исхода токена: [`XFrame::currency_implied_prob`]; в JSON `0`, если в кадре `None`.
     ip: f64,
-    /// VWAP покупки по стакану (ask-walk): номинал [`crate::history_sim::NO_KELLY_POSITION_SIZE_USD`] USDC, cap к L1 [`crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT`]; `0`, если fill невозможен.
-    bb: f64,
-    /// VWAP продажи того же числа шеров (bid-walk) с тем же cap к best bid; `0`, если fill невозможен.
-    bs: f64,
-    /// VWAP продажи того же числа шеров без cap (полный bid-walk); `0`, если fill невозможен.
-    bu: f64,
+    /// VWAP покупки по стакану (ask-walk) на номинал [`crate::history_sim::NO_KELLY_POSITION_SIZE_USD`] USDC
+    /// с cap к L1 [`crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT`]; `null` (разрыв линии в Plotly), если
+    /// `book_fill_buy(...)` вернул `None` — недостаточно depth'a, либо VWAP пробил cap.
+    bb: Option<f64>,
+    /// VWAP продажи того же числа шеров (bid-walk) с тем же cap к best bid; `null` (разрыв), если bid-walk
+    /// не дал заполниться или пробил cap. Считается **независимо** от cap-результата `bb`: размер шеров
+    /// берётся из uncapped buy-walk'а ([`book_fill_buy`] без slip-cap'а), поэтому sell-метрика остаётся
+    /// видимой даже когда buy-VWAP пробил cap.
+    bs: Option<f64>,
+    /// VWAP продажи того же числа шеров без cap (полный bid-walk); `null` (разрыв), если bid-walk не дал
+    /// заполниться. Тот же decoupled `shares_estimate`, что и у [`Self::bs`].
+    bu: Option<f64>,
     /// `(price_to_beat - spot) / price_to_beat * 100` (%): [`XFrame::currency_price_vs_beat_pct`]; `0`, если `None`.
     vb: f64,
     /// Z-score спота в окне: [`XFrame::currency_price_z_score`]; `0`, если `None`.
@@ -97,9 +103,10 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   <div class="hint">
     В JSON время <code>t</code> — Unix-мс, <code>er</code> — мс до конца окна. Начало окна на оси X: <code>median(t + er) − window_duration</code> по точкам с <code>er ≥ 0</code> (как у восстановления времени из <code>.bin</code>); затем секунды <code>(t − origin) / 1000</code> ограничиваются 0…window_duration_sec (5m → 300 с). Поле <code>window_start_ms</code> в JSON — то же начало окна.
     Ось Y — выбранное поле кадра, в т.ч. <code>currency_price_vs_beat_pct</code>, <code>currency_price_z_score</code> (нет значения → <code>0</code>).
+    Для sim book VWAP'ов (<code>sim_book_buy_vwap</code>, <code>sim_book_sell_vwap_slip</code>, <code>sim_book_sell_vwap</code>) недостающие значения отображаются <strong>разрывами линии</strong> (Plotly <code>connectgaps:false</code>), а не нулями. Sell-метрики считаются на размере шеров из uncapped buy-walk и видны независимо от того, пробил ли buy slip-cap.
     Параметры URL: <code>y</code> — метрика по вертикали; устаревший <code>x</code> (≠ <code>time</code>) = как <code>y</code>.
     <code>side</code> — <code>up</code> или <code>down</code>.
-    <code>ts1</code>, <code>ts2</code> — вертикальные линии, **Unix-мс** как <code>t</code> в данных; переводятся в секунды от начала окна.
+    <code>ts1</code> — одна вертикальная линия открытия; <code>ts2</code> может повторяться (одна линия на каждое закрытие). **Unix-мс**, как <code>t</code> в данных; переводятся в секунды от начала окна.
     Клик по легенде — скрыть/показать ряд (Plotly).
   </div>
   <div>
@@ -154,6 +161,16 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     if (raw === null || raw === '') return null;
     const v = Number(raw);
     return Number.isFinite(v) ? v : null;
+  }
+  function readTsAll(name) {
+    if (!params.has(name)) return [];
+    const out = [];
+    for (const raw of params.getAll(name)) {
+      if (raw === null || raw === '') continue;
+      const v = Number(raw);
+      if (Number.isFinite(v)) out.push(v);
+    }
+    return out;
   }
   const sel = document.getElementById('yField');
   for (const m of Y_METRICS) {
@@ -210,7 +227,7 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
   }
   function rowY(row, key) {
     const v = row[key];
-    return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+    return typeof v === 'number' && Number.isFinite(v) ? v : null;
   }
   function buildTraces(yModeDef) {
     const yKey = yModeDef.key;
@@ -224,6 +241,7 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         x: DATA.up.map(r => msFromWindowStart(r.t)),
         y: DATA.up.map(r => rowY(r, yKey)),
         line: { width: 2 },
+        connectgaps: false,
       });
     }
     if (side !== 'up' && DATA.down.length) {
@@ -234,6 +252,7 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         x: DATA.down.map(r => msFromWindowStart(r.t)),
         y: DATA.down.map(r => rowY(r, yKey)),
         line: { width: 2 },
+        connectgaps: false,
       });
     }
     return traces;
@@ -242,7 +261,7 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
     const yModeDef = Y_METRICS.find(o => o.id === sel.value) || Y_METRICS[0];
     const traces = buildTraces(yModeDef);
     const ts1 = readTs('ts1');
-    const ts2 = readTs('ts2');
+    const ts2List = readTsAll('ts2');
     const shapes = [];
     if (ts1 !== null) {
       shapes.push({
@@ -252,10 +271,10 @@ const MARKET_GRAPH_HTML_TEMPLATE: &str = r#"<!DOCTYPE html>
         line: { color: 'rgba(220,20,60,0.75)', width: 2, dash: 'dash' },
       });
     }
-    if (ts2 !== null) {
+    for (const ts of ts2List) {
       shapes.push({
         type: 'line',
-        x0: msFromWindowStart(ts2), x1: msFromWindowStart(ts2),
+        x0: msFromWindowStart(ts), x1: msFromWindowStart(ts),
         yref: 'paper', y0: 0, y1: 1,
         line: { color: 'rgba(25,25,112,0.75)', width: 2, dash: 'dot' },
       });
@@ -290,24 +309,46 @@ fn graph_html_f64_or_zero(o: Option<f64>) -> f64 {
     o.filter(|x| x.is_finite()).unwrap_or(0.0)
 }
 
-/// Три VWAP для графика HTML: покупка на [`crate::history_sim::NO_KELLY_POSITION_SIZE_USD`] с cap к L1 ([`crate::history_sim::book_fill_buy`]);
-/// продажа того же числа шеров по bid с cap и без ([`crate::history_sim::book_fill_sell`]). Нули при нехватке ликвидности.
-fn graph_sim_book_roundtrip_vwaps(frame: &XFrame<SIZE>) -> (f64, f64, f64) {
-    let Some((buy_vwap, shares)) = book_fill_buy(
+/// Три VWAP для графика HTML.
+///
+/// * `buy_vwap`: покупка на [`crate::history_sim::NO_KELLY_POSITION_SIZE_USD`] USDC через
+///   [`crate::history_sim::book_fill_buy`] с cap к L1 ([`crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT`]).
+///   `None` — недостаточно depth'a или VWAP пробил cap.
+/// * `sell_slip`, `sell_uncapped`: продажа того же числа шеров через [`crate::history_sim::book_fill_sell`]
+///   (с cap'ом и без). Размер шеров — из **uncapped buy-walk'а** (`book_fill_buy(..., None)`), поэтому
+///   sell-метрики **развязаны** от того, пробил ли buy slip-cap: даже если `buy_vwap = None` из-за cap'а,
+///   sell-стороны видны (и наоборот — если bid-стакан пуст, buy всё равно может остаться).
+/// * Все три отдельно `Option<f64>` — на графике каждая ветка обрывается своими пропусками независимо.
+fn graph_sim_book_roundtrip_vwaps(
+    frame: &XFrame<SIZE>,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let buy_vwap = book_fill_buy(
         frame,
         NO_KELLY_POSITION_SIZE_USD,
         Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
-    ) else {
-        return (0.0, 0.0, 0.0);
-    };
-    let sell_slip = book_fill_sell(frame, shares, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT))
-        .map(|gross_usdc| gross_usdc / shares);
-    let sell_uncapped = book_fill_sell(frame, shares, None).map(|gross_usdc| gross_usdc / shares);
-    (
-        buy_vwap,
-        sell_slip.unwrap_or(0.0),
-        sell_uncapped.unwrap_or(0.0),
     )
+    .map(|(vwap, _shares)| vwap)
+    .filter(|v| v.is_finite() && *v > 0.0);
+
+    // Decoupled baseline для sell-стороны: full depth-walk без cap'а. Возвращает Some только если
+    // ask-side вообще способна впитать $30 (без оглядки на slip-cap). В этом случае мы знаем число
+    // шеров, доступных на $30 USDC, и считаем sell-VWAP для них независимо от cap-исхода `buy_vwap`.
+    let shares_estimate = book_fill_buy(frame, NO_KELLY_POSITION_SIZE_USD, None)
+        .map(|(_vwap, shares)| shares)
+        .filter(|s| s.is_finite() && *s > 0.0);
+
+    let sell_slip = shares_estimate.and_then(|sh| {
+        book_fill_sell(frame, sh, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT))
+            .map(|gross_usdc| gross_usdc / sh)
+            .filter(|v| v.is_finite() && *v > 0.0)
+    });
+    let sell_uncapped = shares_estimate.and_then(|sh| {
+        book_fill_sell(frame, sh, None)
+            .map(|gross_usdc| gross_usdc / sh)
+            .filter(|v| v.is_finite() && *v > 0.0)
+    });
+
+    (buy_vwap, sell_slip, sell_uncapped)
 }
 
 fn graph_html_row(frame: &XFrame<SIZE>, aligned_ts: i64) -> GraphHtmlRow {
@@ -316,9 +357,9 @@ fn graph_html_row(frame: &XFrame<SIZE>, aligned_ts: i64) -> GraphHtmlRow {
         t: aligned_ts,
         er: frame.event_remaining_ms,
         ip: graph_html_f64_or_zero(frame.currency_implied_prob),
-        bb: graph_html_f64_or_zero(Some(bb)),
-        bs: graph_html_f64_or_zero(Some(bs)),
-        bu: graph_html_f64_or_zero(Some(bu)),
+        bb,
+        bs,
+        bu,
         vb: graph_html_f64_or_zero(frame.currency_price_vs_beat_pct),
         zs: graph_html_f64_or_zero(frame.currency_price_z_score),
     }
@@ -378,13 +419,21 @@ pub fn graph_html_path_from_bin(bin_path: &Path) -> Option<PathBuf> {
     switched.then(|| out.with_extension("html"))
 }
 
-/// `file:///.../graph/...html?ts1=<open_ms>&ts2=<close_ms>[&side=up|down]` для колонки CSV; пустая строка, если
-/// путь не под `xframes/` или не удалось собрать абсолютный URI. `ts_*` — Unix **миллисекунды**, как на графике (`ts1`/`ts2`).
-/// `trade_side` — `Some("up")` / `Some("down")`: на странице остаётся только выбранный токен ([`MARKET_GRAPH_HTML_TEMPLATE`] → `side`).
+/// `file:///.../graph/...html?ts1=<open_ms>&ts2=<close_ms>[&ts2=<close_ms>...][&side=up|down]`
+/// для колонки CSV; пустая строка, если путь не под `xframes/` или не удалось собрать
+/// абсолютный URI. `ts_*` — Unix **миллисекунды**, как на графике.
+///
+/// * `ts_open_ms` — **одна** точка открытия (`ts1`, красный пунктир).
+/// * `ts_close_ms` — **массив** точек закрытия (`ts2`, синий пунктир): один и тот же
+///   параметр повторяется в query-string по числу точек; в HTML читается через
+///   `URLSearchParams.getAll('ts2')`. Невалидные/нефинитные значения пропускаются.
+///
+/// `trade_side` — `Some("up")` / `Some("down")`: на странице остаётся только выбранный
+/// токен ([`MARKET_GRAPH_HTML_TEMPLATE`] → `side`).
 pub fn graph_html_trade_file_uri(
     bin_dump_path: &Path,
     ts_open_ms: Option<i64>,
-    ts_close_ms: Option<i64>,
+    ts_close_ms: &[i64],
     trade_side: Option<&str>,
 ) -> String {
     let Some(html_rel) = graph_html_path_from_bin(bin_dump_path) else {
@@ -402,7 +451,7 @@ pub fn graph_html_trade_file_uri(
     if let Some(a) = ts_open_ms {
         qs.push(format!("ts1={a}"));
     }
-    if let Some(b) = ts_close_ms {
+    for b in ts_close_ms {
         qs.push(format!("ts2={b}"));
     }
     if let Some(raw) = trade_side {

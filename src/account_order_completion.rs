@@ -130,6 +130,7 @@ pub(crate) fn fire_failed_invocation_for_side(
             partial: false,
             error_msg,
             fee_paid_usdc: 0.0,
+            landed_at: None,
         },
     );
 }
@@ -322,6 +323,15 @@ pub struct SingleOrderClobInvocationReport {
     /// Используется в `stats.fees_paid` real_sim'а (Mock и Submit) — точная
     /// per-trade fee вместо приближения по «плановому стакану кадра».
     pub fee_paid_usdc: f64,
+    /// Unix epoch **ms** — момент, когда транзакция успешно приземлилась:
+    /// * **Real CLOB**: время, когда settlement-агрегатор зафиксировал
+    ///   ненулевой on-chain fill ([`Self::build_report`] на `should_invoke=true`).
+    /// * **Mock**: время фиксации mock-fill'а (taker — после прохода стакана,
+    ///   maker — на пересечении лимита и WS L1).
+    ///
+    /// Инвариант: `Some` ⇔ [`Self::success`] = `true`. Во всех fail-исходах —
+    /// `None` (включая `Canceled`, `zero-fill`, ранний server-error).
+    pub landed_at: Option<i64>,
 }
 
 #[inline]
@@ -1369,6 +1379,16 @@ impl PostOrderInvokeAggregator {
             0.0
         };
 
+        // `landed_at` — момент финализации settlement-агрегатора (когда
+        // `should_invoke` пропустил отчёт): по построению `build_report`
+        // вызывается из `try_finalize_locked` после прохождения гейта.
+        // Фиксируем «сейчас» только при ненулевом on-chain settle (success=true).
+        let landed_at = if report_success {
+            Some(crate::util::current_timestamp_ms())
+        } else {
+            None
+        };
+
         SingleOrderClobInvocationReport {
             order_id: None,
             making_amount,
@@ -1377,6 +1397,7 @@ impl PostOrderInvokeAggregator {
             partial: report_partial,
             error_msg,
             fee_paid_usdc,
+            landed_at,
         }
     }
 
@@ -1814,6 +1835,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                 partial: false,
                 error_msg: server_error,
                 fee_paid_usdc: 0.0,
+                landed_at: None,
             },
         );
         let _ = take_tracker_entry(&trackers, &cloned_order_id).await;
@@ -1835,6 +1857,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                         .to_string(),
                 ),
                 fee_paid_usdc: 0.0,
+                landed_at: None,
             },
         );
         return;
@@ -1854,6 +1877,7 @@ pub(crate) async fn after_post_order_maybe_track_invoke(
                 partial: false,
                 error_msg: Some("CLOB вернул пустой order_id при success=true".to_string()),
                 fee_paid_usdc: 0.0,
+                landed_at: None,
             },
         );
         return;

@@ -26,6 +26,7 @@ use crate::history_sim::{
 };
 use crate::project_manager::ProjectManager;
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
+use chrono::{DateTime, Utc};
 use polymarket_client_sdk::clob::types::Side;
 use std::sync::Arc;
 use std::time::Duration;
@@ -228,7 +229,7 @@ pub(crate) fn spawn_sell_taker(
     tokio::spawn(async move {
         crate::tee_eprintln!(
             "[submit/{submit_mode:?}] sell taker reason={reason:?}: ждём settle BUY-invoke; \
-             при TakeProfit/EvExitProfit и активном maker TP — выход без taker; иначе cancel maker TP, \
+             при TakeProfit и активном maker TP — выход без taker; иначе cancel maker TP, \
              до {TAKER_SELL_ATTEMPTS} FAK SELL (exit≈{exit_price:.4}), затем close_position_after_submit \
              (пропуск после event_end — post-market-end resolution)",
         );
@@ -290,7 +291,7 @@ pub(crate) fn spawn_sell_taker(
             return;
         }
         
-        if reason == CloseReason::TakeProfit || reason == CloseReason::EvExitProfit {
+        if reason == CloseReason::TakeProfit {
             if let Some(maker_tp_arc) = maker_tp_position.as_ref() {
                 let maker_closing = maker_tp_arc.read().await;
                 let active_maker_tp = maker_closing
@@ -597,6 +598,7 @@ pub(crate) fn spawn_open_buy_taker(
             currency_str,
             interval_kind,
             side,
+            opened_in_hold_zone,
         ) = {
             let p = position.read().await;
             (
@@ -608,6 +610,7 @@ pub(crate) fn spawn_open_buy_taker(
                 p.currency.clone(),
                 crate::constants::XFrameIntervalKind::from_i32(p.xframe_interval_type_at_open),
                 CurrencyUpDownOutcome::from_i32(p.currency_up_down_outcome_at_open),
+                p.opened_in_hold_zone,
             )
         };
 
@@ -630,14 +633,26 @@ pub(crate) fn spawn_open_buy_taker(
             let mut open_position = position.write().await;
             open_position.open_buy_invoke = Some(invoke_rx.clone());
         }
+        // Канал входа определяется флагом позиции: hold-zone → maker post-only
+        // (GTD до конца рынка), вне hold-zone → taker FAK.
+        let role = if opened_in_hold_zone {
+            OrderRole::Maker
+        } else {
+            OrderRole::Taker
+        };
+        let buy_expiration = if opened_in_hold_zone {
+            event_end_ms.and_then(DateTime::<Utc>::from_timestamp_millis)
+        } else {
+            None
+        };
         let buy_post_request = PostOrderRequest {
             asset_id: asset_id.clone(),
             side: Side::Buy,
-            role: OrderRole::Taker,
+            role,
             amount: OrderAmount::UsdNotional(amount),
             price,
             max_slippage_pp: None,
-            expiration: None,
+            expiration: buy_expiration,
             market_end_unix_ms: event_end_ms,
             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
             strict_book,
@@ -987,6 +1002,12 @@ pub(crate) fn spawn_open_buy_taker(
             crate::tee_eprintln!(
                 "[submit] maker TP pos_id={pos_id}: shares_floor={shares_floor:.4} < min_order_size={min_order_size:.4} — \
                  maker не выставляем (CLOB Size lower than the minimum)",
+            );
+            return;
+        }
+        if opened_in_hold_zone {
+            crate::tee_println!(
+                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: resolution-channel entry (maker BUY, hold-to-resolution) — maker TP не выставляем",
             );
             return;
         }

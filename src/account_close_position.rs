@@ -6,7 +6,7 @@
 //! submit-CSV (`tee_log`) и спавнит partial-graph HTML.
 //!
 //! * [`close_position`] — единая ветка для **non-submit** закрытий:
-//!     * backtest / real_sim рыночный выход (TP / SL / Timeout / EvExit) через
+//!     * backtest / real_sim рыночный выход (TP / SL / Timeout) через
 //!       bid-walk — вызывается из [`crate::history_sim::manage_positions`] после
 //!       того как caller подготовил `gross_usdc` (либо
 //!       [`gross_usdc_sell_take_profit`] для voluntary, либо
@@ -145,11 +145,18 @@ pub(crate) async fn close_position(
         stats.losses += 1;
     }
     stats.fees_paid += fee_usdc;
-    // Резолюция тоже попадает в `closed_trade_entries` — replay'ю калибровки
-    // нужен и pnl-знак на резолюционных закрытиях.
-    stats
-        .closed_trade_entries
-        .push((pos.raw_pred_at_open, pnl > 0.0));
+    // Калибровочный канал выбирается по тому, какой моделью открывали позицию
+    // (PnL вне hold-zone vs Resolution внутри). Резолюции тоже попадают —
+    // PAV нужен pnl-знак и для них.
+    if pos.opened_in_hold_zone {
+        stats
+            .closed_resolution_trade_entries
+            .push((pos.raw_pred_at_open, pnl > 0.0));
+    } else {
+        stats
+            .closed_trade_entries
+            .push((pos.raw_pred_at_open, pnl > 0.0));
+    }
     match reason {
         CloseReason::TakeProfit => {
             stats.tp_count += 1;
@@ -162,14 +169,6 @@ pub(crate) async fn close_position(
         CloseReason::Timeout => {
             stats.timeout_count += 1;
             stats.pnl_timeout += pnl;
-        }
-        CloseReason::EvExitProfit => {
-            stats.ev_exit_profit_count += 1;
-            stats.pnl_ev_exit_profit += pnl;
-        }
-        CloseReason::EvExitLoss => {
-            stats.ev_exit_loss_count += 1;
-            stats.pnl_ev_exit_loss += pnl;
         }
         CloseReason::ResolutionWin => {
             stats.resolution_win += 1;
@@ -194,13 +193,18 @@ pub(crate) async fn close_position(
     let open_unix_ms = pos
         .event_end_ms
         .map(|end_ms| end_ms - pos.event_remaining_ms_at_open);
+    // Точки на графике — event-timeline (`event_end_ms − event_remaining_ms_at_*`):
+    // корректно во всех режимах (backtest / real_sim live non-submit / resolve).
+    // Wall-clock использовать нельзя: в backtest он не лежит на исторической
+    // оси окна — обе точки клампятся к правому краю.
+    let graph_close_ms: Vec<i64> = close_unix_ms.into_iter().collect();
     let graph_html_file_uri =
         crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
             .map(|bin_path| {
                 crate::xframe_graph_dump::graph_html_trade_file_uri(
                     &bin_path,
                     open_unix_ms,
-                    close_unix_ms,
+                    &graph_close_ms,
                     Some(side_label),
                 )
             })
@@ -225,7 +229,6 @@ pub(crate) async fn close_position(
         fee_usdc,
         pnl,
         frames_held: pos.frames_held,
-        p_win_ema_at_close: pos.p_win_ema,
         event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
         event_remaining_ms_at_close,
         open_unix_ms,
@@ -255,7 +258,7 @@ pub(crate) async fn close_position(
 ///   когда `shares_remaining_to_sell ≤
 ///   [`crate::account_submit::CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE`]`
 ///   (taker дошёл до ~0, возможно вместе с partial-maker'ом); `reason` —
-///   фактический (TP / SL / Timeout / EvExit),
+///   фактический (TP / SL / Timeout),
 ///   `finalized_via = "taker_sell_fill"`.
 ///
 /// Сам метод вытаскивает все SELL-fills и order-id'шники из
@@ -277,10 +280,11 @@ pub(crate) async fn close_position(
 /// (`fee_usdc = 0` — maker всегда `0`, taker-fee CLOB уже вычел из
 /// `taking_amount`), обновляет `bankroll` и [`SideStats`] лейна (через
 /// [`crate::account::Account::real_sim_state_for_currency`]: `trades` / `wins` /
-/// `losses` / `pnl_usd` / `closed_trade_entries` + специфичный
-/// `{tp,sl,timeout,ev_exit_profit,ev_exit_loss}_count` / `pnl_*` — `match reason`
-/// как в [`close_position_market_exit`]). Пишет regular- и submit-CSV-строку,
-/// спавнит partial-graph HTML.
+/// `losses` / `pnl_usd` + специфичный `{tp,sl,timeout,resolution_*}_count` /
+/// `pnl_*` — `match reason`). Калибровочные векторы (`closed_*_trade_entries`)
+/// здесь НЕ заполняются: они нужны только sim-replay калибровке
+/// ([`fit_calibration_via_sim_replay`]), которая идёт через [`close_position`].
+/// Пишет regular- и submit-CSV-строку, спавнит partial-graph HTML.
 ///
 /// Порядок локов `state → bankroll` совпадает с [`crate::real_sim::tick_once`]
 /// (иначе deadlock при пересечении с tick'ом). Если [`crate::real_sim::RealSimState`]
@@ -307,11 +311,10 @@ pub(crate) async fn close_position(
 ///   `"ResolutionWin"` / `"ResolutionLoss"` через
 ///   [`trade_csv_close_reason_label`].
 /// * Остальные ([`CloseReason::TakeProfit`] / [`CloseReason::StopLoss`] /
-///   [`CloseReason::Timeout`] / [`CloseReason::EvExitProfit`] /
-///   [`CloseReason::EvExitLoss`]) — after-sell: позиция полностью распродана
+///   [`CloseReason::Timeout`]) — after-sell: позиция полностью распродана
 ///   через maker TP / taker FAK. PNL = `usd_received - actual_entry_cost`;
 ///   SideStats апдейтит соответствующую ветку (`tp_count` / `sl_count` /
-///   `timeout_count` / `ev_exit_*`). Bail если SELL-fills нулевые
+///   `timeout_count`). Bail если SELL-fills нулевые
 ///   (флаг НЕ взводим — пусть future-callback попробует).
 ///
 /// **Идемпотентность.** Maker-TP callback в `spawn_open_buy_taker`, taker-FAK
@@ -352,11 +355,7 @@ pub(crate) async fn close_position_after_submit(
     let token_won_resolution: Option<bool> = match reason {
         CloseReason::ResolutionWin => Some(true),
         CloseReason::ResolutionLoss => Some(false),
-        CloseReason::TakeProfit
-        | CloseReason::StopLoss
-        | CloseReason::Timeout
-        | CloseReason::EvExitProfit
-        | CloseReason::EvExitLoss => None,
+        CloseReason::TakeProfit | CloseReason::StopLoss | CloseReason::Timeout => None,
     };
 
     // `actual_shares_net` берём напрямую из BUY-invoke watch'а
@@ -388,6 +387,7 @@ pub(crate) async fn close_position_after_submit(
     let mut sell_fee_usdc = 0.0_f64;
     let mut tp_order_id: Option<String> = None;
     let mut close_order_ids: Vec<String> = Vec::new();
+    let mut graph_close_landed_ms: Vec<i64> = Vec::new();
 
     // Maker (TP) у Polymarket всегда 0; taker (FAK SELL) — `report.fee_paid_usdc`
     // от mock'а (`polymarket_taker_fee_usd(gross, vwap)`) или real CLOB-агрегатора
@@ -433,6 +433,9 @@ pub(crate) async fn close_position_after_submit(
                 &mut usd_received,
                 &mut sell_fee_usdc,
             );
+            if report.success && let Some(landed_at) = report.landed_at {
+                graph_close_landed_ms.push(landed_at);
+            }
         }
     }
 
@@ -455,6 +458,9 @@ pub(crate) async fn close_position_after_submit(
                 &mut usd_received,
                 &mut sell_fee_usdc,
             );
+            if report.success && let Some(landed_at) = report.landed_at {
+                graph_close_landed_ms.push(landed_at);
+            }
         }
     }
 
@@ -580,11 +586,6 @@ pub(crate) async fn close_position_after_submit(
                     side_stats.losses += 1;
                 }
                 side_stats.fees_paid += fee_usdc;
-                side_stats
-                    .closed_trade_entries
-                    .push((position_snapshot.raw_pred_at_open, pnl > 0.0));
-                // Reason carries path: ResolutionWin/Loss → резолюционные
-                // счётчики; остальные → reason-based ветка (после-sell).
                 match reason {
                     CloseReason::TakeProfit => {
                         side_stats.tp_count += 1;
@@ -597,14 +598,6 @@ pub(crate) async fn close_position_after_submit(
                     CloseReason::Timeout => {
                         side_stats.timeout_count += 1;
                         side_stats.pnl_timeout += pnl;
-                    }
-                    CloseReason::EvExitProfit => {
-                        side_stats.ev_exit_profit_count += 1;
-                        side_stats.pnl_ev_exit_profit += pnl;
-                    }
-                    CloseReason::EvExitLoss => {
-                        side_stats.ev_exit_loss_count += 1;
-                        side_stats.pnl_ev_exit_loss += pnl;
                     }
                     CloseReason::ResolutionWin => {
                         side_stats.resolution_win += 1;
@@ -633,13 +626,19 @@ pub(crate) async fn close_position_after_submit(
     let open_unix_ms = position_snapshot
         .event_end_ms
         .map(|end_ms| end_ms - position_snapshot.event_remaining_ms_at_open);
+    let graph_open_landed_ms = position_snapshot
+        .open_buy_invoke
+        .as_ref()
+        .and_then(invoke_settlement_report)
+        .filter(|report| report.success)
+        .and_then(|report| report.landed_at);
     let graph_html_file_uri =
         crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&position_snapshot)
             .map(|bin_path| {
                 crate::xframe_graph_dump::graph_html_trade_file_uri(
                     &bin_path,
-                    open_unix_ms,
-                    close_unix_ms,
+                    graph_open_landed_ms,
+                    &graph_close_landed_ms,
                     Some(side_label),
                 )
             })
@@ -708,7 +707,6 @@ pub(crate) async fn close_position_after_submit(
         fee_usdc,
         pnl,
         frames_held: position_snapshot.frames_held,
-        p_win_ema_at_close: position_snapshot.p_win_ema,
         event_remaining_ms_at_open,
         event_remaining_ms_at_close,
         open_unix_ms,

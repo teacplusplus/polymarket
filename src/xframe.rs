@@ -957,8 +957,16 @@ pub fn currency_price_z_score_from_sec_history(
 /// Минимальная чистая доходность (после комиссий) для метки y=1 (Take Profit).
 /// Например, 0.05 означает: вложенный 1 USDC должен принести ≥ 1.05 USDC нетто.
 pub const Y_TRAIN_TAKE_PROFIT_PP: f64 = 0.05;
-/// Максимальная чистая доходность для метки y=0 (Stop Loss).
-pub const Y_TRAIN_STOP_LOSS_PP: f64 = -0.03;
+/// Максимальная чистая доходность для метки y=0 (Stop Loss) PnL-модели.
+/// Используется [`calc_y_train_pnl`] и runtime PnL-каналом
+/// ([`crate::history_sim::sell_gate`] вне hold-zone).
+pub const Y_TRAIN_PNL_STOP_LOSS_PP: f64 = -0.03;
+/// Максимальная чистая доходность для метки y=0 (Stop Loss) Resolution-модели.
+/// Используется [`calc_y_train_resolution`] и runtime Resolution-каналом
+/// ([`crate::history_sim::sell_gate`] для `opened_in_hold_zone`).
+/// Численно совпадает с [`Y_TRAIN_PNL_STOP_LOSS_PP`], но семантически независим:
+/// пороги двух моделей не обязаны быть равны.
+pub const Y_TRAIN_RESOLUTION_STOP_LOSS_PP: f64 = -0.03;
 /// Минимальная **относительная** просадка urgent sell VWAP относительно **фактического**
 /// sell VWAP на входе (полный bid-walk в [`walk_sell_xfeatures`]). Та же доля, что
 /// в runtime SL от ref с cap ([`crate::history_sim::sell_gate`]); в y-разметке ref без cap.
@@ -1230,7 +1238,7 @@ fn walk_sell_xfeatures<const N: usize>(frame: &XFrame<N>, shares: f64) -> Option
 ///
 ///    `net_ret = (net_usdc − Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC`
 ///    нормирован относительно gross-нотионала, поэтому пороги
-///    `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_STOP_LOSS_PP` (как % от
+///    `Y_TRAIN_TAKE_PROFIT_PP` / `Y_TRAIN_PNL_STOP_LOSS_PP` (как % от
 ///    нотионала) переиспользуются 1:1.
 ///
 ///    * **SL** (mandatory exit, без cap'а): если `net_ret ≤ SL_PP` **и**
@@ -1379,7 +1387,7 @@ pub fn calc_y_train_pnl(
         // SL — mandatory exit, slippage cap отключён, taker-fee; дополнительно —
         // urgent [`WalkSellResult::vwap`] должен просесть относительно входного ref
         // не меньше чем на [`Y_TRAIN_SL_MIN_REF_SELL_REL_DROP`] (симметрично runtime SL).
-        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP
+        if net_ret_taker <= Y_TRAIN_PNL_STOP_LOSS_PP
         // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
         {
             return Some(0.0);
@@ -1554,7 +1562,7 @@ fn y_train_resolution_token_won(frame: &XFrame<SIZE>, up_won: bool) -> bool {
 ///    `walk_sell_xfeatures(actual_shares)`. Если глубины bid не хватает —
 ///    выйти нельзя, идём дальше (как в `calc_y_train_pnl`). Если хватает,
 ///    `net_ret = (net_usdc − Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC`
-///    и проверяется только SL: `net_ret ≤ Y_TRAIN_STOP_LOSS_PP` →
+///    и проверяется только SL: `net_ret ≤ Y_TRAIN_RESOLUTION_STOP_LOSS_PP` →
 ///    `Some(0.0)` (исполнитель закрыл бы по mandatory-exit).
 /// 3. **Резолюция** (`event_remaining_ms ≤ 0` или нет следующего кадра):
 ///    `Some(1.0)` если токен выиграл, `Some(0.0)` если проиграл.
@@ -1576,7 +1584,6 @@ pub fn calc_y_train_resolution(
     index: usize,
     price_to_beat: f64,
     final_price: f64,
-    max_slippage_from_l1_pct: f64,
 ) -> Option<f32> {
     let up_won = final_price >= price_to_beat;
     let current = x_frames.get(index)?;
@@ -1587,9 +1594,9 @@ pub fn calc_y_train_resolution(
         Some(buy) => buy,
     };
 
-    if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
-        return Some(0.0);
-    }
+    // if (buy.vwap - buy.best_ask) / buy.best_ask > max_slippage_from_l1_pct {
+    //     return Some(0.0);
+    // }
 
     let actual_shares = buy.actual_shares;
     // Фактический sell VWAP на входе — полный bid-walk ([`walk_sell_xfeatures`]), без cap к L1.
@@ -1633,7 +1640,7 @@ pub fn calc_y_train_resolution(
         // `sell.net_usdc` (= gross − taker-fee) без maker-ветки.
         // Симметрично с обработкой SL в [`calc_y_train_pnl`].
         let net_ret_taker = (sell.net_usdc - Y_TRAIN_NOMINAL_USDC) / Y_TRAIN_NOMINAL_USDC;
-        if net_ret_taker <= Y_TRAIN_STOP_LOSS_PP
+        if net_ret_taker <= Y_TRAIN_RESOLUTION_STOP_LOSS_PP
         // && y_train_stop_loss_sell_deteriorated_vs_entry_ref(sell_vwap_at_entry, sell.vwap)
         {
             return Some(0.0);

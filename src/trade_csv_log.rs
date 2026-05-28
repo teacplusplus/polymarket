@@ -21,7 +21,7 @@ pub fn set_current_regime(regime: &'static str) {
 const TRADE_CSV_HEADER: &str = "regime,polymarket_url,price_to_beat,final_price,\
 currency,interval,side,market_id,asset_id,exit_reason,\
 buy_price,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
-frames_held,p_win_ema_at_close,event_remaining_ms_at_open,event_remaining_ms_at_close,\
+frames_held,event_remaining_ms_at_open,event_remaining_ms_at_close,\
 open_unix_ms,close_unix_ms,graph_html_file_uri,pnl_top5_shap,final_outcome";
 
 pub fn init_trade_csv_log_file(path: &Path) -> std::io::Result<()> {
@@ -55,7 +55,6 @@ pub struct TradeCsvRow<'a> {
     pub fee_usdc: f64,
     pub pnl: f64,
     pub frames_held: usize,
-    pub p_win_ema_at_close: Option<f64>,
     pub event_remaining_ms_at_open: i64,
     pub event_remaining_ms_at_close: i64,
     pub open_unix_ms: Option<i64>,
@@ -91,7 +90,7 @@ fn final_outcome_from_exit_reason(exit_reason: &str) -> &'static str {
 
 fn format_trade_csv_row(regime: &str, row: TradeCsvRow<'_>, final_outcome: &str) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         regime,
         csv_escape(row.polymarket_url),
         row.price_to_beat.map(fmt_f64).unwrap_or_default(),
@@ -112,7 +111,6 @@ fn format_trade_csv_row(regime: &str, row: TradeCsvRow<'_>, final_outcome: &str)
         fmt_f64(row.fee_usdc),
         fmt_f64(row.pnl),
         row.frames_held,
-        row.p_win_ema_at_close.map(fmt_f64).unwrap_or_default(),
         row.event_remaining_ms_at_open,
         row.event_remaining_ms_at_close,
         row.open_unix_ms.map(|v| v.to_string()).unwrap_or_default(),
@@ -132,7 +130,7 @@ currency,interval,side,market_id,asset_id,exit_reason,finalized_via,\
 planned_buy_price,buy_price,planned_shares_held,shares_held,planned_entry_cost,entry_cost,\
 planned_fee_usdc,entry_fee_usdc,exit_price,fee_usdc,pnl,\
 open_order_id,tp_order_id,close_order_ids,\
-raw_pred,cal_pred,kelly_f,p_win_ema_at_close,frames_held,\
+raw_pred,cal_pred,kelly_f,frames_held,\
 event_remaining_ms_at_open,event_remaining_ms_at_close,open_unix_ms,close_unix_ms,\
 graph_html_file_uri,pnl_top5_shap";
 
@@ -149,7 +147,7 @@ pub fn finish_submit_trade_csv_log() {
 pub fn write_submit_trade_csv_row(row: TradeCsvRow<'_>) {
     let regime: &'static str = CURRENT_REGIME.lock().map(|g| *g).unwrap_or("");
     let line = format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         regime,
         csv_escape(row.pos_id),
         csv_escape(row.polymarket_url),
@@ -183,7 +181,6 @@ pub fn write_submit_trade_csv_row(row: TradeCsvRow<'_>) {
         fmt_f32(row.raw_pred),
         fmt_f32(row.cal_pred),
         fmt_f64(row.kelly_f),
-        row.p_win_ema_at_close.map(fmt_f64).unwrap_or_default(),
         row.frames_held,
         row.event_remaining_ms_at_open,
         row.event_remaining_ms_at_close,

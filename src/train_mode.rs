@@ -12,7 +12,7 @@ use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::sim_stats::{SideStats, SimStats};
 use crate::tee_log;
 use crate::xframe::{
-    SIZE, XFrame, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_STOP_LOSS_PP, Y_TRAIN_TAKE_PROFIT_PP,
+    SIZE, XFrame, Y_TRAIN_HORIZON_FRAMES, Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_TAKE_PROFIT_PP,
     apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution,
 };
 use crate::xframe_dump::MarketXFramesDump;
@@ -329,55 +329,26 @@ impl Calibration {
 /// ([`crate::trade_csv_log::init_trade_csv_log_file`] дёргается только в
 /// [`crate::history_sim::run_sim_mode`]); если открыт — туда попадут лишние
 /// строки, в `train_and_history_sim` это не происходит.
-/// Hold-zone threshold (sec) для sim-replay калибровки `ModelType::Resolution`.
-///
-/// Управляет [`compute_p_win_now`] **только в калибровочном прогоне**: production
-/// (`run_sim_mode_inner`, `real_sim::tick_once`) продолжает использовать
-/// [`HOLD_TO_END_THRESHOLD_SEC`]. Эти константы намеренно разные:
-///   * production сейчас фиксирован в `0` — EvExit отключён, resolution-модель
-///     в живом sim'е не запрашивается;
-///   * для калибровки же resolution на пустом множестве смысла нет, нужно
-///     набрать `(raw_resolution, token_won)` точки в реалистичном окне последних
-///     30 секунд эвента (где модель в принципе будет применяться, как только
-///     production включит EvExit).
-const RESOLUTION_CALIBRATION_HOLD_SEC: i64 = 30;
-
-/// Hold-zone threshold (sec) для sim-replay калибровки `ModelType::Pnl`.
-/// Жёстко `= 0`: при PnL-калибровке нам нужен «чистый» trade outcome (TP/SL/
-/// Timeout/Resolution) без EvExit-выходов, поэтому resolution-ветку
-/// глушим, выставляя пустой hold-zone.
-const PNL_CALIBRATION_HOLD_SEC: i64 = 0;
-
 /// Sim-replay сбор данных для калибровки одной из двух моделей.
 ///
-/// **Контракт по моделям:**
+/// Модели не связаны между собой и калибруются ТОЛЬКО на тех кадрах, где
+/// они реально работают:
 ///
-/// * `ModelType::Pnl`: `booster_for_calibration` — сама обучаемая PnL-модель.
-///   `pnl_for_entries` игнорируется. `run_side_simulation` запускается в
-///   raw-режиме (`is_kelly=false`, identity-калибровка PnL, без resolution).
-///   Hold-zone = `PNL_CALIBRATION_HOLD_SEC = 0` (resolution-ветка отключена,
-///   EvExit'ы не «съедают» трейды). Возврат — `(raw_pnl_at_open, pnl > 0)` из
+/// * `ModelType::Pnl`: в `run_side_simulation` активен только PnL-канал
+///   (`booster_pnl=Some(booster_for_calibration)`, identity-калибровка,
+///   `booster_resolution=None`). Позиции открываются вне hold-zone,
+///   точки калибровки — `(raw_pnl_at_open, pnl > 0)` из
 ///   [`SideStats::closed_trade_entries`].
 ///
-/// * `ModelType::Resolution`: `booster_for_calibration` — обучаемая
-///   Resolution-модель. `pnl_for_entries = Some((pnl_booster, pnl_cal))`
-///   обязателен — вход в позиции должен идти **через уже откалиброванный
-///   PnL-канал в Kelly-режиме**, иначе калибровочные точки берутся из
-///   нерепрезентативной популяции кадров (production-сайзинг по Kelly влияет
-///   на то, какие маркеты вообще получают позицию). `run_side_simulation`
-///   получает `(pnl_booster, Some(pnl_cal), Some(resolution_booster),
-///   None /* calibration_resolution */, is_kelly=true)`. Hold-zone =
-///   `RESOLUTION_CALIBRATION_HOLD_SEC = 30`. На каждом кадре в hold-zone
-///   `compute_p_win_now` (т.к. `calibration_resolution=None`) вернёт **сырой**
-///   скор — `run_side_simulation` копит его в
-///   [`SideStats::hold_zone_resolution_predictions`]. После прохода каждое
-///   значение пар'ится с `token_won` маркета (`up_won` для UP, `!up_won` для
-///   DOWN) — единый исход монотонно делит все hold-zone-кадры на «выигрышные»
-///   и «проигрышные». PAV сошьёт их в монотонную калибровку.
+/// * `ModelType::Resolution`: активен только Resolution-канал
+///   (`booster_pnl=None`, `booster_resolution=Some(booster_for_calibration)`,
+///   identity-калибровка). Позиции открываются только в hold-zone, точки —
+///   `(raw_resolution_at_open, pnl > 0)` из
+///   [`SideStats::closed_resolution_trade_entries`]. SL до резолюции даёт
+///   `won=false`, выигрыш токена на резолюции — `won=true`.
 async fn fit_calibration_via_sim_replay(
     val_paths: &[PathBuf],
     booster_for_calibration: &Booster,
-    pnl_for_entries: Option<(&Booster, &Calibration)>,
     side: FrameSide,
     currency: &str,
     interval_kind: XFrameIntervalKind,
@@ -386,38 +357,14 @@ async fn fit_calibration_via_sim_replay(
 ) -> Vec<(f32, bool)> {
     let outcome = side.to_outcome();
     let lane_key = (currency.to_string(), interval_kind, outcome);
-    let identity = Calibration::identity();
 
-    // Раскладка ролей моделей и режима sim-replay по `model_type`.
-    // `booster_pnl` / `calibration_pnl` идут в PnL-канал `run_side_simulation`,
-    // `booster_resolution` — в resolution-канал. Hold-zone определяет окно,
-    // в котором собираются точки для калибровки Resolution (см. doc).
-    let (booster_pnl, calibration_pnl, booster_resolution, is_kelly, hold_sec) = match model_type {
-        ModelType::Pnl => (
-            booster_for_calibration,
-            &identity,
-            None,
-            false,
-            PNL_CALIBRATION_HOLD_SEC,
-        ),
-        ModelType::Resolution => {
-            let Some((pnl_b, pnl_c)) = pnl_for_entries else {
-                tee_eprintln!(
-                    "[calibration-sim] {tag}: ModelType::Resolution требует \
-                         pnl_for_entries (PnL booster + калибровку для драйва entry); \
-                         sim-replay пропущен — будет fallback на per-frame."
-                );
-                return Vec::new();
-            };
-            (
-                pnl_b,
-                pnl_c,
-                Some(booster_for_calibration),
-                true,
-                RESOLUTION_CALIBRATION_HOLD_SEC,
-            )
-        }
+    // Активен только канал калибруемой модели — никаких кросс-загрузок.
+    // `is_kelly=false`: фиксированный размер позиции, raw-порог `SIM_BUY_THRESHOLD`.
+    let (booster_pnl, booster_resolution) = match model_type {
+        ModelType::Pnl => (Some(booster_for_calibration), None),
+        ModelType::Resolution => (None, Some(booster_for_calibration)),
     };
+    let is_kelly = false;
 
     let mut entries: Vec<(f32, bool)> = Vec::new();
 
@@ -460,10 +407,6 @@ async fn fit_calibration_via_sim_replay(
         let bin_dump_path = path.to_string_lossy().into_owned();
         let market_id_opt = frames_vec.first().map(|f| f.market_id.clone());
         let up_won = dump.up_won();
-        let token_won = match side {
-            FrameSide::Up => up_won,
-            FrameSide::Down => !up_won,
-        };
 
         {
             let side_stats: &mut SideStats = match side {
@@ -473,9 +416,9 @@ async fn fit_calibration_via_sim_replay(
             run_side_simulation(
                 &frames_vec,
                 booster_pnl,
-                Some(calibration_pnl),
+                None,
                 booster_resolution,
-                None, // см. doc: calibration_resolution не передаётся
+                None,
                 &account,
                 &lane_key,
                 side_stats,
@@ -486,7 +429,6 @@ async fn fit_calibration_via_sim_replay(
                 Some(dump.final_price),
                 event_end_ms,
                 &bin_dump_path,
-                hold_sec,
             )
             .await;
         }
@@ -516,19 +458,16 @@ async fn fit_calibration_via_sim_replay(
                 entries.extend_from_slice(&side_stats_ref.closed_trade_entries);
             }
             ModelType::Resolution => {
-                // Все hold-zone кадры одного маркета получают один и тот же
-                // `token_won` — резолюция эвента бинарна и общая для всех
-                // кадров его hold-окна. Это и есть «правильная» метка для
-                // калибровки P(токен_выиграл | признаки кадра).
-                entries.extend(
-                    side_stats_ref
-                        .hold_zone_resolution_predictions
-                        .iter()
-                        .map(|&p| (p, token_won)),
-                );
+                // Точки идут от закрытых hold-zone-позиций (resolution-канал):
+                // `(raw_resolution_at_open, pnl > 0)`. SL до резолюции пометит
+                // позицию как `won=false`, выигравшая резолюция — `won=true`.
+                entries.extend_from_slice(&side_stats_ref.closed_resolution_trade_entries);
             }
         }
         markets_processed += 1;
+        // up_won доступен в логе на следующих итерациях — пометка не нужна, метку
+        // ставит сам `close_position`/`close_position_after_submit` через знак pnl.
+        let _ = up_won;
     }
 
     let n_won = entries.iter().filter(|(_, w)| *w).count();
@@ -558,14 +497,10 @@ async fn fit_calibration_via_sim_replay(
     } else {
         0.0
     };
-    let label = match model_type {
-        ModelType::Pnl => "trades",
-        ModelType::Resolution => "hold_frames",
-    };
     tee_println!(
-        "[calibration-sim] {tag} ({model_type:?} hold={hold_sec}s is_kelly={is_kelly}): \
+        "[calibration-sim] {tag} ({model_type:?} is_kelly={is_kelly}): \
          обработано {markets_processed}/{} маркетов ({} пропущено, {} кадров) | \
-         {label}={} won={n_won} lost={n_lost} win_rate={win_rate:.3} \
+         trades={} won={n_won} lost={n_lost} win_rate={win_rate:.3} \
          mean_raw_won={mean_raw_won:.4} mean_raw_lost={mean_raw_lost:.4}",
         val_paths.len(),
         markets_skipped,
@@ -582,13 +517,11 @@ async fn fit_calibration_via_sim_replay(
 /// # Источник данных
 ///
 /// **Основной путь** — sim-replay (см. [`fit_calibration_via_sim_replay`]):
-/// прогоняем `run_side_simulation` на val-сплите. Для PnL-модели — в
-/// raw-режиме с identity-калибровкой и собираем `(raw_pred_at_open, pnl > 0)`
-/// из закрытых трейдов. Для Resolution-модели — в Kelly-режиме с **уже
-/// откалиброванным PnL** (передаётся через `pnl_for_entries`), без
-/// `calibration_resolution`, и собираем `(raw_resolution, token_won)` на
-/// каждом hold-zone-кадре. Подробности — в doc к
-/// [`fit_calibration_via_sim_replay`].
+/// прогоняем `run_side_simulation` на val-сплите с активным каналом ТОЛЬКО
+/// калибруемой модели и identity-калибровкой. Для PnL собираем
+/// `(raw_pnl_at_open, pnl > 0)` из закрытых трейдов вне hold-zone, для
+/// Resolution — `(raw_resolution_at_open, token_won)` из закрытых hold-zone
+/// трейдов. Подробности — в doc к [`fit_calibration_via_sim_replay`].
 ///
 /// **Fallback** — full per-frame `(preds, y)` (как было до перехода на
 /// sim-replay). Срабатывает, если sim-replay набрал меньше
@@ -613,7 +546,6 @@ async fn fit_calibration(
     interval_kind: XFrameIntervalKind,
     side: FrameSide,
     model_type: ModelType,
-    pnl_for_entries: Option<(&Booster, &Calibration)>,
     tag: &str,
 ) -> anyhow::Result<Calibration> {
     let preds = booster.predict(dmat)?;
@@ -658,7 +590,6 @@ async fn fit_calibration(
     let entries = fit_calibration_via_sim_replay(
         val_paths,
         booster,
-        pnl_for_entries,
         side,
         currency,
         interval_kind,
@@ -1085,11 +1016,13 @@ struct AppendStats {
     /// Resolution-only: кадры вне hold-zone (`event_remaining_ms <= 0` или
     /// `> HOLD_TO_END_THRESHOLD_SEC * 1000`).
     out_of_hold_zone: usize,
-    /// Pnl-only: кадры со слишком малым остатком до резолюции
+    /// Кадры со слишком малым остатком до резолюции
     /// (`event_remaining_ms < MIN_ENTRY_REMAINING_MS`, включая `<= 0`).
     /// Совпадает с ранним отказом [`crate::history_sim::buy_gate`]
-    /// `BuyGate::LateEntry`: модель PnL не должна учиться на тиках,
-    /// где исполнитель в любом случае не открывает позицию.
+    /// `BuyGate::LateEntry`: модели не должны учиться на тиках, где
+    /// исполнитель в любом случае не открывает позицию. Применяется к
+    /// PnL **и** Resolution симметрично — `buy_gate` режет оба канала
+    /// одним и тем же фильтром.
     late_entry: usize,
     /// `calc_y_*` вернул `None` (тонкий стакан / slippage cap / нет
     /// `currency_implied_prob` / прочие причины внутри Y-функции).
@@ -1191,22 +1124,6 @@ async fn train_all_variants(
                 side.label(),
             ));
 
-            // Для Resolution той же стороны рядом уже должен лежать сохранённый
-            // PnL: внешний цикл идёт `[Pnl, Resolution]`, внутренний — `[Up, Down]`.
-            // К моменту, когда обучаем `(Resolution, Up)`, файл
-            // `model_{interval}_1s_pnl_up.ubj` (+ `.calibration.bin`) уже на
-            // диске; аналогично для `Down`. Если по какой-то причине его нет
-            // (ошибка/skip предыдущей итерации) — `train_and_save` опустится
-            // в fallback на per-frame калибровку.
-            let pnl_model_path: Option<PathBuf> = match model_type {
-                ModelType::Pnl => None,
-                ModelType::Resolution => Some(version_path.join(format!(
-                    "model_{interval}_{step_sec}s_{}_{}.ubj",
-                    ModelType::Pnl.label(),
-                    side.label(),
-                ))),
-            };
-
             match train_and_save(
                 &train_markets,
                 &val_markets,
@@ -1216,7 +1133,6 @@ async fn train_all_variants(
                 interval_kind,
                 side,
                 &model_path,
-                pnl_model_path.as_deref(),
                 &tag,
                 model_type,
                 max_lag,
@@ -1358,23 +1274,18 @@ fn append_frames(
 
     for index in 0..frames.len() {
         let remaining = frames[index].event_remaining_ms;
-        match model_type {
-            ModelType::Resolution => {
-                if remaining <= 0 || remaining > hold_zone_max_ms {
-                    stats.out_of_hold_zone += 1;
-                    continue;
-                }
-            }
-            ModelType::Pnl => {
-                // Симметрично `buy_gate::LateEntry` в `history_sim`: при
-                // `event_remaining_ms < MIN_ENTRY_REMAINING_MS` исполнитель
-                // не открывает позицию — учить PnL-модель на этих кадрах
-                // тоже нечему (распределение разъезжается с инференсом).
-                if remaining < MIN_ENTRY_REMAINING_MS {
-                    stats.late_entry += 1;
-                    continue;
-                }
-            }
+        // Симметрично `buy_gate::LateEntry` в `history_sim`: при
+        // `event_remaining_ms < MIN_ENTRY_REMAINING_MS` исполнитель не
+        // открывает позицию — учить ни PnL, ни Resolution на этих кадрах
+        // нечему (распределение разъезжается с инференсом). Resolution
+        // дополнительно фильтруется верхней границей hold-zone.
+        if remaining < MIN_ENTRY_REMAINING_MS {
+            stats.late_entry += 1;
+            continue;
+        }
+        if matches!(model_type, ModelType::Resolution) && remaining > hold_zone_max_ms {
+            stats.out_of_hold_zone += 1;
+            continue;
         }
 
         let label = match model_type {
@@ -1392,7 +1303,6 @@ fn append_frames(
                 index,
                 price_to_beat,
                 final_price,
-                Y_TRAIN_MAX_SLIPPAGE_FROM_L1_PCT,
             ),
         };
         let Some(label) = label else {
@@ -1445,7 +1355,6 @@ async fn train_and_save(
     interval_kind: XFrameIntervalKind,
     side: FrameSide,
     model_path: &Path,
-    pnl_model_path: Option<&Path>,
     tag: &str,
     model_type: ModelType,
     max_lag: Option<usize>,
@@ -1487,7 +1396,7 @@ async fn train_and_save(
     };
     match model_type {
         ModelType::Pnl => tee_println!(
-            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({optimizer_trials} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_STOP_LOSS_PP})…"
+            "[train] {tag}: оптимизация гиперпараметров по AUC на val ({optimizer_trials} итераций, TP={Y_TRAIN_TAKE_PROFIT_PP}, SL={Y_TRAIN_PNL_STOP_LOSS_PP})…"
         ),
         ModelType::Resolution => tee_println!(
             "[train] {tag}: оптимизация гиперпараметров по AUC на val ({optimizer_trials} итераций)…"
@@ -1516,54 +1425,11 @@ async fn train_and_save(
     // test обязан оставаться полностью held-out для честной финальной оценки AUC.
     // Кроме того, isotonic имеет O(N) параметров и катастрофически переобучается
     // если калибровочный сет совпадает с тем, по которому меряется AUC.
-
-    // Для Resolution-модели подгружаем PnL `Booster` + `Calibration` той же
-    // стороны (записаны на диск более ранней итерацией внешнего цикла
-    // `train_all_variants`). Они нужны, чтобы entry в sim-replay шёл через
-    // production-эквивалентный канал (PnL Kelly), а не через сырые скоры
-    // самой Resolution-модели. Держим `Option`-обёртки локально, чтобы
-    // ссылки внутри `pnl_for_entries` жили до конца вызова `fit_calibration`.
-    let (loaded_pnl_booster, loaded_pnl_cal): (Option<Booster>, Option<Calibration>) =
-        if matches!(model_type, ModelType::Resolution) {
-            match pnl_model_path {
-                Some(p) => {
-                    let b = crate::history_sim::load_booster(p);
-                    let c = load_calibration(p).ok();
-                    if b.is_none() {
-                        tee_eprintln!(
-                            "[train] {tag}: PnL booster для sim-replay калибровки Resolution \
-                             не загрузился (путь {}); fit_calibration_via_sim_replay упадёт в \
-                             fallback на per-frame.",
-                            p.display(),
-                        );
-                    }
-                    if c.is_none() {
-                        tee_eprintln!(
-                            "[train] {tag}: PnL calibration для sim-replay калибровки Resolution \
-                             не загрузилась (путь {}.calibration.bin); \
-                             fit_calibration_via_sim_replay упадёт в fallback на per-frame.",
-                            p.display(),
-                        );
-                    }
-                    (b, c)
-                }
-                None => {
-                    tee_eprintln!(
-                        "[train] {tag}: ModelType::Resolution без `pnl_model_path` — \
-                         sim-replay калибровка пропущена, ждём fallback на per-frame."
-                    );
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-    let pnl_for_entries: Option<(&Booster, &Calibration)> =
-        match (loaded_pnl_booster.as_ref(), loaded_pnl_cal.as_ref()) {
-            (Some(b), Some(c)) => Some((b, c)),
-            _ => None,
-        };
-
+    //
+    // Каждая модель калибруется ТОЛЬКО на тех данных, где она реально работает:
+    // PnL — на закрытых трейдах вне hold-zone (`closed_trade_entries`),
+    // Resolution — на закрытых трейдах внутри hold-zone (`closed_resolution_trade_entries`).
+    // Никаких кросс-загрузок чужой модели не требуется.
     match fit_calibration(
         &booster,
         &dval,
@@ -1573,7 +1439,6 @@ async fn train_and_save(
         interval_kind,
         side,
         model_type,
-        pnl_for_entries,
         tag,
     )
     .await

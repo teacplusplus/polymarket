@@ -5,9 +5,8 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, HOLD_TO_END_THRESHOLD_SEC, StrictBook, any_position_would_sell,
-    buy_gate, compute_p_win_now, compute_pnl_inference, load_booster, manage_positions,
-    try_open_position,
+    BuyGate, StrictBook, any_position_would_sell, buy_gate, compute_pnl_inference,
+    compute_resolution_inference, load_booster, manage_positions, try_open_position,
 };
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
@@ -114,11 +113,11 @@ impl RealSimState {
 /// Booster(+cal) PnL и опционально resolution для одного лейна.
 struct SideModels {
     /// Модель PnL.
-    booster_pnl: Arc<Booster>,
+    booster_pnl: Option<Booster>,
     /// Калибровка PnL.
     calibration_pnl: Option<Calibration>,
     /// Модель resolution.
-    booster_resolution: Option<Arc<Booster>>,
+    booster_resolution: Option<Booster>,
     /// Калибровка resolution.
     calibration_resolution: Option<Calibration>,
 }
@@ -200,14 +199,11 @@ pub async fn run_real_sim(
         let label = interval_label(interval_kind);
         let side_lbl = side_label(side);
         let models = load_side_models(&version_path, label, side_lbl)
-            .ok_or_else(|| anyhow!("не удалось загрузить pnl-модель {label}/{side_lbl}"))?;
+            .ok_or_else(|| anyhow!("не загружено ни одной модели {label}/{side_lbl}"))?;
         crate::tee_println!(
-            "[real_sim] {tag_prefix}/{label}/{side_lbl}: pnl ✓  resolution={}",
-            if models.booster_resolution.is_some() {
-                "✓"
-            } else {
-                "✗"
-            },
+            "[real_sim] {tag_prefix}/{label}/{side_lbl}: pnl={}  resolution={}",
+            if models.booster_pnl.is_some() { "✓" } else { "✗" },
+            if models.booster_resolution.is_some() { "✓" } else { "✗" },
         );
 
         let (tx, rx) = mpsc::channel::<LaneFrame>(LANE_FRAME_CHANNEL_CAP);
@@ -303,6 +299,16 @@ async fn tick_once(
         gamma_question,
         frame,
     } = lane_frame;
+
+    // Минимальная выдержка позиции до первой проверки SL/TP в [`sell_gate`] /
+    // [`any_position_would_sell`]. Включена в Mock-режиме (как в history_sim),
+    // чтобы убирать micro-noise exits сразу после открытия. В Submit-режиме
+    // реальные ордера уже стоят на CLOB и затягивать выход искусственно нельзя
+    // (особенно SL) — поэтому `None`.
+    let min_position_frames: Option<usize> = match submit_mode {
+        crate::account_submit::SubmitMode::Mock => Some(crate::history_sim::MINPOSITION_FRAMES),
+        crate::account_submit::SubmitMode::Submit | crate::account_submit::SubmitMode::None => None,
+    };
 
     let market_id = frame.market_id.as_str();
     let asset_id = frame.asset_id.as_str();
@@ -420,7 +426,7 @@ async fn tick_once(
         };
         (
             !this_positions.is_empty(),
-            any_position_would_sell(this_positions, &frame, None).await,
+            any_position_would_sell(this_positions, &frame, min_position_frames).await,
             available,
             dd_halt,
             *max_dd_guard,
@@ -429,26 +435,26 @@ async fn tick_once(
 
     let pnl_inference = compute_pnl_inference(
         &frame,
-        &models.booster_pnl,
+        models.booster_pnl.as_ref(),
         models.calibration_pnl.as_ref(),
         true,
     );
-    let p_win_now = compute_p_win_now(
+    let resolution_inference = compute_resolution_inference(
         &frame,
-        models.booster_resolution.as_deref(),
+        models.booster_resolution.as_ref(),
         models.calibration_resolution.as_ref(),
         true,
-        HOLD_TO_END_THRESHOLD_SEC,
     );
 
     let buy_gate_proceed = matches!(
         buy_gate(
             &frame,
             pnl_inference,
+            resolution_inference,
             available_bankroll_pre,
             None,
             true,
-            Some(&models.booster_pnl),
+            models.booster_pnl.as_ref(),
         ),
         BuyGate::Proceed { .. }
     );
@@ -493,10 +499,13 @@ async fn tick_once(
     };
 
     let pnl_top5_shap_at_open_precomputed: Option<String> = if may_open && !ws_lagging {
-        Some(crate::history_sim::pnl_top5_shap_csv_cell(
-            &models.booster_pnl,
-            &frame,
-        ))
+        Some(
+            models
+                .booster_pnl
+                .as_ref()
+                .map(|b| crate::history_sim::pnl_top5_shap_csv_cell(b, &frame))
+                .unwrap_or_default(),
+        )
     } else {
         Some(String::new())
     };
@@ -559,10 +568,9 @@ async fn tick_once(
                     this_positions,
                     &frame,
                     false,
-                    p_win_now,
                     side_stats,
                     strict_book.as_ref(),
-                    None,
+                    min_position_frames,
                     submit_mode,
                     Some(project_manager),
                     account,
@@ -628,7 +636,8 @@ async fn tick_once(
                     try_open_position(
                         &frame,
                         pnl_inference,
-                        Some(&models.booster_pnl),
+                        resolution_inference,
+                        models.booster_pnl.as_ref(),
                         &mut *positions_guard,
                         &*pending_close_guard,
                         &lane_key,
@@ -987,13 +996,16 @@ fn load_side_models(version_path: &Path, interval: &str, side: &str) -> Option<S
     let pnl_path = version_path.join(format!("model_{interval}_1s_pnl_{side}.ubj"));
     let resolution_path = version_path.join(format!("model_{interval}_1s_resolution_{side}.ubj"));
 
-    let booster_pnl = load_booster(&pnl_path)?;
+    let booster_pnl = load_booster(&pnl_path);
     let calibration_pnl = load_calibration(&pnl_path).ok();
-    let booster_resolution = load_booster(&resolution_path).map(Arc::new);
+    let booster_resolution = load_booster(&resolution_path);
     let calibration_resolution = load_calibration(&resolution_path).ok();
 
+    if booster_pnl.is_none() && booster_resolution.is_none() {
+        return None;
+    }
     Some(SideModels {
-        booster_pnl: Arc::new(booster_pnl),
+        booster_pnl,
         calibration_pnl,
         booster_resolution,
         calibration_resolution,

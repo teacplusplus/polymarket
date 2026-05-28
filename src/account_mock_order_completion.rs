@@ -323,6 +323,10 @@ fn fire_mock_success_report(
             partial: false,
             error_msg: None,
             fee_paid_usdc,
+            // Mock-fill только что зафиксирован выше — это и есть момент
+            // «успешного приземления» в симуляции (taker — после прохода
+            // стакана, maker — на пересечении лимита и WS L1).
+            landed_at: Some(crate::util::current_timestamp_ms()),
         },
     );
 }
@@ -344,6 +348,7 @@ fn fire_mock_failed_report(
             partial: false,
             error_msg,
             fee_paid_usdc: 0.0,
+            landed_at: None,
         },
     );
 }
