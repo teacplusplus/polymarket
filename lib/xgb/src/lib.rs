@@ -78,7 +78,9 @@ mod dmatrix;
 pub use dmatrix::DMatrix;
 
 mod booster;
+mod cuda;
 pub use booster::{Booster, FeatureMap, FeatureType, PredictConfig, PredictType};
+pub use cuda::{cuda_built, cuda_device_count, cuda_runtime_available, preferred_device};
 pub mod parameters;
 use std::{ffi, path::Path};
 

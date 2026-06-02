@@ -255,6 +255,24 @@ pub fn tee_log_write(line: &str) {
     TEE_CHANNEL.send_line(line);
 }
 
+/// Обновляет строку прогресса на месте (без `\n`, в tee-файл не пишет).
+pub fn tee_progress_update(line: &str) {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    print!("\r{line}\x1b[K");
+    let _ = std::io::stdout().flush();
+}
+
+/// Завершает in-place прогресс — следующий вывод идёт с новой строки.
+pub fn tee_progress_finish() {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!();
+    }
+}
+
 /// Открывает (или перезаписывает) файл `path` и регистрирует основной tee-канал.
 pub fn init_tee_log_file(path: &Path) -> std::io::Result<()> {
     register_channel(TeeKind::Main, path)
@@ -272,6 +290,14 @@ macro_rules! tee_println {
         let __line = format!($($arg)*);
         println!("{}", __line);
         $crate::tee_log::tee_log_write(&__line);
+    }};
+}
+
+/// In-place прогресс в терминале (`\r`, без tee).
+#[macro_export]
+macro_rules! tee_progress {
+    ($($arg:tt)*) => {{
+        $crate::tee_log::tee_progress_update(&format!($($arg)*));
     }};
 }
 

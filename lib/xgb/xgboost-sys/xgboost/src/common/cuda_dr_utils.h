@@ -11,6 +11,8 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
+#include "cuda_old_toolkit_compat.h"
+
 #include <cstdint>  // for int32_t
 
 #include "xgboost/string_view.h"  // for StringView

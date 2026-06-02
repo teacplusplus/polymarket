@@ -10,6 +10,8 @@ documentation = "https://docs.rs/xgboost_lib"
 readme = "README.md"
 edition = "2021"
 
+build = "build.rs"
+
 [dependencies]
 xgboost-sys = { package = "xgboost_lib-sys", path = "xgboost-sys", version = "3.0.4" }
 libc = "0.2"

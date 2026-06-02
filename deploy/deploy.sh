@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Локальная сборка, rsync в $DEPLOY_DIR, остановка старого poly, старт через nohup.
+# Локальная сборка (CPU-only, без CUDA), rsync в $DEPLOY_DIR, остановка старого poly, старт через nohup.
 #   DEPLOY_REMOTE — хост (по умолчанию root@204.13.237.94)
 #   DEPLOY_DIR    — каталог на сервере (по умолчанию /home/poly)
 #
+# На сервере нет GPU — собираем с --no-default-features (локально по умолчанию cuda).
 # Запускайте откуда угодно, например:
 #   bash deploy/deploy.sh
 #   bash /полный/путь/deploy.sh
@@ -13,7 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$REPO_ROOT"
-cargo build --profile release
+# Сервер без GPU: prebuilt libxgboost (~секунды), без CUDA, без cmake-сборки.
+cargo build --no-default-features --features xgb-prebuilt --profile release
 cp "$REPO_ROOT/target/release/poly" "$SCRIPT_DIR/poly"
 cd "$SCRIPT_DIR"
 

@@ -219,6 +219,7 @@ impl Booster {
         };
 
         let mut bst = Booster::new_with_cached_dmats(&params.booster_params, &cached_dmats)?;
+        bst.configure_device_for_inference()?;
         for i in 0..params.boost_rounds as i32 {
             // debug!("Updating in round: {}", i);
             if let Some(objective_fn) = params.custom_objective_fn {
@@ -276,6 +277,11 @@ impl Booster {
             self.set_param(&key, &value)?;
         }
         Ok(())
+    }
+
+    /// Выставляет `device=cpu|cuda` для inference (predict / SHAP).
+    pub fn configure_device_for_inference(&mut self) -> XGBResult<()> {
+        self.set_param("device", crate::cuda::preferred_device())
     }
 
     /// Update this model by training it for one round with given training matrix.

@@ -1053,6 +1053,88 @@ impl AppendStats {
     }
 }
 
+/// Обучение одной ноги (`up` / `down`) для пары `(model_type, …)`.
+async fn train_one_side_variant(
+    train_paths: &[PathBuf],
+    val_paths: &[PathBuf],
+    test_paths: &[PathBuf],
+    version_path: &Path,
+    tag_prefix: &str,
+    currency: &str,
+    interval: &str,
+    interval_kind: XFrameIntervalKind,
+    step_sec: u64,
+    model_type: ModelType,
+    side: FrameSide,
+) -> anyhow::Result<()> {
+    let tag = format!("{tag_prefix}/{}/{}", model_type.label(), side.label());
+
+    let max_lag = match model_type {
+        ModelType::Resolution => RESOLUTION_MAX_LAG,
+        ModelType::Pnl => PNL_MAX_LAG,
+    };
+
+    let (train_markets, train_stats) = build_market_datasets(train_paths, side, model_type, max_lag);
+    let (val_markets, val_stats) = build_market_datasets(val_paths, side, model_type, max_lag);
+    let (test_markets, test_stats) = build_market_datasets(test_paths, side, model_type, max_lag);
+
+    let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
+    if total_markets == 0 {
+        tee_println!("[train] {tag}: нет данных, пропуск");
+        return Ok(());
+    }
+
+    let feature_count = match max_lag {
+        Some(n) => XFrame::<SIZE>::count_features_n(n),
+        None => XFrame::<SIZE>::count_features(),
+    };
+    let total_rows: usize = train_markets
+        .iter()
+        .chain(val_markets.iter())
+        .chain(test_markets.iter())
+        .map(|m| m.y.len())
+        .sum();
+    tee_println!(
+        "[train] {tag}: маркетов {}/{}/{} (train/val/test), {} строк, {} признаков",
+        train_markets.len(),
+        val_markets.len(),
+        test_markets.len(),
+        total_rows,
+        feature_count,
+    );
+
+    print_append_stats(&tag, "train", &train_stats);
+    print_append_stats(&tag, "val", &val_stats);
+    print_append_stats(&tag, "test", &test_stats);
+
+    let model_path = version_path.join(format!(
+        "model_{interval}_{step_sec}s_{}_{}.ubj",
+        model_type.label(),
+        side.label(),
+    ));
+
+    match train_and_save(
+        &train_markets,
+        &val_markets,
+        &test_markets,
+        val_paths,
+        currency,
+        interval_kind,
+        side,
+        &model_path,
+        &tag,
+        model_type,
+        max_lag,
+    )
+    .await
+    {
+        Ok(()) => tee_println!("[train] {tag}: модель сохранена → {}", model_path.display()),
+        Err(err) => tee_eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
+    }
+
+    Ok(())
+}
+
 /// Обучает модели для всех комбинаций `model_type × side` на одном
 /// `(currency, version, interval, step_sec)`. Каждая комбинация даёт отдельный
 /// файл `model_{interval}_{step_sec}s_{model_type}_{side}.ubj` — формат,
@@ -1080,80 +1162,33 @@ async fn train_all_variants(
             continue;
         }
 
-        for side in [FrameSide::Up, FrameSide::Down] {
-            let tag = format!("{tag_prefix}/{}/{}", model_type.label(), side.label());
-
-            let max_lag = match model_type {
-                ModelType::Resolution => RESOLUTION_MAX_LAG,
-                ModelType::Pnl => PNL_MAX_LAG,
-            };
-
-            let (train_markets, train_stats) =
-                build_market_datasets(train_paths, side, model_type, max_lag);
-            let (val_markets, val_stats) =
-                build_market_datasets(val_paths, side, model_type, max_lag);
-            let (test_markets, test_stats) =
-                build_market_datasets(test_paths, side, model_type, max_lag);
-
-            let total_markets = train_markets.len() + val_markets.len() + test_markets.len();
-            if total_markets == 0 {
-                tee_println!("[train] {tag}: нет данных, пропуск");
-                continue;
-            }
-
-            let feature_count = match max_lag {
-                Some(n) => XFrame::<SIZE>::count_features_n(n),
-                None => XFrame::<SIZE>::count_features(),
-            };
-            let total_rows: usize = train_markets
-                .iter()
-                .chain(val_markets.iter())
-                .chain(test_markets.iter())
-                .map(|m| m.y.len())
-                .sum();
+        const SIDES: [FrameSide; 2] = [FrameSide::Up, FrameSide::Down];
+        // Обучение всегда однопоточное (по одной ноге за раз):
+        //   * есть CUDA  → device=cuda, параллелизм даёт сам GPU;
+        //   * нет CUDA   → CPU hist.
+        // Параллельных потоков по сторонам нет: на одной GPU они делят
+        // память/устройство (риск OOM и нестабильности) без выигрыша по времени.
+        if cuda_gpu_available() {
             tee_println!(
-                "[train] {tag}: маркетов {}/{}/{} (train/val/test), {} строк, {} признаков",
-                train_markets.len(),
-                val_markets.len(),
-                test_markets.len(),
-                total_rows,
-                feature_count,
+                "[train] {tag_prefix}/{}: обучение на CUDA (up/down последовательно)",
+                model_type.label()
             );
-
-            // Воронка разметки: сколько кадров отвалилось до попадания в y.
-            // Печатаем на каждом сплите отдельно, чтобы увидеть, не уехал ли,
-            // например, `y_none` в test (например, из-за переключения y_train
-            // на версию с walk-обходом — на тонком стакане `None` будет чаще).
-            print_append_stats(&tag, "train", &train_stats);
-            print_append_stats(&tag, "val", &val_stats);
-            print_append_stats(&tag, "test", &test_stats);
-
-            let model_path = version_path.join(format!(
-                "model_{interval}_{step_sec}s_{}_{}.ubj",
-                model_type.label(),
-                side.label(),
-            ));
-
-            match train_and_save(
-                &train_markets,
-                &val_markets,
-                &test_markets,
+        }
+        for side in SIDES {
+            train_one_side_variant(
+                train_paths,
                 val_paths,
+                test_paths,
+                version_path,
+                tag_prefix,
                 currency,
+                interval,
                 interval_kind,
-                side,
-                &model_path,
-                &tag,
+                step_sec,
                 model_type,
-                max_lag,
+                side,
             )
-            .await
-            {
-                Ok(()) => {
-                    tee_println!("[train] {tag}: модель сохранена → {}", model_path.display())
-                }
-                Err(err) => tee_eprintln!("[train] {tag}: ошибка обучения: {err:#}"),
-            }
+            .await?;
         }
     }
     Ok(())
@@ -1651,8 +1686,10 @@ fn tune_xgboost_optimizer(
             alpha: trial.suggest_float("alpha", 0.0, 80.0)? as f32,
             scale_pos_weight: trial.suggest_float("scale_pos_weight", 4.0, 30.0)? as f32,
         };
-        let metrics = eval_xgboost(&params, eval_sets, dtrain)
-            .map_err(|_err| optimizer::Error::InvalidStep)?;
+        let metrics = eval_xgboost(&params, eval_sets, dtrain).map_err(|err| {
+            tee_eprintln!("[train] {tag} trial #{}: ошибка XGBoost: {err}", trial.id());
+            optimizer::Error::InvalidStep
+        })?;
         let score = metrics.score_for(objective);
         tee_println!(
             "[train] {tag} trial #{}: {label}={score:.6} (auc={auc:.6} logloss={logloss:.6})",
@@ -1726,6 +1763,7 @@ fn fit_booster_with_early_stopping(
     let booster_params = build_booster_params(params)?;
     let cached = [dtrain, dtest];
     let mut bst = Booster::new_with_cached_dmats(&booster_params, &cached)?;
+    bst.configure_device_for_inference()?;
 
     let mut best_score: Option<f64> = None;
     let mut best_metrics: Option<TrialMetrics> = None;
@@ -1797,8 +1835,50 @@ fn fit_booster_with_early_stopping(
         anyhow::bail!("не удалось получить ни одного валидного раунда бустинга");
     }
     let mut result_bst = Booster::load_buffer(&best_snapshot)?;
+    result_bst.configure_device_for_inference()?;
     result_bst.eval_dmat_results = best_eval_results;
     Ok(result_bst)
+}
+
+/// Метод построения деревьев XGBoost, выбираемый в рантайме.
+///
+/// * Сборка **без** feature `cuda` — всегда CPU `hist` (поведение по умолчанию,
+///   полностью как раньше).
+/// * Сборка **с** feature `cuda` — если GPU доступна, `hist` + `device=cuda`
+///   (API XGBoost 3.x); иначе CPU `hist`.
+fn resolve_tree_method() -> TreeMethod {
+    TreeMethod::Hist
+}
+
+#[cfg(not(feature = "cuda"))]
+fn cuda_gpu_available() -> bool {
+    false
+}
+
+/// Доступна ли GPU для обучения. Диагностику печатает один раз за запуск.
+/// Само устройство выставляет `configure_device_for_inference` → `preferred_device`.
+#[cfg(feature = "cuda")]
+fn cuda_gpu_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !xgb::cuda_built() {
+            tee_eprintln!(
+                "[train] CUDA: toolkit не найден при сборке — XGBoost CPU-only, обучение на hist"
+            );
+            return false;
+        }
+        let count = xgb::cuda_device_count();
+        if count > 0 {
+            tee_println!("[train] CUDA: видимых GPU={count} — обучение на hist + device=cuda");
+            true
+        } else {
+            tee_eprintln!(
+                "[train] CUDA: видимых GPU нет (нет карты / драйвер недоступен) — откат на CPU hist"
+            );
+            false
+        }
+    })
 }
 
 fn build_booster_params(params: &XgbParams) -> anyhow::Result<xgb::parameters::BoosterParameters> {
@@ -1820,7 +1900,7 @@ fn build_booster_params(params: &XgbParams) -> anyhow::Result<xgb::parameters::B
         .lambda(params.lambda)
         .alpha(params.alpha)
         .scale_pos_weight(params.scale_pos_weight)
-        .tree_method(TreeMethod::Hist)
+        .tree_method(resolve_tree_method())
         .build()?;
 
     Ok(BoosterParametersBuilder::default()

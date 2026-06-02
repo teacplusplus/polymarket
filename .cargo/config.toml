@@ -1,0 +1,11 @@
+# Локальная конфигурация сборки.
+# default features: xgb-local + cuda (см. Cargo.toml).
+
+[build]
+rustflags = ["-C", "link-args=-fopenmp"]
+
+[alias]
+# Быстрая проверка Rust-кода без cmake/CUDA (~секунды после первого prebuilt).
+check-fast = "check --no-default-features --features xgb-prebuilt"
+# Явная GPU-сборка (если default features отключены).
+build-gpu = "build --features xgb-local,cuda --profile release"

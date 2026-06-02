@@ -16,7 +16,13 @@ fn main() {
         .clang_arg(format!("-I{}", xgb_root.join("dmlc-core").join("include").display()));
 
     #[cfg(feature = "cuda")]
-    let bindings = bindings.clang_arg("-I/usr/local/cuda/include");
+    let bindings = {
+        if let Some(cuda) = cuda_toolkit_root() {
+            bindings.clang_arg(format!("-I{}/include", cuda))
+        } else {
+            bindings
+        }
+    };
     let bindings = bindings.generate().expect("Unable to generate bindings.");
 
     let out_path = PathBuf::from(&out_dir);
@@ -80,22 +86,52 @@ fn main() {
     {
         // compile XGBOOST with cmake and ninja
 
+        let cache_dir = xgb_persistent_cache_dir();
+        let _ = std::fs::create_dir_all(&cache_dir);
+        println!("cargo:warning=XGBoost cmake cache: {}", cache_dir.display());
+
         // CMake
-        let mut dst = cmake::Config::new(&xgb_root);
-        let dst = dst.generator("Ninja");
-        let dst = dst.define("CMAKE_BUILD_TYPE", "RelWithDebInfo");
+        let mut cfg = cmake::Config::new(&xgb_root);
+        cfg.out_dir(&cache_dir)
+            .generator("Ninja")
+            .define("CMAKE_BUILD_TYPE", "RelWithDebInfo");
+
+        // Ускоряет повторные пересборки C++/CUDA (apt install ccache).
+        if Path::new("/usr/bin/ccache").exists() {
+            cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", "ccache")
+                .define("CMAKE_CUDA_COMPILER_LAUNCHER", "ccache");
+        }
 
         #[cfg(feature = "cuda")]
-        let mut dst = dst
-            .define("USE_CUDA", "ON")
-            .define("BUILD_WITH_CUDA", "ON")
-            .define("BUILD_WITH_CUDA_CUB", "ON");
+        if let Some(cuda) = cuda_toolkit_root() {
+            println!("cargo:warning=Building XGBoost with CUDA (toolkit root: {cuda})");
+            cfg.define("USE_CUDA", "ON")
+                .define("BUILD_WITH_CUDA", "ON")
+                .define("BUILD_WITH_CUDA_CUB", "ON")
+                .define("CUDAToolkit_ROOT", &cuda);
+            if let Some(host) = cuda_host_cxx_compiler() {
+                println!("cargo:warning=Using {host} as CUDA host compiler");
+                cfg.define("CMAKE_CUDA_HOST_COMPILER", host);
+            }
+        } else {
+            #[cfg(feature = "cuda")]
+            println!(
+                "cargo:warning=CUDA feature enabled but nvcc not found; \
+                 building CPU-only XGBoost (install nvidia-cuda-toolkit for GPU)"
+            );
+        }
 
-        let dst = dst.build();
+        let dst = cfg.build();
 
+        let lib_dir = dst.join("lib");
+        let lib64_dir = dst.join("lib64");
         println!("cargo:rustc-link-search=native={}", dst.display());
-        println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
-        println!("cargo:rustc-link-search=native={}", dst.join("lib64").display());
+        if lib_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        }
+        if lib64_dir.exists() {
+            println!("cargo:rustc-link-search=native={}", lib64_dir.display());
+        }
         println!("cargo:rustc-link-lib=static=dmlc");
     }
 
@@ -112,13 +148,74 @@ fn main() {
         }
     }
 
-    println!("cargo:rustc-link-lib=dylib=xgboost");
-
-    #[cfg(feature = "cuda")]
+    #[cfg(not(feature = "local_build"))]
     {
-        println!("cargo:rustc-link-search={}", "/usr/local/cuda/lib64");
-        println!("cargo:rustc-link-lib=static=cudart_static");
+        println!("cargo:rustc-link-lib=dylib=xgboost");
     }
+}
+
+/// Постоянный каталог cmake-сборки XGBoost (не удаляется при `cargo clean`).
+/// Переопределение: `XGBOOST_BUILD_CACHE=/path/to/dir`.
+#[cfg(feature = "local_build")]
+fn xgb_persistent_cache_dir() -> PathBuf {
+    let base = env::var("XGBOOST_BUILD_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            PathBuf::from(home).join(".cache").join("poly-xgboost-build")
+        });
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
+    #[cfg(feature = "cuda")]
+    let variant = if cuda_toolkit_root().is_some() {
+        "cuda"
+    } else {
+        "cpu"
+    };
+    #[cfg(not(feature = "cuda"))]
+    let variant = "cpu";
+    base.join(variant).join(profile)
+}
+
+/// Корень CUDA toolkit, если `nvcc` доступен.
+#[cfg(feature = "cuda")]
+fn cuda_toolkit_root() -> Option<String> {
+    if let Ok(p) = env::var("CUDA_PATH")
+        .or_else(|_| env::var("CUDA_HOME"))
+        .or_else(|_| env::var("CUDA_ROOT"))
+    {
+        let root = Path::new(&p);
+        if root.join("bin/nvcc").exists() {
+            return Some(p);
+        }
+    }
+
+    for candidate in [
+        "/usr/lib/nvidia-cuda-toolkit",
+        "/usr/local/cuda",
+        "/usr/lib/cuda",
+    ] {
+        let root = Path::new(candidate);
+        if root.join("bin/nvcc").exists() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    if Path::new("/usr/bin/nvcc").exists() {
+        return Some("/usr/lib/nvidia-cuda-toolkit".to_string());
+    }
+
+    None
+}
+
+/// CUDA 12 из apt не поддерживает GCC 14; g++-12 обычно есть в Ubuntu 24.04.
+#[cfg(feature = "cuda")]
+fn cuda_host_cxx_compiler() -> Option<&'static str> {
+    for candidate in ["/usr/bin/g++-12", "/usr/bin/g++-11"] {
+        if Path::new(candidate).exists() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

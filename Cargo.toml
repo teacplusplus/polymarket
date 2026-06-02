@@ -2,6 +2,7 @@
 name = "poly"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
@@ -24,13 +25,23 @@ xframe-features-derive = { path = "./lib/xframe-features-derive" }
 polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0-canary.1", features = ["gamma", "data", "clob"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 dotenvy = "0.15"
-xgb = { path = "./lib/xgb", default-features = false, features = ["local_build"] }
+xgb = { path = "./lib/xgb", default-features = false }
 optimizer = "0.3.0"
 rand = "0.8"
 indexmap = "2.14.0"
 alloy = "1.8"
 arc-swap = "1.7"
 uuid = { version = "1.23.1", features = ["v4"] }
+
+[features]
+default = ["xgb-local", "cuda"]
+# Сборка XGBoost из исходников (cmake). Первый раз долго (~30 мин с CUDA),
+# дальше кэш в ~/.cache/poly-xgboost-build/. Альтернатива: xgb-prebuilt (секунды).
+xgb-local = ["xgb/local_build"]
+# Готовый libxgboost.so с GitHub — для deploy и быстрого cargo check без GPU.
+xgb-prebuilt = ["xgb/use_prebuilt_xgb"]
+# CUDA в XGBoost. Без xgb-local бессмысленно (prebuilt без GPU).
+cuda = ["xgb/cuda"]
 
 [dev-dependencies]
 anyhow = "1.0"

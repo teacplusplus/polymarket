@@ -21,7 +21,8 @@ use crate::xframe::{
     apply_side_symmetry,
 };
 use crate::xframe_dump::MarketXFramesDump;
-use crate::{tee_eprintln, tee_println};
+use crate::{tee_eprintln, tee_println, tee_progress};
+use crate::tee_log::tee_progress_finish;
 
 pub use crate::sim_stats::{
     print_side_stats, print_sim_stats, SideStats, SimStats, SimStatsLogSink,
@@ -654,7 +655,14 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     all_paths.len(),
                 );
 
-                for file_path in test_paths {
+                let test_total = test_paths.len();
+                tee_println!(
+                    "[sim] {tag}: симуляция test-сплита: {test_total} маркетов…"
+                );
+
+                for (idx, file_path) in test_paths.iter().enumerate() {
+                    let market_n = idx + 1;
+                    tee_progress!("[sim] {tag}: [{market_n}/{test_total}]");
                     match load_market_xframes(file_path) {
                         Ok(market_xframes) => {
                             let polymarket_url =
@@ -687,6 +695,7 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                         Err(err) => tee_eprintln!("[sim] {}: {err}", file_path.display()),
                     }
                 }
+                tee_progress_finish();
 
                 let bankroll_now = *account.bankroll.read().await;
                 let max_drawdown_pct_now = *account.max_drawdown_pct.read().await;
@@ -781,7 +790,7 @@ async fn simulate_event(
 
     if let Some(market_id) = market_id_opt {
         crate::account::Account::resolve_pending_market_sync(
-            &account,
+            account,
             sim_stats,
             currency,
             interval_kind,
@@ -791,8 +800,6 @@ async fn simulate_event(
         )
         .await;
     }
-
-
 }
 
 /// Один проход стороны (UP/DOWN) по ряду кадров: manage/open → MtM equity.
@@ -2109,12 +2116,39 @@ pub(crate) fn load_booster(path: &Path) -> Option<Booster> {
         return None;
     }
     match Booster::load(path) {
-        Ok(b) => Some(b),
+        Ok(mut b) => {
+            log_xgb_inference_device_once();
+            if let Err(err) = b.configure_device_for_inference() {
+                tee_eprintln!(
+                    "[sim] не удалось выставить device={} для {}: {err}",
+                    xgb::preferred_device(),
+                    path.display()
+                );
+            }
+            Some(b)
+        }
         Err(err) => {
             tee_eprintln!("[sim] не удалось загрузить модель {}: {err}", path.display());
             None
         }
     }
+}
+
+fn log_xgb_inference_device_once() {
+    use std::sync::OnceLock;
+    static LOGGED: OnceLock<()> = OnceLock::new();
+    LOGGED.get_or_init(|| {
+        if xgb::cuda_runtime_available() {
+            tee_println!(
+                "[sim] XGBoost inference: device=cuda (GPU={})",
+                xgb::cuda_device_count()
+            );
+        } else if xgb::cuda_built() {
+            tee_eprintln!("[sim] XGBoost inference: device=cpu (GPU недоступна)");
+        } else {
+            tee_println!("[sim] XGBoost inference: device=cpu (сборка без CUDA)");
+        }
+    });
 }
 
 pub(crate) fn load_market_xframes(path: &Path) -> anyhow::Result<MarketXFramesDump> {
@@ -2168,7 +2202,7 @@ pub(crate) struct DumpWindowBounds {
     pub event_end_ms: i64,
 }
 
-/// Длительность тест-сплита: `n_paths × interval` (не span по датам файлов).
+/// Длительность test-сплита: `n_paths × interval` (не span по датам файлов).
 fn test_period_label(paths: &[std::path::PathBuf], interval_kind: XFrameIntervalKind) -> String {
     if paths.is_empty() {
         return "период=—".to_string();
