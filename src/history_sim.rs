@@ -16,9 +16,8 @@ use crate::train_mode::{
 };
 use crate::xframe::{
     BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN_NO_TRADE_PROB_LOW,
-    Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_STOP_LOSS_PP,
-    Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP,
-    apply_side_symmetry,
+    Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB, Y_TRAIN_RESOLUTION_STOP_LOSS_PP,
+    Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP, apply_side_symmetry,
 };
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println, tee_progress};
@@ -33,9 +32,10 @@ use std::path::Path;
 use std::sync::Arc;
 use xgb::{Booster, DMatrix};
 
-/// Нижний порог raw перед Kelly (`f* > 0`).
-pub const SIM_BUY_THRESHOLD: f32 = 0.60;
-
+/// Нижний порог raw PnL-модели перед Kelly (`f* > 0`).
+pub const SIM_PNL_BUY_THRESHOLD: f32 = 0.60;
+/// Нижний порог raw Resolution-модели перед Kelly (`f* > 0`).
+pub const SIM_RESOLUTION_BUY_THRESHOLD: f32 = 0.60;
 /// Max отклонение VWAP от L1 при strict fill; voluntary TP может обойти cap
 /// ([`sell_gate`], [`crate::account_close_position::gross_usdc_sell_take_profit`]).
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
@@ -74,6 +74,12 @@ pub const HOLD_TO_END_THRESHOLD_SEC: i64 = 60;
 /// калибровки не грузятся (трактуются как отсутствующие), hold-zone fallback
 /// не активируется; работает только PnL-канал на всём диапазоне рынка.
 pub const ENABLE_RESOLUTION: bool = false;
+
+/// Глобальный тумблер PnL-канала для всех симуляций: [`run_sim_mode`] и
+/// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
+/// грузятся (трактуются как отсутствующие), что позволяет оставить только
+/// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
+pub const ENABLE_PNL: bool = true;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -564,10 +570,19 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
 
                 let tag = format!("{currency}/{version}/{interval}/{regime_label}");
 
-                let booster_up = load_booster(&model_up_path);
-                let booster_down = load_booster(&model_down_path);
-                let calibration_up = load_calibration(&model_up_path).ok();
-                let calibration_down = load_calibration(&model_down_path).ok();
+                // PnL-канал грузим только если включён флагом; иначе все
+                // четыре значения → `None`, и входы возможны только через
+                // Resolution-канал (если он включён и сработал в hold-zone).
+                let (booster_up, booster_down, calibration_up, calibration_down) = if ENABLE_PNL {
+                    (
+                        load_booster(&model_up_path),
+                        load_booster(&model_down_path),
+                        load_calibration(&model_up_path).ok(),
+                        load_calibration(&model_down_path).ok(),
+                    )
+                } else {
+                    (None, None, None, None)
+                };
 
                 // Resolution-канал грузим только если включён флагом; иначе все
                 // четыре значения → `None`, и hold-zone fallback не активируется.
@@ -622,7 +637,7 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                         "[sim] {tag}: pnl: up={} down={} | {} | {} \
                          | resolution: up={} down={} \
                          | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s (PnL приоритет, Resolution fallback с TP/Timeout off) \
-                         | threshold={SIM_BUY_THRESHOLD} | kelly={KELLY_MULTIPLIER} | max_bet={MAX_BET_FRACTION} | max_pos=${MAX_POSITION_USD} \
+                         | thresholds: pnl={SIM_PNL_BUY_THRESHOLD} resolution={SIM_RESOLUTION_BUY_THRESHOLD} | kelly={KELLY_MULTIPLIER} | max_bet={MAX_BET_FRACTION} | max_pos=${MAX_POSITION_USD} \
                          | no_trade_zone=({Y_TRAIN_NO_TRADE_PROB_LOW}..{Y_TRAIN_NO_TRADE_PROB_HIGH}) \
                          | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE} \
                          | {test_period_str}",
@@ -637,7 +652,7 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     tee_println!(
                         "[sim] {tag}: pnl: up={} down={} | resolution: up={} down={} \
                          | hold_zone≤{HOLD_TO_END_THRESHOLD_SEC}s (PnL приоритет, Resolution fallback с TP/Timeout off) \
-                         | threshold={SIM_BUY_THRESHOLD} | entry=${NO_KELLY_POSITION_SIZE_USD} (fixed, no Kelly, no calibration) \
+                         | thresholds: pnl={SIM_PNL_BUY_THRESHOLD} resolution={SIM_RESOLUTION_BUY_THRESHOLD} | entry=${NO_KELLY_POSITION_SIZE_USD} (fixed, no Kelly, no calibration) \
                          | no_trade_zone=({Y_TRAIN_NO_TRADE_PROB_LOW}..{Y_TRAIN_NO_TRADE_PROB_HIGH}) \
                          | bankroll={INITIAL_BANKROLL}$ | fee_rate={POLYMARKET_CRYPTO_TAKER_FEE_RATE} \
                          | {test_period_str}",
@@ -977,10 +992,10 @@ pub(crate) async fn run_side_simulation(
     // дренирует их по `market_id` напрямую из `positions`.
 }
 
-/// Сырой (`raw`) и калиброванный (`pred`) скор PnL; см. [`compute_pnl_inference`].
+/// Сырой (`raw`) и калиброванный (`pred`) скор модели; см. [`compute_pnl_inference`].
 #[derive(Clone, Copy, Debug)]
 pub struct PnlInference {
-    /// Raw booster до порога [`SIM_BUY_THRESHOLD`].
+    /// Raw booster до порога соответствующего канала.
     pub raw: f32,
     /// Для Kelly — после калибровки; иначе совпадает с `raw`.
     pub pred: f32,
@@ -1051,12 +1066,16 @@ pub enum BuyGate {
     LateEntry,
     /// Кадр нестабилен ([`crate::xframe::compute_xframe_stable`]).
     Unstable,
-    /// Нет инференса или raw < [`SIM_BUY_THRESHOLD`].
+    /// Нет инференса или raw ниже порога соответствующего канала.
     BelowThreshold,
     /// Центральная no-trade зона по `entry_prob`; диагностика суммируется.
     EntryProbOutOfRange { raw: f32, pred: f32, kelly_f: f64 },
     /// После порога нет edge или размер < [`MIN_POSITION_USD`] (`kelly_skips`).
     KellySkip { raw: f32, pred: f32, kelly_f: f64 },
+    /// Resolution-канал: отрицательный/нулевой EV held-to-resolution
+    /// (`pred · W ≤ 1 + [`SIM_RESOLUTION_MIN_EDGE`]`); диагностика
+    /// суммируется, инкрементируется `no_edge_skips`.
+    NoEdge { raw: f32, pred: f32, kelly_f: f64 },
     /// Открыть на `size` USDC. `opened_in_hold_zone` указывает канал входа,
     /// а не временную зону кадра: `true` — вход через Resolution-модель
     /// (доступно только внутри hold-zone, и только если PnL-канал не дал
@@ -1110,6 +1129,7 @@ pub(crate) fn buy_gate(
     // PnL — приоритетный канал, активен на всём диапазоне рынка.
     let pnl_decision = buy_gate_for_channel(
         pnl_inference,
+        SIM_PNL_BUY_THRESHOLD,
         false, // opened_in_hold_zone: PnL-канал
         entry_prob,
         bankroll,
@@ -1125,6 +1145,7 @@ pub(crate) fn buy_gate(
     if in_hold_zone {
         let res_decision = buy_gate_for_channel(
             resolution_inference,
+            SIM_RESOLUTION_BUY_THRESHOLD,
             true, // opened_in_hold_zone: Resolution-канал
             entry_prob,
             bankroll,
@@ -1144,6 +1165,7 @@ pub(crate) fn buy_gate(
 /// с соответствующим payout-плечом Kelly.
 fn buy_gate_for_channel(
     inference: Option<PnlInference>,
+    buy_threshold: f32,
     opened_in_hold_zone: bool,
     entry_prob: f64,
     bankroll: f64,
@@ -1152,16 +1174,17 @@ fn buy_gate_for_channel(
     let Some(PnlInference { raw, pred }) = inference else {
         return BuyGate::BelowThreshold;
     };
-    if raw < SIM_BUY_THRESHOLD {
+    if raw < buy_threshold {
         return BuyGate::BelowThreshold;
     }
 
-    // Resolution-канал: payout $1/шер без sell-fee, SL-loss с resolution-порогом.
+    // Resolution-канал: payout $1/шер без sell-fee, проигрыш = вся ставка
+    // (held-to-resolution, [`kelly_resolution_loss_ratio`]).
     // PnL-канал: классический TP/SL с PnL-порогом.
     let (kelly_gain, kelly_loss) = if opened_in_hold_zone {
         (
             kelly_resolution_gain_ratio(entry_prob),
-            kelly_loss_ratio(entry_prob, Y_TRAIN_RESOLUTION_STOP_LOSS_PP),
+            kelly_resolution_loss_ratio(),
         )
     } else {
         (
@@ -1174,6 +1197,27 @@ fn buy_gate_for_channel(
     // Хвосты распределения: вне центральной no-trade зоны ([`crate::xframe::calc_y_train_pnl`]).
     if entry_prob > Y_TRAIN_NO_TRADE_PROB_LOW && entry_prob < Y_TRAIN_NO_TRADE_PROB_HIGH {
         return BuyGate::EntryProbOutOfRange { raw, pred, kelly_f };
+    }
+
+    // Потолок цены входа только для Resolution-канала: в зоне near-certain
+    // (`entry_prob ≥ MAX`) нет извлекаемого edge, а переуверенность калибровки
+    // делает realized win-rate < цены → −EV. Синхронизировано с разметкой
+    // ([`crate::xframe::calc_y_train_resolution`]). На PnL-канал не действует.
+    if opened_in_hold_zone && entry_prob >= Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB {
+        return BuyGate::EntryProbOutOfRange { raw, pred, kelly_f };
+    }
+
+    // Edge-гейт Resolution-канала: бинарный held-to-resolution payoff прибылен
+    // только при положительном EV (`pred · W > 1`, `W = kelly_gain + 1` —
+    // нетто-множитель выигрыша). Покупка по `entry_prob ≈ 0.99` при win-prob
+    // ниже цены даёт отрицательный EV — пропускаем. Применяется в обоих режимах
+    // (Kelly и raw), т.к. raw-режим не считает `f*` и иначе входил бы в минус.
+    if opened_in_hold_zone {
+        let win_mult = kelly_gain + 1.0;
+        let ev = pred as f64 * win_mult - 1.0;
+        if ev <= 0.0 {
+            return BuyGate::NoEdge { raw, pred, kelly_f };
+        }
     }
 
     if !is_kelly {
@@ -1292,6 +1336,15 @@ pub(crate) async fn try_open_position(
             stats.diag_sum_entry_prob += entry_prob;
             stats.diag_sum_kelly_f += kelly_f;
             stats.kelly_skips += 1;
+            false
+        }
+        BuyGate::NoEdge { raw, pred, kelly_f } => {
+            stats.raw_above_threshold += 1;
+            stats.diag_sum_raw += raw as f64;
+            stats.diag_sum_calibrated += pred as f64;
+            stats.diag_sum_entry_prob += entry_prob;
+            stats.diag_sum_kelly_f += kelly_f;
+            stats.no_edge_skips += 1;
             false
         }
         BuyGate::Proceed { raw, pred, kelly_f, size, opened_in_hold_zone } => {
@@ -1744,7 +1797,7 @@ fn kelly_gain_ratio(entry_prob: f64) -> f64 {
 
 /// Доля убытка при SL: всегда taker на выходе (как [`crate::account_close_position::close_position`] на SL).
 /// `sl_pp` — порог SL соответствующей модели: [`Y_TRAIN_PNL_STOP_LOSS_PP`] для PnL-канала
-/// или [`Y_TRAIN_RESOLUTION_STOP_LOSS_PP`] для Resolution-канала (hold-zone).
+/// (Resolution-канал теперь использует полный убыток, см. [`kelly_resolution_loss_ratio`]).
 fn kelly_loss_ratio(entry_prob: f64, sl_pp: f64) -> f64 {
     let sell_price = (entry_prob + sl_pp).clamp(0.001, 0.999);
     let net = net_round_trip(entry_prob, sell_price, /*sell_is_taker=*/ true);
@@ -1756,6 +1809,18 @@ fn kelly_loss_ratio(entry_prob: f64, sl_pp: f64) -> f64 {
 fn kelly_resolution_gain_ratio(entry_prob: f64) -> f64 {
     let net = net_round_trip(entry_prob, 1.0, /*sell_is_taker=*/ false);
     (net - 1.0).max(1e-9)
+}
+
+/// Доля убытка при held-to-resolution: консервативно `loss = 1.0` (полная
+/// ставка). SL в [`sell_gate`] для resolution-канала активен, но срабатывает
+/// только при `net_ret ≤ Y_TRAIN_RESOLUTION_STOP_LOSS_PP` **и** ухудшении
+/// urgent-VWAP относительно входа; на резолюции бинарный токен часто прыгает
+/// `entry_prob → 0` без торгуемого промежуточного уровня — тогда SL не успевает
+/// и теряется вся ставка. Поэтому Kelly закладывает полный даунсайд: кормить
+/// его SL-ограниченным `loss ≈ 3%` опасно — `f*` раздувается на порядок и
+/// кратно переставляет в стратегию с отрицательным edge (см. разбор 5m в истории).
+fn kelly_resolution_loss_ratio() -> f64 {
+    1.0
 }
 
 /// Чистый множитель на $1 notional: вход taker; `sell_is_taker` — urgent vs maker выход.
@@ -1777,7 +1842,7 @@ fn net_round_trip(buy: f64, sell: f64, sell_is_taker: bool) -> f64 {
 /// Семантика совпадает с [`crate::xframe::calc_y_train_pnl`] /
 /// [`crate::xframe::calc_y_train_resolution`]: `net_ret_taker` /
 /// `net_ret_maker` vs [`Y_TRAIN_TAKE_PROFIT_PP`] / [`Y_TRAIN_PNL_STOP_LOSS_PP`] /
-/// [`Y_TRAIN_RESOLUTION_STOP_LOSS_PP`].
+/// [`crate::xframe::Y_TRAIN_RESOLUTION_STOP_LOSS_PP`].
 fn net_ret_after_exit(buy_price: f64, sell_vwap: f64, sell_is_taker: bool) -> f64 {
     net_round_trip(buy_price, sell_vwap, sell_is_taker) - 1.0
 }

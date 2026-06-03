@@ -5,8 +5,9 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, ENABLE_RESOLUTION, StrictBook, any_position_would_sell, buy_gate, compute_pnl_inference,
-    compute_resolution_inference, load_booster, manage_positions, try_open_position,
+    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, StrictBook, any_position_would_sell, buy_gate,
+    compute_pnl_inference, compute_resolution_inference, load_booster, manage_positions,
+    try_open_position,
 };
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
@@ -996,8 +997,13 @@ fn load_side_models(version_path: &Path, interval: &str, side: &str) -> Option<S
     let pnl_path = version_path.join(format!("model_{interval}_1s_pnl_{side}.ubj"));
     let resolution_path = version_path.join(format!("model_{interval}_1s_resolution_{side}.ubj"));
 
-    let booster_pnl = load_booster(&pnl_path);
-    let calibration_pnl = load_calibration(&pnl_path).ok();
+    // PnL-канал грузим только под общим тумблером [`ENABLE_PNL`];
+    // иначе `None` → входы идут только через Resolution, если он включён.
+    let (booster_pnl, calibration_pnl) = if ENABLE_PNL {
+        (load_booster(&pnl_path), load_calibration(&pnl_path).ok())
+    } else {
+        (None, None)
+    };
     // Resolution-канал грузим только под общим тумблером [`ENABLE_RESOLUTION`];
     // иначе `None` → hold-zone fallback не активируется (PnL-канал работает).
     let (booster_resolution, calibration_resolution) = if ENABLE_RESOLUTION {

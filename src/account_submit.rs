@@ -634,8 +634,9 @@ pub(crate) fn spawn_open_buy_taker(
         }
         // Вход всегда taker FAK (`market_order` с `price` как worst-case cap).
         // Resolution-канал (opened_in_hold_zone=true) сохраняет специфический
-        // exit-режим в [`sell_gate`] / `close_position` (TP/Timeout off, SL only)
-        // и пропуск maker TP ниже, но сам BUY идёт таким же тейкер-FAK,
+        // exit-режим в [`sell_gate`] / `close_position` (TP/SL/Timeout off,
+        // выход строго по резолюции) и пропуск maker TP ниже, но сам BUY идёт
+        // таким же тейкер-FAK,
         // как и для PnL-канала.
         let buy_post_request = PostOrderRequest {
             asset_id: asset_id.clone(),

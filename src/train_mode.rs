@@ -5,8 +5,8 @@
 use crate::account::Account;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
-    HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS, load_market_xframes, run_side_simulation,
-    window_bounds_from_dump_path,
+    ENABLE_PNL, ENABLE_RESOLUTION, HOLD_TO_END_THRESHOLD_SEC, MIN_ENTRY_REMAINING_MS,
+    load_market_xframes, run_side_simulation, window_bounds_from_dump_path,
 };
 use crate::project_manager::FRAME_BUILD_INTERVALS_SEC;
 use crate::sim_stats::{SideStats, SimStats};
@@ -105,9 +105,26 @@ const CALIBRATION_MIN_BLOCK_WEIGHT_CAP: f64 = 10.0;
 /// Минимальное количество трейдов в калибровочном сете sim-replay
 /// (см. [`fit_calibration_via_sim_replay`]). Если симулятор на val'е набрал
 /// меньше — калибровка fallback'ит на полный per-frame `(preds, y)` сет
-/// с предупреждением. Меньше ~20 точек слишком мало для устойчивого PAV:
-/// верхний бакет может содержать всего 1–2 трейда, и `cal(raw≥0.7)` будет случайным.
-const CALIBRATION_MIN_FILTERED_SAMPLES: usize = 20;
+/// с предупреждением. Per-frame fallback на сильно несбалансированных данных
+/// (доля `y=1` ~0.2%) схлопывает все вероятности вниз (`raw=0.95 → cal≈0.24`),
+/// из-за чего Kelly f\* уходит в минус и весь канал перестаёт торговать
+/// (см. разбор 15m в истории).
+///
+/// Порог зависит от интервала окна:
+///   - `5m` — `20`: маркетов на порядок больше (≈1500 vs ≈500), sim-replay
+///     легко набирает устойчивый набор, поэтому держим строгий порог.
+///   - `15m` — `10`: маркетов мало, sim-replay часто набирает 10–20 точек;
+///     даже скромный реальный набор предпочтительнее заведомо «придавленной»
+///     per-frame калибровки, отключающей Kelly-торговлю.
+///
+/// Меньше ~10 точек уже слишком мало для устойчивого PAV: верхний бакет может
+/// содержать всего 1–2 трейда, и `cal(raw≥0.7)` будет случайным.
+const fn calibration_min_filtered_samples(interval_kind: XFrameIntervalKind) -> usize {
+    match interval_kind {
+        XFrameIntervalKind::FiveMin => 20,
+        XFrameIntervalKind::FifteenMin => 10,
+    }
+}
 
 /// Стартовый банкролл для sim-replay калибровки
 /// (см. [`fit_calibration_via_sim_replay`]).
@@ -535,7 +552,7 @@ async fn fit_calibration_via_sim_replay(
 ///
 /// **Fallback** — full per-frame `(preds, y)` (как было до перехода на
 /// sim-replay). Срабатывает, если sim-replay набрал меньше
-/// [`CALIBRATION_MIN_FILTERED_SAMPLES`] точек или один из классов пуст
+/// [`calibration_min_filtered_samples`] точек или один из классов пуст
 /// (например, в test-сплите модель не открывает позиций при
 /// `SIM_BUY_THRESHOLD` — диагностический сигнал, что AUC высокий за счёт
 /// «низких» кадров, а не сигналов на покупку). Per-frame fallback
@@ -616,15 +633,16 @@ async fn fit_calibration(
     let n_neg_sim = entries.len() - n_pos_sim;
 
     // Решаем какой набор кормить в PAV.
+    let min_filtered_samples = calibration_min_filtered_samples(interval_kind);
     let (cal_preds, cal_y, source_label): (&[f32], &[f32], &'static str) = if entries.len()
-        >= CALIBRATION_MIN_FILTERED_SAMPLES
+        >= min_filtered_samples
         && n_pos_sim > 0
         && n_neg_sim > 0
     {
         (preds_sim.as_slice(), y_sim.as_slice(), "sim-replay")
     } else {
         tee_eprintln!(
-            "[calibration] {tag}: sim-replay набор слишком мал ({} < {CALIBRATION_MIN_FILTERED_SAMPLES}) \
+            "[calibration] {tag}: sim-replay набор слишком мал ({} < {min_filtered_samples}) \
                  или один класс пуст (won={n_pos_sim} lost={n_neg_sim}) — fallback на per-frame.",
             entries.len(),
         );
@@ -1151,6 +1169,21 @@ async fn train_all_variants(
     step_sec: u64,
 ) -> anyhow::Result<()> {
     for model_type in [ModelType::Pnl, ModelType::Resolution] {
+        // Обучаем только модели включённых каналов ([`ENABLE_PNL`] /
+        // [`ENABLE_RESOLUTION`]): симулятор использует ровно их, тренировать
+        // отключённые бессмысленно (трата времени GPU и перезапись .ubj).
+        let channel_enabled = match model_type {
+            ModelType::Pnl => ENABLE_PNL,
+            ModelType::Resolution => ENABLE_RESOLUTION,
+        };
+        if !channel_enabled {
+            tee_println!(
+                "[train] {tag_prefix}/{}: канал отключён флагом — пропуск обучения",
+                model_type.label()
+            );
+            continue;
+        }
+
         // Pnl и Resolution обучаем только на step_sec = 1 с: лейблы обеих
         // моделей считаются через [`crate::xframe::calc_y_train_pnl`] /
         // [`crate::xframe::calc_y_train_resolution`] по горизонту

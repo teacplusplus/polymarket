@@ -1009,6 +1009,18 @@ pub const Y_TRAIN_NO_TRADE_PROB_LOW: f64 = 0.3;
 /// См. [`Y_TRAIN_NO_TRADE_PROB_LOW`] для обоснования.
 pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.7;
 
+/// Верхний потолок цены входа **только для Resolution-канала**
+/// (held-to-resolution): при `entry_prob ≥` этого значения у позиции нет
+/// извлекаемого edge — апсайд `≈ 1/p − 1` (доли процента при `p → 1`), а
+/// даунсайд при проигрыше токена = вся ставка. Чтобы окупить такой payoff,
+/// нужен realized win-rate ≥ `p`, но в зоне 0.99+ даже мелкая переуверенность
+/// калибровки на 1–2 п.п. переворачивает реальный EV в минус (см. разбор в
+/// истории: realized 0.91–0.98 при цене 0.99+). Поэтому кадры с
+/// `entry_prob ≥ MAX` исключаются из Resolution-разметки ([`calc_y_train_resolution`]
+/// → `None`) и из runtime-входа ([`crate::history_sim::buy_gate`] →
+/// `EntryProbOutOfRange`). На PnL-канал не распространяется.
+pub const Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB: f64 = 0.90;
+
 /// Целевой нотионал позиции (gross USDC), под который размечаются Y-метки
 /// [`calc_y_train_pnl`] / [`calc_y_train_resolution`]. Совпадает с типичным
 /// размером, которым реально торгует `real_sim` (Kelly-fraction × bankroll
@@ -1588,7 +1600,16 @@ pub fn calc_y_train_resolution(
 ) -> Option<f32> {
     let up_won = final_price >= price_to_beat;
     let current = x_frames.get(index)?;
-    let _ = current.currency_implied_prob?;
+    let p_buy = current.currency_implied_prob?;
+
+    // Потолок цены входа: в зоне `entry_prob ≥ MAX` нет извлекаемого edge
+    // (апсайд → 0 при `p → 1`, даунсайд = вся ставка). Исключаем такие кадры
+    // из обучения, чтобы модель не училась «угадывать» уже заложенный в цену
+    // near-certain исход. Синхронизировано с runtime-гейтом в
+    // [`crate::history_sim::buy_gate`]. См. [`Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB`].
+    if p_buy >= Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB {
+        return Some(0.0);
+    }
 
     let buy = match walk_buy_xfeatures(current, Y_TRAIN_NOMINAL_USDC) {
         None => return Some(0.0),
