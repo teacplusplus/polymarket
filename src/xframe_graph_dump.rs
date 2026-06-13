@@ -406,17 +406,7 @@ fn graph_html_rows_from_dump_frames(
 
 /// Заменяет первый сегмент пути `xframes` на `graph` и расширение на `.html`.
 pub fn graph_html_path_from_bin(bin_path: &Path) -> Option<PathBuf> {
-    let mut out = PathBuf::new();
-    let mut switched = false;
-    for comp in bin_path.components() {
-        if comp.as_os_str() == "xframes" {
-            out.push("graph");
-            switched = true;
-        } else {
-            out.push(comp);
-        }
-    }
-    switched.then(|| out.with_extension("html"))
+    crate::path_config::graph_html_path_from_xframes_bin(bin_path)
 }
 
 /// `file:///.../graph/...html?ts1=<open_ms>&ts2=<close_ms>[&ts2=<close_ms>...][&side=up|down]`
@@ -494,7 +484,7 @@ pub fn try_write_graph_html_from_bin_dump(
     }
     let Some(out) = graph_html_path_from_bin(bin_path) else {
         anyhow::bail!(
-            "graph HTML: путь не содержит сегмент xframes: {}",
+            "graph HTML: путь не находится в дереве xframes: {}",
             bin_path.display()
         );
     };
@@ -574,7 +564,7 @@ pub async fn dump_market_graph_html_lane(
     let step_secs = FRAME_BUILD_INTERVALS_SEC[lane];
     let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let base: PathBuf = Path::new("graph")
+    let base: PathBuf = crate::path_config::graph_root()
         .join(project_manager.currency.as_str())
         .join(format!("{schema_size}"))
         .join(interval_label)

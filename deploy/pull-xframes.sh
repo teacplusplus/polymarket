@@ -2,7 +2,8 @@
 # Скачать `$REMOTE_XFRAMES_DIR` с удалённого сервера в `$LOCAL_XFRAMES_DIR`.
 #   FETCH_REMOTE       — хост (по умолчанию root@204.13.237.94)
 #   REMOTE_XFRAMES_DIR — путь на сервере (по умолчанию /home/poly/xframes)
-#   LOCAL_XFRAMES_DIR  — путь локально (по умолчанию <repo>/xframes)
+#   LOCAL_XFRAMES_DIR  — путь локально (по умолчанию XFRAMES_DIR из .env,
+#                        иначе <repo>/xframes)
 #   DELETE=1           — удалять локальные файлы, которых уже нет на сервере
 #                        (по умолчанию выключено)
 #
@@ -17,7 +18,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 REMOTE="${FETCH_REMOTE:-root@204.13.237.94}"
 REMOTE_XFRAMES_DIR="${REMOTE_XFRAMES_DIR:-/home/poly/xframes}"
-LOCAL_XFRAMES_DIR="${LOCAL_XFRAMES_DIR:-$REPO_ROOT/xframes}"
+
+ENV_XFRAMES_DIR=""
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    [[ "$line" == XFRAMES_DIR=* ]] || continue
+    ENV_XFRAMES_DIR="${line#XFRAMES_DIR=}"
+    ENV_XFRAMES_DIR="${ENV_XFRAMES_DIR%\"}"
+    ENV_XFRAMES_DIR="${ENV_XFRAMES_DIR#\"}"
+    break
+  done < "$REPO_ROOT/.env"
+fi
+LOCAL_XFRAMES_DIR="${LOCAL_XFRAMES_DIR:-${ENV_XFRAMES_DIR:-$REPO_ROOT/xframes}}"
 
 mkdir -p "$LOCAL_XFRAMES_DIR"
 

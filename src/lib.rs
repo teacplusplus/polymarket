@@ -19,6 +19,7 @@ pub mod market_snapshot;
 pub mod migration;
 pub mod migration_graph_html;
 pub mod migration_price_to_beat;
+pub mod path_config;
 pub mod poly_chain;
 pub mod project_manager;
 pub mod real_sim;

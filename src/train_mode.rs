@@ -914,7 +914,7 @@ impl ModelType {
 /// `train_and_save` → `fit_calibration` → `fit_calibration_via_sim_replay`
 /// дёргает `Account::*`-API под `.write().await` per-field RwLock'ов.
 pub async fn run_train_mode() -> anyhow::Result<()> {
-    let xframes_root = Path::new("xframes");
+    let xframes_root = crate::path_config::xframes_root();
     if !xframes_root.exists() {
         anyhow::bail!("Папка xframes/ не найдена — сначала запустите сбор данных (STATUS=default)");
     }
@@ -923,7 +923,7 @@ pub async fn run_train_mode() -> anyhow::Result<()> {
     tee_log::init_tee_log_file(&log_path)?;
     tee_println!("[train] лог пишется в {}", log_path.display());
 
-    for currency_path in fs_read_dirs(xframes_root)? {
+    for currency_path in fs_read_dirs(&xframes_root)? {
         if !currency_path.is_dir() {
             continue;
         }

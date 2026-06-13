@@ -79,7 +79,7 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = true;
+pub const ENABLE_PNL: bool = false;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -515,7 +515,7 @@ impl CloseReason {
 
 /// Два прогона: `kelly` и `raw` ([`NO_KELLY_POSITION_SIZE_USD`]); колонка CSV `regime`; отдельный [`Account`] на режим.
 pub async fn run_sim_mode() -> anyhow::Result<()> {
-    let xframes_root = Path::new("xframes");
+    let xframes_root = crate::path_config::xframes_root();
     if !xframes_root.exists() {
         anyhow::bail!("Папка xframes/ не найдена — сначала соберите данные (STATUS=default)");
     }
@@ -542,10 +542,10 @@ pub async fn run_sim_mode() -> anyhow::Result<()> {
 
 /// Один режим `is_kelly`; свой свежий [`Account::new()`].
 async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
-    let xframes_root = Path::new("xframes");
+    let xframes_root = crate::path_config::xframes_root();
     let regime_label = if is_kelly { "kelly" } else { "raw" };
 
-    for currency_path in fs_sorted_dirs(xframes_root)? {
+    for currency_path in fs_sorted_dirs(&xframes_root)? {
         let currency = dir_name(&currency_path);
 
         for version_path in fs_sorted_dirs(&currency_path)? {

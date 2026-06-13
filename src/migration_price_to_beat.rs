@@ -70,8 +70,7 @@ pub async fn run_price_to_beat_migration(http: &reqwest::Client) -> Result<()> {
     println!("[migration_ptb] current schema_size={current_size}");
 
     for currency in crate::CURRENCIES {
-        let dump_root = Path::new("xframes")
-            .join(currency)
+        let dump_root = crate::path_config::xframes_path(currency)
             .join(format!("{current_size}"));
         if !dump_root.exists() {
             println!(

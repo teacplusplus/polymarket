@@ -595,7 +595,7 @@ pub fn run_migration() -> Result<()> {
     println!("[migration] schema_size: current={current_size} legacy(expected_old)={legacy_size}");
 
     for currency in crate::CURRENCIES {
-        let currency_root = Path::new("xframes").join(currency);
+        let currency_root = crate::path_config::xframes_path(currency);
         if !currency_root.exists() {
             println!(
                 "[migration] {currency}: каталог {} отсутствует, пропуск",

@@ -88,17 +88,13 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         }};
     }
 
-    let test_log_path = std::path::Path::new("xframes/last_live_taker_roundtrip.txt");
-    poly::tee_log::init_test_tee_log_file(test_log_path, "live_taker_roundtrip_btc_updown_5m")?;
+    let test_log_path = poly::path_config::xframes_path("last_live_taker_roundtrip.txt");
+    poly::tee_log::init_test_tee_log_file(&test_log_path, "live_taker_roundtrip_btc_updown_5m")?;
 
-    let stream_log_path = std::path::Path::new("xframes/last_stream.txt");
-    poly::tee_log::init_stream_tee_log_file(
-        stream_log_path,
-    )?;
-    let user_stream_log_path = std::path::Path::new("xframes/last_user_stream.txt");
-    poly::tee_log::init_user_stream_tee_log_file(
-        user_stream_log_path,
-    )?;
+    let stream_log_path = poly::path_config::xframes_path("last_stream.txt");
+    poly::tee_log::init_stream_tee_log_file(&stream_log_path)?;
+    let user_stream_log_path = poly::path_config::xframes_path("last_user_stream.txt");
+    poly::tee_log::init_user_stream_tee_log_file(&user_stream_log_path)?;
 
     let account = Account::new_shared();
     let country_and_ip = detect_country_and_ip(account.http.as_ref())

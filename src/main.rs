@@ -3,7 +3,7 @@ use poly::account::Account;
 use poly::project_manager::ProjectManager;
 use poly::{
     account, account_exit, account_ws, history_sim, migration, migration_graph_html,
-    migration_price_to_beat, real_sim, tee_log, trade_csv_log, train_mode, util, CURRENCIES,
+    migration_price_to_beat, path_config, real_sim, tee_log, trade_csv_log, train_mode, util, CURRENCIES,
 };
 
 /// Режим из переменной окружения `STATUS` (`.env`).
@@ -17,6 +17,8 @@ enum AppMode {
     HistorySim,
     /// Подряд Train и HistorySim (разные tee-лога).
     TrainAndHistorySim,
+    /// Подряд Train, HistorySim и RealSim (mock).
+    TrainAndHistorySimRealSim,
     /// Живой WS, виртуальные fill'ы без CLOB.
     RealSim,
     /// Живой WS + ордера на CLOB (heartbeat, user-WS, auth).
@@ -35,6 +37,7 @@ impl AppMode {
             Ok("train") => AppMode::Train,
             Ok("history_sim") => AppMode::HistorySim,
             Ok("train_and_history_sim") => AppMode::TrainAndHistorySim,
+            Ok("train_and_history_sim_real_sim") => AppMode::TrainAndHistorySimRealSim,
             Ok("real_sim") => AppMode::RealSim,
             Ok("real_sim_with_submit") => AppMode::RealSimWithSubmit,
             Ok("migrate") => AppMode::Migrate,
@@ -83,6 +86,37 @@ async fn main() -> Result<()> {
             tee_log::finish_tee_log();
             history_sim::run_sim_mode().await?;
         }
+        AppMode::TrainAndHistorySimRealSim => {
+            train_mode::run_train_mode().await?;
+            tee_log::finish_tee_log();
+            history_sim::run_sim_mode().await?;
+
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
+
+            tee_log::init_tee_log_file(
+                &path_config::xframes_path("last_real_sim.txt")
+            )?;
+            tee_log::init_sim_stats_tee_log_file(
+                &path_config::xframes_path("last_sim_stats.txt")
+            )?;
+            trade_csv_log::init_submit_trade_csv_log_file(&path_config::xframes_path(
+                "last_real_sim_submit_trades.csv",
+            ))?;
+            trade_csv_log::set_current_regime("real_sim");
+
+            for currency in CURRENCIES {
+                let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
+                real_sim::run_real_sim(
+                    project_manager,
+                    poly::account_submit::SubmitMode::Mock,
+                )
+                .await?;
+            }
+
+            std::future::pending::<()>().await;
+        }
         AppMode::Migrate => {
             migration::run_migration()?;
         }
@@ -101,7 +135,7 @@ async fn main() -> Result<()> {
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
             tee_log::init_tee_log_file(
-                std::path::Path::new("xframes/last_default.txt")
+                &path_config::xframes_path("last_default.txt")
             )?;
 
             for currency in CURRENCIES {
@@ -116,13 +150,13 @@ async fn main() -> Result<()> {
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
             tee_log::init_tee_log_file(
-                std::path::Path::new("xframes/last_real_sim.txt")
+                &path_config::xframes_path("last_real_sim.txt")
             )?;
             tee_log::init_sim_stats_tee_log_file(
-                std::path::Path::new("xframes/last_sim_stats.txt")
+                &path_config::xframes_path("last_sim_stats.txt")
             )?;
-            trade_csv_log::init_submit_trade_csv_log_file(std::path::Path::new(
-                "xframes/last_real_sim_submit_trades.csv",
+            trade_csv_log::init_submit_trade_csv_log_file(&path_config::xframes_path(
+                "last_real_sim_submit_trades.csv",
             ))?;
             trade_csv_log::set_current_regime("real_sim");
 
@@ -143,19 +177,19 @@ async fn main() -> Result<()> {
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
             tee_log::init_tee_log_file(
-                std::path::Path::new("xframes/last_real_sim_with_submit.txt")
+                &path_config::xframes_path("last_real_sim_with_submit.txt")
             )?;
             tee_log::init_stream_tee_log_file(
-                std::path::Path::new("xframes/last_stream.txt")
+                &path_config::xframes_path("last_stream.txt")
             )?;
             tee_log::init_user_stream_tee_log_file(
-                std::path::Path::new("xframes/last_user_stream.txt")
+                &path_config::xframes_path("last_user_stream.txt")
             )?;
             tee_log::init_sim_stats_tee_log_file(
-                std::path::Path::new("xframes/last_sim_stats.txt")
+                &path_config::xframes_path("last_sim_stats.txt")
             )?;
-            trade_csv_log::init_submit_trade_csv_log_file(std::path::Path::new(
-                "xframes/last_real_sim_with_submit_trades.csv",
+            trade_csv_log::init_submit_trade_csv_log_file(&path_config::xframes_path(
+                "last_real_sim_with_submit_trades.csv",
             ))?;
             trade_csv_log::set_current_regime("real_sim_with_submit");
 

@@ -780,17 +780,13 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
 
     let wall_anchor = Arc::new(t0);
 
-    let test_log_path = std::path::Path::new("xframes/last_live_duel_maker_race.txt");
-    poly::tee_log::init_test_tee_log_file(test_log_path, "live_duel_up_down_maker_race_tp10")?;
+    let test_log_path = poly::path_config::xframes_path("last_live_duel_maker_race.txt");
+    poly::tee_log::init_test_tee_log_file(&test_log_path, "live_duel_up_down_maker_race_tp10")?;
 
-    let stream_log_path = std::path::Path::new("xframes/last_stream.txt");
-    poly::tee_log::init_stream_tee_log_file(
-        stream_log_path,
-    )?;
-    let user_stream_log_path = std::path::Path::new("xframes/last_user_stream.txt");
-    poly::tee_log::init_user_stream_tee_log_file(
-        user_stream_log_path,
-    )?;
+    let stream_log_path = poly::path_config::xframes_path("last_stream.txt");
+    poly::tee_log::init_stream_tee_log_file(&stream_log_path)?;
+    let user_stream_log_path = poly::path_config::xframes_path("last_user_stream.txt");
+    poly::tee_log::init_user_stream_tee_log_file(&user_stream_log_path)?;
     let (dt, wall) = evt_ms!(last_evt, t0);
     poly::test_tee_println!(
         "[от старта {wall} ms | с прошлого {dt} ms] live_duel ноги Up+Down: `[order_invoke/...]` tee → {}; `[user_ws]` tee → {}",

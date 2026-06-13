@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// Точка входа (`STATUS=migrate_graph_html`).
 pub fn run_graph_html_migration() -> Result<()> {
-    let root = Path::new("xframes");
+    let root = crate::path_config::xframes_root();
     if !root.exists() {
         println!(
             "[migration_graph_html] каталог {} отсутствует — нечего делать",

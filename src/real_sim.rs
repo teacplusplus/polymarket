@@ -975,7 +975,7 @@ fn is_ws_lagging(book: &StrictBook, frame: &XFrame<SIZE>) -> bool {
 }
 
 fn latest_version_path(currency: &str) -> Option<PathBuf> {
-    let base = Path::new("xframes").join(currency);
+    let base = crate::path_config::xframes_path(currency);
     let mut versions: Vec<(usize, PathBuf)> = std::fs::read_dir(&base)
         .ok()?
         .filter_map(|e| e.ok())

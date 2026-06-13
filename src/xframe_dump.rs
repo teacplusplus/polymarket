@@ -176,8 +176,7 @@ pub async fn dump_market_xframes_binary_lane(
     let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
 
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let base: PathBuf = Path::new("xframes")
-        .join(project_manager.currency.as_str())
+    let base: PathBuf = crate::path_config::xframes_path(project_manager.currency.as_str())
         .join(format!("{schema_size}"))
         .join(interval_label)
         .join(format!("{step_secs}s"))
@@ -229,8 +228,7 @@ pub(crate) fn synthetic_xframes_dump_bin_path_for_csv_link(
     let ts_suffix = event_end_ms.unwrap_or_else(current_timestamp_ms);
     let fname = format!("{stem}__{ts_suffix}.bin");
     Some(
-        Path::new("xframes")
-            .join(currency)
+        crate::path_config::xframes_path(currency)
             .join(format!("{schema_size}"))
             .join(interval_label)
             .join(format!("{step_secs}s"))
