@@ -349,11 +349,13 @@ fn collect_dump_files_with_window(
             if !step_path.is_dir() {
                 continue;
             }
-            for date_entry in fs::read_dir(&step_path)?.flatten() {
-                let date_path = date_entry.path();
-                if !date_path.is_dir() {
-                    continue;
-                }
+            let date_paths = crate::path_config::last_xframes_date_dirs(
+                fs::read_dir(&step_path)?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .collect::<Vec<_>>(),
+            );
+            for date_path in date_paths {
                 for file_entry in fs::read_dir(&date_path)?.flatten() {
                     let file_path = file_entry.path();
                     if !file_path.is_file() {

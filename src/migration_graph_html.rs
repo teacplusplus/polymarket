@@ -146,14 +146,14 @@ fn collect_bin_files_under_currency(cur_root: &Path) -> Result<Vec<(PathBuf, XFr
                 if !step_path.is_dir() {
                     continue;
                 }
-                for date_entry in fs::read_dir(&step_path)
-                    .with_context(|| step_path.display().to_string())?
-                    .flatten()
-                {
-                    let date_path = date_entry.path();
-                    if !date_path.is_dir() {
-                        continue;
-                    }
+                let date_paths = crate::path_config::last_xframes_date_dirs(
+                    fs::read_dir(&step_path)
+                        .with_context(|| step_path.display().to_string())?
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .collect::<Vec<_>>(),
+                );
+                for date_path in date_paths {
                     for file_entry in fs::read_dir(&date_path)
                         .with_context(|| date_path.display().to_string())?
                         .flatten()

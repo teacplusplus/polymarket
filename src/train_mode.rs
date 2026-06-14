@@ -1235,10 +1235,10 @@ pub fn collect_bin_paths(step_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
     if !step_path.is_dir() {
         return Ok(paths);
     }
-    for date_path in fs_read_dirs(step_path)? {
-        if !date_path.is_dir() {
-            continue;
-        }
+
+    let date_paths = crate::path_config::last_xframes_date_dirs(fs_read_dirs(step_path)?);
+
+    for date_path in date_paths {
         for file_path in fs_read_dirs(&date_path)? {
             if file_path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
                 paths.push(file_path);
