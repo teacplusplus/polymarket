@@ -80,11 +80,16 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = true;
+pub const ENABLE_PNL: bool = false;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
 pub const REDEEM_01: bool = true;
+
+const REDEEM_01_TAIL_MIN_PROB: f64 = 0.01;
+const REDEEM_01_TAIL_MAX_PROB: f64 = 0.10;
+const REDEEM_01_TAIL_TARGET_REMAINING_MS: i64 = 30 * 1000;
+const REDEEM_01_TAIL_REMAINING_TOLERANCE_MS: i64 = 2_500;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -172,8 +177,13 @@ pub(crate) fn effective_buy_usdc_strict(book: &StrictBook, position_size: f64) -
     }
 }
 
-/// Покупка по HTTP asks: полный fill `position_size`, cap от L1 ask, опционально `min_order_size`.
-pub(crate) fn book_fill_buy_strict(book: &StrictBook, position_size: f64) -> Option<(f64, f64)> {
+/// Покупка по HTTP asks: полный fill `position_size`, опциональный cap VWAP от L1 ask,
+/// опционально `min_order_size`.
+pub(crate) fn book_fill_buy_strict(
+    book: &StrictBook,
+    position_size: f64,
+    slippage_cap: Option<f64>,
+) -> Option<(f64, f64)> {
     if position_size <= 0.0 {
         return None;
     }
@@ -202,8 +212,10 @@ pub(crate) fn book_fill_buy_strict(book: &StrictBook, position_size: f64) -> Opt
         return None;
     }
     let vwap = position_size / total_shares;
-    if (vwap - best_ask) / best_ask > SIM_MAX_SLIPPAGE_FROM_L1_PCT {
-        return None;
+    if let Some(cap) = slippage_cap {
+        if (vwap - best_ask) / best_ask > cap {
+            return None;
+        }
     }
     if let Some(min) = book.min_order_size {
         if total_shares < min {
@@ -615,6 +627,7 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     && booster_down.is_none()
                     && booster_resolution_up.is_none()
                     && booster_resolution_down.is_none()
+                    && !REDEEM_01
                 {
                     tee_println!("[sim] {tag}: ни одной модели (pnl/resolution) не найдено, пропуск");
                     continue;
@@ -1167,12 +1180,15 @@ pub(crate) fn buy_gate(
         }
     }
 
-    if REDEEM_01 {     
+    if REDEEM_01 {
+        let Some(size) = redeem_01_tail_entry_size(frame, strict_book, entry_prob, bankroll) else {
+            return pnl_decision;
+        };
         return BuyGate::Proceed {
             raw: 0.0,
             pred: 0.0,
             kelly_f: 0.0,
-            size: 1.0,
+            size,
             opened_in_hold_zone: false,
             redeem_01: true,
         };
@@ -1180,6 +1196,91 @@ pub(crate) fn buy_gate(
 
     // Оба канала не дали Proceed — возвращаем skip-причину PnL (приоритетного).
     pnl_decision
+}
+
+fn redeem_01_tail_entry_size(
+    frame: &XFrame<SIZE>,
+    strict_book: Option<&StrictBook>,
+    entry_prob: f64,
+    bankroll: f64,
+) -> Option<f64> {
+    if (frame.event_remaining_ms - REDEEM_01_TAIL_TARGET_REMAINING_MS).abs()
+        > REDEEM_01_TAIL_REMAINING_TOLERANCE_MS
+    {
+        return None;
+    }
+
+    let interval_kind = XFrameIntervalKind::from_i32(frame.xframe_interval_type)?;
+    let (budget_usdc, primary_price_cap, fallback_price_cap) =
+        redeem_01_tail_budget_and_price_cap(interval_kind, entry_prob)?;
+
+    let asks = strict_book
+        .map(|book| book.asks.as_slice())
+        .or_else(|| frame.book_asks.as_deref());
+    let book_limited_size = match asks {
+        Some(asks) => {
+            let primary_liquidity = ask_notional_up_to_price_cap(asks, primary_price_cap);
+            let price_cap = if primary_liquidity < budget_usdc {
+                fallback_price_cap.unwrap_or(primary_price_cap)
+            } else {
+                primary_price_cap
+            };
+            let available_usdc = ask_notional_up_to_price_cap(asks, price_cap);
+            if available_usdc < MIN_POSITION_USD {
+                return None;
+            }
+            budget_usdc.min(available_usdc)
+        }
+        None => budget_usdc,
+    };
+
+    let size = book_limited_size.min(bankroll).max(0.0);
+    if size < MIN_POSITION_USD {
+        None
+    } else {
+        Some(size)
+    }
+}
+
+fn redeem_01_tail_budget_and_price_cap(
+    interval_kind: XFrameIntervalKind,
+    entry_prob: f64,
+) -> Option<(f64, f64, Option<f64>)> {
+    if !entry_prob.is_finite()
+        || !(REDEEM_01_TAIL_MIN_PROB..=REDEEM_01_TAIL_MAX_PROB).contains(&entry_prob)
+    {
+        return None;
+    }
+
+    match interval_kind {
+        XFrameIntervalKind::FiveMin if entry_prob <= 0.02 => Some((25.0, 0.02, Some(0.05))),
+        XFrameIntervalKind::FiveMin if entry_prob <= 0.05 => Some((25.0, 0.05, None)),
+        XFrameIntervalKind::FiveMin => Some((10.0, 0.10, None)),
+        XFrameIntervalKind::FifteenMin if entry_prob <= 0.02 => Some((10.0, 0.02, None)),
+        XFrameIntervalKind::FifteenMin if entry_prob <= 0.05 => Some((5.0, 0.05, None)),
+        XFrameIntervalKind::FifteenMin => None,
+    }
+}
+
+fn ask_notional_up_to_price_cap(asks: &[BookLevel], price_cap: f64) -> f64 {
+    if !price_cap.is_finite() || price_cap <= 0.0 {
+        return 0.0;
+    }
+    let mut usdc = 0.0;
+    for level in asks {
+        if !level.price.is_finite()
+            || !level.size.is_finite()
+            || level.price <= 0.0
+            || level.size <= 0.0
+        {
+            continue;
+        }
+        if level.price > price_cap {
+            break;
+        }
+        usdc += level.price * level.size;
+    }
+    usdc
 }
 
 /// Оценка одного канала входа (PnL или Resolution): порог, no-trade-zone,
@@ -1294,6 +1395,8 @@ fn buy_gate_for_channel(
 ///   - [`MAX_OPEN_POSITIONS`] — суммарный count по **всем** lane'ам как в
 ///     live, так и в pending-close. Лимит интерпретируется как глобальный
 ///     потолок одновременно открытых позиций процесса.
+///   - [`OpenPosition::redeem_01`] — не открываем вторую redeem-01 позицию,
+///     пока любая redeem-01 позиция уже есть в live или pending-close bucket'ах.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_open_position(
     frame: &XFrame<SIZE>,
@@ -1401,6 +1504,48 @@ pub(crate) async fn try_open_position(
                 }
                 if same_asset_open {
                     stats.same_asset_open_skips += 1;
+                    return false;
+                }
+            }
+            if redeem_01 {
+                let mut redeem_01_open = false;
+                let mut same_asset_open = false;
+                for lane_positions in positions_by_lane.values() {
+                    for p in lane_positions.values() {
+                        let pos = p.read().await;
+                        if pos.asset_id.as_str() == frame.asset_id.as_str() {
+                            same_asset_open = true;
+                        }
+                        if pos.redeem_01 {
+                            redeem_01_open = true;
+                        }
+                        if redeem_01_open && same_asset_open {
+                            break;
+                        }
+                    }
+                }
+                if !redeem_01_open && !same_asset_open {
+                    for lane_pending in pending_close_by_lane.values() {
+                        for p in lane_pending.values() {
+                            let pos = p.read().await;
+                            if pos.asset_id.as_str() == frame.asset_id.as_str() {
+                                same_asset_open = true;
+                            }
+                            if pos.redeem_01 {
+                                redeem_01_open = true;
+                            }
+                            if redeem_01_open && same_asset_open {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if same_asset_open {
+                    stats.same_asset_open_skips += 1;
+                    return false;
+                }
+                if redeem_01_open {
+                    stats.max_open_positions_skips += 1;
                     return false;
                 }
             }
@@ -1929,9 +2074,14 @@ fn open_position(
         Some(book) => effective_buy_usdc_strict(book, position_size),
         None => position_size,
     };
+    let buy_slippage_cap = if redeem_01 {
+        None
+    } else {
+        Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
+    };
     let (buy_price, nominal_shares) = match strict_book {
-        Some(book) => book_fill_buy_strict(book, effective_size)?,
-        None => book_fill_buy(frame, position_size, Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT))?,
+        Some(book) => book_fill_buy_strict(book, effective_size, buy_slippage_cap)?,
+        None => book_fill_buy(frame, position_size, buy_slippage_cap)?,
     };
     if nominal_shares <= 0.0 {
         return None;
