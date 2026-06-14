@@ -8,7 +8,7 @@ use crate::history_sim::{
 use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager, XFRAMES_LANE_1S};
 use crate::util::sanitized_filename_from_gamma_question;
 use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
-use crate::xframe_dump::MarketXFramesDump;
+use crate::xframe_dump::{MarketXFramesDump, canonical_dump_event_end_ms};
 use anyhow::Context as _;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -572,6 +572,7 @@ pub async fn dump_market_graph_html_lane(
         .join(&date);
     tokio::fs::create_dir_all(&base).await?;
 
+    let event_end_ms = canonical_dump_event_end_ms(interval_kind, event_end_ms);
     let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
     let fname = format!("{stem}__{event_end_ms}.html");
     let path = base.join(&fname);

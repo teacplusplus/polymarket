@@ -8,8 +8,10 @@ use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt as _;
 
 /// Писать WS-стрим в `streams/...` после дампа xframes ([`dump_market_ws_stream_txt`]).
 const DUMP_MARKET_WS_STREAM_TXT: bool = false;
@@ -32,6 +34,14 @@ impl MarketXFramesDump {
     pub fn up_won(&self) -> bool {
         self.final_price >= self.price_to_beat
     }
+}
+
+pub(crate) fn canonical_dump_event_end_ms(
+    interval_kind: XFrameIntervalKind,
+    event_end_ms: i64,
+) -> i64 {
+    let interval_ms = interval_kind.interval_ms();
+    event_end_ms.div_euclid(interval_ms) * interval_ms
 }
 
 /// Асинхронно пишет дамп **каждого лейна** в `xframes/{currency}/{count_features}/{interval}/{step}s/{YYYY-MM-DD}/{name}.bin`,
@@ -183,12 +193,35 @@ pub async fn dump_market_xframes_binary_lane(
         .join(&date);
     tokio::fs::create_dir_all(&base).await?;
 
+    let raw_event_end_ms = event_end_ms;
+    let interval_ms = interval_kind.interval_ms();
+    let event_end_ms = canonical_dump_event_end_ms(interval_kind, raw_event_end_ms);
+    if event_end_ms != raw_event_end_ms {
+        eprintln!(
+            "xframe_dump: market_id={market_id}: normalized event_end_ms \
+             raw={raw_event_end_ms} -> canonical={event_end_ms} \
+             interval_ms={interval_ms}"
+        );
+    }
+
     let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
     let fname = format!("{stem}__{event_end_ms}.bin");
     let path = base.join(&fname);
     let bytes = bincode::serialize(&dump)?;
     let byte_len = bytes.len();
-    tokio::fs::write(&path, bytes).await?;
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            panic!("xframe_dump: duplicate dump path: {}", path.display());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    file.write_all(&bytes).await?;
     run_log::xframe_dump_written(&path, &market_id, frame_count, byte_len);
     Ok(())
 }
@@ -225,7 +258,9 @@ pub(crate) fn synthetic_xframes_dump_bin_path_for_csv_link(
     let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
     let step_secs = *FRAME_BUILD_INTERVALS_SEC.first().unwrap_or(&1);
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let ts_suffix = event_end_ms.unwrap_or_else(current_timestamp_ms);
+    let ts_suffix = event_end_ms
+        .map(|ms| canonical_dump_event_end_ms(interval_kind, ms))
+        .unwrap_or_else(current_timestamp_ms);
     let fname = format!("{stem}__{ts_suffix}.bin");
     Some(
         crate::path_config::xframes_path(currency)

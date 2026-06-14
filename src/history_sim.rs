@@ -1112,7 +1112,7 @@ pub enum BuyGate {
         pred: f32,
         kelly_f: f64,
         size: f64,
-        opened_in_hold_zone: bool,     
+        opened_in_hold_zone: bool,
         redeem_01: bool,
     },
 }
@@ -1509,40 +1509,25 @@ pub(crate) async fn try_open_position(
             }
             if redeem_01 {
                 let mut redeem_01_open = false;
-                let mut same_asset_open = false;
                 for lane_positions in positions_by_lane.values() {
                     for p in lane_positions.values() {
                         let pos = p.read().await;
-                        if pos.asset_id.as_str() == frame.asset_id.as_str() {
-                            same_asset_open = true;
-                        }
-                        if pos.redeem_01 {
+                        if pos.asset_id.as_str() == frame.asset_id.as_str() && pos.redeem_01 {
                             redeem_01_open = true;
-                        }
-                        if redeem_01_open && same_asset_open {
                             break;
                         }
                     }
                 }
-                if !redeem_01_open && !same_asset_open {
+                if !redeem_01_open {
                     for lane_pending in pending_close_by_lane.values() {
                         for p in lane_pending.values() {
                             let pos = p.read().await;
-                            if pos.asset_id.as_str() == frame.asset_id.as_str() {
-                                same_asset_open = true;
-                            }
-                            if pos.redeem_01 {
+                            if pos.asset_id.as_str() == frame.asset_id.as_str() && pos.redeem_01 {
                                 redeem_01_open = true;
-                            }
-                            if redeem_01_open && same_asset_open {
                                 break;
                             }
                         }
                     }
-                }
-                if same_asset_open {
-                    stats.same_asset_open_skips += 1;
-                    return false;
                 }
                 if redeem_01_open {
                     stats.max_open_positions_skips += 1;
@@ -1961,7 +1946,7 @@ pub(crate) async fn manage_positions(
                     strict_book.cloned(),
                     submit_mode,
                 );
-            }         
+            }
         } else {
             remaining.insert(pos_id, pos_arc);
         }
