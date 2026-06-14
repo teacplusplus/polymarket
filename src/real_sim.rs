@@ -5,7 +5,7 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, StrictBook, any_position_would_sell, buy_gate,
+    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, REDEEM_01, StrictBook, any_position_would_sell, buy_gate,
     compute_pnl_inference, compute_resolution_inference, load_booster, manage_positions,
     try_open_position,
 };
@@ -1015,7 +1015,7 @@ fn load_side_models(version_path: &Path, interval: &str, side: &str) -> Option<S
         (None, None)
     };
 
-    if booster_pnl.is_none() && booster_resolution.is_none() {
+    if booster_pnl.is_none() && booster_resolution.is_none() && !REDEEM_01 {
         return None;
     }
     Some(SideModels {

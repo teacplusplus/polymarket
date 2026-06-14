@@ -82,11 +82,9 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
 pub const ENABLE_PNL: bool = true;
 
-/// Глобальный тумблер redeem-компенсации при SL/Timeout: вместо taker-SELL
-/// покупаем обратный токен на `position_size` (виртуально) / фактический
-/// entry-cost (submit) и ждём резолюцию обеих ног. См. [`CloseReason::StopLossRedeem`]
-/// / [`CloseReason::TimeoutRedeem`], [`OpenPosition::redeem`].
-pub const REDEEM: bool = true;
+/// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
+/// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
+pub const REDEEM_01: bool = true;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -320,6 +318,10 @@ pub struct OpenPosition {
     /// **включая** кадры внутри hold-zone, где PnL получает приоритет. BUY-ордер
     /// в обоих случаях одинаковый — taker FAK с slippage cap.
     pub(crate) opened_in_hold_zone: bool,
+    /// `true` — hold-to-resolution без TP/SL/Timeout ([`sell_gate`] всегда
+    /// [`SellGate::Hold`]); maker TP в [`crate::account_submit::spawn_open_buy`] не
+    /// выставляется. Позиция закрывается только по резолюции рынка.
+    pub(crate) redeem_01: bool,
     /// CSV: raw pred на входе.
     pub(crate) raw_pred_at_open: f32,
     /// CSV: calibrated pred на входе.
@@ -1097,7 +1099,8 @@ pub enum BuyGate {
         pred: f32,
         kelly_f: f64,
         size: f64,
-        opened_in_hold_zone: bool,
+        opened_in_hold_zone: bool,     
+        redeem_01: bool,
     },
 }
 
@@ -1111,7 +1114,8 @@ pub enum BuyGate {
 /// оцениваем Resolution-канал ([`compute_resolution_inference`]) как fallback:
 /// если PnL не дал `Proceed`, но Resolution дал — открываем Resolution-позицию
 /// (`opened_in_hold_zone=true`, hold-to-resolution, $1/шер payout). Если оба
-/// не дали `Proceed` — возвращаем диагностику PnL (приоритетного канала).
+/// не дали `Proceed` и [`REDEEM_01`] — открываем redeem-01 позицию без ML.
+/// Иначе — диагностика PnL (приоритетного канала).
 /// BUY-ордер на CLOB в обоих каналах одинаковый: taker FAK с slippage cap.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn buy_gate(
@@ -1161,6 +1165,17 @@ pub(crate) fn buy_gate(
         if matches!(res_decision, BuyGate::Proceed { .. }) {
             return res_decision;
         }
+    }
+
+    if REDEEM_01 {     
+        return BuyGate::Proceed {
+            raw: 0.0,
+            pred: 0.0,
+            kelly_f: 0.0,
+            size: 1.0,
+            opened_in_hold_zone: false,
+            redeem_01: true,
+        };
     }
 
     // Оба канала не дали Proceed — возвращаем skip-причину PnL (приоритетного).
@@ -1239,6 +1254,7 @@ fn buy_gate_for_channel(
             kelly_f,
             size,
             opened_in_hold_zone,
+            redeem_01: false,
         };
     }
 
@@ -1257,6 +1273,7 @@ fn buy_gate_for_channel(
         kelly_f,
         size,
         opened_in_hold_zone,
+        redeem_01: false,
     }
 }
 
@@ -1354,7 +1371,14 @@ pub(crate) async fn try_open_position(
             stats.no_edge_skips += 1;
             false
         }
-        BuyGate::Proceed { raw, pred, kelly_f, size, opened_in_hold_zone } => {
+        BuyGate::Proceed {
+            raw,
+            pred,
+            kelly_f,
+            size,
+            opened_in_hold_zone,
+            redeem_01,
+        } => {
             if BLOCK_SAME_ASSET_OPEN {
                 let mut same_asset_open = false;
                 if let Some(lane_positions) = positions_by_lane.get(lane_key) {
@@ -1417,6 +1441,7 @@ pub(crate) async fn try_open_position(
                 pred,
                 kelly_f,
                 opened_in_hold_zone,
+                redeem_01,
                 currency,
                 polymarket_url,
                 price_to_beat,
@@ -1447,8 +1472,8 @@ pub(crate) async fn try_open_position(
                         project_manager.cloned(),
                         pos_arc,
                         decision_price,
-                        Some(0.3),
-                        Some(5),
+                        None,
+                        None,
                         decision_book,
                         submit_mode,
                     );
@@ -1514,6 +1539,7 @@ fn stop_loss_sell_deteriorated_vs_entry_ref(pos: &OpenPosition, urgent_sell_vwap
 /// Для позиций с [`OpenPosition::opened_in_hold_zone`]=true действует
 /// «hold-to-resolution» режим: TP/Timeout off, проверяется только SL —
 /// иначе ждём резолюцию рынка ([`crate::account::Account::resolve_pending_market_sync`]).
+/// Для [`OpenPosition::redeem_01`]=true — только [`SellGate::Hold`] (без SL/TP/Timeout).
 /// Для остальных — классический TP/SL/Timeout даже после того, как кадр
 /// зашёл в hold-zone.
 pub(crate) fn sell_gate(
@@ -1536,6 +1562,10 @@ pub(crate) fn sell_gate(
         if frames_held < min_frames {
             return SellGate::Hold;
         }
+    }
+
+    if pos.redeem_01 {
+        return SellGate::Hold;
     }
 
     if pos.opened_in_hold_zone {
@@ -1885,6 +1915,7 @@ fn open_position(
     cal_pred_at_open: f32,
     kelly_f_at_open: f64,
     opened_in_hold_zone: bool,
+    redeem_01: bool,
     currency: &str,
     polymarket_url: &str,
     price_to_beat: Option<f64>,
@@ -1941,6 +1972,7 @@ fn open_position(
         best_bid_at_entry,
         frames_held: 0,
         opened_in_hold_zone,
+        redeem_01,
         raw_pred_at_open,
         cal_pred_at_open,
         kelly_f_at_open,

@@ -612,6 +612,7 @@ pub(crate) fn spawn_open_buy(
             interval_kind,
             side,
             opened_in_hold_zone,
+            redeem_01,
         ) = {
             let p = position.read().await;
             (
@@ -624,6 +625,7 @@ pub(crate) fn spawn_open_buy(
                 crate::constants::XFrameIntervalKind::from_i32(p.xframe_interval_type_at_open),
                 CurrencyUpDownOutcome::from_i32(p.currency_up_down_outcome_at_open),
                 p.opened_in_hold_zone,
+                p.redeem_01,
             )
         };
 
@@ -703,8 +705,7 @@ pub(crate) fn spawn_open_buy(
                     drain_position_from_account().await;
                     return;
                 }
-                if let Some(min_order_size) = min_order_size_shares
-                    && shares_floor + 1e-9 < min_order_size
+                if let Some(min_order_size) = min_order_size_shares && shares_floor + 1e-9 < min_order_size
                 {
                     crate::tee_eprintln!(
                         "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor:.4} < \
@@ -1039,6 +1040,8 @@ pub(crate) fn spawn_open_buy(
             });
         }
 
+        
+
         let Some(min_order_size) = min_order_size_shares else {
             crate::tee_eprintln!(
                 "[submit] maker TP pos_id={pos_id}: нет min_order_size в strict_book — пропуск maker",
@@ -1052,12 +1055,19 @@ pub(crate) fn spawn_open_buy(
             );
             return;
         }
-        if opened_in_hold_zone {
+        if opened_in_hold_zone || redeem_01 {
             crate::tee_println!(
-                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: resolution-channel entry (hold-to-resolution) — maker TP не выставляем",
+                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: \
+                 {} — maker TP не выставляем",
+                if redeem_01 {
+                    "redeem_01 (hold-to-resolution)"
+                } else {
+                    "resolution-channel entry (hold-to-resolution)"
+                },
             );
             return;
         }
+
         let maker_price = (implied_buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
         crate::tee_println!(
             "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: NET shares {shares_net:.6} → floor {shares_floor:.2}; \
