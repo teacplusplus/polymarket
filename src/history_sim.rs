@@ -15,9 +15,10 @@ use crate::train_mode::{
     Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
 };
 use crate::xframe::{
-    BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN_NO_TRADE_PROB_LOW,
-    Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB, Y_TRAIN_RESOLUTION_STOP_LOSS_PP,
-    Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP, apply_side_symmetry,
+    BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH,
+    Y_TRAIN_NO_TRADE_PROB_LOW, Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB,
+    Y_TRAIN_RESOLUTION_STOP_LOSS_PP, Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP,
+    apply_side_symmetry,
 };
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println, tee_progress};
@@ -79,7 +80,13 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = false;
+pub const ENABLE_PNL: bool = true;
+
+/// Глобальный тумблер redeem-компенсации при SL/Timeout: вместо taker-SELL
+/// покупаем обратный токен на `position_size` (виртуально) / фактический
+/// entry-cost (submit) и ждём резолюцию обеих ног. См. [`CloseReason::StopLossRedeem`]
+/// / [`CloseReason::TimeoutRedeem`], [`OpenPosition::redeem`].
+pub const REDEEM: bool = true;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -278,7 +285,7 @@ pub struct OpenPosition {
     /// Фактически купленные шеры (after fee). В backtest = `planned_shares_held`
     /// (виртуальный fill). В submit: при создании = `planned_shares_held`; после
     /// успешного `buy_rep` обновляется на `buy_rep.taking_amount`
-    /// ([`crate::account_submit::spawn_open_buy_taker`]).
+    /// ([`crate::account_submit::spawn_open_buy`]).
     pub(crate) shares_held: f64,
     /// План шер: расчётное от Kelly/SIM_*. Никогда не меняется после создания.
     pub(crate) planned_shares_held: f64,
@@ -307,7 +314,7 @@ pub struct OpenPosition {
     /// Resolution-`Proceed` как fallback после того, как PnL-канал не сработал;
     /// возможно только внутри hold-zone). Для такой позиции в [`sell_gate`]
     /// TP/Timeout отключены — выход только по SL или резолюции; maker TP в
-    /// [`crate::account_submit::spawn_open_buy_taker`] не выставляется.
+    /// [`crate::account_submit::spawn_open_buy`] не выставляется.
     /// Калибровочные точки идут в [`crate::sim_stats::SideStats::closed_resolution_trade_entries`].
     /// `false` — PnL-канал (TP/SL/Timeout) на любом диапазоне рынка,
     /// **включая** кадры внутри hold-zone, где PnL получает приоритет. BUY-ордер
@@ -352,7 +359,7 @@ pub struct OpenPosition {
     /// Идемпотентность [`crate::account_close_position::close_position_after_submit`]:
     /// взводится в `true` при первом входе (под `position.write().await`) и блокирует
     /// повторные вызовы (CSV/SideStats/bankroll/graph должны записаться ровно один раз).
-    /// Maker-TP callback в [`crate::account_submit::spawn_open_buy_taker`] и taker-FAK
+    /// Maker-TP callback в [`crate::account_submit::spawn_open_buy`] и taker-FAK
     /// callback в [`crate::account_submit::spawn_sell_taker`] могут гоняться за один и
     /// тот же fully-closed PNL — флаг гарантирует, что финализирует только победитель.
     pub(crate) close_after_submit_finalized: bool,
@@ -360,7 +367,7 @@ pub struct OpenPosition {
     /// [`crate::sim_stats::SideStats::fees_paid`] лейна. В backtest (`SubmitMode::None`)
     /// = [`Self::planned_fee_usdc`] (виртуальный fill идентичен плану). При первом
     /// создании позиции (real_sim) — тоже план; после settle BUY
-    /// [`crate::account_submit::spawn_open_buy_taker`] заменяет его на actual из
+    /// [`crate::account_submit::spawn_open_buy`] заменяет его на actual из
     /// mock/CLOB-fill (через
     /// [`crate::account_order::SingleOrderClobInvocationReport::fee_paid_usdc`]):
     /// `delta = actual − stored` → правка `stats.fees_paid`, новое значение
@@ -1435,11 +1442,13 @@ pub(crate) async fn try_open_position(
                         .entry(lane_key.clone())
                         .or_default()
                         .insert(pos_id, pos_arc.clone());
-                    crate::account_submit::spawn_open_buy_taker(
+                    crate::account_submit::spawn_open_buy(
                         account.clone(),
                         project_manager.cloned(),
                         pos_arc,
                         decision_price,
+                        Some(0.3),
+                        Some(5),
                         decision_book,
                         submit_mode,
                     );

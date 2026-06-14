@@ -26,11 +26,12 @@ use crate::history_sim::{
 };
 use crate::project_manager::ProjectManager;
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
+use chrono::{DateTime, Utc};
 use polymarket_client_sdk::clob::types::Side;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Способ исполнения CLOB-ордеров [`spawn_open_buy_taker`] / [`spawn_sell_taker`] /
+/// Способ исполнения CLOB-ордеров [`spawn_open_buy`] / [`spawn_sell_taker`] /
 /// [`spawn_cancel_order`]. При `None` `spawn_*` выходит ранним return; в
 /// [`crate::real_sim::tick_once`] также отключает submit-window-гейт.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +49,7 @@ pub enum SubmitMode {
 /// Один REST/SUBMIT timeout — также для [`crate::account_order_completion`] и invoke-poll (через дубль константы там).
 pub(crate) const ORDER_HTTP_TIMEOUT_SEC: u64 = 10;
 /// CLOB-lot Polymarket = 0.01 share. После успешного SELL-fill (maker-TP `resting → fill`
-/// в [`spawn_open_buy_taker`] или taker-FAK SELL в [`spawn_sell_taker`]) остаток
+/// в [`spawn_open_buy`] или taker-FAK SELL в [`spawn_sell_taker`]) остаток
 /// `shares_remaining_to_sell < lot` означает, что позиция фактически закрыта (на
 /// CLOB больше нечего продавать), и pnl/SideStats/CSV/graph можно финализировать
 /// через [`crate::account_close_position::close_position_after_sell`].
@@ -67,7 +68,7 @@ pub(crate) const TAKER_SELL_ATTEMPTS: u32 = 10;
 /// наступил — `break` цикл, ретраи бессмысленны.
 pub(crate) const TAKER_SELL_RETRY_SLEEP_MS: u64 = 1_000;
 /// Отсрочка отложенной post-market-end финализации, спавнящейся из
-/// [`spawn_open_buy_taker`] сразу после успешного BUY: через
+/// [`spawn_open_buy`] сразу после успешного BUY: через
 /// `event_end_ms + POST_MARKET_END_RESOLUTION_DELAY_MS` проверяем
 /// `shares_remaining_to_sell`, и если на счёте ещё есть остаток
 /// (`> CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE`) — финализируем PNL/CSV
@@ -79,7 +80,7 @@ pub(crate) const TAKER_SELL_RETRY_SLEEP_MS: u64 = 1_000;
 /// `OpenPosition::close_after_submit_finalized`.
 pub(crate) const POST_MARKET_END_RESOLUTION_DELAY_MS: u64 = 5_000;
 /// Диспатч `post_order_on_clob` по [`SubmitMode`]: единая точка ветвления real↦mock, чтобы
-/// тело `spawn_open_buy_taker` / `spawn_sell_taker` не дублировало `match`. `None` не ожидается —
+/// тело `spawn_open_buy` / `spawn_sell_taker` не дублировало `match`. `None` не ожидается —
 /// `spawn_*` уже выходит ранним return при `submit_mode == SubmitMode::None`.
 async fn post_order_on_clob(
     account: &SharedAccount,
@@ -387,7 +388,7 @@ pub(crate) fn spawn_sell_taker(
                 // 1-я попытка и `taker_positions` был пуст до спавна → продавать
                 // нечего и история taker SELL'ов отсутствует, т.е. остаток ≈ 0
                 // дало уже maker TP (PNL финализируется в его собственном
-                // callback'е в `spawn_open_buy_taker`). Никакого taker'а в этом
+                // callback'е в `spawn_open_buy`). Никакого taker'а в этом
                 // спавне не было — PNL-callback ниже звать не надо, выходим
                 // полностью.
                 if attempt == 1 && position_snapshot.taker_positions.is_empty() {
@@ -539,7 +540,7 @@ pub(crate) fn spawn_sell_taker(
             return;
         }
         // Если маркет уже закрылся — не финализируем здесь: post-market-end
-        // resolution-таск (заспавненный из `spawn_open_buy_taker`) сам решит,
+        // resolution-таск (заспавненный из `spawn_open_buy`) сам решит,
         // нужно ли закрыть с residual'ом, или другая ветка уже взяла идемпотентный
         // флаг. Гонка между last-second taker fill и post-market resolution
         // защищена `close_after_submit_finalized`, но семантически чище после
@@ -566,11 +567,18 @@ pub(crate) fn spawn_sell_taker(
 }
 
 
-pub(crate) fn spawn_open_buy_taker(
+/// Открытие позиции на CLOB: taker-FAK или maker-GTD.
+///
+/// * `delta_price = None` — taker BUY по `planned_entry_cost` (cap `price`, как раньше).
+/// * `delta_price = Some(delta)` — maker limit BUY по `price + delta`, GTD
+///   `maker_gtd_sec` секунд; размер в shares из `amount / limit_price`.
+pub(crate) fn spawn_open_buy(
     account: SharedAccount,
     project_manager: Option<Arc<ProjectManager>>,
     position: SharedOpenPosition,
     price: Option<f64>,
+    delta_price: Option<f64>,
+    maker_gtd_sec: Option<u64>,
     strict_book: Option<StrictBook>,
     submit_mode: SubmitMode,
 ) {
@@ -578,10 +586,16 @@ pub(crate) fn spawn_open_buy_taker(
         return;
     }
     tokio::spawn(async move {
+        let buy_role_label = if delta_price.is_some() {
+            "maker"
+        } else {
+            "taker"
+        };
         crate::tee_eprintln!(
-            "[submit/{submit_mode:?}] open BUY taker: POST taker BUY по planned_entry_cost \
-             (cap price={price:?}), invoke settle → actual shares/fee в позицию и stats; \
-             при успехе — выставляем maker TP; после event_end — post-market-end resolution",
+            "[submit/{submit_mode:?}] open BUY {buy_role_label}: POST BUY по planned_entry_cost \
+             (price={price:?}, delta_price={delta_price:?}), invoke settle → actual shares/fee \
+             в позицию и stats; при успехе — выставляем maker TP; после event_end — \
+             post-market-end resolution",
         );
         // `planned_*` живут в `OpenPosition` (выставлены в `open_position`) и более не
         // меняются — для submit-CSV их читает `close_position_maker_tp` из позиции.
@@ -615,7 +629,7 @@ pub(crate) fn spawn_open_buy_taker(
 
         if !(amount > 0.0 && amount.is_finite()) {
             crate::tee_eprintln!(
-                "[submit] open BUY taker pos_id={pos_id}: невалидный amount={amount} — OpenFailed",
+                "[submit] open BUY {buy_role_label} pos_id={pos_id}: невалидный amount={amount} — OpenFailed",
             );
             return;
         }
@@ -632,50 +646,6 @@ pub(crate) fn spawn_open_buy_taker(
             let mut open_position = position.write().await;
             open_position.open_buy_invoke = Some(invoke_rx.clone());
         }
-        // Вход всегда taker FAK (`market_order` с `price` как worst-case cap).
-        // Resolution-канал (opened_in_hold_zone=true) сохраняет специфический
-        // exit-режим в [`sell_gate`] / `close_position` (TP/SL/Timeout off,
-        // выход строго по резолюции) и пропуск maker TP ниже, но сам BUY идёт
-        // таким же тейкер-FAK,
-        // как и для PnL-канала.
-        let buy_post_request = PostOrderRequest {
-            asset_id: asset_id.clone(),
-            side: Side::Buy,
-            role: OrderRole::Taker,
-            amount: OrderAmount::UsdNotional(amount),
-            price,
-            max_slippage_pp: None,
-            expiration: None,
-            market_end_unix_ms: event_end_ms,
-            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-            strict_book,
-        };
-        let buy_invoke_cb: crate::account_order::SingleOrderInvokeCb =
-            Box::new(move |buy_rep| {
-                let _ = invoke_tx.send(Some(buy_rep));
-            });
-        let post_result = post_order_on_clob(
-            &account,
-            project_manager.as_ref(),
-            submit_mode,
-            buy_post_request,
-            buy_invoke_cb,
-        )
-        .await;
-
-        // Все BUY-failure ветки ниже дренят `position` из `account.positions` (зеркало
-        // финализации в `close_position_after_submit`): иначе зомби-позиция останется
-        // в lane и `manage_positions` / MtM-учёт будут видеть несуществующий BUY.
-        // Идемпотентно (lane_positions::remove(non-existent) — no-op), всегда обходим
-        // все lane'ы, т.к. `LaneKey` сюда не пробрасывается.
-        //
-        // Парно дреним `pending_close_positions` (зеркало `close_position_after_submit`):
-        // если manage_positions в next-tick'е уже успела переселить позицию
-        // туда (sell_gate сработал на planned-фрейме до того, как BUY-invoke
-        // вернул fail), её надо вычистить — иначе `position_size` навсегда
-        // зависнет в `available_bankroll`/MtM, ведь `close_position_after_submit`
-        // в BUY-fail сценарии не зовётся (sell_taker сделает early return на
-        // `!buy_rep.success`). Лок-порядок: positions → pending_close.
         let drain_position_from_account = || async {
             {
                 let mut positions_guard = account.positions.write().await;
@@ -691,6 +661,92 @@ pub(crate) fn spawn_open_buy_taker(
             }
         };
 
+        let (buy_post_request, invoke_wait) = match delta_price {
+            None => (
+                PostOrderRequest {
+                    asset_id: asset_id.clone(),
+                    side: Side::Buy,
+                    role: OrderRole::Taker,
+                    amount: OrderAmount::UsdNotional(amount),
+                    price,
+                    max_slippage_pp: None,
+                    expiration: None,
+                    market_end_unix_ms: event_end_ms,
+                    timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                    strict_book: strict_book.clone(),
+                },
+                Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+            ),
+            Some(delta) => {
+                let Some(gtd_sec) = maker_gtd_sec.filter(|&s| s > 0) else {
+                    crate::tee_eprintln!(
+                        "[submit] open BUY maker pos_id={pos_id}: maker_gtd_sec={maker_gtd_sec:?} \
+                         при delta_price={delta} — OpenFailed",
+                    );
+                    drain_position_from_account().await;
+                    return;
+                };
+                let Some(base_price) = price else {
+                    crate::tee_eprintln!(
+                        "[submit] open BUY maker pos_id={pos_id}: price=None при delta_price={delta} — OpenFailed",
+                    );
+                    drain_position_from_account().await;
+                    return;
+                };
+                let maker_price = (base_price + delta).clamp(0.001, 0.999);
+                let shares_floor = (amount / maker_price * 100.0).floor() / 100.0;
+                if !(shares_floor > 0.0 && shares_floor.is_finite()) {
+                    crate::tee_eprintln!(
+                        "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor} из amount={amount} \
+                         @ price={maker_price:.6} — OpenFailed",
+                    );
+                    drain_position_from_account().await;
+                    return;
+                }
+                if let Some(min_order_size) = min_order_size_shares
+                    && shares_floor + 1e-9 < min_order_size
+                {
+                    crate::tee_eprintln!(
+                        "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor:.4} < \
+                         min_order_size={min_order_size:.4} — OpenFailed",
+                    );
+                    drain_position_from_account().await;
+                    return;
+                }
+                let expiration: Option<DateTime<Utc>> = Some(
+                    Utc::now() + chrono::Duration::seconds(gtd_sec as i64),
+                );
+                (
+                    PostOrderRequest {
+                        asset_id: asset_id.clone(),
+                        side: Side::Buy,
+                        role: OrderRole::Maker,
+                        amount: OrderAmount::Shares(shares_floor),
+                        price: Some(maker_price),
+                        max_slippage_pp: None,
+                        expiration,
+                        market_end_unix_ms: event_end_ms,
+                        timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                        strict_book: None,
+                    },
+                    Duration::from_secs(gtd_sec.saturating_add(ORDER_HTTP_TIMEOUT_SEC)),
+                )
+            }
+        };
+
+        let buy_invoke_cb: crate::account_order::SingleOrderInvokeCb =
+            Box::new(move |buy_rep| {
+                let _ = invoke_tx.send(Some(buy_rep));
+            });
+        let post_result = post_order_on_clob(
+            &account,
+            project_manager.as_ref(),
+            submit_mode,
+            buy_post_request,
+            buy_invoke_cb,
+        )
+        .await;
+
         let http_order_id = match post_result {
             Ok(Some(order_id)) => {
                 {
@@ -698,36 +754,34 @@ pub(crate) fn spawn_open_buy_taker(
                     p.open_order_id = Some(order_id.clone());
                 }
                 crate::tee_println!(
-                    "[submit] open BUY taker pos_id={pos_id} asset_id={asset_id}: HTTP POST ok order_id={order_id}",
+                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: HTTP POST ok order_id={order_id}",
                 );
                 Some(order_id)
             }
             Ok(None) => {
                 crate::tee_eprintln!(
-                    "[submit] open BUY taker pos_id={pos_id} asset_id={asset_id}: HTTP POST отклонён — OpenFailed",
+                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: HTTP POST отклонён — OpenFailed",
                 );
                 drain_position_from_account().await;
                 return;
             }
             Err(err) => {
                 crate::tee_eprintln!(
-                    "[submit] open BUY taker pos_id={pos_id} asset_id={asset_id}: post_order_on_clob err={err:#} — OpenFailed",
+                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: post_order_on_clob err={err:#} — OpenFailed",
                 );
                 drain_position_from_account().await;
                 return;
             }
         };
 
-        let buy_rep = match wait_invoke_settlement(
-            &mut invoke_rx,
-            Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-        )
-        .await
+        let buy_rep = match wait_invoke_settlement(&mut invoke_rx, invoke_wait).await
         {
             Some(rep) => rep,
             None => {
                 crate::tee_eprintln!(
-                    "[submit] open BUY taker pos_id={pos_id} order_id={http_order_id:?}: invoke timeout {ORDER_HTTP_TIMEOUT_SEC}s — OpenFailed",
+                    "[submit] open BUY {buy_role_label} pos_id={pos_id} order_id={http_order_id:?}: \
+                     invoke timeout {:?} — OpenFailed",
+                    invoke_wait,
                 );
                 drain_position_from_account().await;
                 return;
@@ -735,7 +789,7 @@ pub(crate) fn spawn_open_buy_taker(
         };
 
         crate::tee_println!(
-            "[submit] open BUY taker pos_id={pos_id} asset_id={asset_id}: invoke settle success={} partial={} \
+            "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: invoke settle success={} partial={} \
              order_id={:?}; making={:?}, taking={:?}, err={:?}",
             buy_rep.success,
             buy_rep.partial,
@@ -823,7 +877,7 @@ pub(crate) fn spawn_open_buy_taker(
                 side_stats.fees_paid += entry_fee_delta;
             }
             crate::tee_println!(
-                "[submit] open BUY taker pos_id={pos_id}: entry_fee planned={planned_entry_fee:.6} \
+                "[submit] open BUY {buy_role_label} pos_id={pos_id}: entry_fee planned={planned_entry_fee:.6} \
                  actual={actual_entry_fee:.6} delta={entry_fee_delta:+.6} \
                  (fees_paid corrected)",
             );
