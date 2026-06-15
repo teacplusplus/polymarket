@@ -76,6 +76,8 @@ pub fn price_to_beat_from_event_page(period: &str, slug: &str, price: f64) {
 
 /// RTDS `crypto_prices`: последний ключ `rtds_currency_prices_by_ms` слишком старый — кадры помечаются `stable=false`.
 pub fn rtds_currency_prices_lagging_for_xframe(
+    currency: &str,
+    rtds_symbol: &str,
     wall_now_ms: i64,
     last_key_ms: Option<i64>,
     max_lag_ms: i64,
@@ -85,7 +87,7 @@ pub fn rtds_currency_prices_lagging_for_xframe(
     }
     let lag = last_key_ms.map(|k| wall_now_ms.saturating_sub(k));
     crate::tee_eprintln!(
-        "rtds_currency_prices: отстаёт для stable — wall_now_ms={wall_now_ms} last_key_ms={last_key_ms:?} lag_ms={lag:?} (порог {max_lag_ms} ms) → XFrame.stable=false"
+        "rtds_currency_prices: отстаёт для stable — currency={currency} rtds_symbol={rtds_symbol} wall_now_ms={wall_now_ms} last_key_ms={last_key_ms:?} lag_ms={lag:?} (порог {max_lag_ms} ms) → XFrame.stable=false"
     );
 }
 

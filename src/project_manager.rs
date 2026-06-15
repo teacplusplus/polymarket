@@ -4,7 +4,7 @@ pub use crate::constants::{CurrencyUpDownInterval, FIFTEEN_MIN_SEC, FIVE_MIN_SEC
 pub use crate::currency_updown_sibling::{
     CurrencyUpDownSiblingSlot, CurrencyUpDownSiblingState, five_min_belongs_to_fifteen_window,
 };
-use crate::currency_ws::RTDS_MS_MAX_LAG_FOR_STABLE_FRAME;
+use crate::currency_ws::{RTDS_MS_MAX_LAG_FOR_STABLE_FRAME, rtds_spot_pair_symbol};
 use crate::data_ws::{
     CurrencyUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer, MarketSnapshotBufferMut,
     MarketWsSubscription, Ws, WsCommand, make_ws_channel, spawn_persistent_interval_market_ws,
@@ -604,7 +604,10 @@ impl ProjectManager {
             (fresh, last_key)
         };
         if !rtds_ms_fresh {
+            let rtds_symbol = rtds_spot_pair_symbol(self.currency.as_str());
             run_log::rtds_currency_prices_lagging_for_xframe(
+                self.currency.as_str(),
+                rtds_symbol.as_str(),
                 now_ms,
                 rtds_last_key_ms,
                 RTDS_MS_MAX_LAG_FOR_STABLE_FRAME,
