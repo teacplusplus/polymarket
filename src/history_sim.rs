@@ -10,6 +10,7 @@ use crate::account_order::{
 };
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
+use crate::redeem_01_tail::redeem_01_tail_entry_size;
 use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
     Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
@@ -85,11 +86,6 @@ pub const ENABLE_PNL: bool = false;
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
 pub const REDEEM_01: bool = true;
-
-const REDEEM_01_TAIL_MIN_PROB: f64 = 0.01;
-const REDEEM_01_TAIL_MAX_PROB: f64 = 0.10;
-const REDEEM_01_TAIL_TARGET_REMAINING_MS: i64 = 30 * 1000;
-const REDEEM_01_TAIL_REMAINING_TOLERANCE_MS: i64 = 2_500;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -1196,91 +1192,6 @@ pub(crate) fn buy_gate(
 
     // Оба канала не дали Proceed — возвращаем skip-причину PnL (приоритетного).
     pnl_decision
-}
-
-fn redeem_01_tail_entry_size(
-    frame: &XFrame<SIZE>,
-    strict_book: Option<&StrictBook>,
-    entry_prob: f64,
-    bankroll: f64,
-) -> Option<f64> {
-    if (frame.event_remaining_ms - REDEEM_01_TAIL_TARGET_REMAINING_MS).abs()
-        > REDEEM_01_TAIL_REMAINING_TOLERANCE_MS
-    {
-        return None;
-    }
-
-    let interval_kind = XFrameIntervalKind::from_i32(frame.xframe_interval_type)?;
-    let (budget_usdc, primary_price_cap, fallback_price_cap) =
-        redeem_01_tail_budget_and_price_cap(interval_kind, entry_prob)?;
-
-    let asks = strict_book
-        .map(|book| book.asks.as_slice())
-        .or_else(|| frame.book_asks.as_deref());
-    let book_limited_size = match asks {
-        Some(asks) => {
-            let primary_liquidity = ask_notional_up_to_price_cap(asks, primary_price_cap);
-            let price_cap = if primary_liquidity < budget_usdc {
-                fallback_price_cap.unwrap_or(primary_price_cap)
-            } else {
-                primary_price_cap
-            };
-            let available_usdc = ask_notional_up_to_price_cap(asks, price_cap);
-            if available_usdc < MIN_POSITION_USD {
-                return None;
-            }
-            budget_usdc.min(available_usdc)
-        }
-        None => budget_usdc,
-    };
-
-    let size = book_limited_size.min(bankroll).max(0.0);
-    if size < MIN_POSITION_USD {
-        None
-    } else {
-        Some(size)
-    }
-}
-
-fn redeem_01_tail_budget_and_price_cap(
-    interval_kind: XFrameIntervalKind,
-    entry_prob: f64,
-) -> Option<(f64, f64, Option<f64>)> {
-    if !entry_prob.is_finite()
-        || !(REDEEM_01_TAIL_MIN_PROB..=REDEEM_01_TAIL_MAX_PROB).contains(&entry_prob)
-    {
-        return None;
-    }
-
-    match interval_kind {
-        XFrameIntervalKind::FiveMin if entry_prob <= 0.02 => Some((25.0, 0.02, Some(0.05))),
-        XFrameIntervalKind::FiveMin if entry_prob <= 0.05 => Some((25.0, 0.05, None)),
-        XFrameIntervalKind::FiveMin => Some((10.0, 0.10, None)),
-        XFrameIntervalKind::FifteenMin if entry_prob <= 0.02 => Some((10.0, 0.02, None)),
-        XFrameIntervalKind::FifteenMin if entry_prob <= 0.05 => Some((5.0, 0.05, None)),
-        XFrameIntervalKind::FifteenMin => None,
-    }
-}
-
-fn ask_notional_up_to_price_cap(asks: &[BookLevel], price_cap: f64) -> f64 {
-    if !price_cap.is_finite() || price_cap <= 0.0 {
-        return 0.0;
-    }
-    let mut usdc = 0.0;
-    for level in asks {
-        if !level.price.is_finite()
-            || !level.size.is_finite()
-            || level.price <= 0.0
-            || level.size <= 0.0
-        {
-            continue;
-        }
-        if level.price > price_cap {
-            break;
-        }
-        usdc += level.price * level.size;
-    }
-    usdc
 }
 
 /// Оценка одного канала входа (PnL или Resolution): порог, no-trade-zone,

@@ -103,14 +103,14 @@ pub struct MarketEventData {
 pub struct MarketResolution {
     pub price_to_beat: f64,
     pub final_price: Option<f64>,
+    pub market_end_ms: i64,
 }
 
 /// Capacity-cap для [`ProjectManager::market_resolution_by_market`]: при
-/// `len > MARKET_RESOLUTION_RETENTION` дёргаем `BTreeMap::pop_first` (старейший
-/// по `market_id` лексикографически — backstop поверх явного
-/// [`ProjectManager::cleanup_stale_market_data`], чтобы кэш не рос неограниченно
-/// даже если cleanup сломан/пропущен).
-pub const MARKET_RESOLUTION_RETENTION: usize = 10;
+/// `len > MARKET_RESOLUTION_RETENTION` удаляем запись с минимальным
+/// `market_end_ms`, чтобы кэш не рос неограниченно даже если cleanup
+/// сломан/пропущен.
+pub const MARKET_RESOLUTION_RETENTION: usize = 100;
 
 pub struct ProjectManager {
     pub currency: Arc<String>,
@@ -119,7 +119,7 @@ pub struct ProjectManager {
     pub ws_stream_by_asset_id: Arc<RwLock<HashMap<String, Vec<WsStreamEntry>>>>,
     pub event_data_by_market: Arc<RwLock<HashMap<String, MarketEventData>>>,
     pub slug_to_market_id: Arc<RwLock<HashMap<String, String>>>,
-    pub market_resolution_by_market: Arc<RwLock<BTreeMap<String, MarketResolution>>>,
+    pub market_resolution_by_market: Arc<RwLock<HashMap<String, MarketResolution>>>,
     pub currency_up_down_by_asset_id: Arc<RwLock<HashMap<String, CurrencyUpDownOutcome>>>,
     pub ws_connect_wall_ms_by_asset_id: Arc<RwLock<HashMap<String, i64>>>,
     pub currency_updown_sibling_state: Arc<RwLock<CurrencyUpDownSiblingState>>,
@@ -173,7 +173,7 @@ impl ProjectManager {
             ws_stream_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             event_data_by_market: Arc::new(RwLock::new(HashMap::new())),
             slug_to_market_id: Arc::new(RwLock::new(HashMap::new())),
-            market_resolution_by_market: Arc::new(RwLock::new(BTreeMap::new())),
+            market_resolution_by_market: Arc::new(RwLock::new(HashMap::new())),
             currency_up_down_by_asset_id: Arc::new(RwLock::new(HashMap::<
                 String,
                 CurrencyUpDownOutcome,
@@ -453,17 +453,23 @@ impl ProjectManager {
     /// уже записанный `final_price` (если был выставлен через
     /// [`Self::merge_market_final_price`] — теоретически возможно при out-of-order
     /// колбэке). Evicts старейшие записи если `len > MARKET_RESOLUTION_RETENTION`.
-    pub async fn merge_market_price_to_beat(&self, price_to_beat: f64, market_id: &str) {
+    pub async fn merge_market_price_to_beat(
+        &self,
+        price_to_beat: f64,
+        market_id: &str,
+        market_end_ms: i64,
+    ) {
         let mut map = self.market_resolution_by_market.write().await;
         map.entry(market_id.to_string())
-            .and_modify(|entry| entry.price_to_beat = price_to_beat)
+            .and_modify(|entry| {
+                entry.price_to_beat = price_to_beat;
+            })
             .or_insert(MarketResolution {
                 price_to_beat,
                 final_price: None,
+                market_end_ms,
             });
-        while map.len() > MARKET_RESOLUTION_RETENTION {
-            map.pop_first();
-        }
+        Self::evict_old_market_resolutions(&mut map);
     }
 
     /// Выставляет `final_price` для завершившегося маркета (вызывается из
@@ -474,16 +480,41 @@ impl ProjectManager {
     /// потребителя (`close_position_submit_resolution`) такая запись даст
     /// `up_won = (spot >= spot) = true` — приемлемая дефолтная политика для
     /// крайне редкого race. Evicts при `len > MARKET_RESOLUTION_RETENTION`.
-    pub async fn merge_market_final_price(&self, final_price: f64, market_id: &str) {
+    pub async fn merge_market_final_price(
+        &self,
+        final_price: f64,
+        market_id: &str,
+        market_end_ms: i64,
+    ) {
         let mut map = self.market_resolution_by_market.write().await;
         map.entry(market_id.to_string())
-            .and_modify(|entry| entry.final_price = Some(final_price))
+            .and_modify(|entry| {
+                entry.final_price = Some(final_price);
+            })
             .or_insert(MarketResolution {
                 price_to_beat: final_price,
                 final_price: Some(final_price),
+                market_end_ms,
             });
+        Self::evict_old_market_resolutions(&mut map);
+    }
+
+    fn evict_old_market_resolutions(map: &mut HashMap<String, MarketResolution>) {
         while map.len() > MARKET_RESOLUTION_RETENTION {
-            map.pop_first();
+            let Some(oldest_market_id) = map
+                .iter()
+                .min_by(|(left_id, left), (right_id, right)| {
+                    let left_end_ms = left.market_end_ms;
+                    let right_end_ms = right.market_end_ms;
+                    left_end_ms
+                        .cmp(&right_end_ms)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(market_id, _)| market_id.clone())
+            else {
+                break;
+            };
+            map.remove(&oldest_market_id);
         }
     }
 
@@ -1071,7 +1102,7 @@ impl ProjectManager {
                 }
             };
             if let (Some(ptb), Some(mid)) = (inline_ptb_opt, market_id.as_deref()) {
-                self.merge_market_price_to_beat(ptb, mid).await;
+                self.merge_market_price_to_beat(ptb, mid, market_end_ms).await;
             }
 
             // Фон: exact PTB → кэш + oneshot для следующей итерации; дамп prev по паре exact.
@@ -1086,6 +1117,7 @@ impl ProjectManager {
                 period_sec,
                 window_start_sec,
                 current_exact_tx,
+                market_end_ms,
             );
             let price_to_beat = inline_ptb_opt;
 
@@ -1161,6 +1193,7 @@ fn spawn_bg_price_to_beat_refine(
     period_sec: i64,
     current_window_start_sec: i64,
     current_exact_tx: oneshot::Sender<f64>,
+    current_market_end_ms: i64,
 ) {
     const MAX_REFINE_ATTEMPTS: u32 = 30;
     const REFINE_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -1179,7 +1212,7 @@ fn spawn_bg_price_to_beat_refine(
                 run_log::price_to_beat_from_event_page(period, &slug, exact_price);
                 if let Some(market_id) = market_id.as_deref() {
                     project_manager
-                        .merge_market_price_to_beat(exact_price, market_id)
+                        .merge_market_price_to_beat(exact_price, market_id, current_market_end_ms)
                         .await;
                 }
                 let _ = current_exact_tx.send(exact_price);
@@ -1214,7 +1247,11 @@ fn spawn_bg_price_to_beat_refine(
         // окон prev-market получил `final_price` — submit-резолюция читает
         // именно её.
         project_manager
-            .merge_market_final_price(current_exact, &prev_market_id)
+            .merge_market_final_price(
+                current_exact,
+                &prev_market_id,
+                prev.event_end_ms.unwrap_or_else(current_timestamp_ms),
+            )
             .await;
 
         let expected_current_window_start_sec = prev.window_start_sec.saturating_add(period_sec);
