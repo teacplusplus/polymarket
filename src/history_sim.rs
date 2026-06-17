@@ -81,11 +81,11 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = true;
+pub const ENABLE_PNL: bool = false;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
-pub const REDEEM_01: bool = false;
+pub const REDEEM_01: bool = true;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -1445,7 +1445,6 @@ pub(crate) async fn try_open_position(
                     }
                 }
                 if redeem_01_open {
-                    stats.max_open_positions_skips += 1;
                     return false;
                 }
             }
