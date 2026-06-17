@@ -19,7 +19,7 @@ const MIN_POSITIVE_ASK: f64 = 1e-12;
 /// Один уровень стакана: цена в probability-шкале `[0..1]` и размер в шерсах.
 ///
 /// Лежит в [`XFrame::book_bids`] / [`XFrame::book_asks`] (в порядке от лучшего
-/// к худшему) и в [`crate::history_sim::StrictBook`]. Тип общий, поэтому
+/// к худшему) и в [`StrictBook`]. Тип общий, поэтому
 /// `XFrame`-side фолбэки в [`crate::history_sim::book_fill_buy`] /
 /// [`crate::history_sim::book_fill_sell`] и strict-исполнение по HTTP-снимку
 /// CLOB обходят одну и ту же лестницу.
@@ -29,6 +29,19 @@ pub struct BookLevel {
     pub price: f64,
     /// Размер уровня в шерсах.
     pub size: f64,
+}
+
+/// HTTP/WS стакан для strict fill в `real_sim`: `None` в history (WS [`crate::history_sim::book_fill_*`]).
+#[derive(Debug, Clone, Default)]
+pub struct StrictBook {
+    /// Bids, лучший первый.
+    pub(crate) bids: Vec<BookLevel>,
+    /// Asks, лучший первый.
+    pub(crate) asks: Vec<BookLevel>,
+    /// Last trade (широкий спред → как polymarket-style mid).
+    pub(crate) last_trade_price: Option<f64>,
+    /// Min размер ордера в шерах (strict).
+    pub(crate) min_order_size: Option<f64>,
 }
 
 /// Окно секундных цен спота для μ и σ в z-score (≈ 60 мин). Ключи `prices_by_sec` — Unix-секунды.
@@ -789,81 +802,141 @@ impl<const N: usize> XFrame<N> {
         frame.trade_size > 0.0 || frame.trade_volume_bucket > 0.0
     }
 
+    fn apply_book_field_deltas(&mut self, lag_index: usize, prior_frame: &XFrame<N>) {
+        self.delta_n_book_bid_l1_price[lag_index] =
+            match (self.book_bid_l1_price, prior_frame.book_bid_l1_price) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_ask_l1_price[lag_index] =
+            match (self.book_ask_l1_price, prior_frame.book_ask_l1_price) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_spread[lag_index] = match (self.spread, prior_frame.spread) {
+            (Some(current), Some(prior)) => Some(current - prior),
+            _ => None,
+        };
+        self.delta_n_book_bid_l1_size[lag_index] =
+            match (self.book_bid_l1_size, prior_frame.book_bid_l1_size) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_ask_l1_size[lag_index] =
+            match (self.book_ask_l1_size, prior_frame.book_ask_l1_size) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_bid_l2_price[lag_index] =
+            match (self.book_bid_l2_price, prior_frame.book_bid_l2_price) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_bid_l2_size[lag_index] =
+            match (self.book_bid_l2_size, prior_frame.book_bid_l2_size) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_bid_l3_price[lag_index] =
+            match (self.book_bid_l3_price, prior_frame.book_bid_l3_price) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_bid_l3_size[lag_index] =
+            match (self.book_bid_l3_size, prior_frame.book_bid_l3_size) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_ask_l2_price[lag_index] =
+            match (self.book_ask_l2_price, prior_frame.book_ask_l2_price) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_ask_l2_size[lag_index] =
+            match (self.book_ask_l2_size, prior_frame.book_ask_l2_size) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_ask_l3_price[lag_index] =
+            match (self.book_ask_l3_price, prior_frame.book_ask_l3_price) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_book_ask_l3_size[lag_index] =
+            match (self.book_ask_l3_size, prior_frame.book_ask_l3_size) {
+                (Some(current), Some(prior)) => Some(current - prior),
+                _ => None,
+            };
+        self.delta_n_last_trade_price[lag_index] =
+            match (self.last_trade_price, prior_frame.last_trade_price) {
+                (Some(current_price), Some(prior_price)) => Some(current_price - prior_price),
+                _ => None,
+            };
+    }
+
+    /// Подменяет ордербук strict book и пересчитывает связанные `delta_n_*` по prior кадрам
+    /// (как в [`Self::populate_deltas`], индекс `0` — ближайший предшественник).
+    pub fn apply_strict_book(&mut self, book: &StrictBook, prior_frames: &[XFrame<N>]) {
+        fn level_at(levels: &[BookLevel], idx: usize) -> (Option<f64>, Option<f64>) {
+            levels
+                .get(idx)
+                .map(|l| (Some(l.price), Some(l.size)))
+                .unwrap_or((None, None))
+        }
+
+        let (book_bid_l1_price, book_bid_l1_size) = level_at(&book.bids, 0);
+        let (book_bid_l2_price, book_bid_l2_size) = level_at(&book.bids, 1);
+        let (book_bid_l3_price, book_bid_l3_size) = level_at(&book.bids, 2);
+        let (book_ask_l1_price, book_ask_l1_size) = level_at(&book.asks, 0);
+        let (book_ask_l2_price, book_ask_l2_size) = level_at(&book.asks, 1);
+        let (book_ask_l3_price, book_ask_l3_size) = level_at(&book.asks, 2);
+
+        self.book_bid_l1_price = book_bid_l1_price;
+        self.book_bid_l1_size = book_bid_l1_size;
+        self.book_bid_l2_price = book_bid_l2_price;
+        self.book_bid_l2_size = book_bid_l2_size;
+        self.book_bid_l3_price = book_bid_l3_price;
+        self.book_bid_l3_size = book_bid_l3_size;
+        self.book_ask_l1_price = book_ask_l1_price;
+        self.book_ask_l1_size = book_ask_l1_size;
+        self.book_ask_l2_price = book_ask_l2_price;
+        self.book_ask_l2_size = book_ask_l2_size;
+        self.book_ask_l3_price = book_ask_l3_price;
+        self.book_ask_l3_size = book_ask_l3_size;
+        self.book_bids = Some(book.bids.clone());
+        self.book_asks = Some(book.asks.clone());
+
+        if let Some(ltp) = book.last_trade_price {
+            self.last_trade_price = Some(ltp);
+        }
+
+        let spread = match (book_bid_l1_price, book_ask_l1_price) {
+            (Some(b), Some(a)) if b.is_finite() && a.is_finite() => Some((a - b).max(0.0)),
+            _ => None,
+        };
+        self.spread = spread;
+
+        if let Some(prob) = currency_implied_prob_polymarket_style(
+            book_bid_l1_price,
+            book_ask_l1_price,
+            spread,
+            book.last_trade_price.or(self.last_trade_price),
+        ) {
+            self.currency_implied_prob = Some(prob.clamp(0.001, 0.999));
+        }
+
+        for (lag_index, prior_frame) in prior_frames.iter().take(N).enumerate() {
+            self.apply_book_field_deltas(lag_index, prior_frame);
+        }
+    }
+
     fn populate_deltas(&mut self, frames: &BTreeMap<i64, XFrame<N>>) {
         for (lag_index, prior_frame) in frames.values().rev().take(N).enumerate() {
-            self.delta_n_book_bid_l1_price[lag_index] =
-                match (self.book_bid_l1_price, prior_frame.book_bid_l1_price) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_ask_l1_price[lag_index] =
-                match (self.book_ask_l1_price, prior_frame.book_ask_l1_price) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
+            self.apply_book_field_deltas(lag_index, prior_frame);
             self.delta_n_tick_size[lag_index] = match (self.tick_size, prior_frame.tick_size) {
                 (Some(current), Some(prior)) => Some(current - prior),
                 _ => None,
             };
-            self.delta_n_spread[lag_index] = match (self.spread, prior_frame.spread) {
-                (Some(current), Some(prior)) => Some(current - prior),
-                _ => None,
-            };
-            self.delta_n_book_bid_l1_size[lag_index] =
-                match (self.book_bid_l1_size, prior_frame.book_bid_l1_size) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_ask_l1_size[lag_index] =
-                match (self.book_ask_l1_size, prior_frame.book_ask_l1_size) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_bid_l2_price[lag_index] =
-                match (self.book_bid_l2_price, prior_frame.book_bid_l2_price) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_bid_l2_size[lag_index] =
-                match (self.book_bid_l2_size, prior_frame.book_bid_l2_size) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_bid_l3_price[lag_index] =
-                match (self.book_bid_l3_price, prior_frame.book_bid_l3_price) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_bid_l3_size[lag_index] =
-                match (self.book_bid_l3_size, prior_frame.book_bid_l3_size) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_ask_l2_price[lag_index] =
-                match (self.book_ask_l2_price, prior_frame.book_ask_l2_price) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_ask_l2_size[lag_index] =
-                match (self.book_ask_l2_size, prior_frame.book_ask_l2_size) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_ask_l3_price[lag_index] =
-                match (self.book_ask_l3_price, prior_frame.book_ask_l3_price) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_book_ask_l3_size[lag_index] =
-                match (self.book_ask_l3_size, prior_frame.book_ask_l3_size) {
-                    (Some(current), Some(prior)) => Some(current - prior),
-                    _ => None,
-                };
-            self.delta_n_last_trade_price[lag_index] =
-                match (self.last_trade_price, prior_frame.last_trade_price) {
-                    (Some(current_price), Some(prior_price)) => Some(current_price - prior_price),
-                    _ => None,
-                };
             self.delta_n_trade_size[lag_index] = Some(self.trade_size - prior_frame.trade_size);
             self.delta_n_trade_volume_bucket[lag_index] =
                 Some(self.trade_volume_bucket - prior_frame.trade_volume_bucket);
@@ -1737,7 +1810,7 @@ pub(crate) const POLYMARKET_WIDE_SPREAD_USD: f64 = 0.10;
 ///
 /// Используется и при сборке `XFrame.currency_implied_prob` из WS-кадра
 /// (см. `XFrame::from_market_snapshot`), и в `history_sim::effective_implied_prob`
-/// поверх HTTP-стакана ([`crate::history_sim::StrictBook`]) — один источник
+/// поверх HTTP-стакана ([`StrictBook`]) — один источник
 /// истины для «отображаемой» Polymarket-вероятности, чтобы фичи модели и
 /// решения о входе/выходе работали в одной шкале.
 pub(crate) fn currency_implied_prob_polymarket_style(

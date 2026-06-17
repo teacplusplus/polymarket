@@ -1,13 +1,13 @@
-//! Live-сим: логика как [`crate::history_sim`], кадры из [`ProjectManager`], HTTP-батч стаканов [`run_book_coordinator`], при расхождении WS↔HTTP — только закрытия.
+//! Live-сим: логика как [`crate::history_sim`], кадры из [`ProjectManager::xframes_by_market`], HTTP-батч стаканов [`run_book_coordinator`].
 
 use crate::account::SharedAccount;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, REDEEM_01, StrictBook, any_position_would_sell, buy_gate,
-    compute_pnl_inference, compute_resolution_inference, load_booster, manage_positions,
-    try_open_position,
+    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, MIN_ENTRY_REMAINING_MS, REDEEM_01, StrictBook,
+    any_position_would_sell, buy_gate, compute_pnl_inference, compute_resolution_inference,
+    load_booster, manage_positions, try_open_position,
 };
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
@@ -15,7 +15,6 @@ use crate::sim_stats::{SimStats};
 use crate::train_mode::{Calibration, load_calibration};
 use crate::util::current_timestamp_ms;
 use crate::xframe::BookLevel;
-use crate::xframe::{SIZE, XFrame};
 
 use anyhow::{Result, anyhow};
 use futures_util::FutureExt;
@@ -296,10 +295,20 @@ async fn tick_once(
     submit_mode: crate::account_submit::SubmitMode,
 ) -> Result<()> {
     let LaneFrame {
+        market_id,
+        asset_id,
         price_to_beat,
         gamma_question,
-        frame,
     } = lane_frame;
+
+    let Some((aligned_ts, xframe_cell)) = project_manager
+        .latest_xframe_cell(market_id.as_str(), asset_id.as_str())
+        .await
+    else {
+        return Ok(());
+    };
+
+    let mut frame = xframe_cell.read().await.clone();
 
     // Минимальная выдержка позиции до первой проверки SL/TP в [`sell_gate`] /
     // [`any_position_would_sell`]. Включена в Mock-режиме (как в history_sim),
@@ -311,8 +320,8 @@ async fn tick_once(
         crate::account_submit::SubmitMode::Submit | crate::account_submit::SubmitMode::None => None,
     };
 
-    let market_id = frame.market_id.as_str();
-    let asset_id = frame.asset_id.as_str();
+    let market_id = market_id.as_str();
+    let asset_id = asset_id.as_str();
     let Some(interval_kind) = XFrameIntervalKind::from_i32(frame.xframe_interval_type) else {
         return Ok(());
     };
@@ -434,6 +443,56 @@ async fn tick_once(
         )
     };
 
+    let submit_market_window_open: bool = match (event_start_ms, event_end_ms) {
+        (Some(start_ms), Some(end_ms)) => now_wall_ms >= start_ms && now_wall_ms < end_ms,
+        _ => false,
+    };
+    let could_attempt_entry = !dd_halt_active
+        && !market_already_resolved
+        && frame.stable
+        && frame.currency_implied_prob.is_some()
+        && frame.event_remaining_ms >= MIN_ENTRY_REMAINING_MS
+        && submit_market_window_open;
+    let needs_http = needs_sell || has_positions || could_attempt_entry;
+
+    let strict_book: Option<StrictBook> = if needs_http {
+        match try_fresh_ws_strict_book(project_manager, asset_id, now_wall_ms).await {
+            Some(book) => Some(book),
+            None => fetch_http_strict_book(book_tx, asset_id).await,
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref book) = strict_book {
+        project_manager
+            .apply_strict_book_to_latest_xframe(
+                market_id,
+                asset_id,
+                aligned_ts,
+                xframe_cell.clone(),
+                book,
+            )
+            .await;
+        frame = xframe_cell.read().await.clone();
+    }
+
+    let needs_sell = if has_positions {
+        let positions_guard = account.positions.read().await;
+        let this_positions = positions_guard
+            .get(&lane_key)
+            .expect("Account.positions pre-populated by run_real_sim");
+        any_position_would_sell(this_positions, &frame, min_position_frames).await
+    } else {
+        false
+    };
+
+    let currency_implied_prob = frame
+        .currency_implied_prob
+        .filter(|p| p.is_finite())
+        .map(|p| p.clamp(0.001, 0.999))
+        .unwrap_or(currency_implied_prob);
+
     let pnl_inference = compute_pnl_inference(
         &frame,
         models.booster_pnl.as_ref(),
@@ -453,20 +512,18 @@ async fn tick_once(
             pnl_inference,
             resolution_inference,
             available_bankroll_pre,
-            None,
+            strict_book.as_ref(),
             true,
             models.booster_pnl.as_ref(),
-        ),
+            currency,
+            Some(project_manager),
+        )
+        .await,
         BuyGate::Proceed { .. }
     );
-    // Submit/Mock: новые BUY только при wall-clock внутри `[event_start_ms, event_end_ms)` от Gamma.
-    // Для `SubmitMode::None` (чисто виртуальный fill) window-гейта нет.
-    let submit_market_window_open: bool = match (event_start_ms, event_end_ms) {
-        (Some(start_ms), Some(end_ms)) => now_wall_ms >= start_ms && now_wall_ms < end_ms,
-        _ => false,
-    };
-    let may_open = !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
-    
+    let may_open =
+        !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
+
     if buy_gate_proceed && dd_halt_active {
         crate::tee_eprintln!(
             "[real_sim] halt by drawdown — новые позиции заблокированы (порог={:?}%, max_dd_pct={:.2}%), закрытия продолжаем",
@@ -474,32 +531,8 @@ async fn tick_once(
             account_max_dd_pct
         );
     }
-    
-    let needs_http = needs_sell || may_open;
 
-    let strict_book: Option<StrictBook> = if needs_http {
-        match try_fresh_ws_strict_book(project_manager, asset_id, now_wall_ms).await {
-            Some(book) => Some(book),
-            None => fetch_http_strict_book(book_tx, asset_id).await,
-        }
-    } else {
-        None
-    };
-
-    let ws_lagging = match strict_book.as_ref() {
-        Some(book) => {
-            let lagging = is_ws_lagging(book, &frame);
-            if lagging {
-                crate::tee_eprintln!(
-                    "[real_sim] WS отстаёт — ордербук по HTTP расходится с last XFrame (market={market_id} asset={asset_id}); новые позиции пропускаем, ведём только закрытия"
-                );
-            }
-            lagging
-        }
-        None => false,
-    };
-
-    let pnl_top5_shap_at_open_precomputed: Option<String> = if may_open && !ws_lagging {
+    let pnl_top5_shap_at_open_precomputed: Option<String> = if may_open {
         Some(
             models
                 .booster_pnl
@@ -588,7 +621,7 @@ async fn tick_once(
                 }
             }
 
-            if may_open && !ws_lagging {
+            if may_open {
                 if tick_started.elapsed() > TICK_OPEN_MAX_ELAPSED {
                     crate::tee_eprintln!(
                         "[real_sim] tick elapsed {:.0}ms > {}ms \
@@ -916,61 +949,6 @@ fn parse_book_levels(book: &OrderBookSummaryResponse) -> StrictBook {
         asks,
         last_trade_price,
         min_order_size,
-    }
-}
-
-/// HTTP vs WS по L1–L3 bid/ask; порог `2×tick_size` (или 0.02 при дефолтном tick). Три уровня — ловим stale, когда L1 совпал случайно.
-fn is_ws_lagging(book: &StrictBook, frame: &XFrame<SIZE>) -> bool {
-    let tol = frame.tick_size.unwrap_or(0.01).max(1e-6) * 2.0;
-    let diverges = |ws: Option<f64>, http: Option<f64>| -> bool {
-        match (ws, http) {
-            (Some(a), Some(b)) => (a - b).abs() > tol,
-            (None, Some(_)) | (Some(_), None) => true,
-            (None, None) => false,
-        }
-    };
-
-    let http_level = |side: &[BookLevel], idx: usize| side.get(idx).map(|l| l.price);
-    let http_bid = |i| http_level(&book.bids, i);
-    let http_ask = |i| http_level(&book.asks, i);
-
-    let ws_bid = [
-        frame.book_bid_l1_price,
-        frame.book_bid_l2_price,
-        frame.book_bid_l3_price,
-    ];
-    let ws_ask = [
-        frame.book_ask_l1_price,
-        frame.book_ask_l2_price,
-        frame.book_ask_l3_price,
-    ];
-
-    let bid_bad = (0..ws_bid.len()).any(|i| diverges(ws_bid[i], http_bid(i)));
-    let ask_bad = (0..ws_ask.len()).any(|i| diverges(ws_ask[i], http_ask(i)));
-
-    if bid_bad || ask_bad {
-        crate::tee_eprintln!(
-            "[real_sim] WS vs HTTP ордербук (tol={tol:.4}):\n  \
-             bid WS  L1/L2/L3 = {:?}/{:?}/{:?}\n  \
-             bid HTTP L1/L2/L3 = {:?}/{:?}/{:?}\n  \
-             ask WS  L1/L2/L3 = {:?}/{:?}/{:?}\n  \
-             ask HTTP L1/L2/L3 = {:?}/{:?}/{:?}",
-            ws_bid[0],
-            ws_bid[1],
-            ws_bid[2],
-            http_bid(0),
-            http_bid(1),
-            http_bid(2),
-            ws_ask[0],
-            ws_ask[1],
-            ws_ask[2],
-            http_ask(0),
-            http_ask(1),
-            http_ask(2),
-        );
-        true
-    } else {
-        false
     }
 }
 

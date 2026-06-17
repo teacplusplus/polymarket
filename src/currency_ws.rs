@@ -74,7 +74,7 @@ async fn run_rtds_spot_ws_loop(project_manager: Arc<ProjectManager>) {
     loop {
         if let Err(err) = run_rtds_spot_session(&project_manager).await {
             let pair = rtds_spot_pair_symbol(project_manager.currency.as_str());
-            eprintln!("rtds ({pair}): сессия завершилась: {err}");
+            eprintln!("rtds ({pair}): сессия завершилась: {err:#}");
         }
         tokio::time::sleep(Duration::from_secs(RTDS_RECONNECT_DELAY_SECS)).await;
     }
@@ -82,13 +82,28 @@ async fn run_rtds_spot_ws_loop(project_manager: Arc<ProjectManager>) {
 
 async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<()> {
     let proxy = ws_proxy_from_env();
+    let pair_symbol = rtds_spot_pair_symbol(project_manager.currency.as_str());
     let (ws_stream, _http_response) =
-        connect_async_maybe_proxy(POLYMARKET_RTDS_WS_URL, proxy.as_ref())
-            .await
-            .context("rtds connect_async_maybe_proxy")?;
+        match connect_async_maybe_proxy(POLYMARKET_RTDS_WS_URL, proxy.as_ref()).await {
+            Ok(stream_and_response) => stream_and_response,
+            Err(connect_err) => {
+                match proxy.as_ref() {
+                    Some(p) => {
+                        eprintln!(
+                            "rtds ({pair_symbol}): connect failed via proxy {}:{}: {connect_err}",
+                            p.host,
+                            p.port
+                        );
+                    }
+                    None => {
+                        eprintln!("rtds ({pair_symbol}): connect failed (direct): {connect_err}");
+                    }
+                }
+                return Err(connect_err.into());
+            }
+        };
     let (mut write, mut read) = ws_stream.split();
 
-    let pair_symbol = rtds_spot_pair_symbol(project_manager.currency.as_str());
     let filters = serde_json::json!({ "symbol": pair_symbol }).to_string();
     let subscribe = serde_json::json!({
         "action": "subscribe",

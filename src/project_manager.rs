@@ -10,6 +10,8 @@ use crate::data_ws::{
     MarketWsSubscription, Ws, WsCommand, make_ws_channel, spawn_persistent_interval_market_ws,
 };
 use crate::market_snapshot::aggregate_events;
+use crate::xframe::StrictBook;
+use crate::redeem_01_tail::Redeem01TailMarketRegime;
 use crate::run_log;
 use crate::util::{
     CurrencyEventSlugData, current_timestamp_ms, fetch_gamma_event_data_for_gamma_client,
@@ -30,7 +32,8 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::{self, Duration};
 
-type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrame<SIZE>>>>;
+type XFrameCell = Arc<RwLock<XFrame<SIZE>>>;
+type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrameCell>>>;
 
 /// Prev-маркет для дампа: `final_price` = exact текущего окна, `price_to_beat` = exact из `exact_price_to_beat_rx` (без повторного HTTP).
 struct PrevMarket {
@@ -44,16 +47,16 @@ struct PrevMarket {
     event_end_ms: Option<i64>,
 }
 
-/// Стабильный кадр лейна 1s → [`real_sim`](crate::real_sim) по каналам (без поллинга `xframes_by_market`).
-/// `market_id` / `asset_id` / интервал / сторона — в [`XFrame`]; окно Gamma — в
-/// [`ProjectManager::event_data_by_market`] по `frame.market_id`.
+/// Сигнал real_sim: новый кадр в [`ProjectManager::xframes_by_market`]. Сам [`XFrame`]
+/// воркер читает последний кадр по `market_id` / `asset_id` из хранилища.
 #[derive(Clone, Debug)]
 pub struct LaneFrame {
+    pub market_id: String,
+    pub asset_id: String,
     /// Кэш PTB на момент фанаута → CSV; `None`, если страница ещё не дала значение.
     pub price_to_beat: Option<f64>,
     /// Текст вопроса Gamma для имени дампа и синтетического пути `.bin` в CSV ([`crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link`]).
     pub gamma_question: Option<String>,
-    pub frame: XFrame<SIZE>,
 }
 
 #[derive(Clone, Debug)]
@@ -133,6 +136,8 @@ pub struct ProjectManager {
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
+    pub redeem_01_tail_market_regime:
+        Arc<RwLock<HashMap<XFrameIntervalKind, Redeem01TailMarketRegime>>>,
     pub account: SharedAccount,
 }
 
@@ -192,6 +197,7 @@ impl ProjectManager {
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             last_snapshot_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
+            redeem_01_tail_market_regime: Arc::new(RwLock::new(HashMap::new())),
             account,
         });
 
@@ -222,6 +228,9 @@ impl ProjectManager {
                 .run_currency_updown_interval(FIFTEEN_MIN_SEC, "15m")
                 .await;
         });
+        crate::redeem_01_tail::spawn_redeem_01_tail_market_regime_refresh(
+            project_manager.clone(),
+        );
 
         project_manager
     }
@@ -326,6 +335,43 @@ impl ProjectManager {
         }
         let cu = self.currency_up_down_by_asset_id.read().await;
         asset_ids.iter().all(|aid| cu.contains_key(aid))
+    }
+
+    /// Последняя ячейка кадра в [`Self::xframes_by_market`] для пары `market_id`/`asset_id`.
+    pub async fn latest_xframe_cell(
+        &self,
+        market_id: &str,
+        asset_id: &str,
+    ) -> Option<(i64, XFrameCell)> {
+        let lock = self.xframes_by_market[XFRAMES_LANE_1S].read().await;
+        let asset_frames = lock.get(market_id)?.get(asset_id)?;
+        asset_frames
+            .last_key_value()
+            .map(|(aligned_ts, xframe_cell)| (*aligned_ts, xframe_cell.clone()))
+    }
+
+    /// Подменяет ордербук кадра strict book.
+    pub async fn apply_strict_book_to_latest_xframe(
+        &self,
+        market_id: &str,
+        asset_id: &str,
+        aligned_ts: i64,
+        xframe_cell: XFrameCell,
+        book: &StrictBook,
+    ) {
+        let priors = {
+            let lock = self.xframes_by_market[XFRAMES_LANE_1S].read().await;
+            let Some(asset_frames) = lock.get(market_id).and_then(|m| m.get(asset_id)) else {
+                return;
+            };
+            let mut priors = Vec::new();
+            for (_, prior_xframe_cell) in asset_frames.range(..aligned_ts).rev().take(SIZE) {
+                priors.push(prior_xframe_cell.read().await.clone());
+            }
+            priors
+        };
+        let mut xframe = xframe_cell.write().await;
+        xframe.apply_strict_book(book, &priors);
     }
 
     /// Снос всех кэшей по `market_id`.
@@ -655,16 +701,15 @@ impl ProjectManager {
                 align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
             let frames_history = {
                 let xframes_by_market_read_lock = self.xframes_by_market[lane].read().await;
-                let history = xframes_by_market_read_lock
+                let mut history = BTreeMap::new();
+                if let Some(by_ts) = xframes_by_market_read_lock
                     .get(&market_id)
                     .and_then(|by_asset_id| by_asset_id.get(&asset_id))
-                    .map(|aligned_ts_to_xframe| {
-                        aligned_ts_to_xframe
-                            .range(..aligned_ts)
-                            .map(|(ts, xframe)| (*ts, xframe.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                {
+                    for (ts, xframe_cell) in by_ts.range(..aligned_ts) {
+                        history.insert(*ts, xframe_cell.read().await.clone());
+                    }
+                }
                 drop(xframes_by_market_read_lock);
                 history
             };
@@ -798,9 +843,11 @@ impl ProjectManager {
                         &other_asset_id,
                         &batch_frame_by_asset,
                         &xframes_stored_lane,
-                    ) {
+                    )
+                    .await
+                    {
                         Some(other_frame) => {
-                            entry.frame.merge_other_leg_features_from(other_frame)
+                            entry.frame.merge_other_leg_features_from(&other_frame)
                         }
                         None => {
                             if entry.frame.stable {
@@ -839,10 +886,12 @@ impl ProjectManager {
                         &sibling_asset_id,
                         &batch_frame_by_asset,
                         &xframes_stored_lane,
-                    ) {
+                    )
+                    .await
+                    {
                         Some(sibling_frame) => entry
                             .frame
-                            .merge_sibling_market_features_from(sibling_frame),
+                            .merge_sibling_market_features_from(&sibling_frame),
                         None => {
                             if entry.frame.stable {
                                 eprintln!(
@@ -917,9 +966,10 @@ impl ProjectManager {
                         .cloned()
                         .flatten();
                     let lane_frame = LaneFrame {
+                        market_id: entry.market_id.clone(),
+                        asset_id: entry.asset_id.clone(),
                         price_to_beat,
                         gamma_question,
-                        frame: entry.frame.clone(),
                     };
                     let _ = tx.send(lane_frame).await;
                 }
@@ -930,7 +980,7 @@ impl ProjectManager {
                 .or_insert_with(HashMap::new)
                 .entry(entry.asset_id)
                 .or_insert_with(BTreeMap::new)
-                .insert(entry.aligned_ts, entry.frame);
+                .insert(entry.aligned_ts, Arc::new(RwLock::new(entry.frame)));
             drop(xframes_by_market_lock);
         }
     }
@@ -1343,20 +1393,17 @@ async fn retry_fetch_exact_price_to_beat(
 /// После Scenario A в `batch` гарантированно ≤ 1 запись на `(market, asset)`,
 /// а в `stored` берём самый свежий кадр без ограничения по `aligned_ts` —
 /// это и есть «пустышка с прошлых итераций», если asset молчал > 1 сек.
-fn lookup_frame_for_leg_merge<'a>(
+async fn lookup_frame_for_leg_merge(
     market_id: &str,
     asset_id: &str,
-    batch: &'a HashMap<(String, String), XFrame<SIZE>>,
-    stored: &'a MarketFrames,
-) -> Option<&'a XFrame<SIZE>> {
+    batch: &HashMap<(String, String), XFrame<SIZE>>,
+    stored: &MarketFrames,
+) -> Option<XFrame<SIZE>> {
     if let Some(frame) = batch.get(&(market_id.to_string(), asset_id.to_string())) {
-        return Some(frame);
+        return Some(frame.clone());
     }
-    stored
-        .get(market_id)?
-        .get(asset_id)?
-        .values()
-        .next_back()
+    let xframe_cell = stored.get(market_id)?.get(asset_id)?.values().next_back()?;
+    Some(xframe_cell.read().await.clone())
 }
 
 /// `(beat - spot) / beat * 100`; положительно, если spot ниже beat.

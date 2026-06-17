@@ -43,7 +43,7 @@ pub const SIM_RESOLUTION_BUY_THRESHOLD: f32 = 0.60;
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый банкролл (USDC).
-pub const INITIAL_BANKROLL: f64 = 50.0;
+pub const INITIAL_BANKROLL: f64 = 100.0;
 /// Доля Kelly (<1 — fractional).
 pub const KELLY_MULTIPLIER: f64 = 0.1;
 /// Max доля банкролла на сделку.
@@ -81,11 +81,11 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = false;
+pub const ENABLE_PNL: bool = true;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
-pub const REDEEM_01: bool = true;
+pub const REDEEM_01: bool = false;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -108,18 +108,7 @@ pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
 /// Стоп новых входов при DD ≥ pct (`real_sim` только).
 pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
 
-/// HTTP стакан для strict fill в `real_sim`: `None` в history (WS [`book_fill_*`]).
-#[derive(Debug, Clone, Default)]
-pub struct StrictBook {
-    /// Bids, лучший первый.
-    pub(crate) bids: Vec<BookLevel>,
-    /// Asks, лучший первый.
-    pub(crate) asks: Vec<BookLevel>,
-    /// Last trade (широкий спред → как polymarket-style mid).
-    pub(crate) last_trade_price: Option<f64>,
-    /// Min размер ордера в шерах (strict).
-    pub(crate) min_order_size: Option<f64>,
-}
+pub use crate::xframe::StrictBook;
 
 /// Polymarket-style implied prob: из [`StrictBook`] как `currency_implied_prob_polymarket_style`, иначе `frame.currency_implied_prob`.
 pub(crate) fn effective_implied_prob(
@@ -1127,7 +1116,7 @@ pub enum BuyGate {
 /// Иначе — диагностика PnL (приоритетного канала).
 /// BUY-ордер на CLOB в обоих каналах одинаковый: taker FAK с slippage cap.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn buy_gate(
+pub(crate) async fn buy_gate(
     frame: &XFrame<SIZE>,
     pnl_inference: Option<PnlInference>,
     resolution_inference: Option<PnlInference>,
@@ -1135,6 +1124,8 @@ pub(crate) fn buy_gate(
     strict_book: Option<&StrictBook>,
     is_kelly: bool,
     _booster_pnl_for_shap: Option<&Booster>,
+    currency: &str,
+    project_manager: Option<&Arc<ProjectManager>>,
 ) -> BuyGate {
     if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return BuyGate::LateEntry;
@@ -1177,7 +1168,16 @@ pub(crate) fn buy_gate(
     }
 
     if REDEEM_01 {
-        let Some(size) = redeem_01_tail_entry_size(frame, strict_book, entry_prob, bankroll) else {
+        let Some(size) = redeem_01_tail_entry_size(
+            frame,
+            strict_book,
+            entry_prob,
+            bankroll,
+            currency,
+            project_manager,
+        )
+        .await
+        else {
             return pnl_decision;
         };
         return BuyGate::Proceed {
@@ -1348,7 +1348,11 @@ pub(crate) async fn try_open_position(
         strict_book,
         is_kelly,
         booster_pnl_for_shap,
-    ) {
+        currency,
+        project_manager,
+    )
+    .await
+    {
         BuyGate::LateEntry => {
             stats.late_entry_skips += 1;
             false

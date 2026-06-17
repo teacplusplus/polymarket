@@ -144,8 +144,8 @@ pub async fn dump_market_xframes_binary_lane(
 
     let mut flat: Vec<(String, i64, XFrame<SIZE>)> = Vec::new();
     for (asset_id, by_ts) in by_asset.iter() {
-        for (aligned_ts, frame) in by_ts.iter() {
-            flat.push((asset_id.clone(), *aligned_ts, frame.clone()));
+        for (aligned_ts, xframe_cell) in by_ts.iter() {
+            flat.push((asset_id.clone(), *aligned_ts, xframe_cell.read().await.clone()));
         }
     }
     flat.sort_by_key(|(_, aligned_ts, _)| *aligned_ts);
