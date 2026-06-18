@@ -8,6 +8,9 @@ use crate::account_proxy::PolyProxyEnvGuard;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{CloseReason, INITIAL_BANKROLL, LanePositions, SharedOpenPosition};
 use crate::real_sim::RealSimState;
+use crate::redeem_01_tail::{
+    Redeem01TailMarketRegime, Redeem01TailMarketRegimeLoadCommand,
+};
 use crate::sim_stats::SimStats;
 use alloy::signers::local::PrivateKeySigner;
 use arc_swap::ArcSwapAny;
@@ -18,7 +21,7 @@ use polymarket_client_sdk::data;
 use polymarket_client_sdk::gamma;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 /// Production CLOB V2 host (cutover 2026-04-28; см.
 /// [docs.polymarket.com/v2-migration](https://docs.polymarket.com/v2-migration)).
@@ -35,6 +38,9 @@ pub type SharedAccount = Arc<Account>;
 
 /// Ключ лейна: `(currency, interval, side)` — маршрут в maps и `last_prob`.
 pub type LaneKey = (String, XFrameIntervalKind, CurrencyUpDownOutcome);
+
+/// Ключ redeem-01 tail режима: `(coin, period)`.
+pub type Redeem01TailMarketRegimeKey = (String, XFrameIntervalKind);
 
 /// Счёт процесса: cash, MtM, позиции, CLOB. См. модульный комментарий про порядок локов и один inner на позицию.
 #[derive(Debug)]
@@ -74,6 +80,11 @@ pub struct Account {
     pub order_invoke_hub: Arc<RwLock<HashMap<String, TrackerEntry>>>,
     /// `currency` → [`RealSimState`]; лок отдельно от цепочки `bankroll → …`.
     pub real_sim_state_by_currency: Arc<RwLock<HashMap<String, Arc<RwLock<RealSimState>>>>>,
+    /// Redeem-01 tail режим рынка по `(coin, period)`; лениво создаётся worker'ом из xframes.
+    pub redeem_01_tail_market_regime:
+        Arc<RwLock<HashMap<Redeem01TailMarketRegimeKey, Redeem01TailMarketRegime>>>,
+    pub(crate) redeem_01_tail_market_regime_tx:
+        mpsc::Sender<Redeem01TailMarketRegimeLoadCommand>,
 }
 
 impl Account {
@@ -98,6 +109,13 @@ impl Account {
         let gamma = Arc::new(gamma::Client::default());
         let data = Arc::new(data::Client::default());
         PolyProxyEnvGuard::uninstall_from_env(poly_proxy_env);
+
+        let (redeem_01_tail_market_regime_tx, redeem_01_tail_market_regime_rx) =
+            mpsc::channel(1024);
+        tokio::spawn(crate::redeem_01_tail::run_redeem_01_tail_market_regime_loader(
+            redeem_01_tail_market_regime_rx,
+        ));
+
         Self {
             bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
             peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
@@ -113,6 +131,8 @@ impl Account {
             clob_signer: ArcSwapAny::new(Arc::new(None)),
             order_invoke_hub: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state_by_currency: Arc::new(RwLock::new(HashMap::new())),
+            redeem_01_tail_market_regime: Arc::new(RwLock::new(HashMap::new())),
+            redeem_01_tail_market_regime_tx,
         }
     }
 

@@ -516,7 +516,7 @@ async fn tick_once(
             true,
             models.booster_pnl.as_ref(),
             currency,
-            Some(project_manager),
+            Some(account),
         )
         .await,
         BuyGate::Proceed { .. }

@@ -3,29 +3,26 @@
 //! This module contains the live/project decision rule only. It does not replay
 //! bot activity and does not depend on precomputed market/asset tables.
 
+use crate::account::{Redeem01TailMarketRegimeKey, SharedAccount};
 use crate::constants::XFrameIntervalKind;
 use crate::history_sim::{
     KELLY_MULTIPLIER, MAX_BET_FRACTION, MAX_POSITION_USD, MIN_POSITION_USD,
     StrictBook,
 };
-use crate::project_manager::ProjectManager;
 use crate::xframe::{BookLevel, SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::Context as _;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::time::{self, Duration};
+use tokio::sync::mpsc;
 
 const BTC_5M_CURRENCY: &str = "btc";
 const BTC_5M_MAX_TARGET_USDC: f64 = 1.0;
-const BTC_5M_FALLBACK_ENTRY_PRICE: f64 = 0.01;
 const DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS: i64 = 50_000;
 const REDEEM_01_TAIL_ENTRY_PRICE_COUNT: usize = 3;
 const REDEEM_01_TAIL_ENTRY_PRICES: [f64; REDEEM_01_TAIL_ENTRY_PRICE_COUNT] = [0.01, 0.02, 0.03];
 const MARKET_REGIME_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
-const MARKET_REGIME_REFRESH_SECS: u64 = 60 * 60;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Redeem01TailMarketRegime {
@@ -59,32 +56,46 @@ struct Redeem01TailEntryPlan {
     min_event_remaining_ms: i64,
 }
 
-pub fn spawn_redeem_01_tail_market_regime_refresh(project_manager: Arc<ProjectManager>) {
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = refresh_redeem_01_tail_market_regime(project_manager.clone()).await {
-                crate::tee_eprintln!(
-                    "[redeem_01_tail] market regime refresh failed currency={}: {err:#}",
-                    project_manager.currency.as_str(),
-                );
-            }
-            time::sleep(Duration::from_secs(MARKET_REGIME_REFRESH_SECS)).await;
-        }
-    });
+#[derive(Debug, Clone)]
+pub(crate) struct Redeem01TailMarketRegimeLoadCommand {
+    pub account: SharedAccount,
+    pub currency: String,
+    pub interval: XFrameIntervalKind,
 }
 
-async fn refresh_redeem_01_tail_market_regime(
-    project_manager: Arc<ProjectManager>,
+pub(crate) async fn run_redeem_01_tail_market_regime_loader(
+    mut rx: mpsc::Receiver<Redeem01TailMarketRegimeLoadCommand>,
+) {
+    while let Some(command) = rx.recv().await {
+        if let Err(err) = load_redeem_01_tail_market_regime_key(command).await {
+            crate::tee_eprintln!("[redeem_01_tail] market regime load failed: {err:#}");
+        }
+    }
+}
+
+async fn load_redeem_01_tail_market_regime_key(
+    command: Redeem01TailMarketRegimeLoadCommand,
 ) -> anyhow::Result<()> {
-    let currency = project_manager.currency.to_ascii_lowercase();
+    let key: Redeem01TailMarketRegimeKey = (command.currency.clone(), command.interval);
+    {
+        let guard = command.account.redeem_01_tail_market_regime.read().await;
+        if guard.contains_key(&key) {
+            return Ok(());
+        }
+    }
+
     let xframes_root = crate::path_config::xframes_root();
     let now_ms = crate::util::current_timestamp_ms();
-    let regimes = scan_redeem_01_tail_market_regime(&xframes_root, &currency, now_ms)?;
+    let mut regimes = scan_redeem_01_tail_market_regime(&xframes_root, &command.currency, now_ms)?;
+    let regime = regimes
+        .remove(&command.interval)
+        .unwrap_or_else(|| Redeem01TailMarketRegime {
+            updated_at_ms: now_ms,
+            ..Redeem01TailMarketRegime::default()
+        });
 
-    let mut guard = project_manager.redeem_01_tail_market_regime.write().await;
-    for (key, regime) in regimes {
-        guard.insert(key, regime);
-    }
+    let mut guard = command.account.redeem_01_tail_market_regime.write().await;
+    guard.entry(key).or_insert(regime);
     Ok(())
 }
 
@@ -279,7 +290,7 @@ pub(crate) async fn redeem_01_tail_entry_size(
     _entry_prob: f64,
     bankroll: f64,
     currency: &str,
-    project_manager: Option<&Arc<ProjectManager>>,
+    account: Option<&SharedAccount>,
 ) -> Option<f64> {
     if !currency.eq_ignore_ascii_case(BTC_5M_CURRENCY) {
         return None;
@@ -289,7 +300,7 @@ pub(crate) async fn redeem_01_tail_entry_size(
         return None;
     }
 
-    let plan = redeem_01_tail_market_regime_entry_plan(interval, bankroll, project_manager).await?;
+    let plan = redeem_01_tail_market_regime_entry_plan(currency, interval, bankroll, account).await?;
     if frame.event_remaining_ms < plan.min_event_remaining_ms {
         return None;
     }
@@ -302,32 +313,31 @@ pub(crate) async fn redeem_01_tail_entry_size(
 }
 
 async fn redeem_01_tail_market_regime_entry_plan(
+    currency: &str,
     interval: XFrameIntervalKind,
     bankroll: f64,
-    project_manager: Option<&Arc<ProjectManager>>,
+    account: Option<&SharedAccount>,
 ) -> Option<Redeem01TailEntryPlan> {
-    let Some(project_manager) = project_manager else {
-        return fallback_redeem_01_tail_entry_plan(bankroll);
+    let Some(account) = account else {
+        return None;
     };
-    let guard = project_manager.redeem_01_tail_market_regime.read().await;
-    match guard.get(&interval) {
+    let key: Redeem01TailMarketRegimeKey = (currency.to_ascii_lowercase(), interval);
+    let guard = account.redeem_01_tail_market_regime.read().await;
+    match guard.get(&key) {
         Some(regime) => regime.recommendation.and_then(|recommendation| {
             redeem_01_tail_entry_plan_from_recommendation(recommendation, bankroll)
         }),
-        None => fallback_redeem_01_tail_entry_plan(bankroll),
+        None => {
+            let _ = account
+                .redeem_01_tail_market_regime_tx
+                .try_send(Redeem01TailMarketRegimeLoadCommand {
+                    account: account.clone(),
+                    currency: currency.to_ascii_lowercase(),
+                    interval,
+                });
+            None
+        }
     }
-}
-
-fn fallback_redeem_01_tail_entry_plan(bankroll: f64) -> Option<Redeem01TailEntryPlan> {
-    let target_usdc = BTC_5M_MAX_TARGET_USDC.min(bankroll).max(0.0);
-    if target_usdc < MIN_POSITION_USD {
-        return None;
-    }
-    Some(Redeem01TailEntryPlan {
-        entry_price: BTC_5M_FALLBACK_ENTRY_PRICE,
-        target_usdc,
-        min_event_remaining_ms: DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS,
-    })
 }
 
 fn redeem_01_tail_entry_plan_from_recommendation(

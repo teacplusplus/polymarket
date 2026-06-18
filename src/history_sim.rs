@@ -1125,7 +1125,7 @@ pub(crate) async fn buy_gate(
     is_kelly: bool,
     _booster_pnl_for_shap: Option<&Booster>,
     currency: &str,
-    project_manager: Option<&Arc<ProjectManager>>,
+    account: Option<&SharedAccount>,
 ) -> BuyGate {
     if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return BuyGate::LateEntry;
@@ -1174,7 +1174,7 @@ pub(crate) async fn buy_gate(
             entry_prob,
             bankroll,
             currency,
-            project_manager,
+            account,
         )
         .await
         else {
@@ -1349,7 +1349,7 @@ pub(crate) async fn try_open_position(
         is_kelly,
         booster_pnl_for_shap,
         currency,
-        project_manager,
+        Some(account),
     )
     .await
     {

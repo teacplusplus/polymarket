@@ -11,7 +11,6 @@ use crate::data_ws::{
 };
 use crate::market_snapshot::aggregate_events;
 use crate::xframe::StrictBook;
-use crate::redeem_01_tail::Redeem01TailMarketRegime;
 use crate::run_log;
 use crate::util::{
     CurrencyEventSlugData, current_timestamp_ms, fetch_gamma_event_data_for_gamma_client,
@@ -136,8 +135,6 @@ pub struct ProjectManager {
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
-    pub redeem_01_tail_market_regime:
-        Arc<RwLock<HashMap<XFrameIntervalKind, Redeem01TailMarketRegime>>>,
     pub account: SharedAccount,
 }
 
@@ -197,7 +194,6 @@ impl ProjectManager {
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             last_snapshot_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
-            redeem_01_tail_market_regime: Arc::new(RwLock::new(HashMap::new())),
             account,
         });
 
@@ -228,10 +224,6 @@ impl ProjectManager {
                 .run_currency_updown_interval(FIFTEEN_MIN_SEC, "15m")
                 .await;
         });
-        crate::redeem_01_tail::spawn_redeem_01_tail_market_regime_refresh(
-            project_manager.clone(),
-        );
-
         project_manager
     }
 
