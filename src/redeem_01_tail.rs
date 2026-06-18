@@ -12,9 +12,10 @@ use crate::history_sim::{
 use crate::xframe::{BookLevel, SIZE, XFrame};
 use crate::xframe_dump::MarketXFramesDump;
 use anyhow::Context as _;
-use std::collections::HashMap;
+use indexmap::IndexMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc;
 
 const BTC_5M_CURRENCY: &str = "btc";
@@ -23,9 +24,11 @@ const DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS: i64 = 50_000;
 const REDEEM_01_TAIL_ENTRY_PRICE_COUNT: usize = 3;
 const REDEEM_01_TAIL_ENTRY_PRICES: [f64; REDEEM_01_TAIL_ENTRY_PRICE_COUNT] = [0.01, 0.02, 0.03];
 const MARKET_REGIME_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
+const MARKET_REGIME_DUMP_CACHE_CAP: usize = 8_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Redeem01TailMarketRegime {
+    pub event_end_ms: i64,
     pub markets: usize,
     pub price_stats: [Redeem01TailPriceRegime; REDEEM_01_TAIL_ENTRY_PRICE_COUNT],
     pub recommendation: Option<Redeem01TailEntryRecommendation>,
@@ -61,6 +64,7 @@ pub(crate) struct Redeem01TailMarketRegimeLoadCommand {
     pub account: SharedAccount,
     pub currency: String,
     pub interval: XFrameIntervalKind,
+    pub event_end_ms: i64,
 }
 
 pub(crate) async fn run_redeem_01_tail_market_regime_loader(
@@ -76,25 +80,35 @@ pub(crate) async fn run_redeem_01_tail_market_regime_loader(
 async fn load_redeem_01_tail_market_regime_key(
     command: Redeem01TailMarketRegimeLoadCommand,
 ) -> anyhow::Result<()> {
-    let key: Redeem01TailMarketRegimeKey = (command.currency.clone(), command.interval);
+    let currency = command.currency.to_ascii_lowercase();
+    let key: Redeem01TailMarketRegimeKey = (currency.clone(), command.interval);
     {
         let guard = command.account.redeem_01_tail_market_regime.read().await;
-        if guard.contains_key(&key) {
+        if guard
+            .get(&key)
+            .is_some_and(|regime| regime.event_end_ms == command.event_end_ms)
+        {
             return Ok(());
         }
     }
 
     let xframes_root = crate::path_config::xframes_root();
     let now_ms = crate::util::current_timestamp_ms();
-    let mut regimes = scan_redeem_01_tail_market_regime(&xframes_root, &command.currency, now_ms)?;
-    let regime = regimes
-        .remove(&command.interval)
-        .unwrap_or_else(|| Redeem01TailMarketRegime {
-            updated_at_ms: now_ms,
-            ..Redeem01TailMarketRegime::default()
-        });
+    let regime = scan_redeem_01_tail_market_regime(
+        &xframes_root,
+        &currency,
+        command.interval,
+        command.event_end_ms,
+        now_ms,
+    )?;
 
     let mut guard = command.account.redeem_01_tail_market_regime.write().await;
+    if guard
+        .get(&key)
+        .is_some_and(|existing| existing.event_end_ms != command.event_end_ms)
+    {
+        guard.remove(&key);
+    }
     guard.entry(key).or_insert(regime);
     Ok(())
 }
@@ -102,15 +116,20 @@ async fn load_redeem_01_tail_market_regime_key(
 fn scan_redeem_01_tail_market_regime(
     xframes_root: &Path,
     currency: &str,
-    now_ms: i64,
-) -> anyhow::Result<HashMap<XFrameIntervalKind, Redeem01TailMarketRegime>> {
+    target_interval: XFrameIntervalKind,
+    regime_event_end_ms: i64,
+    updated_at_ms: i64,
+) -> anyhow::Result<Redeem01TailMarketRegime> {
     let currency_root = xframes_root.join(currency);
     if !currency_root.exists() {
-        return Ok(HashMap::new());
+        return Ok(empty_redeem_01_tail_market_regime(
+            regime_event_end_ms,
+            updated_at_ms,
+        ));
     }
 
-    let cutoff_ms = now_ms - MARKET_REGIME_WINDOW_MS;
-    let mut stats: HashMap<XFrameIntervalKind, MarketRegimeAccumulator> = HashMap::new();
+    let cutoff_ms = regime_event_end_ms - MARKET_REGIME_WINDOW_MS;
+    let mut acc = MarketRegimeAccumulator::default();
     let files = collect_bin_files(&currency_root)?;
 
     for path in files {
@@ -118,67 +137,121 @@ fn scan_redeem_01_tail_market_regime(
         else {
             continue;
         };
-        if event_end_ms < cutoff_ms || event_end_ms > now_ms {
+        if interval != target_interval {
             continue;
         }
-        let Ok(bytes) = fs::read(&path) else {
+        if event_end_ms < cutoff_ms || event_end_ms >= regime_event_end_ms {
             continue;
-        };
-        let Ok(dump) = bincode::deserialize::<MarketXFramesDump>(&bytes) else {
+        }
+        let Some(cached) = cached_tail_regime_dump(&path) else {
             continue;
-        };
-        let winning_frames = if dump.up_won() {
-            &dump.frames_up
-        } else {
-            &dump.frames_down
         };
 
-        let entry = stats.entry(interval).or_default();
-        entry.markets += 1;
-        for (idx, entry_price) in REDEEM_01_TAIL_ENTRY_PRICES.iter().copied().enumerate() {
-            if let Some(deadline_ms) = latest_tail_entry_remaining_ms(winning_frames, entry_price) {
-                let price_entry = &mut entry.price_entries[idx];
+        acc.markets += 1;
+        for (idx, deadline_ms) in cached.deadline_event_remaining_ms.iter().copied().enumerate() {
+            if let Some(deadline_ms) = deadline_ms {
+                let price_entry = &mut acc.price_entries[idx];
                 price_entry.reversals += 1;
                 price_entry.latest_entry_remaining_ms.push(deadline_ms);
             }
         }
     }
 
-    let mut regimes = HashMap::with_capacity(stats.len());
-    for (key, acc) in stats {
-        let price_stats = std::array::from_fn(|idx| {
-            let entry_price = REDEEM_01_TAIL_ENTRY_PRICES[idx];
-            let price_acc = &acc.price_entries[idx];
-            let reversal_rate = if acc.markets > 0 {
-                price_acc.reversals as f64 / acc.markets as f64
-            } else {
-                0.0
-            };
-            let expected_roi = if entry_price > 0.0 {
-                reversal_rate / entry_price - 1.0
-            } else {
-                0.0
-            };
-            Redeem01TailPriceRegime {
-                entry_price,
-                reversals: price_acc.reversals,
-                reversal_rate,
-                deadline_event_remaining_ms: median_i64(&price_acc.latest_entry_remaining_ms),
-                expected_roi,
-            }
-        });
-        let recommendation = choose_redeem_01_tail_recommendation(&price_stats);
-        regimes.insert(
-            key,
-            Redeem01TailMarketRegime {
-                markets: acc.markets,
-                price_stats,
-                recommendation,
-                updated_at_ms: now_ms,
-            },
-        );
+    Ok(redeem_01_tail_market_regime_from_accumulator(
+        acc,
+        regime_event_end_ms,
+        updated_at_ms,
+    ))
+}
+
+fn empty_redeem_01_tail_market_regime(
+    event_end_ms: i64,
+    updated_at_ms: i64,
+) -> Redeem01TailMarketRegime {
+    redeem_01_tail_market_regime_from_accumulator(
+        MarketRegimeAccumulator::default(),
+        event_end_ms,
+        updated_at_ms,
+    )
+}
+
+fn redeem_01_tail_market_regime_from_accumulator(
+    acc: MarketRegimeAccumulator,
+    event_end_ms: i64,
+    updated_at_ms: i64,
+) -> Redeem01TailMarketRegime {
+    let price_stats = std::array::from_fn(|idx| {
+        let entry_price = REDEEM_01_TAIL_ENTRY_PRICES[idx];
+        let price_acc = &acc.price_entries[idx];
+        let reversal_rate = if acc.markets > 0 {
+            price_acc.reversals as f64 / acc.markets as f64
+        } else {
+            0.0
+        };
+        let expected_roi = if entry_price > 0.0 {
+            reversal_rate / entry_price - 1.0
+        } else {
+            0.0
+        };
+        Redeem01TailPriceRegime {
+            entry_price,
+            reversals: price_acc.reversals,
+            reversal_rate,
+            deadline_event_remaining_ms: median_i64(&price_acc.latest_entry_remaining_ms),
+            expected_roi,
+        }
+    });
+    let recommendation = choose_redeem_01_tail_recommendation(&price_stats);
+    Redeem01TailMarketRegime {
+        event_end_ms,
+        markets: acc.markets,
+        price_stats,
+        recommendation,
+        updated_at_ms,
     }
-    Ok(regimes)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedTailRegimeDump {
+    deadline_event_remaining_ms: [Option<i64>; REDEEM_01_TAIL_ENTRY_PRICE_COUNT],
+}
+
+static TAIL_REGIME_DUMP_CACHE: OnceLock<Mutex<IndexMap<PathBuf, CachedTailRegimeDump>>> =
+    OnceLock::new();
+
+fn cached_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
+    let key = path.to_path_buf();
+    let cache = TAIL_REGIME_DUMP_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
+    {
+        let mut guard = cache.lock().ok()?;
+        if let Some(cached) = guard.shift_remove(&key) {
+            guard.insert(key.clone(), cached);
+            return Some(cached);
+        }
+    }
+
+    let cached = load_tail_regime_dump(path)?;
+    let mut guard = cache.lock().ok()?;
+    if guard.len() >= MARKET_REGIME_DUMP_CACHE_CAP {
+        guard.shift_remove_index(0);
+    }
+    guard.insert(key, cached);
+    Some(cached)
+}
+
+fn load_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
+    let bytes = fs::read(path).ok()?;
+    let dump = bincode::deserialize::<MarketXFramesDump>(&bytes).ok()?;
+    let winning_frames = if dump.up_won() {
+        &dump.frames_up
+    } else {
+        &dump.frames_down
+    };
+    Some(CachedTailRegimeDump {
+        deadline_event_remaining_ms: std::array::from_fn(|idx| {
+            latest_tail_entry_remaining_ms(winning_frames, REDEEM_01_TAIL_ENTRY_PRICES[idx])
+        }),
+    })
 }
 
 #[derive(Default)]
@@ -290,6 +363,8 @@ pub(crate) async fn redeem_01_tail_entry_size(
     _entry_prob: f64,
     bankroll: f64,
     currency: &str,
+    event_end_ms: Option<i64>,
+    load_missing_inline: bool,
     account: Option<&SharedAccount>,
 ) -> Option<f64> {
     if !currency.eq_ignore_ascii_case(BTC_5M_CURRENCY) {
@@ -300,7 +375,16 @@ pub(crate) async fn redeem_01_tail_entry_size(
         return None;
     }
 
-    let plan = redeem_01_tail_market_regime_entry_plan(currency, interval, bankroll, account).await?;
+    let event_end_ms = event_end_ms?;
+    let plan = redeem_01_tail_market_regime_entry_plan(
+        currency,
+        interval,
+        event_end_ms,
+        bankroll,
+        load_missing_inline,
+        account,
+    )
+    .await?;
     if frame.event_remaining_ms < plan.min_event_remaining_ms {
         return None;
     }
@@ -315,29 +399,70 @@ pub(crate) async fn redeem_01_tail_entry_size(
 async fn redeem_01_tail_market_regime_entry_plan(
     currency: &str,
     interval: XFrameIntervalKind,
+    event_end_ms: i64,
     bankroll: f64,
+    load_missing_inline: bool,
     account: Option<&SharedAccount>,
 ) -> Option<Redeem01TailEntryPlan> {
     let Some(account) = account else {
         return None;
     };
     let key: Redeem01TailMarketRegimeKey = (currency.to_ascii_lowercase(), interval);
-    let guard = account.redeem_01_tail_market_regime.read().await;
-    match guard.get(&key) {
-        Some(regime) => regime.recommendation.and_then(|recommendation| {
-            redeem_01_tail_entry_plan_from_recommendation(recommendation, bankroll)
-        }),
-        None => {
-            let _ = account
-                .redeem_01_tail_market_regime_tx
-                .try_send(Redeem01TailMarketRegimeLoadCommand {
-                    account: account.clone(),
-                    currency: currency.to_ascii_lowercase(),
-                    interval,
+    {
+        let guard = account.redeem_01_tail_market_regime.read().await;
+        if let Some(regime) = guard.get(&key) {
+            if regime.event_end_ms == event_end_ms {
+                return regime.recommendation.and_then(|recommendation| {
+                    redeem_01_tail_entry_plan_from_recommendation(recommendation, bankroll)
                 });
-            None
+            }
         }
     }
+
+    {
+        let mut guard = account.redeem_01_tail_market_regime.write().await;
+        if guard
+            .get(&key)
+            .is_some_and(|regime| regime.event_end_ms != event_end_ms)
+        {
+            guard.remove(&key);
+        }
+    }
+
+    if load_missing_inline {
+        if let Err(err) = load_redeem_01_tail_market_regime_key(
+            Redeem01TailMarketRegimeLoadCommand {
+                account: account.clone(),
+                currency: currency.to_ascii_lowercase(),
+                interval,
+                event_end_ms,
+            },
+        )
+        .await
+        {
+            crate::tee_eprintln!("[redeem_01_tail] market regime load failed: {err:#}");
+            return None;
+        }
+        let guard = account.redeem_01_tail_market_regime.read().await;
+        return guard.get(&key).and_then(|regime| {
+            (regime.event_end_ms == event_end_ms)
+                .then_some(regime)
+                .and_then(|regime| regime.recommendation)
+                .and_then(|recommendation| {
+                    redeem_01_tail_entry_plan_from_recommendation(recommendation, bankroll)
+                })
+        });
+    }
+
+    let _ = account
+        .redeem_01_tail_market_regime_tx
+        .try_send(Redeem01TailMarketRegimeLoadCommand {
+            account: account.clone(),
+            currency: currency.to_ascii_lowercase(),
+            interval,
+            event_end_ms,
+        });
+    None
 }
 
 fn redeem_01_tail_entry_plan_from_recommendation(

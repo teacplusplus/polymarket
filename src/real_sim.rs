@@ -516,6 +516,8 @@ async fn tick_once(
             true,
             models.booster_pnl.as_ref(),
             currency,
+            event_end_ms,
+            submit_mode,
             Some(account),
         )
         .await,

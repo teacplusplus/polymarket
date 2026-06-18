@@ -1125,6 +1125,8 @@ pub(crate) async fn buy_gate(
     is_kelly: bool,
     _booster_pnl_for_shap: Option<&Booster>,
     currency: &str,
+    event_end_ms: Option<i64>,
+    submit_mode: crate::account_submit::SubmitMode,
     account: Option<&SharedAccount>,
 ) -> BuyGate {
     if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
@@ -1174,6 +1176,8 @@ pub(crate) async fn buy_gate(
             entry_prob,
             bankroll,
             currency,
+            event_end_ms,
+            submit_mode == crate::account_submit::SubmitMode::None,
             account,
         )
         .await
@@ -1349,6 +1353,8 @@ pub(crate) async fn try_open_position(
         is_kelly,
         booster_pnl_for_shap,
         currency,
+        event_end_ms,
+        submit_mode,
         Some(account),
     )
     .await
