@@ -16,7 +16,7 @@ use crate::xframe::{
     apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution,
 };
 use crate::xframe_dump::MarketXFramesDump;
-use crate::{tee_eprintln, tee_println};
+use crate::{tee_eprintln, tee_println, CURRENCIES};
 use optimizer::sampler::tpe::TpeSampler;
 use optimizer::{Direction, ParamValue, Study};
 use serde::{Deserialize, Serialize};
@@ -932,6 +932,9 @@ pub async fn run_train_mode() -> anyhow::Result<()> {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        if !CURRENCIES.contains(&currency.as_str()) {
+            continue;
+        }
 
         for version_path in fs_read_dirs(&currency_path)? {
             if !version_path.is_dir() {

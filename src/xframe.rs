@@ -1057,7 +1057,7 @@ pub const Y_TRAIN_SL_MIN_REF_SELL_REL_DROP: f64 = 0.03;
 /// Если эта связка нарушится (значения разойдутся), runtime будет
 /// торговать на тиках, которые модель не видела при обучении, — это
 /// прямой источник bias'а между симуляцией и live-режимом.
-pub const Y_TRAIN_HORIZON_FRAMES: usize = 5;
+pub const Y_TRAIN_HORIZON_FRAMES: usize = 30;
 
 /// Нижняя граница **исключённого** центра распределения `currency_implied_prob`
 /// для [`calc_y_train_pnl`]: модель учится **только на хвостах** —
@@ -1076,11 +1076,11 @@ pub const Y_TRAIN_HORIZON_FRAMES: usize = 5;
 /// `BuyGate::EntryProbOutOfRange` и инкрементируется `entry_prob_skips`,
 /// поэтому inference происходит только на хвостах — на том же
 /// распределении, на котором училась модель.
-pub const Y_TRAIN_NO_TRADE_PROB_LOW: f64 = 0.3;
+pub const Y_TRAIN_NO_TRADE_PROB_LOW: f64 = 0.5;
 
 /// Верхняя граница исключённого центра для y-разметки.
 /// См. [`Y_TRAIN_NO_TRADE_PROB_LOW`] для обоснования.
-pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.7;
+pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.5;
 
 /// Верхний потолок цены входа **только для Resolution-канала**
 /// (held-to-resolution): при `entry_prob ≥` этого значения у позиции нет
@@ -1093,6 +1093,7 @@ pub const Y_TRAIN_NO_TRADE_PROB_HIGH: f64 = 0.7;
 /// → `None`) и из runtime-входа ([`crate::history_sim::buy_gate`] →
 /// `EntryProbOutOfRange`). На PnL-канал не распространяется.
 pub const Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB: f64 = 0.90;
+pub const Y_TRAIN_PNL_MAX_ENTRY_PROB: f64 = 0.90;
 
 /// Целевой нотионал позиции (gross USDC), под который размечаются Y-метки
 /// [`calc_y_train_pnl`] / [`calc_y_train_resolution`]. Совпадает с типичным
@@ -1386,6 +1387,15 @@ pub fn calc_y_train_pnl(
     // skip, чтобы поведение совпадало с прежним «нет цены — нет y».
     let p_buy = current.currency_implied_prob?;
 
+    // Потолок цены входа: в зоне `entry_prob ≥ MAX` нет извлекаемого edge
+    // (апсайд → 0 при `p → 1`, даунсайд = вся ставка). Исключаем такие кадры
+    // из обучения, чтобы модель не училась «угадывать» уже заложенный в цену
+    // near-certain исход. Синхронизировано с runtime-гейтом в
+    // [`crate::history_sim::buy_gate`]. См. [`Y_TRAIN_PNL_MAX_ENTRY_PROB`].
+    if p_buy >= Y_TRAIN_PNL_MAX_ENTRY_PROB {
+        return Some(0.0);
+    }
+
     // Фильтр «только хвосты»: учим модель на направленных рынках,
     // где доминирующая сторона уже выявлена ценой
     // (`p_buy ≤ NO_TRADE_LOW` или `p_buy ≥ NO_TRADE_HIGH`).
@@ -1432,9 +1442,10 @@ pub fn calc_y_train_pnl(
         // Отсутствие следующего кадра трактуется как конец маркета
         // (дампы обрезаются по реальному завершению события).
         let future_opt = x_frames.get(index + i);
+        let next_future_opt = x_frames.get(index + i + 1);
         let reached_end = match future_opt {
             None => true,
-            Some(f) => f.event_remaining_ms <= 0,
+            Some(f) => f.event_remaining_ms <= 0 && next_future_opt.is_none(),
         };
 
         if reached_end {
@@ -1704,9 +1715,10 @@ pub fn calc_y_train_resolution(
         // Отсутствие следующего кадра трактуется как конец маркета
         // (дампы обрезаются по реальному завершению события).
         let future_opt = x_frames.get(index + i);
+        let next_future_opt = x_frames.get(index + i + 1);
         let reached_end = match future_opt {
             None => true,
-            Some(f) => f.event_remaining_ms <= 0,
+            Some(f) => f.event_remaining_ms <= 0 && next_future_opt.is_none(),
         };
 
         if reached_end {

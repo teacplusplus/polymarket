@@ -15,14 +15,9 @@ use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
     Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
 };
-use crate::xframe::{
-    BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH,
-    Y_TRAIN_NO_TRADE_PROB_LOW, Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB,
-    Y_TRAIN_RESOLUTION_STOP_LOSS_PP, Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP,
-    apply_side_symmetry,
-};
+use crate::xframe::{BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN_NO_TRADE_PROB_LOW, Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB, Y_TRAIN_RESOLUTION_STOP_LOSS_PP, Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP, apply_side_symmetry, Y_TRAIN_PNL_MAX_ENTRY_PROB};
 use crate::xframe_dump::MarketXFramesDump;
-use crate::{tee_eprintln, tee_println, tee_progress};
+use crate::{tee_eprintln, tee_println, tee_progress, CURRENCIES};
 use crate::tee_log::tee_progress_finish;
 
 pub use crate::sim_stats::{
@@ -81,11 +76,11 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = false;
+pub const ENABLE_PNL: bool = true;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
-pub const REDEEM_01: bool = true;
+pub const REDEEM_01: bool = false;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -553,6 +548,9 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
 
     for currency_path in fs_sorted_dirs(&xframes_root)? {
         let currency = dir_name(&currency_path);
+        if !CURRENCIES.contains(&currency.as_str()) {
+            continue;
+        }
 
         for version_path in fs_sorted_dirs(&currency_path)? {
             let version = dir_name(&version_path);
@@ -1019,7 +1017,7 @@ pub(crate) fn compute_pnl_inference(
     calibration_pnl: Option<&Calibration>,
     is_kelly: bool,
 ) -> Option<PnlInference> {
-    if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
+    if frame.event_remaining_ms <= 0 || frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return None;
     }
     if !frame.stable {
@@ -1242,6 +1240,10 @@ fn buy_gate_for_channel(
     // делает realized win-rate < цены → −EV. Синхронизировано с разметкой
     // ([`crate::xframe::calc_y_train_resolution`]). На PnL-канал не действует.
     if opened_in_hold_zone && entry_prob >= Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB {
+        return BuyGate::EntryProbOutOfRange { raw, pred, kelly_f };
+    }
+
+    if !opened_in_hold_zone && entry_prob >= Y_TRAIN_PNL_MAX_ENTRY_PROB {
         return BuyGate::EntryProbOutOfRange { raw, pred, kelly_f };
     }
 
