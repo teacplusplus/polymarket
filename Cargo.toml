@@ -7,6 +7,7 @@ build = "build.rs"
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 bincode = "1.3"
+flate2 = "1.0"
 chrono-tz = "0.10"
 anyhow = "1.0"
 derivative = "2.2.0"

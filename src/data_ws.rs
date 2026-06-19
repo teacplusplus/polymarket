@@ -4,7 +4,7 @@ use crate::run_log;
 use crate::util::current_timestamp_ms;
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -70,70 +70,38 @@ pub struct WsStreamEntry {
     pub payload: WsStreamPayload,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WsStreamBookLevel {
     pub price: f64,
     pub size: f64,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WsStreamPriceChange {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub asset_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub best_bid: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub best_ask: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub side: Option<String>,
-    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: Map<String, Value>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WsStreamPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub market: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub condition_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub asset_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hash: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bids: Vec<WsStreamBookLevel>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub asks: Vec<WsStreamBookLevel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub best_bid: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub best_ask: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub side: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tick_size: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub new_tick_size: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub old_tick_size: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub order_price_min_tick_size: Option<f64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub assets_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub price_changes: Vec<WsStreamPriceChange>,
-    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: Map<String, Value>,
 }
 
 pub type MarketSnapshotBuffer = HashMap<String, HashMap<String, Vec<MarketSnapshot>>>;
@@ -566,11 +534,7 @@ fn ws_stream_payload_from_event(value: &Value) -> WsStreamPayload {
     };
 
     WsStreamPayload {
-        market: ws_string_field(object, "market"),
-        condition_id: ws_string_field(object, "condition_id"),
-        asset_id: ws_string_field(object, "asset_id"),
         timestamp_ms: parse_i64(object.get("timestamp")),
-        hash: ws_string_field(object, "hash"),
         bids: parse_ws_stream_levels(object.get("bids").and_then(Value::as_array)),
         asks: parse_ws_stream_levels(object.get("asks").and_then(Value::as_array)),
         best_bid: parse_f64(object.get("best_bid")),
@@ -583,11 +547,9 @@ fn ws_stream_payload_from_event(value: &Value) -> WsStreamPayload {
         new_tick_size: parse_f64(object.get("new_tick_size")),
         old_tick_size: parse_f64(object.get("old_tick_size")),
         order_price_min_tick_size: parse_f64(object.get("order_price_min_tick_size")),
-        assets_ids: ws_string_array_field(object, "assets_ids"),
         price_changes: parse_ws_stream_price_changes(
             object.get("price_changes").and_then(Value::as_array),
         ),
-        extra: ws_stream_extra_fields(object, is_known_ws_stream_payload_key),
     }
 }
 
@@ -637,21 +599,6 @@ fn ws_string_field(object: &Map<String, Value>, key: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn ws_string_array_field(object: &Map<String, Value>, key: &str) -> Vec<String> {
-    object
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn ws_stream_extra_fields(
     object: &Map<String, Value>,
     is_known_key: fn(&str) -> bool,
@@ -661,31 +608,6 @@ fn ws_stream_extra_fields(
         .filter(|(key, _)| !is_known_key(key.as_str()))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
-}
-
-fn is_known_ws_stream_payload_key(key: &str) -> bool {
-    matches!(
-        key,
-        "market"
-            | "condition_id"
-            | "asset_id"
-            | "timestamp"
-            | "hash"
-            | "bids"
-            | "asks"
-            | "best_bid"
-            | "best_ask"
-            | "spread"
-            | "price"
-            | "size"
-            | "side"
-            | "tick_size"
-            | "new_tick_size"
-            | "old_tick_size"
-            | "order_price_min_tick_size"
-            | "assets_ids"
-            | "price_changes"
-    )
 }
 
 fn is_known_ws_stream_price_change_key(key: &str) -> bool {

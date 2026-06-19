@@ -1,20 +1,19 @@
 //! Сохранение накопленных [`crate::xframe::XFrame`] в бинарный файл при пересоздании WS.
 
 use crate::constants::XFrameIntervalKind;
+use crate::data_ws::WsStreamPayload;
 use crate::project_manager::{FRAME_BUILD_INTERVALS_SEC, ProjectManager};
 use crate::run_log;
 use crate::util::{current_timestamp_ms, sanitized_filename_from_gamma_question};
 use crate::xframe::{CurrencyUpDownOutcome, SIZE, XFrame};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 
-/// Писать WS-стрим в `streams/...` после дампа xframes ([`dump_market_ws_stream_txt`]).
-const DUMP_MARKET_WS_STREAM_TXT: bool = false;
+/// Писать сжатый WS-стрим в `streams/...` после дампа xframes ([`dump_market_ws_stream_bin`]).
+const DUMP_MARKET_WS_STREAM_BIN: bool = true;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MarketXFramesDump {
@@ -34,6 +33,19 @@ impl MarketXFramesDump {
     pub fn up_won(&self) -> bool {
         self.final_price >= self.price_to_beat
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MarketWsStreamDumpMarket {
+    pub market_id: String,
+    pub up: Vec<MarketWsStreamDumpEntry>,
+    pub down: Vec<MarketWsStreamDumpEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MarketWsStreamDumpEntry {
+    pub ingest_wall_ms: i64,
+    pub payload: WsStreamPayload,
 }
 
 pub(crate) fn canonical_dump_event_end_ms(
@@ -103,12 +115,13 @@ pub fn spawn_dump_market_xframes_binary(
                 eprintln!("graph_dump lane={lane}: {err:#}");
             }
         }
-        if DUMP_MARKET_WS_STREAM_TXT {
-            if let Err(err) = dump_market_ws_stream_txt(
+        if DUMP_MARKET_WS_STREAM_BIN {
+            if let Err(err) = dump_market_ws_stream_bin(
                 project_manager.clone(),
                 market_id.clone(),
                 gamma_question.clone(),
                 interval_kind,
+                event_end_ms,
             )
             .await
             {
@@ -272,13 +285,19 @@ pub(crate) fn synthetic_xframes_dump_bin_path_for_csv_link(
     )
 }
 
-pub async fn dump_market_ws_stream_txt(
+pub async fn dump_market_ws_stream_bin(
     project_manager: Arc<ProjectManager>,
     market_id: String,
     gamma_question: Option<String>,
     interval_kind: XFrameIntervalKind,
+    event_end_ms: i64,
 ) -> anyhow::Result<()> {
-    let entries = {
+    let mut dump = MarketWsStreamDumpMarket {
+        market_id: market_id.clone(),
+        up: Vec::new(),
+        down: Vec::new(),
+    };
+    {
         let asset_ids = project_manager
             .market_asset_ids_by_market
             .read()
@@ -286,72 +305,70 @@ pub async fn dump_market_ws_stream_txt(
             .get(&market_id)
             .cloned()
             .unwrap_or_default();
+        let currency_up_down_by_asset_id = project_manager
+            .currency_up_down_by_asset_id
+            .read()
+            .await;
         let ws_stream_by_asset_id = project_manager.ws_stream_by_asset_id.read().await;
-        let mut out = Vec::new();
         for asset_id in asset_ids {
             if let Some(list) = ws_stream_by_asset_id.get(&asset_id) {
-                out.extend(list.iter().cloned());
+                for entry in list {
+                    if entry.market_id != market_id {
+                        continue;
+                    }
+                    let Some(outcome) = currency_up_down_by_asset_id.get(&entry.asset_id).copied()
+                    else {
+                        continue;
+                    };
+                    let dump_entry = MarketWsStreamDumpEntry {
+                        ingest_wall_ms: entry.ingest_wall_ms,
+                        payload: entry.payload.clone(),
+                    };
+                    match outcome {
+                        CurrencyUpDownOutcome::Up => dump.up.push(dump_entry),
+                        CurrencyUpDownOutcome::Down => dump.down.push(dump_entry),
+                    }
+                }
             }
         }
-        out.sort_by_key(|e| (e.ingest_wall_ms, e.event_timestamp_ms));
-        out
-    };
-    if entries.is_empty() {
+    }
+    if dump.up.is_empty() && dump.down.is_empty() {
         return Ok(());
     }
-    let mut entries_by_asset_id: BTreeMap<String, Vec<_>> = BTreeMap::new();
-    for entry in entries {
-        entries_by_asset_id
-            .entry(entry.asset_id.clone())
-            .or_default()
-            .push(entry);
-    }
+
+    dump.up
+        .sort_by_key(|e| (e.ingest_wall_ms, e.payload.timestamp_ms.unwrap_or_default()));
+    dump.down
+        .sort_by_key(|e| (e.ingest_wall_ms, e.payload.timestamp_ms.unwrap_or_default()));
 
     let interval_label = match interval_kind {
         XFrameIntervalKind::FiveMin => "5m",
         XFrameIntervalKind::FifteenMin => "15m",
     };
-
     let schema_size = crate::xframe::xframe_bincode_schema_size_bytes();
+    let event_end_ms = canonical_dump_event_end_ms(interval_kind, event_end_ms);
+
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let base: PathBuf = Path::new("streams")
+    let base: PathBuf = crate::path_config::streams_root()
         .join(project_manager.currency.as_str())
         .join(format!("{schema_size}"))
         .join(interval_label)
         .join(&date);
+    tokio::fs::create_dir_all(&base).await?;
 
     let stem = sanitized_filename_from_gamma_question(gamma_question.as_deref());
-    let ts = current_timestamp_ms();
-
-    for (asset_id, asset_entries) in entries_by_asset_id {
-        let asset_dir = base.join(asset_id.as_str());
-        tokio::fs::create_dir_all(&asset_dir).await?;
-
-        let fname = format!("{stem}__{ts}.txt");
-        let path = asset_dir.join(&fname);
-
-        let mut out = String::new();
-        writeln!(&mut out, "# ws_stream_dump").ok();
-        writeln!(&mut out, "market_id={market_id}").ok();
-        writeln!(&mut out, "asset_id={asset_id}").ok();
-        writeln!(&mut out, "currency={}", project_manager.currency).ok();
-        writeln!(&mut out, "interval={interval_label}").ok();
-        writeln!(
-            &mut out,
-            "format=ingest_wall_ms|event_ts_ms|asset_id|event_type|payload_json"
-        )
-        .ok();
-        for e in asset_entries {
-            let payload_one_line = serde_json::to_string(&e.payload)
-                .unwrap_or_else(|err| format!(r#"{{"serialization_error":"{err}"}}"#));
-            writeln!(
-                &mut out,
-                "{}|{}|{}|{}|{}",
-                e.ingest_wall_ms, e.event_timestamp_ms, e.asset_id, e.event_type, payload_one_line
-            )
-            .ok();
-        }
-        tokio::fs::write(&path, out).await?;
+    let raw_path = base.join(format!("{stem}__{event_end_ms}.bin"));
+    let path = base.join(format!("{stem}__{event_end_ms}.bin.gz"));
+    let bytes = bincode::serialize(&dump)?;
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &bytes)?;
+    let compressed = encoder.finish()?;
+    tokio::fs::write(&path, compressed).await?;
+    match tokio::fs::remove_file(&raw_path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
     Ok(())
 }

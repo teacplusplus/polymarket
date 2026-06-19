@@ -57,6 +57,10 @@ pub fn graph_root() -> PathBuf {
     sibling_root("graph")
 }
 
+pub fn streams_root() -> PathBuf {
+    sibling_root("streams")
+}
+
 pub fn graph_html_path_from_xframes_bin(bin_path: &Path) -> Option<PathBuf> {
     if let Some(rel) = strip_configured_xframes_root(bin_path) {
         return Some(graph_root().join(rel).with_extension("html"));
