@@ -7,7 +7,8 @@ pub use crate::currency_updown_sibling::{
 use crate::currency_ws::{RTDS_MS_MAX_LAG_FOR_STABLE_FRAME, rtds_spot_pair_symbol};
 use crate::data_ws::{
     CurrencyUpDownOutcome, MarketSnapshot, MarketSnapshotBuffer, MarketSnapshotBufferMut,
-    MarketWsSubscription, Ws, WsCommand, make_ws_channel, spawn_persistent_interval_market_ws,
+    MarketWsSubscription, Ws, WsCommand, WsStreamEntry, make_ws_channel,
+    spawn_persistent_interval_market_ws,
 };
 use crate::market_snapshot::aggregate_events;
 use crate::xframe::StrictBook;
@@ -56,16 +57,6 @@ pub struct LaneFrame {
     pub price_to_beat: Option<f64>,
     /// Текст вопроса Gamma для имени дампа и синтетического пути `.bin` в CSV ([`crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link`]).
     pub gamma_question: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct WsStreamEntry {
-    pub market_id: String,
-    pub asset_id: String,
-    pub event_type: String,
-    pub ingest_wall_ms: i64,
-    pub event_timestamp_ms: i64,
-    pub payload_raw: String,
 }
 
 /// Результат одного тика сборщика до записи в `xframes_by_market`.

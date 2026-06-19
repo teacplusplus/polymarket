@@ -338,11 +338,12 @@ pub async fn dump_market_ws_stream_txt(
         writeln!(&mut out, "interval={interval_label}").ok();
         writeln!(
             &mut out,
-            "format=ingest_wall_ms|event_ts_ms|asset_id|event_type|payload_raw"
+            "format=ingest_wall_ms|event_ts_ms|asset_id|event_type|payload_json"
         )
         .ok();
         for e in asset_entries {
-            let payload_one_line = e.payload_raw.replace('\n', "\\n");
+            let payload_one_line = serde_json::to_string(&e.payload)
+                .unwrap_or_else(|err| format!(r#"{{"serialization_error":"{err}"}}"#));
             writeln!(
                 &mut out,
                 "{}|{}|{}|{}|{}",

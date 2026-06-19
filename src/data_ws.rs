@@ -1,10 +1,11 @@
 use crate::currency_updown_sibling::update_currency_updown_sibling_slots;
-use crate::project_manager::{ProjectManager, WsStreamEntry};
+use crate::project_manager::ProjectManager;
 use crate::run_log;
 use crate::util::current_timestamp_ms;
 use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -57,6 +58,82 @@ pub enum WsCommand {
 
 pub struct Ws {
     pub market_snapshot_sender: mpsc::Sender<Arc<MarketSnapshot>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WsStreamEntry {
+    pub market_id: String,
+    pub asset_id: String,
+    pub event_type: String,
+    pub ingest_wall_ms: i64,
+    pub event_timestamp_ms: i64,
+    pub payload: WsStreamPayload,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WsStreamBookLevel {
+    pub price: f64,
+    pub size: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct WsStreamPriceChange {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct WsStreamPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub market: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bids: Vec<WsStreamBookLevel>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<WsStreamBookLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_ask: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spread: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_tick_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_tick_size: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_price_min_tick_size: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assets_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub price_changes: Vec<WsStreamPriceChange>,
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 pub type MarketSnapshotBuffer = HashMap<String, HashMap<String, Vec<MarketSnapshot>>>;
@@ -379,18 +456,14 @@ async fn ingest_json_event(project_manager: &Arc<ProjectManager>, raw_payload: &
     };
     if let Some(events) = value.as_array() {
         for event in events {
-            ingest_single(project_manager, event, raw_payload).await?;
+            ingest_single(project_manager, event).await?;
         }
         return Ok(());
     }
-    ingest_single(project_manager, &value, raw_payload).await
+    ingest_single(project_manager, &value).await
 }
 
-async fn ingest_single(
-    project_manager: &Arc<ProjectManager>,
-    value: &Value,
-    raw_payload: &str,
-) -> Result<()> {
+async fn ingest_single(project_manager: &Arc<ProjectManager>, value: &Value) -> Result<()> {
     let Some(event_type) = value.get("event_type").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -435,6 +508,7 @@ async fn ingest_single(
 
     if !snapshots.is_empty() {
         let ingest_wall_ms = current_timestamp_ms();
+        let payload = ws_stream_payload_from_event(value);
         let entries: Vec<WsStreamEntry> = snapshots
             .iter()
             .map(|snapshot| WsStreamEntry {
@@ -443,7 +517,7 @@ async fn ingest_single(
                 event_type: event_type.to_string(),
                 ingest_wall_ms,
                 event_timestamp_ms: snapshot.timestamp_ms,
-                payload_raw: raw_payload.to_string(),
+                payload: payload.clone(),
             })
             .collect();
         project_manager.append_ws_stream_entries(entries).await;
@@ -484,6 +558,138 @@ pub fn parse_snapshots_from_event(
         }
         _ => Vec::new(),
     }
+}
+
+fn ws_stream_payload_from_event(value: &Value) -> WsStreamPayload {
+    let Some(object) = value.as_object() else {
+        return WsStreamPayload::default();
+    };
+
+    WsStreamPayload {
+        market: ws_string_field(object, "market"),
+        condition_id: ws_string_field(object, "condition_id"),
+        asset_id: ws_string_field(object, "asset_id"),
+        timestamp_ms: parse_i64(object.get("timestamp")),
+        hash: ws_string_field(object, "hash"),
+        bids: parse_ws_stream_levels(object.get("bids").and_then(Value::as_array)),
+        asks: parse_ws_stream_levels(object.get("asks").and_then(Value::as_array)),
+        best_bid: parse_f64(object.get("best_bid")),
+        best_ask: parse_f64(object.get("best_ask")),
+        spread: parse_f64(object.get("spread")),
+        price: parse_f64(object.get("price")),
+        size: parse_f64(object.get("size")),
+        side: ws_string_field(object, "side"),
+        tick_size: parse_f64(object.get("tick_size")),
+        new_tick_size: parse_f64(object.get("new_tick_size")),
+        old_tick_size: parse_f64(object.get("old_tick_size")),
+        order_price_min_tick_size: parse_f64(object.get("order_price_min_tick_size")),
+        assets_ids: ws_string_array_field(object, "assets_ids"),
+        price_changes: parse_ws_stream_price_changes(
+            object.get("price_changes").and_then(Value::as_array),
+        ),
+        extra: ws_stream_extra_fields(object, is_known_ws_stream_payload_key),
+    }
+}
+
+fn parse_ws_stream_levels(levels: Option<&Vec<Value>>) -> Vec<WsStreamBookLevel> {
+    let Some(levels) = levels else {
+        return Vec::new();
+    };
+    levels
+        .iter()
+        .filter_map(|level| {
+            let price = parse_f64(level.get("price"))?;
+            let size = parse_f64(level.get("size"))?;
+            if price > 0.0 && size >= 0.0 && price.is_finite() && size.is_finite() {
+                Some(WsStreamBookLevel { price, size })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_ws_stream_price_changes(changes: Option<&Vec<Value>>) -> Vec<WsStreamPriceChange> {
+    let Some(changes) = changes else {
+        return Vec::new();
+    };
+    changes
+        .iter()
+        .filter_map(|change| {
+            let object = change.as_object()?;
+            Some(WsStreamPriceChange {
+                asset_id: ws_string_field(object, "asset_id"),
+                price: parse_f64(object.get("price")),
+                best_bid: parse_f64(object.get("best_bid")),
+                best_ask: parse_f64(object.get("best_ask")),
+                side: ws_string_field(object, "side"),
+                extra: ws_stream_extra_fields(object, is_known_ws_stream_price_change_key),
+            })
+        })
+        .collect()
+}
+
+fn ws_string_field(object: &Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn ws_string_array_field(object: &Map<String, Value>, key: &str) -> Vec<String> {
+    object
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ws_stream_extra_fields(
+    object: &Map<String, Value>,
+    is_known_key: fn(&str) -> bool,
+) -> Map<String, Value> {
+    object
+        .iter()
+        .filter(|(key, _)| !is_known_key(key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn is_known_ws_stream_payload_key(key: &str) -> bool {
+    matches!(
+        key,
+        "market"
+            | "condition_id"
+            | "asset_id"
+            | "timestamp"
+            | "hash"
+            | "bids"
+            | "asks"
+            | "best_bid"
+            | "best_ask"
+            | "spread"
+            | "price"
+            | "size"
+            | "side"
+            | "tick_size"
+            | "new_tick_size"
+            | "old_tick_size"
+            | "order_price_min_tick_size"
+            | "assets_ids"
+            | "price_changes"
+    )
+}
+
+fn is_known_ws_stream_price_change_key(key: &str) -> bool {
+    matches!(key, "asset_id" | "price" | "best_bid" | "best_ask" | "side")
 }
 
 fn xframe_interval_kind_for_asset(
