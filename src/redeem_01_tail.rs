@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 
 const BTC_5M_CURRENCY: &str = "btc";
 const BTC_5M_MAX_TARGET_USDC: f64 = 1.0;
-const DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS: i64 = 50_000;
+const DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS: i64 = 10_000;
 const REDEEM_01_TAIL_ENTRY_PRICE_COUNT: usize = 3;
 const REDEEM_01_TAIL_ENTRY_PRICES: [f64; REDEEM_01_TAIL_ENTRY_PRICE_COUNT] = [0.01, 0.02, 0.03];
 const MARKET_REGIME_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -254,7 +254,10 @@ fn load_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).ok()?;
     let dump = bincode::deserialize::<MarketWsStreamDumpMarket>(&decoded).ok()?;
-    let winning_entries = winning_stream_entries(&dump);
+    let winning_entries = match dump.winner {
+        CurrencyUpDownOutcome::Up => &dump.up,
+        CurrencyUpDownOutcome::Down => &dump.down,
+    };
     Some(CachedTailRegimeDump {
         deadline_event_remaining_ms: std::array::from_fn(|idx| {
             latest_tail_entry_remaining_ms_from_stream(
@@ -264,13 +267,6 @@ fn load_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
             )
         }),
     })
-}
-
-fn winning_stream_entries(dump: &MarketWsStreamDumpMarket) -> &[MarketWsStreamDumpEntry] {
-    match dump.winner {
-        CurrencyUpDownOutcome::Up => &dump.up,
-        CurrencyUpDownOutcome::Down => &dump.down,
-    }
 }
 
 fn latest_tail_entry_remaining_ms_from_stream(
@@ -284,7 +280,7 @@ fn latest_tail_entry_remaining_ms_from_stream(
     sorted.sort_by_key(|entry| (stream_entry_ts(entry), entry.ingest_wall_ms));
     for entry in sorted {
         let ts = stream_entry_ts(entry);
-        apply_stream_entry(&mut state, entry);
+        state = stream_tail_state_after_entry(state, entry);
         let remaining_ms = event_end_ms.saturating_sub(ts);
         if remaining_ms < DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS {
             continue;
@@ -307,7 +303,10 @@ struct StreamTailState {
     ask_l1_size: Option<f64>,
 }
 
-fn apply_stream_entry(state: &mut StreamTailState, entry: &MarketWsStreamDumpEntry) {
+fn stream_tail_state_after_entry(
+    mut state: StreamTailState,
+    entry: &MarketWsStreamDumpEntry,
+) -> StreamTailState {
     let payload = &entry.payload;
     if !payload.asks.is_empty() {
         let asks = ws_levels_to_book_levels(&payload.asks, false);
@@ -320,15 +319,12 @@ fn apply_stream_entry(state: &mut StreamTailState, entry: &MarketWsStreamDumpEnt
         state.ask_l1_price = Some(best_ask);
     }
 
-    if let Some(change) = select_stream_price_change(state, &payload.price_changes) {
-        apply_stream_price_change(state, change);
-    }
-}
-
-fn apply_stream_price_change(state: &mut StreamTailState, change: &WsStreamPriceChange) {
-    if let Some(best_ask) = change.best_ask {
+    if let Some(change) = select_stream_price_change(&state, &payload.price_changes)
+        && let Some(best_ask) = change.best_ask
+    {
         state.ask_l1_price = Some(best_ask);
     }
+    state
 }
 
 fn select_stream_price_change<'a>(
@@ -371,7 +367,16 @@ fn stream_tail_ask_buyable(state: &StreamTailState, max_price: f64) -> bool {
 }
 
 fn stream_tail_level_buyable(level: &BookLevel, max_price: f64) -> bool {
-    level.price > 0.0 && level.price <= max_price && level.size > 0.0
+    if level.price <= 0.0 {
+        return false;
+    }
+    if level.price > max_price {
+        return false;
+    }
+    if level.size <= 0.0 {
+        return false;
+    }
+    true
 }
 
 fn ws_levels_to_book_levels(
