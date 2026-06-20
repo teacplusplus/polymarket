@@ -4,16 +4,18 @@
 //! bot activity and does not depend on precomputed market/asset tables.
 
 use crate::account::{Redeem01TailMarketRegimeKey, SharedAccount};
-use crate::constants::XFrameIntervalKind;
+use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
+use crate::data_ws::WsStreamPriceChange;
 use crate::history_sim::{
-    KELLY_MULTIPLIER, MAX_BET_FRACTION, MAX_POSITION_USD, MIN_POSITION_USD,
-    StrictBook,
+    KELLY_MULTIPLIER, MAX_BET_FRACTION, MAX_POSITION_USD, MIN_POSITION_USD, StrictBook,
 };
 use crate::xframe::{BookLevel, SIZE, XFrame};
-use crate::xframe_dump::MarketXFramesDump;
+use crate::xframe_dump::{MarketWsStreamDumpEntry, MarketWsStreamDumpMarket};
 use anyhow::Context as _;
+use flate2::read::GzDecoder;
 use indexmap::IndexMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::mpsc;
@@ -92,10 +94,10 @@ async fn load_redeem_01_tail_market_regime_key(
         }
     }
 
-    let xframes_root = crate::path_config::xframes_root();
+    let streams_root = crate::path_config::streams_root();
     let now_ms = crate::util::current_timestamp_ms();
     let regime = scan_redeem_01_tail_market_regime(
-        &xframes_root,
+        &streams_root,
         &currency,
         command.interval,
         command.event_end_ms,
@@ -114,13 +116,13 @@ async fn load_redeem_01_tail_market_regime_key(
 }
 
 fn scan_redeem_01_tail_market_regime(
-    xframes_root: &Path,
+    streams_root: &Path,
     currency: &str,
     target_interval: XFrameIntervalKind,
     regime_event_end_ms: i64,
     updated_at_ms: i64,
 ) -> anyhow::Result<Redeem01TailMarketRegime> {
-    let currency_root = xframes_root.join(currency);
+    let currency_root = streams_root.join(currency);
     if !currency_root.exists() {
         return Ok(empty_redeem_01_tail_market_regime(
             regime_event_end_ms,
@@ -130,10 +132,11 @@ fn scan_redeem_01_tail_market_regime(
 
     let cutoff_ms = regime_event_end_ms - MARKET_REGIME_WINDOW_MS;
     let mut acc = MarketRegimeAccumulator::default();
-    let files = collect_bin_files(&currency_root)?;
+    let files = collect_stream_dump_files(&currency_root)?;
 
     for path in files {
-        let Some((interval, event_end_ms)) = dump_path_interval_and_end_ms(&currency_root, &path)
+        let Some((interval, event_end_ms)) =
+            stream_dump_path_interval_and_end_ms(&currency_root, &path)
         else {
             continue;
         };
@@ -148,7 +151,12 @@ fn scan_redeem_01_tail_market_regime(
         };
 
         acc.markets += 1;
-        for (idx, deadline_ms) in cached.deadline_event_remaining_ms.iter().copied().enumerate() {
+        for (idx, deadline_ms) in cached
+            .deadline_event_remaining_ms
+            .iter()
+            .copied()
+            .enumerate()
+        {
             if let Some(deadline_ms) = deadline_ms {
                 let price_entry = &mut acc.price_entries[idx];
                 price_entry.reversals += 1;
@@ -240,18 +248,164 @@ fn cached_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
 }
 
 fn load_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
+    let event_end_ms = stream_dump_event_end_ms(path)?;
     let bytes = fs::read(path).ok()?;
-    let dump = bincode::deserialize::<MarketXFramesDump>(&bytes).ok()?;
-    let winning_frames = if dump.up_won() {
-        &dump.frames_up
-    } else {
-        &dump.frames_down
-    };
+    let mut decoder = GzDecoder::new(bytes.as_slice());
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).ok()?;
+    let dump = bincode::deserialize::<MarketWsStreamDumpMarket>(&decoded).ok()?;
+    let winning_entries = winning_stream_entries(&dump);
     Some(CachedTailRegimeDump {
         deadline_event_remaining_ms: std::array::from_fn(|idx| {
-            latest_tail_entry_remaining_ms(winning_frames, REDEEM_01_TAIL_ENTRY_PRICES[idx])
+            latest_tail_entry_remaining_ms_from_stream(
+                winning_entries,
+                event_end_ms,
+                REDEEM_01_TAIL_ENTRY_PRICES[idx],
+            )
         }),
     })
+}
+
+fn winning_stream_entries(dump: &MarketWsStreamDumpMarket) -> &[MarketWsStreamDumpEntry] {
+    match dump.winner {
+        CurrencyUpDownOutcome::Up => &dump.up,
+        CurrencyUpDownOutcome::Down => &dump.down,
+    }
+}
+
+fn latest_tail_entry_remaining_ms_from_stream(
+    entries: &[MarketWsStreamDumpEntry],
+    event_end_ms: i64,
+    max_price: f64,
+) -> Option<i64> {
+    let mut state = StreamTailState::default();
+    let mut latest_remaining_ms = None;
+    let mut sorted: Vec<&MarketWsStreamDumpEntry> = entries.iter().collect();
+    sorted.sort_by_key(|entry| (stream_entry_ts(entry), entry.ingest_wall_ms));
+    for entry in sorted {
+        let ts = stream_entry_ts(entry);
+        apply_stream_entry(&mut state, entry);
+        let remaining_ms = event_end_ms.saturating_sub(ts);
+        if remaining_ms < DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS {
+            continue;
+        }
+        if stream_tail_ask_buyable(&state, max_price) {
+            latest_remaining_ms = Some(
+                latest_remaining_ms
+                    .map(|prev: i64| prev.min(remaining_ms))
+                    .unwrap_or(remaining_ms),
+            );
+        }
+    }
+    latest_remaining_ms
+}
+
+#[derive(Default)]
+struct StreamTailState {
+    asks: Option<Vec<BookLevel>>,
+    ask_l1_price: Option<f64>,
+    ask_l1_size: Option<f64>,
+}
+
+fn apply_stream_entry(state: &mut StreamTailState, entry: &MarketWsStreamDumpEntry) {
+    let payload = &entry.payload;
+    if !payload.asks.is_empty() {
+        let asks = ws_levels_to_book_levels(&payload.asks, false);
+        if let Some(best) = asks.first() {
+            state.ask_l1_price = Some(best.price);
+            state.ask_l1_size = Some(best.size);
+        }
+        state.asks = Some(asks);
+    } else if let Some(best_ask) = payload.best_ask {
+        state.ask_l1_price = Some(best_ask);
+    }
+
+    if let Some(change) = select_stream_price_change(state, &payload.price_changes) {
+        apply_stream_price_change(state, change);
+    }
+}
+
+fn apply_stream_price_change(state: &mut StreamTailState, change: &WsStreamPriceChange) {
+    if let Some(best_ask) = change.best_ask {
+        state.ask_l1_price = Some(best_ask);
+    }
+}
+
+fn select_stream_price_change<'a>(
+    state: &StreamTailState,
+    changes: &'a [WsStreamPriceChange],
+) -> Option<&'a WsStreamPriceChange> {
+    if changes.len() == 1 {
+        return changes.first();
+    }
+    changes
+        .iter()
+        .filter(|change| {
+            change.best_bid.is_some() || change.best_ask.is_some() || change.price.is_some()
+        })
+        .filter_map(|change| stream_price_change_score(state, change).map(|score| (score, change)))
+        .min_by(|(left, _), (right, _)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(_, change)| change)
+}
+
+fn stream_price_change_score(state: &StreamTailState, change: &WsStreamPriceChange) -> Option<f64> {
+    match (state.ask_l1_price, change.best_ask) {
+        (Some(current), Some(next)) => Some((current - next).abs()),
+        _ => None,
+    }
+}
+
+fn stream_tail_ask_buyable(state: &StreamTailState, max_price: f64) -> bool {
+    if state.asks.as_ref().is_some_and(|asks| {
+        asks.iter()
+            .any(|level| stream_tail_level_buyable(level, max_price))
+    }) {
+        return true;
+    }
+    state
+        .ask_l1_price
+        .is_some_and(|price| price > 0.0 && price <= max_price)
+        && state.ask_l1_size.unwrap_or(1.0) > 0.0
+}
+
+fn stream_tail_level_buyable(level: &BookLevel, max_price: f64) -> bool {
+    level.price > 0.0 && level.price <= max_price && level.size > 0.0
+}
+
+fn ws_levels_to_book_levels(
+    levels: &[crate::data_ws::WsStreamBookLevel],
+    bids: bool,
+) -> Vec<BookLevel> {
+    let mut out: Vec<BookLevel> = levels
+        .iter()
+        .filter(|level| {
+            level.price > 0.0
+                && level.size >= 0.0
+                && level.price.is_finite()
+                && level.size.is_finite()
+        })
+        .map(|level| BookLevel {
+            price: level.price,
+            size: level.size,
+        })
+        .collect();
+    if bids {
+        out.sort_by(|left, right| {
+            right
+                .price
+                .partial_cmp(&left.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    } else {
+        out.sort_by(|left, right| {
+            left.price
+                .partial_cmp(&right.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    out
 }
 
 #[derive(Default)]
@@ -317,20 +471,24 @@ fn choose_redeem_01_tail_recommendation(
         })
 }
 
-fn collect_bin_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+fn collect_stream_dump_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let path = entry?.path();
         if path.is_dir() {
-            out.extend(collect_bin_files(&path)?);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("bin") {
+            out.extend(collect_stream_dump_files(&path)?);
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".bin.gz"))
+        {
             out.push(path);
         }
     }
     Ok(out)
 }
 
-fn dump_path_interval_and_end_ms(
+fn stream_dump_path_interval_and_end_ms(
     currency_root: &Path,
     path: &Path,
 ) -> Option<(XFrameIntervalKind, i64)> {
@@ -343,18 +501,17 @@ fn dump_path_interval_and_end_ms(
         "15m" => XFrameIntervalKind::FifteenMin,
         _ => return None,
     };
-    let stem = path.file_stem()?.to_str()?;
-    let end_ms = stem.rsplit("__").next()?.parse().ok()?;
-    Some((interval, end_ms))
+    Some((interval, stream_dump_event_end_ms(path)?))
 }
 
-fn latest_tail_entry_remaining_ms(frames: &[XFrame<SIZE>], max_price: f64) -> Option<i64> {
-    frames
-        .iter()
-        .filter(|frame| frame.stable && frame.event_remaining_ms >= DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS)
-        .filter(|frame| cheap_tail_ask_notional(frame, None, max_price).is_some())
-        .map(|frame| frame.event_remaining_ms)
-        .min()
+fn stream_dump_event_end_ms(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".bin.gz")?;
+    stem.rsplit("__").next()?.parse().ok()
+}
+
+fn stream_entry_ts(entry: &MarketWsStreamDumpEntry) -> i64 {
+    entry.payload.timestamp_ms.unwrap_or(entry.ingest_wall_ms)
 }
 
 pub(crate) async fn redeem_01_tail_entry_size(
@@ -430,15 +587,14 @@ async fn redeem_01_tail_market_regime_entry_plan(
     }
 
     if load_missing_inline {
-        if let Err(err) = load_redeem_01_tail_market_regime_key(
-            Redeem01TailMarketRegimeLoadCommand {
+        if let Err(err) =
+            load_redeem_01_tail_market_regime_key(Redeem01TailMarketRegimeLoadCommand {
                 account: account.clone(),
                 currency: currency.to_ascii_lowercase(),
                 interval,
                 event_end_ms,
-            },
-        )
-        .await
+            })
+            .await
         {
             crate::tee_eprintln!("[redeem_01_tail] market regime load failed: {err:#}");
             return None;

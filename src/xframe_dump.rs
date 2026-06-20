@@ -38,6 +38,7 @@ impl MarketXFramesDump {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MarketWsStreamDumpMarket {
     pub market_id: String,
+    pub winner: CurrencyUpDownOutcome,
     pub up: Vec<MarketWsStreamDumpEntry>,
     pub down: Vec<MarketWsStreamDumpEntry>,
 }
@@ -84,7 +85,6 @@ pub fn spawn_dump_market_xframes_binary(
             "xframe_dump: market_id={market_id} polymarket={polymarket_event_url} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}"
         );
 
-
         for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
             if let Err(err) = dump_market_xframes_binary_lane(
                 project_manager.clone(),
@@ -116,12 +116,18 @@ pub fn spawn_dump_market_xframes_binary(
             }
         }
         if DUMP_MARKET_WS_STREAM_BIN {
+            let winner = if final_price >= price_to_beat {
+                CurrencyUpDownOutcome::Up
+            } else {
+                CurrencyUpDownOutcome::Down
+            };
             if let Err(err) = dump_market_ws_stream_bin(
                 project_manager.clone(),
                 market_id.clone(),
                 gamma_question.clone(),
                 interval_kind,
                 event_end_ms,
+                winner,
             )
             .await
             {
@@ -158,7 +164,11 @@ pub async fn dump_market_xframes_binary_lane(
     let mut flat: Vec<(String, i64, XFrame<SIZE>)> = Vec::new();
     for (asset_id, by_ts) in by_asset.iter() {
         for (aligned_ts, xframe_cell) in by_ts.iter() {
-            flat.push((asset_id.clone(), *aligned_ts, xframe_cell.read().await.clone()));
+            flat.push((
+                asset_id.clone(),
+                *aligned_ts,
+                xframe_cell.read().await.clone(),
+            ));
         }
     }
     flat.sort_by_key(|(_, aligned_ts, _)| *aligned_ts);
@@ -291,9 +301,11 @@ pub async fn dump_market_ws_stream_bin(
     gamma_question: Option<String>,
     interval_kind: XFrameIntervalKind,
     event_end_ms: i64,
+    winner: CurrencyUpDownOutcome,
 ) -> anyhow::Result<()> {
     let mut dump = MarketWsStreamDumpMarket {
         market_id: market_id.clone(),
+        winner,
         up: Vec::new(),
         down: Vec::new(),
     };
@@ -305,10 +317,8 @@ pub async fn dump_market_ws_stream_bin(
             .get(&market_id)
             .cloned()
             .unwrap_or_default();
-        let currency_up_down_by_asset_id = project_manager
-            .currency_up_down_by_asset_id
-            .read()
-            .await;
+        let currency_up_down_by_asset_id =
+            project_manager.currency_up_down_by_asset_id.read().await;
         let ws_stream_by_asset_id = project_manager.ws_stream_by_asset_id.read().await;
         for asset_id in asset_ids {
             if let Some(list) = ws_stream_by_asset_id.get(&asset_id) {
@@ -320,9 +330,15 @@ pub async fn dump_market_ws_stream_bin(
                     else {
                         continue;
                     };
+                    let mut payload = entry.payload.clone();
+                    if !payload.price_changes.is_empty() {
+                        payload.price_changes.retain(|change| {
+                            change.asset_id.as_deref() == Some(entry.asset_id.as_str())
+                        });
+                    }
                     let dump_entry = MarketWsStreamDumpEntry {
                         ingest_wall_ms: entry.ingest_wall_ms,
-                        payload: entry.payload.clone(),
+                        payload,
                     };
                     match outcome {
                         CurrencyUpDownOutcome::Up => dump.up.push(dump_entry),
@@ -360,8 +376,7 @@ pub async fn dump_market_ws_stream_bin(
     let raw_path = base.join(format!("{stem}__{event_end_ms}.bin"));
     let path = base.join(format!("{stem}__{event_end_ms}.bin.gz"));
     let bytes = bincode::serialize(&dump)?;
-    let mut encoder =
-        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     std::io::Write::write_all(&mut encoder, &bytes)?;
     let compressed = encoder.finish()?;
     tokio::fs::write(&path, compressed).await?;

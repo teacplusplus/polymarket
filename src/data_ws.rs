@@ -6,7 +6,7 @@ use anyhow::{Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
@@ -83,7 +83,7 @@ pub struct WsStreamPriceChange {
     pub best_bid: Option<f64>,
     pub best_ask: Option<f64>,
     pub side: Option<String>,
-    pub extra: Map<String, Value>,
+    pub extra: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -602,11 +602,17 @@ fn ws_string_field(object: &Map<String, Value>, key: &str) -> Option<String> {
 fn ws_stream_extra_fields(
     object: &Map<String, Value>,
     is_known_key: fn(&str) -> bool,
-) -> Map<String, Value> {
+) -> BTreeMap<String, String> {
     object
         .iter()
         .filter(|(key, _)| !is_known_key(key.as_str()))
-        .map(|(key, value)| (key.clone(), value.clone()))
+        .map(|(key, value)| {
+            let value = value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| value.to_string());
+            (key.clone(), value)
+        })
         .collect()
 }
 
