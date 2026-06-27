@@ -37,9 +37,35 @@ use crate::history_sim::{
 };
 use crate::xframe::{SIZE, XFrame};
 use crate::project_manager::ProjectManager;
-use crate::sim_stats::SideStats;
+use crate::sim_stats::{SideStats, SimStats};
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
 use std::sync::Arc;
+
+
+fn accumulate_submit_sell_fill(
+    report: &SingleOrderClobInvocationReport,
+    shares_acc: &mut f64,
+    usd_acc: &mut f64,
+    fee_acc: &mut f64,
+) {
+    if !report.success {
+        return;
+    }
+    if let (OrderAmount::Shares(s), OrderAmount::UsdNotional(u)) =
+        (report.making_amount, report.taking_amount)
+        && s.is_finite()
+        && s > 0.0
+        && u.is_finite()
+        && u > 0.0
+    {
+        *shares_acc += s;
+        *usd_acc += u;
+        let fee = report.fee_paid_usdc;
+        if fee.is_finite() && fee >= 0.0 {
+            *fee_acc += fee;
+        }
+    }
+}
 
 /// Единая ветка закрытия для backtest / real_sim (`SubmitMode::None`) и для
 /// резолюции рынка: PnL/bankroll/SideStats/CSV в одном месте. Сама не лезет в
@@ -236,6 +262,8 @@ pub(crate) async fn close_position(
         graph_html_file_uri: graph_html_file_uri.as_str(),
         pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
         pos_id: pos.id.as_str(),
+        redeem_x_id: pos.redeem_x_id.as_str(),
+        redeem_x_group_pnl: None,
         finalized_via: "",
         planned_buy_price: None,
         planned_shares_held: None,
@@ -246,6 +274,395 @@ pub(crate) async fn close_position(
         tp_order_id: None,
         close_order_ids: &[],
     });
+}
+
+pub(crate) async fn close_position_redeem(
+    account: &SharedAccount,
+    sim_stats: &mut SimStats,
+    redeem_x_id: &str,
+    group: Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)>,
+    up_won: bool,
+    final_price: Option<f64>,
+) {
+    if group.is_empty() {
+        return;
+    }
+
+    let mut group_payout = 0.0;
+    let mut group_cost = 0.0;
+    let mut snapshots = Vec::with_capacity(group.len());
+    for (pos_arc, token_won, side) in group {
+        if let Some(fp) = final_price {
+            pos_arc.write().await.final_price = Some(fp);
+        }
+        let pos = pos_arc.read().await.clone();
+        let gross_usdc = if token_won { pos.shares_held } else { 0.0 };
+        group_payout += gross_usdc;
+        group_cost += pos.position_size;
+        snapshots.push((pos, token_won, side, gross_usdc));
+    }
+
+    let group_pnl = group_payout - group_cost;
+    *account.bankroll.write().await += group_pnl;
+
+    let group_side = if up_won {
+        CurrencyUpDownOutcome::Up
+    } else {
+        CurrencyUpDownOutcome::Down
+    };
+    let side_stats = match group_side {
+        CurrencyUpDownOutcome::Up => &mut sim_stats.up,
+        CurrencyUpDownOutcome::Down => &mut sim_stats.down,
+    };
+    side_stats.pnl_usd += group_pnl;
+    side_stats.trades += 1;
+    if group_pnl >= 0.0 {
+        side_stats.wins += 1;
+    } else {
+        side_stats.losses += 1;
+    }
+    side_stats.resolution_win += 1;
+    side_stats.pnl_resolution_win += group_pnl;
+    if group_pnl >= 0.0 {
+        side_stats.resolution_win_profit += 1;
+    } else {
+        side_stats.resolution_win_loss += 1;
+    }
+
+    for (pos, token_won, _side, gross_usdc) in snapshots {
+        let reason = if token_won {
+            CloseReason::ResolutionWin
+        } else {
+            CloseReason::ResolutionLoss
+        };
+        let sell_price = if token_won { 1.0 } else { 0.0 };
+        let row_pnl = gross_usdc - pos.position_size;
+        let close_unix_ms = pos.event_end_ms;
+        let interval_label = position_interval_label(&pos);
+        let side_label = position_side_label(&pos);
+        let open_unix_ms = pos
+            .event_end_ms
+            .map(|end_ms| end_ms - pos.event_remaining_ms_at_open);
+        let graph_close_ms: Vec<i64> = close_unix_ms.into_iter().collect();
+        let graph_html_file_uri =
+            crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
+                .map(|bin_path| {
+                    crate::xframe_graph_dump::graph_html_trade_file_uri(
+                        &bin_path,
+                        open_unix_ms,
+                        &graph_close_ms,
+                        Some(side_label),
+                    )
+                })
+                .unwrap_or_default();
+        crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
+            polymarket_url: &pos.polymarket_url,
+            price_to_beat: pos.price_to_beat,
+            final_price: pos.final_price,
+            currency: &pos.currency,
+            interval: interval_label,
+            side: side_label,
+            market_id: &pos.market_id,
+            asset_id: &pos.asset_id,
+            exit_reason: trade_csv_close_reason_label(&reason),
+            buy_price: pos.buy_price,
+            raw_pred: pos.raw_pred_at_open,
+            cal_pred: pos.cal_pred_at_open,
+            kelly_f: pos.kelly_f_at_open,
+            position_size: pos.position_size,
+            shares_held: pos.shares_held,
+            exit_price: sell_price,
+            fee_usdc: 0.0,
+            pnl: row_pnl,
+            frames_held: pos.frames_held,
+            event_remaining_ms_at_open: pos.event_remaining_ms_at_open,
+            event_remaining_ms_at_close: 0,
+            open_unix_ms,
+            close_unix_ms,
+            graph_html_file_uri: graph_html_file_uri.as_str(),
+            pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
+            pos_id: pos.id.as_str(),
+            redeem_x_id,
+            redeem_x_group_pnl: Some(group_pnl),
+            finalized_via: "",
+            planned_buy_price: None,
+            planned_shares_held: None,
+            planned_entry_cost: None,
+            planned_fee_usdc: None,
+            entry_fee_usdc: None,
+            open_order_id: None,
+            tp_order_id: None,
+            close_order_ids: &[],
+        });
+    }
+}
+
+
+pub(crate) async fn close_position_redeem_after_submit(
+    account: &SharedAccount,
+    redeem_x_id: &str,
+    group: Vec<(SharedOpenPosition, bool)>,
+    up_won: bool,
+    finalized_via: &'static str,
+) {
+    if group.is_empty() {
+        return;
+    }
+
+    struct SubmitRedeemCloseRow {
+        position: SharedOpenPosition,
+        snapshot: OpenPosition,
+        token_won: bool,
+        actual_shares_net: f64,
+        residual_shares: f64,
+        residual_payout: f64,
+        row_pnl: f64,
+        exit_price: f64,
+        graph_open_landed_ms: Option<i64>,
+    }
+
+    let mut rows = Vec::with_capacity(group.len());
+    for (position, token_won) in group {
+        let snapshot = position.read().await.clone();
+        if snapshot.close_after_submit_finalized {
+            continue;
+        }
+        let actual_shares_net = snapshot
+            .open_buy_invoke
+            .as_ref()
+            .and_then(invoke_settlement_report)
+            .filter(|report| report.success)
+            .and_then(|report| match report.taking_amount {
+                OrderAmount::Shares(shares) if shares.is_finite() && shares > 0.0 => Some(shares),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+
+        let residual_shares = actual_shares_net;
+        let residual_payout = if token_won { residual_shares } else { 0.0 };
+        let row_pnl = residual_payout - snapshot.position_size;
+        let exit_price = if actual_shares_net > 1e-18 {
+            (residual_payout / actual_shares_net).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let graph_open_landed_ms = snapshot
+            .open_buy_invoke
+            .as_ref()
+            .and_then(invoke_settlement_report)
+            .filter(|report| report.success)
+            .and_then(|report| report.landed_at);
+
+        rows.push(SubmitRedeemCloseRow {
+            position,
+            snapshot,
+            token_won,
+            actual_shares_net,
+            residual_shares,
+            residual_payout,
+            row_pnl,
+            exit_price,
+            graph_open_landed_ms,
+        });
+    }
+
+    let mut finalized_rows = Vec::with_capacity(rows.len());
+    {
+        let mut positions_guard = account.positions.write().await;
+        for row in rows {
+            let pos_id = row.snapshot.id.clone();
+            let mut open_position = row.position.write().await;
+            if open_position.close_after_submit_finalized {
+                crate::tee_println!(
+                    "[submit] redeem_x pnl pos_id={pos_id} redeem_x_id={redeem_x_id}: \
+                     close_after_submit_finalized=true — повторный вызов пропускаем",
+                );
+                continue;
+            }
+            open_position.close_after_submit_finalized = true;
+            drop(open_position);
+            for lane_positions in positions_guard.values_mut() {
+                lane_positions.shift_remove(&pos_id);
+            }
+            finalized_rows.push(row);
+        }
+    }
+    if finalized_rows.is_empty() {
+        return;
+    }
+
+    let pos_ids: Vec<String> = finalized_rows
+        .iter()
+        .map(|row| row.snapshot.id.clone())
+        .collect();
+    {
+        let mut pending_guard = account.pending_close_positions.write().await;
+        for lane_pending in pending_guard.values_mut() {
+            for pos_id in &pos_ids {
+                lane_pending.shift_remove(pos_id);
+            }
+        }
+    }
+
+    let group_payout: f64 = finalized_rows
+        .iter()
+        .map(|row| row.residual_payout)
+        .sum();
+    let group_cost: f64 = finalized_rows
+        .iter()
+        .map(|row| row.snapshot.position_size)
+        .sum();
+    let group_fee_usdc = 0.0;
+    let group_pnl = group_payout - group_cost;
+
+    let first = &finalized_rows[0].snapshot;
+    let interval_kind = XFrameIntervalKind::from_i32(first.xframe_interval_type_at_open);
+    let real_sim_state = account.real_sim_state_for_currency(first.currency.as_str()).await;
+    match (real_sim_state, interval_kind) {
+        (Some(real_sim_state), Some(interval_kind)) => {
+            let mut state_guard = real_sim_state.write().await;
+            *account.bankroll.write().await += group_pnl;
+            if let Some(sim_stats) = state_guard.stats.get_mut(&interval_kind) {
+                let group_side = if up_won {
+                    CurrencyUpDownOutcome::Up
+                } else {
+                    CurrencyUpDownOutcome::Down
+                };
+                let side_stats = match group_side {
+                    CurrencyUpDownOutcome::Up => &mut sim_stats.up,
+                    CurrencyUpDownOutcome::Down => &mut sim_stats.down,
+                };
+                side_stats.pnl_usd += group_pnl;
+                side_stats.trades += 1;
+                if group_pnl >= 0.0 {
+                    side_stats.wins += 1;
+                } else {
+                    side_stats.losses += 1;
+                }
+                side_stats.fees_paid += group_fee_usdc;
+                side_stats.resolution_win += 1;
+                side_stats.pnl_resolution_win += group_pnl;
+                if group_pnl >= 0.0 {
+                    side_stats.resolution_win_profit += 1;
+                } else {
+                    side_stats.resolution_win_loss += 1;
+                }
+            }
+        }
+        _ => {
+            *account.bankroll.write().await += group_pnl;
+        }
+    }
+
+    let close_unix_ms = Some(crate::util::current_timestamp_ms());
+    crate::tee_println!(
+        "[submit] redeem_x pnl redeem_x_id={redeem_x_id} finalized_via={finalized_via} \
+         positions={} payout={group_payout:.6} cost={group_cost:.6} fee_usdc={group_fee_usdc:.6} \
+         pnl={group_pnl:+.6}",
+        finalized_rows.len(),
+    );
+
+    for row in &finalized_rows {
+        let position_snapshot = &row.snapshot;
+        let reason = if row.token_won {
+            CloseReason::ResolutionWin
+        } else {
+            CloseReason::ResolutionLoss
+        };
+        let interval_label = position_interval_label(position_snapshot);
+        let side_label = position_side_label(position_snapshot);
+        let open_unix_ms = position_snapshot
+            .event_end_ms
+            .map(|end_ms| end_ms - position_snapshot.event_remaining_ms_at_open);
+        let graph_close_ms: Vec<i64> = close_unix_ms.into_iter().collect();
+        let graph_html_file_uri =
+            crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(position_snapshot)
+                .map(|bin_path| {
+                    crate::xframe_graph_dump::graph_html_trade_file_uri(
+                        &bin_path,
+                        row.graph_open_landed_ms,
+                        &graph_close_ms,
+                        Some(side_label),
+                    )
+                })
+                .unwrap_or_default();
+        let event_remaining_ms_at_close = position_snapshot
+            .event_end_ms
+            .map(|end_ms| (end_ms - close_unix_ms.unwrap_or(end_ms)).max(0))
+            .unwrap_or(0);
+        let exit_reason_label = trade_csv_close_reason_label(&reason);
+        crate::tee_println!(
+            "[submit] redeem_x pnl pos_id={} redeem_x_id={redeem_x_id} \
+             interval={interval_label} side={side_label} reason={exit_reason_label} \
+             planned(USD={:.6} shares={:.6} price={:.6}) \
+             actual_buy(USD={:.6} shares={:.6} price={:.6}) \
+             residual(shares={:.6} payout={:.6}) \
+             exit_price={:.6} row_pnl={:+.6} group_pnl={:+.6}",
+            position_snapshot.id,
+            position_snapshot.planned_entry_cost,
+            position_snapshot.planned_shares_held,
+            position_snapshot.planned_buy_price,
+            position_snapshot.position_size,
+            row.actual_shares_net,
+            position_snapshot.buy_price,
+            row.residual_shares,
+            row.residual_payout,
+            row.exit_price,
+            row.row_pnl,
+            group_pnl,
+        );
+        let trade_row = crate::trade_csv_log::TradeCsvRow {
+            polymarket_url: &position_snapshot.polymarket_url,
+            price_to_beat: position_snapshot.price_to_beat,
+            final_price: position_snapshot.final_price,
+            currency: &position_snapshot.currency,
+            interval: interval_label,
+            side: side_label,
+            market_id: &position_snapshot.market_id,
+            asset_id: &position_snapshot.asset_id,
+            exit_reason: exit_reason_label,
+            buy_price: position_snapshot.buy_price,
+            raw_pred: position_snapshot.raw_pred_at_open,
+            cal_pred: position_snapshot.cal_pred_at_open,
+            kelly_f: position_snapshot.kelly_f_at_open,
+            position_size: position_snapshot.position_size,
+            shares_held: row.actual_shares_net,
+            exit_price: row.exit_price,
+            fee_usdc: 0.0,
+            pnl: row.row_pnl,
+            frames_held: position_snapshot.frames_held,
+            event_remaining_ms_at_open: position_snapshot.event_remaining_ms_at_open,
+            event_remaining_ms_at_close,
+            open_unix_ms,
+            close_unix_ms,
+            graph_html_file_uri: graph_html_file_uri.as_str(),
+            pnl_top5_shap: position_snapshot.pnl_top5_shap_at_open.as_str(),
+            pos_id: position_snapshot.id.as_str(),
+            redeem_x_id,
+            redeem_x_group_pnl: Some(group_pnl),
+            finalized_via,
+            planned_buy_price: Some(position_snapshot.planned_buy_price),
+            planned_shares_held: Some(position_snapshot.planned_shares_held),
+            planned_entry_cost: Some(position_snapshot.planned_entry_cost),
+            planned_fee_usdc: Some(position_snapshot.planned_fee_usdc),
+            entry_fee_usdc: Some(position_snapshot.entry_fee_usdc),
+            open_order_id: position_snapshot.open_order_id.as_deref(),
+            tp_order_id: None,
+            close_order_ids: &[],
+        };
+        crate::trade_csv_log::write_submit_trade_csv_row(trade_row);
+    }
+
+    let sim_snapshot_header = format!(
+        "[sim-snapshot] redeem_x_id={redeem_x_id} reason=Resolution group_pnl={group_pnl:+.6} \
+         finalized_via={finalized_via}",
+    );
+    crate::sim_stats::print_all_real_sim_state_stats(
+        account,
+        &sim_snapshot_header,
+        crate::sim_stats::SimStatsLogSink::SimStatsFile,
+    )
+    .await;
 }
 
 /// Закрытие позиции после SELL-fill'ов в submit/mock-режиме — общая ветка для
@@ -394,29 +811,6 @@ pub(crate) async fn close_position_after_submit(
     // (`Σ trade.size × trade.price × trade.fee_rate_bps / 10_000` по on-chain
     // settled trades). В обоих случаях это уже корректный USD-значок, складываем
     // напрямую в `sell_fee_usdc` для общего `side_stats.fees_paid += fee_usdc` ниже.
-    let accumulate = |report: &SingleOrderClobInvocationReport,
-                      shares_acc: &mut f64,
-                      usd_acc: &mut f64,
-                      fee_acc: &mut f64| {
-        if !report.success {
-            return;
-        }
-        if let (OrderAmount::Shares(s), OrderAmount::UsdNotional(u)) =
-            (report.making_amount, report.taking_amount)
-            && s.is_finite()
-            && s > 0.0
-            && u.is_finite()
-            && u > 0.0
-        {
-            *shares_acc += s;
-            *usd_acc += u;
-            let fee = report.fee_paid_usdc;
-            if fee.is_finite() && fee >= 0.0 {
-                *fee_acc += fee;
-            }
-        }
-    };
-
     if let Some(arc) = position_snapshot.maker_tp_position.as_ref() {
         let closing = arc.read().await;
         tp_order_id = closing
@@ -427,7 +821,7 @@ pub(crate) async fn close_position_after_submit(
             && invoke_settlement_ready(watch)
             && let Some(report) = invoke_settlement_report(watch)
         {
-            accumulate(
+            accumulate_submit_sell_fill(
                 &report,
                 &mut shares_sold,
                 &mut usd_received,
@@ -452,7 +846,7 @@ pub(crate) async fn close_position_after_submit(
             && invoke_settlement_ready(watch)
             && let Some(report) = invoke_settlement_report(watch)
         {
-            accumulate(
+            accumulate_submit_sell_fill(
                 &report,
                 &mut shares_sold,
                 &mut usd_received,
@@ -498,13 +892,13 @@ pub(crate) async fn close_position_after_submit(
     {
         let mut positions_guard = account.positions.write().await;
         for lane_positions in positions_guard.values_mut() {
-            lane_positions.remove(&pos_id);
+            lane_positions.shift_remove(&pos_id);
         }
     }
     {
         let mut pending_guard = account.pending_close_positions.write().await;
         for lane_pending in pending_guard.values_mut() {
-            lane_pending.remove(&pos_id);
+            lane_pending.shift_remove(&pos_id);
         }
     }
 
@@ -714,6 +1108,8 @@ pub(crate) async fn close_position_after_submit(
         graph_html_file_uri: graph_html_file_uri.as_str(),
         pnl_top5_shap: position_snapshot.pnl_top5_shap_at_open.as_str(),
         pos_id: position_snapshot.id.as_str(),
+        redeem_x_id: position_snapshot.redeem_x_id.as_str(),
+        redeem_x_group_pnl: None,
         finalized_via,
         planned_buy_price: Some(planned_buy_price),
         planned_shares_held: Some(planned_shares_held),

@@ -5,7 +5,7 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, MIN_ENTRY_REMAINING_MS, REDEEM_01, StrictBook,
+    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, MIN_ENTRY_REMAINING_MS, REDEEM_01, REDEEM_X, StrictBook,
     any_position_would_sell, buy_gate, compute_pnl_inference, compute_resolution_inference,
     load_booster, manage_positions, try_open_position,
 };
@@ -506,23 +506,28 @@ async fn tick_once(
         true,
     );
 
-    let buy_gate_proceed = matches!(
-        buy_gate(
-            &frame,
-            pnl_inference,
-            resolution_inference,
-            available_bankroll_pre,
-            strict_book.as_ref(),
-            true,
-            models.booster_pnl.as_ref(),
-            currency,
-            event_end_ms,
-            submit_mode,
-            Some(account),
+    let buy_gate_proceed = {
+        let positions_guard = account.positions.read().await;
+        let pending_close_guard = account.pending_close_positions.read().await;
+        matches!(
+            buy_gate(
+                &frame,
+                pnl_inference,
+                resolution_inference,
+                available_bankroll_pre,
+                strict_book.as_ref(),
+                true,
+                currency,
+                event_end_ms,
+                &*positions_guard,
+                &*pending_close_guard,
+                submit_mode,
+                Some(account),
+            )
+            .await,
+            BuyGate::Proceed { .. }
         )
-        .await,
-        BuyGate::Proceed { .. }
-    );
+    };
     let may_open =
         !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
 
@@ -995,7 +1000,7 @@ fn load_side_models(version_path: &Path, interval: &str, side: &str) -> Option<S
         (None, None)
     };
 
-    if booster_pnl.is_none() && booster_resolution.is_none() && !REDEEM_01 {
+    if booster_pnl.is_none() && booster_resolution.is_none() && !REDEEM_01 && !REDEEM_X {
         return None;
     }
     Some(SideModels {

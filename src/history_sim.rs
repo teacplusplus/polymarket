@@ -11,6 +11,7 @@ use crate::account_order::{
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::real_sim::interval_label;
 use crate::redeem_01_tail::redeem_01_tail_entry_size;
+use crate::redeem_x::redeem_x_entry_size;
 use crate::train_mode::{
     collect_bin_paths, load_calibration, split_counts,
     Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
@@ -19,6 +20,7 @@ use crate::xframe::{BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN
 use crate::xframe_dump::MarketXFramesDump;
 use crate::{tee_eprintln, tee_println, tee_progress, CURRENCIES};
 use crate::tee_log::tee_progress_finish;
+use indexmap::IndexMap;
 
 pub use crate::sim_stats::{
     print_side_stats, print_sim_stats, SideStats, SimStats, SimStatsLogSink,
@@ -76,11 +78,16 @@ pub const ENABLE_RESOLUTION: bool = false;
 /// [`crate::real_sim`] (Mock и Submit). `false` — PnL-бустеры и калибровки не
 /// грузятся (трактуются как отсутствующие), что позволяет оставить только
 /// Resolution-канал при [`ENABLE_RESOLUTION`] = `true`.
-pub const ENABLE_PNL: bool = true;
+pub const ENABLE_PNL: bool = false;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
 pub const REDEEM_01: bool = false;
+
+/// Глобальный тумблер redeem-x: реконструированный buy+redeem режим по публичному
+/// профилю бота. Позиция с [`OpenPosition::redeem_x`] доживает до резолюции без
+/// TP/SL/Timeout; вход выбирает [`crate::redeem_x::redeem_x_entry_size`].
+pub const REDEEM_X: bool = true;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -260,13 +267,15 @@ pub type SharedClosingPosition = std::sync::Arc<tokio::sync::RwLock<ClosingPosit
 
 /// Открытые позиции одной лейны в [`crate::account::Account::positions`]; ключ —
 /// [`OpenPosition::id`].
-pub type LanePositions = HashMap<String, SharedOpenPosition>;
+pub type LanePositions = IndexMap<String, SharedOpenPosition>;
 
 /// Открытая позиция; в real_sim фильтр `asset_id == frame.asset_id`.
 #[derive(Debug, Clone)]
 pub struct OpenPosition {
     /// Локальный uuid логов; не путать с CLOB order ids.
     pub(crate) id: String,
+    /// Group id for REDEEM_X multi-leg/multi-entry accounting. Empty for non-redeem_x.
+    pub(crate) redeem_x_id: String,
     /// Gamma outcome asset id.
     pub(crate) asset_id: String,
     /// Condition id маркета (Gamma).
@@ -314,6 +323,9 @@ pub struct OpenPosition {
     /// [`SellGate::Hold`]); maker TP в [`crate::account_submit::spawn_open_buy`] не
     /// выставляется. Позиция закрывается только по резолюции рынка.
     pub(crate) redeem_01: bool,
+    /// `true` — реконструированный buy+redeem режим REDEEM_X: те же правила
+    /// выхода, что у [`Self::redeem_01`], но отдельный entry/sizing rule.
+    pub(crate) redeem_x: bool,
     /// CSV: raw pred на входе.
     pub(crate) raw_pred_at_open: f32,
     /// CSV: calibrated pred на входе.
@@ -611,6 +623,7 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     && booster_resolution_up.is_none()
                     && booster_resolution_down.is_none()
                     && !REDEEM_01
+                    && !REDEEM_X
                 {
                     tee_println!("[sim] {tag}: ни одной модели (pnl/resolution) не найдено, пропуск");
                     continue;
@@ -1097,6 +1110,8 @@ pub enum BuyGate {
         size: f64,
         opened_in_hold_zone: bool,
         redeem_01: bool,
+        redeem_x: bool,
+        redeem_x_id: Option<String>,
     },
 }
 
@@ -1121,9 +1136,10 @@ pub(crate) async fn buy_gate(
     bankroll: f64,
     strict_book: Option<&StrictBook>,
     is_kelly: bool,
-    _booster_pnl_for_shap: Option<&Booster>,
     currency: &str,
     event_end_ms: Option<i64>,
+    positions_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
+    pending_close_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
     submit_mode: crate::account_submit::SubmitMode,
     account: Option<&SharedAccount>,
 ) -> BuyGate {
@@ -1189,6 +1205,35 @@ pub(crate) async fn buy_gate(
             size,
             opened_in_hold_zone: false,
             redeem_01: true,
+            redeem_x: false,
+            redeem_x_id: None,
+        };
+    }
+
+    if REDEEM_X {
+        let Some((size, redeem_x_id)) = redeem_x_entry_size(
+            frame,
+            strict_book,
+            entry_prob,
+            bankroll,
+            currency,
+            event_end_ms,
+            positions_by_lane,
+            pending_close_by_lane,
+        )
+        .await
+        else {
+            return pnl_decision;
+        };
+        return BuyGate::Proceed {
+            raw: 0.0,
+            pred: 0.0,
+            kelly_f: 0.0,
+            size,
+            opened_in_hold_zone: false,
+            redeem_01: false,
+            redeem_x: true,
+            redeem_x_id,
         };
     }
 
@@ -1273,6 +1318,8 @@ fn buy_gate_for_channel(
             size,
             opened_in_hold_zone,
             redeem_01: false,
+            redeem_x: false,
+            redeem_x_id: None,
         };
     }
 
@@ -1292,6 +1339,8 @@ fn buy_gate_for_channel(
         size,
         opened_in_hold_zone,
         redeem_01: false,
+        redeem_x: false,
+        redeem_x_id: None,
     }
 }
 
@@ -1353,9 +1402,10 @@ pub(crate) async fn try_open_position(
         bankroll,
         strict_book,
         is_kelly,
-        booster_pnl_for_shap,
         currency,
         event_end_ms,
+        positions_by_lane,
+        pending_close_by_lane,
         submit_mode,
         Some(account),
     )
@@ -1404,8 +1454,10 @@ pub(crate) async fn try_open_position(
             size,
             opened_in_hold_zone,
             redeem_01,
+            redeem_x,
+            redeem_x_id,
         } => {
-            if BLOCK_SAME_ASSET_OPEN {
+            if BLOCK_SAME_ASSET_OPEN && !redeem_x {
                 let mut same_asset_open = false;
                 if let Some(lane_positions) = positions_by_lane.get(lane_key) {
                     for p in lane_positions.values() {
@@ -1494,6 +1546,8 @@ pub(crate) async fn try_open_position(
                 kelly_f,
                 opened_in_hold_zone,
                 redeem_01,
+                redeem_x,
+                redeem_x_id,
                 currency,
                 polymarket_url,
                 price_to_beat,
@@ -1616,7 +1670,7 @@ pub(crate) fn sell_gate(
         }
     }
 
-    if pos.redeem_01 {
+    if pos.redeem_01 || pos.redeem_x {
         return SellGate::Hold;
     }
 
@@ -1778,7 +1832,7 @@ pub(crate) async fn manage_positions(
     }
 
     let mut sold = false;
-    let mut remaining: LanePositions = HashMap::new();
+    let mut remaining: LanePositions = IndexMap::new();
     for (pos_id, pos_arc) in std::mem::take(positions) {
         // Snapshot позиции один раз — все sell_gate / submit-предикаты
         // ниже работают на этом snapshot'е. Нам не нужно держать pos-lock
@@ -1968,6 +2022,8 @@ fn open_position(
     kelly_f_at_open: f64,
     opened_in_hold_zone: bool,
     redeem_01: bool,
+    redeem_x: bool,
+    redeem_x_id: Option<String>,
     currency: &str,
     polymarket_url: &str,
     price_to_beat: Option<f64>,
@@ -1981,7 +2037,7 @@ fn open_position(
         Some(book) => effective_buy_usdc_strict(book, position_size),
         None => position_size,
     };
-    let buy_slippage_cap = if redeem_01 {
+    let buy_slippage_cap = if redeem_01 || redeem_x {
         None
     } else {
         Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT)
@@ -2014,8 +2070,16 @@ fn open_position(
     };
     let sell_vwap_entry = (gross_sell / shares_held).clamp(0.001, 0.999);
 
+    let id = uuid::Uuid::new_v4().to_string();
+    let redeem_x_id = if redeem_x {
+        redeem_x_id.unwrap_or_else(|| id.clone())
+    } else {
+        String::new()
+    };
+
     Some(OpenPosition {
-        id: uuid::Uuid::new_v4().to_string(),
+        id,
+        redeem_x_id,
         asset_id: frame.asset_id.clone(),
         market_id: frame.market_id.clone(),
         shares_held,
@@ -2030,6 +2094,7 @@ fn open_position(
         frames_held: 0,
         opened_in_hold_zone,
         redeem_01,
+        redeem_x,
         raw_pred_at_open,
         cal_pred_at_open,
         kelly_f_at_open,

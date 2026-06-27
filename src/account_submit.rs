@@ -613,6 +613,7 @@ pub(crate) fn spawn_open_buy(
             side,
             opened_in_hold_zone,
             redeem_01,
+            redeem_x,
         ) = {
             let p = position.read().await;
             (
@@ -626,6 +627,7 @@ pub(crate) fn spawn_open_buy(
                 CurrencyUpDownOutcome::from_i32(p.currency_up_down_outcome_at_open),
                 p.opened_in_hold_zone,
                 p.redeem_01,
+                p.redeem_x,
             )
         };
 
@@ -652,13 +654,13 @@ pub(crate) fn spawn_open_buy(
             {
                 let mut positions_guard = account.positions.write().await;
                 for lane_positions in positions_guard.values_mut() {
-                    lane_positions.remove(&pos_id);
+                    lane_positions.shift_remove(&pos_id);
                 }
             }
             {
                 let mut pending_guard = account.pending_close_positions.write().await;
                 for lane_pending in pending_guard.values_mut() {
-                    lane_pending.remove(&pos_id);
+                    lane_pending.shift_remove(&pos_id);
                 }
             }
         };
@@ -949,13 +951,20 @@ pub(crate) fn spawn_open_buy(
                     );
                     return;
                 };
-                let (market_id, our_side) = {
+                let (market_id, our_side, redeem_x, redeem_x_id) = {
                     let position_read = position_cloned.read().await;
+                    let redeem_x_id = if position_read.redeem_x_id.is_empty() {
+                        position_read.id.clone()
+                    } else {
+                        position_read.redeem_x_id.clone()
+                    };
                     (
                         position_read.market_id.clone(),
                         CurrencyUpDownOutcome::from_i32(
                             position_read.currency_up_down_outcome_at_open,
                         ),
+                        position_read.redeem_x,
+                        redeem_x_id,
                     )
                 };
                 // Бесконечный retry-loop с шагом `POST_MARKET_END_RESOLUTION_DELAY_MS`:
@@ -996,6 +1005,85 @@ pub(crate) fn spawn_open_buy(
                     .await;
                 };
                 let up_won = final_price >= price_to_beat;
+                if redeem_x {
+                    let mut candidates: Vec<SharedOpenPosition> = Vec::new();
+                    candidates.push(position_cloned.clone());
+                    {
+                        let positions_guard = account_cloned.positions.read().await;
+                        for lane_positions in positions_guard.values() {
+                            for pos_arc in lane_positions.values() {
+                                candidates.push(pos_arc.clone());
+                            }
+                        }
+                    }
+                    {
+                        let pending_guard = account_cloned.pending_close_positions.read().await;
+                        for lane_positions in pending_guard.values() {
+                            for pos_arc in lane_positions.values() {
+                                candidates.push(pos_arc.clone());
+                            }
+                        }
+                    }
+
+                    let mut seen_pos_ids: Vec<String> = Vec::new();
+                    let mut redeem_group = Vec::new();
+                    for pos_arc in candidates {
+                        let mut pos = pos_arc.write().await;
+                        if seen_pos_ids.iter().any(|id| id == &pos.id) {
+                            continue;
+                        }
+                        seen_pos_ids.push(pos.id.clone());
+                        let pos_redeem_x_id = if pos.redeem_x_id.is_empty() {
+                            pos.id.clone()
+                        } else {
+                            pos.redeem_x_id.clone()
+                        };
+                        if !pos.redeem_x
+                            || pos_redeem_x_id != redeem_x_id
+                            || pos.market_id.as_str() != market_id.as_str()
+                            || pos.close_after_submit_finalized
+                        {
+                            continue;
+                        }
+                        let Some(side) = CurrencyUpDownOutcome::from_i32(
+                            pos.currency_up_down_outcome_at_open,
+                        ) else {
+                            crate::tee_eprintln!(
+                                "[submit] post-market-end redeem_x pos_id={} redeem_x_id={redeem_x_id}: \
+                                 неизвестный currency_up_down_outcome_at_open — позицию пропускаем",
+                                pos.id,
+                            );
+                            continue;
+                        };
+                        pos.price_to_beat = Some(price_to_beat);
+                        pos.final_price = Some(final_price);
+                        let token_won = match side {
+                            CurrencyUpDownOutcome::Up => up_won,
+                            CurrencyUpDownOutcome::Down => !up_won,
+                        };
+                        drop(pos);
+                        redeem_group.push((pos_arc, token_won));
+                    }
+                    crate::tee_println!(
+                        "[submit] post-market-end redeem_x pos_id={pos_id_post_end} \
+                         redeem_x_id={redeem_x_id} market_id={market_id}: остаток \
+                         {shares_remaining:.6} шер после market end + \
+                         {POST_MARKET_END_RESOLUTION_DELAY_MS}ms; group_positions={} \
+                         price_to_beat={price_to_beat:.6} final_price={final_price:.6} \
+                         up_won={up_won}",
+                        redeem_group.len(),
+                    );
+                    crate::account_close_position::close_position_redeem_after_submit(
+                        &account_cloned,
+                        redeem_x_id.as_str(),
+                        redeem_group,
+                        up_won,
+                        "post_market_end_redeem_x",
+                    )
+                    .await;
+                    return;
+                }
+
                 let token_won = match our_side {
                     Some(CurrencyUpDownOutcome::Up) => up_won,
                     Some(CurrencyUpDownOutcome::Down) => !up_won,
@@ -1055,12 +1143,14 @@ pub(crate) fn spawn_open_buy(
             );
             return;
         }
-        if opened_in_hold_zone || redeem_01 {
+        if opened_in_hold_zone || redeem_01 || redeem_x {
             crate::tee_println!(
                 "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: \
                  {} — maker TP не выставляем",
                 if redeem_01 {
                     "redeem_01 (hold-to-resolution)"
+                } else if redeem_x {
+                    "redeem_x (hold-to-resolution)"
                 } else {
                     "resolution-channel entry (hold-to-resolution)"
                 },

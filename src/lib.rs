@@ -24,6 +24,7 @@ pub mod poly_chain;
 pub mod project_manager;
 pub mod real_sim;
 pub mod redeem_01_tail;
+pub mod redeem_x;
 pub mod run_log;
 pub mod sim_stats;
 pub mod tee_log;

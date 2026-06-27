@@ -210,7 +210,7 @@ impl Account {
                     continue;
                 }
 
-                let Some(pos_arc) = lane_positions.remove(&pos_id) else {
+                let Some(pos_arc) = lane_positions.shift_remove(&pos_id) else {
                     continue;
                 };
                 to_close.push((pos_arc, token_won, *side));
@@ -218,7 +218,28 @@ impl Account {
         }
         drop(positions);
 
+        let mut redeem_x_groups: HashMap<String, Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)>> = HashMap::new();
+        let mut regular_close: Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)> = Vec::new();
         for (pos_arc, token_won, side) in to_close {
+            let pos = pos_arc.read().await;
+            if pos.redeem_x {
+                let redeem_x_id = if pos.redeem_x_id.is_empty() {
+                    pos.id.clone()
+                } else {
+                    pos.redeem_x_id.clone()
+                };
+                drop(pos);
+                redeem_x_groups
+                    .entry(redeem_x_id)
+                    .or_default()
+                    .push((pos_arc, token_won, side));
+            } else {
+                drop(pos);
+                regular_close.push((pos_arc, token_won, side));
+            }
+        }
+
+        for (pos_arc, token_won, side) in regular_close {
             let side_stats = match side {
                 CurrencyUpDownOutcome::Up => &mut sim_stats.up,
                 CurrencyUpDownOutcome::Down => &mut sim_stats.down,
@@ -249,7 +270,20 @@ impl Account {
             )
             .await;
         }
+
+        for (redeem_x_id, group) in redeem_x_groups {
+            crate::account_close_position::close_position_redeem(
+                account,
+                sim_stats,
+                redeem_x_id.as_str(),
+                group,
+                up_won,
+                final_price,
+            )
+            .await;
+        }
     }
+
 
     /// `Arc::new(Account::new())` для `main` и PM.
     pub fn new_shared() -> SharedAccount {

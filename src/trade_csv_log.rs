@@ -22,7 +22,7 @@ const TRADE_CSV_HEADER: &str = "regime,polymarket_url,price_to_beat,final_price,
 currency,interval,side,market_id,asset_id,exit_reason,\
 buy_price,raw_pred,cal_pred,kelly_f,entry_cost,shares_held,exit_price,fee_usdc,pnl,\
 frames_held,event_remaining_ms_at_open,event_remaining_ms_at_close,\
-open_unix_ms,close_unix_ms,graph_html_file_uri,pnl_top5_shap,final_outcome";
+open_unix_ms,close_unix_ms,graph_html_file_uri,pnl_top5_shap,pos_id,redeem_x_id,redeem_x_group_pnl,final_outcome";
 
 pub fn init_trade_csv_log_file(path: &Path) -> std::io::Result<()> {
     crate::tee_log::init_trade_csv_log_file(path)?;
@@ -62,6 +62,8 @@ pub struct TradeCsvRow<'a> {
     pub graph_html_file_uri: &'a str,
     pub pnl_top5_shap: &'a str,
     pub pos_id: &'a str,
+    pub redeem_x_id: &'a str,
+    pub redeem_x_group_pnl: Option<f64>,
     pub finalized_via: &'static str,
     pub planned_buy_price: Option<f64>,
     pub planned_shares_held: Option<f64>,
@@ -90,7 +92,7 @@ fn final_outcome_from_exit_reason(exit_reason: &str) -> &'static str {
 
 fn format_trade_csv_row(regime: &str, row: TradeCsvRow<'_>, final_outcome: &str) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         regime,
         csv_escape(row.polymarket_url),
         row.price_to_beat.map(fmt_f64).unwrap_or_default(),
@@ -117,6 +119,9 @@ fn format_trade_csv_row(regime: &str, row: TradeCsvRow<'_>, final_outcome: &str)
         row.close_unix_ms.map(|v| v.to_string()).unwrap_or_default(),
         csv_escape(row.graph_html_file_uri),
         csv_escape(row.pnl_top5_shap),
+        csv_escape(row.pos_id),
+        csv_escape(row.redeem_x_id),
+        row.redeem_x_group_pnl.map(fmt_f64).unwrap_or_default(),
         csv_escape(final_outcome),
     )
 }
