@@ -274,8 +274,6 @@ pub type LanePositions = IndexMap<String, SharedOpenPosition>;
 pub struct OpenPosition {
     /// Локальный uuid логов; не путать с CLOB order ids.
     pub(crate) id: String,
-    /// Group id for REDEEM_X multi-leg/multi-entry accounting. Empty for non-redeem_x.
-    pub(crate) redeem_x_id: String,
     /// Gamma outcome asset id.
     pub(crate) asset_id: String,
     /// Condition id маркета (Gamma).
@@ -1111,7 +1109,6 @@ pub enum BuyGate {
         opened_in_hold_zone: bool,
         redeem_01: bool,
         redeem_x: bool,
-        redeem_x_id: Option<String>,
     },
 }
 
@@ -1206,17 +1203,14 @@ pub(crate) async fn buy_gate(
             opened_in_hold_zone: false,
             redeem_01: true,
             redeem_x: false,
-            redeem_x_id: None,
         };
     }
 
     if REDEEM_X {
-        let Some((size, redeem_x_id)) = redeem_x_entry_size(
+        let Some(size) = redeem_x_entry_size(
             frame,
             strict_book,
-            entry_prob,
             bankroll,
-            currency,
             event_end_ms,
             positions_by_lane,
             pending_close_by_lane,
@@ -1233,7 +1227,6 @@ pub(crate) async fn buy_gate(
             opened_in_hold_zone: false,
             redeem_01: false,
             redeem_x: true,
-            redeem_x_id,
         };
     }
 
@@ -1319,7 +1312,6 @@ fn buy_gate_for_channel(
             opened_in_hold_zone,
             redeem_01: false,
             redeem_x: false,
-            redeem_x_id: None,
         };
     }
 
@@ -1340,7 +1332,6 @@ fn buy_gate_for_channel(
         opened_in_hold_zone,
         redeem_01: false,
         redeem_x: false,
-        redeem_x_id: None,
     }
 }
 
@@ -1455,7 +1446,6 @@ pub(crate) async fn try_open_position(
             opened_in_hold_zone,
             redeem_01,
             redeem_x,
-            redeem_x_id,
         } => {
             if BLOCK_SAME_ASSET_OPEN && !redeem_x {
                 let mut same_asset_open = false;
@@ -1547,7 +1537,6 @@ pub(crate) async fn try_open_position(
                 opened_in_hold_zone,
                 redeem_01,
                 redeem_x,
-                redeem_x_id,
                 currency,
                 polymarket_url,
                 price_to_beat,
@@ -2023,7 +2012,6 @@ fn open_position(
     opened_in_hold_zone: bool,
     redeem_01: bool,
     redeem_x: bool,
-    redeem_x_id: Option<String>,
     currency: &str,
     polymarket_url: &str,
     price_to_beat: Option<f64>,
@@ -2071,15 +2059,9 @@ fn open_position(
     let sell_vwap_entry = (gross_sell / shares_held).clamp(0.001, 0.999);
 
     let id = uuid::Uuid::new_v4().to_string();
-    let redeem_x_id = if redeem_x {
-        redeem_x_id.unwrap_or_else(|| id.clone())
-    } else {
-        String::new()
-    };
 
     Some(OpenPosition {
         id,
-        redeem_x_id,
         asset_id: frame.asset_id.clone(),
         market_id: frame.market_id.clone(),
         shares_held,

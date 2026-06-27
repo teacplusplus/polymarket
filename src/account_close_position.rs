@@ -262,7 +262,6 @@ pub(crate) async fn close_position(
         graph_html_file_uri: graph_html_file_uri.as_str(),
         pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
         pos_id: pos.id.as_str(),
-        redeem_x_id: pos.redeem_x_id.as_str(),
         redeem_x_group_pnl: None,
         finalized_via: "",
         planned_buy_price: None,
@@ -279,8 +278,7 @@ pub(crate) async fn close_position(
 pub(crate) async fn close_position_redeem(
     account: &SharedAccount,
     sim_stats: &mut SimStats,
-    redeem_x_id: &str,
-    group: Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)>,
+    group: Vec<(SharedOpenPosition, bool)>,
     up_won: bool,
     final_price: Option<f64>,
 ) {
@@ -291,7 +289,7 @@ pub(crate) async fn close_position_redeem(
     let mut group_payout = 0.0;
     let mut group_cost = 0.0;
     let mut snapshots = Vec::with_capacity(group.len());
-    for (pos_arc, token_won, side) in group {
+    for (pos_arc, token_won) in group {
         if let Some(fp) = final_price {
             pos_arc.write().await.final_price = Some(fp);
         }
@@ -299,7 +297,7 @@ pub(crate) async fn close_position_redeem(
         let gross_usdc = if token_won { pos.shares_held } else { 0.0 };
         group_payout += gross_usdc;
         group_cost += pos.position_size;
-        snapshots.push((pos, token_won, side, gross_usdc));
+        snapshots.push((pos, token_won, gross_usdc));
     }
 
     let group_pnl = group_payout - group_cost;
@@ -329,7 +327,7 @@ pub(crate) async fn close_position_redeem(
         side_stats.resolution_win_loss += 1;
     }
 
-    for (pos, token_won, _side, gross_usdc) in snapshots {
+    for (pos, token_won, gross_usdc) in snapshots {
         let reason = if token_won {
             CloseReason::ResolutionWin
         } else {
@@ -382,7 +380,6 @@ pub(crate) async fn close_position_redeem(
             graph_html_file_uri: graph_html_file_uri.as_str(),
             pnl_top5_shap: pos.pnl_top5_shap_at_open.as_str(),
             pos_id: pos.id.as_str(),
-            redeem_x_id,
             redeem_x_group_pnl: Some(group_pnl),
             finalized_via: "",
             planned_buy_price: None,
@@ -400,7 +397,6 @@ pub(crate) async fn close_position_redeem(
 
 pub(crate) async fn close_position_redeem_after_submit(
     account: &SharedAccount,
-    redeem_x_id: &str,
     group: Vec<(SharedOpenPosition, bool)>,
     up_won: bool,
     finalized_via: &'static str,
@@ -474,7 +470,7 @@ pub(crate) async fn close_position_redeem_after_submit(
             let mut open_position = row.position.write().await;
             if open_position.close_after_submit_finalized {
                 crate::tee_println!(
-                    "[submit] redeem_x pnl pos_id={pos_id} redeem_x_id={redeem_x_id}: \
+                    "[submit] redeem_x pnl pos_id={pos_id}: \
                      close_after_submit_finalized=true — повторный вызов пропускаем",
                 );
                 continue;
@@ -516,6 +512,7 @@ pub(crate) async fn close_position_redeem_after_submit(
     let group_pnl = group_payout - group_cost;
 
     let first = &finalized_rows[0].snapshot;
+    let market_id = first.market_id.as_str();
     let interval_kind = XFrameIntervalKind::from_i32(first.xframe_interval_type_at_open);
     let real_sim_state = account.real_sim_state_for_currency(first.currency.as_str()).await;
     match (real_sim_state, interval_kind) {
@@ -556,7 +553,7 @@ pub(crate) async fn close_position_redeem_after_submit(
 
     let close_unix_ms = Some(crate::util::current_timestamp_ms());
     crate::tee_println!(
-        "[submit] redeem_x pnl redeem_x_id={redeem_x_id} finalized_via={finalized_via} \
+        "[submit] redeem_x pnl market_id={market_id} finalized_via={finalized_via} \
          positions={} payout={group_payout:.6} cost={group_cost:.6} fee_usdc={group_fee_usdc:.6} \
          pnl={group_pnl:+.6}",
         finalized_rows.len(),
@@ -592,13 +589,14 @@ pub(crate) async fn close_position_redeem_after_submit(
             .unwrap_or(0);
         let exit_reason_label = trade_csv_close_reason_label(&reason);
         crate::tee_println!(
-            "[submit] redeem_x pnl pos_id={} redeem_x_id={redeem_x_id} \
+            "[submit] redeem_x pnl pos_id={} market_id={} \
              interval={interval_label} side={side_label} reason={exit_reason_label} \
              planned(USD={:.6} shares={:.6} price={:.6}) \
              actual_buy(USD={:.6} shares={:.6} price={:.6}) \
              residual(shares={:.6} payout={:.6}) \
              exit_price={:.6} row_pnl={:+.6} group_pnl={:+.6}",
             position_snapshot.id,
+            position_snapshot.market_id,
             position_snapshot.planned_entry_cost,
             position_snapshot.planned_shares_held,
             position_snapshot.planned_buy_price,
@@ -638,7 +636,6 @@ pub(crate) async fn close_position_redeem_after_submit(
             graph_html_file_uri: graph_html_file_uri.as_str(),
             pnl_top5_shap: position_snapshot.pnl_top5_shap_at_open.as_str(),
             pos_id: position_snapshot.id.as_str(),
-            redeem_x_id,
             redeem_x_group_pnl: Some(group_pnl),
             finalized_via,
             planned_buy_price: Some(position_snapshot.planned_buy_price),
@@ -654,7 +651,7 @@ pub(crate) async fn close_position_redeem_after_submit(
     }
 
     let sim_snapshot_header = format!(
-        "[sim-snapshot] redeem_x_id={redeem_x_id} reason=Resolution group_pnl={group_pnl:+.6} \
+        "[sim-snapshot] market_id={market_id} reason=Resolution group_pnl={group_pnl:+.6} \
          finalized_via={finalized_via}",
     );
     crate::sim_stats::print_all_real_sim_state_stats(
@@ -1108,7 +1105,6 @@ pub(crate) async fn close_position_after_submit(
         graph_html_file_uri: graph_html_file_uri.as_str(),
         pnl_top5_shap: position_snapshot.pnl_top5_shap_at_open.as_str(),
         pos_id: position_snapshot.id.as_str(),
-        redeem_x_id: position_snapshot.redeem_x_id.as_str(),
         redeem_x_group_pnl: None,
         finalized_via,
         planned_buy_price: Some(planned_buy_price),

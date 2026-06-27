@@ -18,11 +18,9 @@ struct PositionBalance {
     own_shares: f64,
     own_entry_cost: f64,
     own_positions: usize,
-    own_redeem_x_id: Option<String>,
     opposite_shares: f64,
     opposite_entry_cost: f64,
     opposite_positions: usize,
-    opposite_redeem_x_id: Option<String>,
 }
 
 impl PositionBalance {
@@ -31,11 +29,9 @@ impl PositionBalance {
             own_shares: 0.0,
             own_entry_cost: 0.0,
             own_positions: 0,
-            own_redeem_x_id: None,
             opposite_shares: 0.0,
             opposite_entry_cost: 0.0,
             opposite_positions: 0,
-            opposite_redeem_x_id: None,
         }
     }
 
@@ -68,13 +64,11 @@ const REDEEM_X_BALANCE_EPS_SHARES: f64 = 1e-6;
 pub(crate) async fn redeem_x_entry_size(
     frame: &XFrame<SIZE>,
     strict_book: Option<&StrictBook>,
-    _entry_prob: f64,
     bankroll: f64,
-    _currency: &str,
     event_end_ms: Option<i64>,
     positions_by_lane: &HashMap<LaneKey, LanePositions>,
     pending_close_by_lane: &HashMap<LaneKey, LanePositions>,
-) -> Option<(f64, Option<String>)> {
+) -> Option<f64> {
     event_end_ms?;
     let interval = XFrameIntervalKind::from_i32(frame.xframe_interval_type)?;
     if frame.event_remaining_ms <= 0 {
@@ -115,21 +109,18 @@ pub(crate) async fn redeem_x_entry_size(
     }
 
     let shortfall_shares = (balance.opposite_shares - balance.own_shares).max(0.0);
-    let (desired_notional, redeem_x_id) = if shortfall_shares > REDEEM_X_BALANCE_EPS_SHARES {
+    let desired_notional = if shortfall_shares > REDEEM_X_BALANCE_EPS_SHARES {
         if !redeem_x_balance_buy_allowed(own_ask, &balance) && !residual_allowed {
             return None;
         }
-        (
-            notional_for_actual_shares(shortfall_shares, own_ask).min(target),
-            balance.opposite_redeem_x_id.clone().or(balance.own_redeem_x_id.clone()),
-        )
+        notional_for_actual_shares(shortfall_shares, own_ask).min(target)
     } else {
         // Balanced book, or no book yet: start a new pair slice only when the
         // current pair is cheap enough, or when this is a tiny residual-tail leg.
         if !pair_allowed && !(residual_allowed && !balance.has_inventory()) {
             return None;
         }
-        (target, None)
+        target
     };
 
     let intended = desired_notional
@@ -147,7 +138,7 @@ pub(crate) async fn redeem_x_entry_size(
         .min(visible_notional)
         .min(bankroll)
         .min(MAX_POSITION_USD);
-    (size >= MIN_POSITION_USD).then_some((size, redeem_x_id))
+    (size >= MIN_POSITION_USD).then_some(size)
 }
 
 async fn redeem_x_position_balance_for_market(
@@ -180,27 +171,16 @@ async fn add_redeem_x_position_balance(
             if !(pos.shares_held > 0.0 && pos.position_size > 0.0) {
                 continue;
             }
-            let redeem_x_id = if pos.redeem_x_id.is_empty() {
-                pos.id.clone()
-            } else {
-                pos.redeem_x_id.clone()
-            };
             match CurrencyUpDownOutcome::from_i32(pos.currency_up_down_outcome_at_open) {
                 Some(side) if side == current_side => {
                     balance.own_shares += pos.shares_held;
                     balance.own_entry_cost += pos.position_size;
                     balance.own_positions += 1;
-                    if balance.own_redeem_x_id.is_none() {
-                        balance.own_redeem_x_id = Some(redeem_x_id);
-                    }
                 }
                 Some(_) => {
                     balance.opposite_shares += pos.shares_held;
                     balance.opposite_entry_cost += pos.position_size;
                     balance.opposite_positions += 1;
-                    if balance.opposite_redeem_x_id.is_none() {
-                        balance.opposite_redeem_x_id = Some(redeem_x_id);
-                    }
                 }
                 None => {}
             }

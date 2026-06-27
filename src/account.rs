@@ -218,21 +218,17 @@ impl Account {
         }
         drop(positions);
 
-        let mut redeem_x_groups: HashMap<String, Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)>> = HashMap::new();
+        let mut redeem_x_groups: HashMap<String, Vec<(SharedOpenPosition, bool)>> = HashMap::new();
         let mut regular_close: Vec<(SharedOpenPosition, bool, CurrencyUpDownOutcome)> = Vec::new();
         for (pos_arc, token_won, side) in to_close {
             let pos = pos_arc.read().await;
             if pos.redeem_x {
-                let redeem_x_id = if pos.redeem_x_id.is_empty() {
-                    pos.id.clone()
-                } else {
-                    pos.redeem_x_id.clone()
-                };
+                let market_id = pos.market_id.clone();
                 drop(pos);
                 redeem_x_groups
-                    .entry(redeem_x_id)
+                    .entry(market_id)
                     .or_default()
-                    .push((pos_arc, token_won, side));
+                    .push((pos_arc, token_won));
             } else {
                 drop(pos);
                 regular_close.push((pos_arc, token_won, side));
@@ -271,11 +267,10 @@ impl Account {
             .await;
         }
 
-        for (redeem_x_id, group) in redeem_x_groups {
+        for group in redeem_x_groups.into_values() {
             crate::account_close_position::close_position_redeem(
                 account,
                 sim_stats,
-                redeem_x_id.as_str(),
                 group,
                 up_won,
                 final_price,

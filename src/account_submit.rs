@@ -951,20 +951,14 @@ pub(crate) fn spawn_open_buy(
                     );
                     return;
                 };
-                let (market_id, our_side, redeem_x, redeem_x_id) = {
+                let (market_id, our_side, redeem_x) = {
                     let position_read = position_cloned.read().await;
-                    let redeem_x_id = if position_read.redeem_x_id.is_empty() {
-                        position_read.id.clone()
-                    } else {
-                        position_read.redeem_x_id.clone()
-                    };
                     (
                         position_read.market_id.clone(),
                         CurrencyUpDownOutcome::from_i32(
                             position_read.currency_up_down_outcome_at_open,
                         ),
                         position_read.redeem_x,
-                        redeem_x_id,
                     )
                 };
                 // Бесконечный retry-loop с шагом `POST_MARKET_END_RESOLUTION_DELAY_MS`:
@@ -1033,13 +1027,7 @@ pub(crate) fn spawn_open_buy(
                             continue;
                         }
                         seen_pos_ids.push(pos.id.clone());
-                        let pos_redeem_x_id = if pos.redeem_x_id.is_empty() {
-                            pos.id.clone()
-                        } else {
-                            pos.redeem_x_id.clone()
-                        };
                         if !pos.redeem_x
-                            || pos_redeem_x_id != redeem_x_id
                             || pos.market_id.as_str() != market_id.as_str()
                             || pos.close_after_submit_finalized
                         {
@@ -1049,7 +1037,7 @@ pub(crate) fn spawn_open_buy(
                             pos.currency_up_down_outcome_at_open,
                         ) else {
                             crate::tee_eprintln!(
-                                "[submit] post-market-end redeem_x pos_id={} redeem_x_id={redeem_x_id}: \
+                                "[submit] post-market-end redeem_x pos_id={} market_id={market_id}: \
                                  неизвестный currency_up_down_outcome_at_open — позицию пропускаем",
                                 pos.id,
                             );
@@ -1066,7 +1054,7 @@ pub(crate) fn spawn_open_buy(
                     }
                     crate::tee_println!(
                         "[submit] post-market-end redeem_x pos_id={pos_id_post_end} \
-                         redeem_x_id={redeem_x_id} market_id={market_id}: остаток \
+                         market_id={market_id}: остаток \
                          {shares_remaining:.6} шер после market end + \
                          {POST_MARKET_END_RESOLUTION_DELAY_MS}ms; group_positions={} \
                          price_to_beat={price_to_beat:.6} final_price={final_price:.6} \
@@ -1075,7 +1063,6 @@ pub(crate) fn spawn_open_buy(
                     );
                     crate::account_close_position::close_position_redeem_after_submit(
                         &account_cloned,
-                        redeem_x_id.as_str(),
                         redeem_group,
                         up_won,
                         "post_market_end_redeem_x",
