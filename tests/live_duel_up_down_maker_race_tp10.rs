@@ -6,9 +6,9 @@ use poly::account::{
     try_authenticate_clob_for_heartbeats,
 };
 use poly::account_order::{
+    CancelOrderRequest, OrderAmount, OrderRole, PostOrderRequest, SingleOrderClobInvocationReport,
     best_ask_sdk, cancel_order_on_clob, invoke_settlement_watch, post_order_on_clob,
-    wait_invoke_settlement, CancelOrderRequest, OrderAmount, OrderRole, PostOrderRequest,
-    SingleOrderClobInvocationReport,
+    wait_invoke_settlement,
 };
 use poly::account_ws::spawn_user_ws_listener;
 use poly::constants::CurrencyUpDownOutcome;
@@ -16,8 +16,8 @@ use poly::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use poly::util::{
     current_timestamp_ms, detect_country_and_ip, fetch_gamma_event_data_for_gamma_client,
 };
-use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::Side;
+use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::types::U256;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -40,8 +40,7 @@ fn current_btc_updown_5m_slug(now_ms: i64) -> String {
 
 /// Конец 5m-окна в unix **ms** для slug `btc-updown-5m-{window_start_sec}` (стартует `window_start`).
 fn btc_updown_5m_window_end_unix_ms_from_slug(slug: &str) -> Option<i64> {
-    slug
-        .strip_prefix("btc-updown-5m-")
+    slug.strip_prefix("btc-updown-5m-")
         .and_then(|s| s.parse::<i64>().ok())
         .map(|window_start_sec| {
             window_start_sec
@@ -83,8 +82,7 @@ async fn live_btc_updown_book_buy_floor(
     let best_ask = best_ask_sdk(&book)
         .ok_or_else(|| anyhow::anyhow!("пустой asks book для asset_id={asset_id} slug={slug}"))?;
     let best_ask_f64 = decimal_to_f64(&best_ask)?;
-    let buy_price_cap =
-        (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
+    let buy_price_cap = (best_ask_f64 + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
     const CLOB_MIN_MARKETABLE_BUY_USD: f64 = 1.0;
     let raw_usd_floor = min_order_size * buy_price_cap + LIVE_DUEL_BUY_USD_HEADROOM;
     let rounded = (raw_usd_floor * 100.0).ceil() / 100.0;
@@ -127,7 +125,9 @@ async fn duel_leg_prep_for_outcome(
         .iter()
         .find(|(_, o)| **o == outcome)
         .map(|(aid, _)| aid.clone())
-        .with_context(|| format!("нет outcome={outcome:?} в Gamma currency_up_down_by_asset_id для slug={slug}"))?;
+        .with_context(|| {
+            format!("нет outcome={outcome:?} в Gamma currency_up_down_by_asset_id для slug={slug}")
+        })?;
     let (best_ask, amount, min_order_size_shares) =
         live_btc_updown_book_buy_floor(account, &asset_id, slug).await?;
     let price = (best_ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999);
@@ -221,6 +221,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
     opposite_prep: &LegPrep,
     wall_ms: u64,
     slug: &str,
+    market_start_unix_ms: Option<i64>,
 ) {
     let opposite = this_outcome.opposite();
     let maybe_oid = {
@@ -294,12 +295,13 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
             None,
             PostOrderRequest {
                 asset_id: opposite_prep.asset_id.clone(),
+                disable_http_settlement_poll_during_market: false,
                 side: Side::Sell,
                 role: OrderRole::Taker,
                 amount: OrderAmount::Shares(shares_to_sell),
                 price: None,
                 max_slippage_pp: None,
-                expiration: None,
+                market_start_unix_ms,
                 market_end_unix_ms: None,
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
                 strict_book: None,
@@ -352,7 +354,7 @@ async fn duel_unwind_opposite_maker_and_taker_flush(
                 sell_rep.taking_amount,
                 sell_rep.error_msg,
             );
-            break;        
+            break;
         }
     }
 }
@@ -367,6 +369,7 @@ async fn duel_self_taker_sell_flush(
     asset_id: &str,
     wall_ms: u64,
     slug: &str,
+    market_start_unix_ms: Option<i64>,
 ) {
     for attempt in 1..=UNWIND_OPPOSITE_TAKER_SELL_ATTEMPTS {
         let my_shares = {
@@ -391,12 +394,13 @@ async fn duel_self_taker_sell_flush(
             None,
             PostOrderRequest {
                 asset_id: asset_id.to_string(),
+                disable_http_settlement_poll_during_market: false,
                 side: Side::Sell,
                 role: OrderRole::Taker,
                 amount: OrderAmount::Shares(shares_to_sell),
                 price: None,
                 max_slippage_pp: None,
-                expiration: None,
+                market_start_unix_ms,
                 market_end_unix_ms: None,
                 timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
                 strict_book: None,
@@ -455,6 +459,7 @@ async fn duel_post_buy_then_maker(
     duel: Arc<RwLock<DuelHarness>>,
     prep: LegPrep,
     slug: String,
+    market_start_unix_ms: Option<i64>,
     wall_anchor: Arc<std::time::Instant>,
     opposite_prep: LegPrep,
 ) -> anyhow::Result<()> {
@@ -463,19 +468,19 @@ async fn duel_post_buy_then_maker(
     let price = prep.price;
     let outcome_t = prep.outcome;
 
-
     let (buy_invoke_tx, mut buy_invoke_rx) = invoke_settlement_watch();
     post_order_on_clob(
         &account,
         None,
         PostOrderRequest {
             asset_id: aid.clone(),
+            disable_http_settlement_poll_during_market: false,
             side: Side::Buy,
             role: OrderRole::Taker,
             amount: OrderAmount::UsdNotional(amount),
             price: Some(price),
             max_slippage_pp: None,
-            expiration: None,
+            market_start_unix_ms,
             market_end_unix_ms: None,
             timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
             strict_book: None,
@@ -497,7 +502,9 @@ async fn duel_post_buy_then_maker(
     let wall_ms = wall_anchor.elapsed().as_millis() as u64;
     poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel: ВХОД в invoke taker BUY {:?} slug={} asset_id={} (целевой amount ≈{amount:.4} USDC price={price:.5})",
-        outcome_t, slug, aid,
+        outcome_t,
+        slug,
+        aid,
     );
     poly::test_tee_println!(
         "[от старта {wall_ms} ms] duel: taker BUY {:?} итог после settle: успех={} частичн.={} order_id={:?}; \
@@ -522,6 +529,7 @@ async fn duel_post_buy_then_maker(
             &opposite_prep,
             wall_ms,
             slug.as_str(),
+            market_start_unix_ms,
         )
         .await;
         return Ok(());
@@ -540,6 +548,7 @@ async fn duel_post_buy_then_maker(
                 &opposite_prep,
                 wall_ms,
                 slug.as_str(),
+                market_start_unix_ms,
             )
             .await;
             return Ok(());
@@ -548,7 +557,8 @@ async fn duel_post_buy_then_maker(
     if !(shares_net > 0.0 && shares_net.is_finite()) {
         poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: BUY {:?}: невалидный shares_net={} — maker не ставится",
-            outcome_t, shares_net,
+            outcome_t,
+            shares_net,
         );
         duel_unwind_opposite_maker_and_taker_flush(
             &account,
@@ -557,6 +567,7 @@ async fn duel_post_buy_then_maker(
             &opposite_prep,
             wall_ms,
             slug.as_str(),
+            market_start_unix_ms,
         )
         .await;
         return Ok(());
@@ -577,6 +588,7 @@ async fn duel_post_buy_then_maker(
             &opposite_prep,
             wall_ms,
             slug.as_str(),
+            market_start_unix_ms,
         )
         .await;
         return Ok(());
@@ -611,6 +623,7 @@ async fn duel_post_buy_then_maker(
             aid.as_str(),
             wall_ms,
             slug.as_str(),
+            market_start_unix_ms,
         )
         .await;
         duel_unwind_opposite_maker_and_taker_flush(
@@ -620,12 +633,17 @@ async fn duel_post_buy_then_maker(
             &opposite_prep,
             wall_ms,
             slug.as_str(),
+            market_start_unix_ms,
         )
         .await;
         return Ok(());
     }
 
-    if duel.read().await.opposite_maker_full_sell_succeeded(outcome_t) {
+    if duel
+        .read()
+        .await
+        .opposite_maker_full_sell_succeeded(outcome_t)
+    {
         poly::test_tee_println!(
             "[от старта {wall_ms} ms] duel: maker {:?} не выставляем — противоположная нога уже full_sell_ok=true",
             outcome_t,
@@ -633,12 +651,13 @@ async fn duel_post_buy_then_maker(
         return Ok(());
     }
 
-    let market_end_unix_ms = btc_updown_5m_window_end_unix_ms_from_slug(slug.as_str()).or_else(|| {
-        let ms = current_timestamp_ms();
-        let poly_sec = ms / 1000;
-        let ws = (poly_sec / BTC_UPDOWN_5M_PERIOD_SEC) * BTC_UPDOWN_5M_PERIOD_SEC;
-        Some((ws.saturating_add(BTC_UPDOWN_5M_PERIOD_SEC)).saturating_mul(1000))
-    });
+    let market_end_unix_ms =
+        btc_updown_5m_window_end_unix_ms_from_slug(slug.as_str()).or_else(|| {
+            let ms = current_timestamp_ms();
+            let poly_sec = ms / 1000;
+            let ws = (poly_sec / BTC_UPDOWN_5M_PERIOD_SEC) * BTC_UPDOWN_5M_PERIOD_SEC;
+            Some((ws.saturating_add(BTC_UPDOWN_5M_PERIOD_SEC)).saturating_mul(1000))
+        });
 
     let (mk_invoke_tx, mut mk_invoke_rx) = invoke_settlement_watch();
     let post_res = post_order_on_clob(
@@ -646,12 +665,13 @@ async fn duel_post_buy_then_maker(
         None,
         PostOrderRequest {
             asset_id: aid.clone(),
+            disable_http_settlement_poll_during_market: false,
             side: Side::Sell,
             role: OrderRole::Maker,
             amount: OrderAmount::Shares(shares_floor),
             price: Some(maker_price_raw),
             max_slippage_pp: None,
-            expiration: None,
+            market_start_unix_ms,
             market_end_unix_ms,
             timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
             strict_book: None,
@@ -746,6 +766,7 @@ async fn duel_post_buy_then_maker(
         &opposite_prep,
         wall_ms,
         slug.as_str(),
+        market_start_unix_ms,
     )
     .await;
     Ok(())
@@ -832,7 +853,10 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let slug = current_btc_updown_5m_slug(current_timestamp_ms());
+    let now_ms = current_timestamp_ms();
+    let market_start_unix_ms =
+        Some((now_ms / 1000 / BTC_UPDOWN_5M_PERIOD_SEC) * BTC_UPDOWN_5M_PERIOD_SEC * 1000);
+    let slug = current_btc_updown_5m_slug(now_ms);
     let gamma = fetch_gamma_event_data_for_gamma_client(account.gamma.as_ref(), &slug).await?;
     let currency_up_down_by_asset_id = &gamma.currency_up_down_by_asset_id;
     let (dt, wall) = evt_ms!(last_evt, t0);
@@ -940,6 +964,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 duel_h,
                 prep_up,
                 slug,
+                market_start_unix_ms,
                 wall_anchor,
                 opposite_prep_for_up_leg,
             )
@@ -957,6 +982,7 @@ async fn live_duel_up_down_maker_race_tp10() -> anyhow::Result<()> {
                 duel_h,
                 prep_down,
                 slug,
+                market_start_unix_ms,
                 wall_anchor,
                 opposite_prep_for_down_leg,
             )

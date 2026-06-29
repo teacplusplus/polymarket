@@ -112,7 +112,7 @@ pub fn ws_start(
     if !WS_LOG_ENABLED {
         return;
     }
-    let polymarket_event_url = format!("https://polymarket.com/event/{slug}");
+    let polymarket_event_url = crate::util::polymarket_event_url(slug);
     let price_to_beat_str = price_to_beat
         .map(|p| format!("{p}"))
         .unwrap_or_else(|| "—".to_string());

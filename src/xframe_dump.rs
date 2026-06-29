@@ -80,7 +80,7 @@ pub fn spawn_dump_market_xframes_binary(
         tokio::time::sleep(std::time::Duration::from_secs(max_step)).await;
 
         let up_won = final_price >= price_to_beat;
-        let polymarket_event_url = format!("https://polymarket.com/event/{slug}");
+        let polymarket_event_url = crate::util::polymarket_event_url(&slug);
         eprintln!(
             "xframe_dump: market_id={market_id} polymarket={polymarket_event_url} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}"
         );

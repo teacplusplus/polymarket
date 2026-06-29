@@ -18,9 +18,8 @@
 //!    это всегда сразу после `POST /order`, для Maker — статус `Matched|Canceled|Unmatched`
 //!    из POST/REST/WS — **и** settlement догнал book-match по обеим осям (нечего больше ждать).
 //!
-//! Никакого «timestamp-deadline» finalize нет: maker-`expiration` (GTD) обрабатывает сам CLOB и
-//! пришлёт нам `Canceled|Unmatched` через WS/HTTP — этот сигнал и есть наш терминал. Если CLOB
-//! не отвечает (сеть/баг), агрегатор ждёт; вызывающий код должен таймаутить сам, если нужно.
+//! Никакого «timestamp-deadline» finalize нет: агрегатор ждёт CLOB terminal/settlement-сигналы.
+//! Если CLOB не отвечает (сеть/баг), вызывающий код должен таймаутить сам, если нужно.
 //!
 //! Источники сигнала:
 //! - **HTTP**: REST-poll каждые [`INVOKE_FALLBACK_POLL_MS`] дёргает `client.order(order_id)` +
@@ -272,9 +271,9 @@ fn report_making_and_taking_amounts(side: Side, eff: LegAgg) -> (OrderAmount, Or
 ///
 /// Никаких timestamp-фоллбэков нет: агрегатор ждёт явных HTTP/WS сигналов сколько нужно. Для
 /// Taker FAK это даёт колбэк в пределах settlement-задержки релайера (~1–3s в норме). Для
-/// Maker GTD `expiration` обрабатывает CLOB и эмитит `Canceled` через WS/HTTP — это и есть
-/// наш терминал. Если CLOB по какой-то причине не отвечает (сеть/баг), вызывающий код
-/// должен таймаутить сам.
+/// Maker с `market_end_unix_ms` уходит в CLOB как GTD и после market-end должен получить
+/// terminal-сигнал от CLOB; вызывающий код ждёт до `market_end_unix_ms + запас`. Если CLOB по
+/// какой-то причине не отвечает (сеть/баг), вызывающий код должен таймаутить сам.
 ///
 /// **Гарантии чисел:** `making_amount`/`taking_amount` — **net of fee** (то, что реально
 /// списано/зачислено на чейне), не gross-нотасчик подписанного ордера. Источник истины —
@@ -379,7 +378,9 @@ pub async fn wait_invoke_settlement(
                 return Some(report);
             }
         }
-    }).await.unwrap_or_else(|_| None)
+    })
+    .await
+    .unwrap_or_else(|_| None)
 }
 
 /// Контекст после успешного HTTP POST для агрегатора invoke.
@@ -463,8 +464,8 @@ struct InvokeAggInner {
     ///   в книге) — отсюда taker FAK с partial fill финализируется на settlement;
     /// - в [`Self::record_poll_http`] / [`Self::record_ws_order_status`] для статусов CLOB
     ///   `Canceled|Unmatched` (POST/REST) либо `CANCELED|UNMATCHED` (WS) — безусловно (ордер
-    ///   ушёл из книги, новых матчей не будет; для maker GTD это ровно то, что приходит после
-    ///   `expiration` — CLOB сам снимает ордер и эмитит `Canceled`);
+    ///   ушёл из книги, новых матчей не будет; для maker GTD это ожидаемый terminal после
+    ///   `market_end_unix_ms`);
     /// - для CLOB `Matched`/`MATCHED|FILLED` (Maker) — **только** когда
     ///   [`is_book_fully_matched_observed`] = `true`, т.е. наблюдаемый `size_matched` покрыл
     ///   `original_size` с дастр-допуском. Polymarket шлёт `MATCHED` после **каждого** трейда
@@ -854,6 +855,12 @@ pub(crate) struct PostOrderInvokeAggregator {
     side: Side,
     /// Asset (token_id строкой) — для replay/curl.
     asset_id: String,
+    /// Если `true`, HTTP fallback ждёт `market_end_unix_ms` и делает только один poll.
+    disable_http_settlement_poll_during_market: bool,
+    /// Unix-ms старта рынка; до него fallback poll не шлёт `GET /order`.
+    market_start_unix_ms: Option<i64>,
+    /// Unix-ms конца рынка; нужен для режима одноразового HTTP poll после market-end.
+    market_end_unix_ms: Option<i64>,
     /// Unix-ms старта трекера (момент возврата POST), для подсчёта latency до колбэка.
     started_at_ms: i64,
     /// Сколько раз отработал HTTP-poll (`spawn_invoke_poll_fallback` iteration count).
@@ -889,10 +896,10 @@ impl PostOrderInvokeAggregator {
         let side = post_request.side;
         let role = post_request.role;
         let asset_id = post_request.asset_id.clone();
-        // Поля только для observability — никакой timestamp-фоллбэк finalize не использует:
-        // maker GTD `expiration` обрабатывает CLOB и пришлёт `Canceled|Unmatched` через
-        // WS/HTTP — это и есть наш терминал.
-        let expiration_unix_ms = post_request.expiration.map(|e| e.timestamp_millis());
+        let disable_http_settlement_poll_during_market =
+            post_request.disable_http_settlement_poll_during_market;
+        // Поля только для observability/poll pacing — timestamp-фоллбэк finalize их не использует.
+        let market_start_unix_ms = post_request.market_start_unix_ms;
         let market_end_unix_ms = post_request.market_end_unix_ms;
         // Сид `original_size_observed` из target'a: для Shares-target (всегда у Maker и часто
         // у Taker SELL) знаем сразу. Для UsdNotional-target (Taker BUY) `original_size` в shares
@@ -929,6 +936,9 @@ impl PostOrderInvokeAggregator {
             target,
             side,
             asset_id: asset_id.clone(),
+            disable_http_settlement_poll_during_market,
+            market_start_unix_ms,
+            market_end_unix_ms,
             started_at_ms: timestamp_ms_started,
             http_poll_count: Arc::new(RwLock::new(0)),
             ws_trade_count: Arc::new(RwLock::new(0)),
@@ -937,8 +947,10 @@ impl PostOrderInvokeAggregator {
 
         crate::stream_tee_println!(
             "[order_invoke/start] order_id={order_id} side={side:?} role={role:?} \
-             asset_id={asset_id} target={target:?} expiration_unix_ms={expiration_unix_ms:?} \
-             market_end_unix_ms={market_end_unix_ms:?} started_at_ms={timestamp_ms_started}",
+             asset_id={asset_id} target={target:?} market_start_unix_ms={market_start_unix_ms:?} \
+             market_end_unix_ms={market_end_unix_ms:?} \
+             disable_http_settlement_poll_during_market={disable_http_settlement_poll_during_market} \
+             started_at_ms={timestamp_ms_started}",
         );
 
         aggregator
@@ -1067,7 +1079,7 @@ impl PostOrderInvokeAggregator {
     /// Применяет WS user-channel `order`-event: подтягивает `original_size`/`size_matched`
     /// (если есть) в observed-поля и выставляет terminal-флаги по правилу:
     /// - `CANCELED` — book-terminal безусловно, плюс `partial=true`.
-    /// - `UNMATCHED` — book-terminal безусловно (FAK без ликвидности / expired GTD).
+    /// - `UNMATCHED` — book-terminal безусловно (например, FAK без ликвидности).
     /// - `MATCHED`/`FILLED` — `success=true` всегда (информационно), book-terminal **только**
     ///   когда [`is_book_fully_matched_observed`] = `true`, т.к. Polymarket шлёт `MATCHED` после
     ///   каждого трейда maker'а, и без этой проверки колбэк мог бы выстрелить прематурно для
@@ -1261,8 +1273,7 @@ impl PostOrderInvokeAggregator {
     ///    **и** terminal-объём (`settled + failed`) по **shares** догнал book-match — больше
     ///    изменений не будет:
     ///    - Taker — сразу после settlement (FAK не остаётся в книге).
-    ///    - Maker `CANCELED`/`UNMATCHED` — безусловно (ордер ушёл из книги; для GTD это и есть
-    ///      событие после `expiration` — CLOB сам снимает ордер).
+    ///    - Maker `CANCELED`/`UNMATCHED` — безусловно (ордер ушёл из книги).
     ///    - Maker `MATCHED`/`FILLED` — **только** если
     ///      [`is_book_fully_matched_observed`] = `true` (т.е. наблюдаемый `size_matched`
     ///      покрыл `original_size` с дастр-допуском). Это защищает partial maker'а от
@@ -1613,6 +1624,41 @@ fn spawn_invoke_poll_fallback(
         loop {
             if *aggregator.finished.read().await {
                 return;
+            }
+
+            if aggregator.disable_http_settlement_poll_during_market
+                && let Some(market_end_ms) = aggregator.market_end_unix_ms
+            {
+                let now_ms = crate::util::current_timestamp_ms();
+                if market_end_ms > now_ms {
+                    let sleep_ms = market_end_ms.saturating_sub(now_ms);
+                    crate::stream_tee_println!(
+                        "[order_invoke/poll/market-life-sleep] order_id={order_id} market_end_unix_ms={market_end_ms} \
+                         now_ms={now_ms} sleep_ms={sleep_ms} — HTTP settlement poll disabled during market life",
+                    );
+                    tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
+                    continue;
+                }
+                if *aggregator.http_poll_count.read().await > 0 {
+                    crate::stream_tee_println!(
+                        "[order_invoke/poll/market-life-stop] order_id={order_id} \
+                         one-shot HTTP poll after market_end already attempted",
+                    );
+                    return;
+                }
+            }
+
+            if let Some(market_start_ms) = aggregator.market_start_unix_ms {
+                let now_ms = crate::util::current_timestamp_ms();
+                if market_start_ms > now_ms {
+                    let sleep_ms = market_start_ms.saturating_sub(now_ms);
+                    crate::stream_tee_println!(
+                        "[order_invoke/poll/prestart] order_id={order_id} market_start_unix_ms={market_start_ms} \
+                         now_ms={now_ms} sleep_ms={sleep_ms} — skip GET /order before market start",
+                    );
+                    tokio::time::sleep(Duration::from_millis(sleep_ms as u64)).await;
+                    continue;
+                }
             }
 
             tokio::time::sleep(Duration::from_millis(INVOKE_FALLBACK_POLL_MS)).await;

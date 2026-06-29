@@ -5,13 +5,12 @@
 
 use crate::account::{POLY_PRIVATE_KEY_ENV, SharedAccount};
 use crate::account_order_completion::{
-    PostOrderHttpOutcome, PostOrderInvokeContext, after_post_order_maybe_track_invoke,
-    fire_failed_invocation_for_side, wrap_post_order_cb,
+    CompletionOnce, PostOrderHttpOutcome, PostOrderInvokeContext,
+    after_post_order_maybe_track_invoke, fire_failed_invocation_for_side, wrap_post_order_cb,
 };
 use crate::history_sim::StrictBook;
 use crate::project_manager::ProjectManager;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Utc};
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
@@ -25,7 +24,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Маркет (FAK) или лимит post-only (GTC/GTD).
+/// Маркет (FAK) или лимит post-only (GTC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderRole {
     /// `market_order`, съём встречной ликвидности.
@@ -43,11 +42,14 @@ pub enum OrderAmount {
     Shares(f64),
 }
 
-/// Вход для [`post_order_on_clob`]: taker BUY (UsdNotional±slippage/worst-price), TP maker (Shares+price+[expiration]), taker SELL (Shares).
+/// Вход для [`post_order_on_clob`]: taker BUY (UsdNotional±slippage/worst-price), TP maker (Shares+price), taker SELL (Shares).
 #[derive(Debug, Clone)]
 pub struct PostOrderRequest {
     /// Десятичный `tokenId` (= `OpenPosition.asset_id`).
     pub asset_id: String,
+    /// Если `true`, HTTP fallback не мониторит settlement во время жизни рынка:
+    /// до `market_end_unix_ms` полагаемся на WS, после конца рынка делаем один HTTP poll.
+    pub disable_http_settlement_poll_during_market: bool,
     /// SDK `Side::Buy` / `Side::Sell`.
     pub side: Side,
     /// Taker vs maker (см. enum).
@@ -58,9 +60,10 @@ pub struct PostOrderRequest {
     pub price: Option<f64>,
     /// Cap от best L1 (prob.), только taker без явного `price`.
     pub max_slippage_pp: Option<f64>,
-    /// GTD на CLOB только у maker; у taker при `Some` задаёт локальный дедлайн финального колбэка POST (не передаётся в `market_order`).
-    pub expiration: Option<DateTime<Utc>>,
-    /// Если `Some` — верхний предел времени unix ms для fallback poll после «живого» POST; если `None` — фиксированный запас секунд с момента POST.
+    /// Если `Some`, invoke fallback poll не шлёт `GET /order` до старта рынка.
+    pub market_start_unix_ms: Option<i64>,
+    /// Для maker: если `Some`, CLOB-ордер будет GTD с expiration в этот unix ms; если `None` — GTC.
+    /// Вызывающий также ждёт invoke до этого времени + запас.
     pub market_end_unix_ms: Option<i64>,
     /// Таймаут HTTP только на `POST /order`.
     pub timeout: Duration,
@@ -212,6 +215,189 @@ pub async fn post_order_on_clob(
         }
     };
 
+    Ok(handle_post_order_response(account, request, invoke_slot, resp, None).await)
+}
+
+/// `POST /orders`: batch-вариант [`post_order_on_clob`] для
+/// [Polymarket CLOB POST /orders](https://docs.polymarket.com/api-reference/trade/post-multiple-orders).
+///
+/// Семантика по каждому `(request, invoke)` такая же, как у одиночного пути:
+/// заявка валидируется/билдится/подписывается теми же helper'ами, а HTTP-ответ каждого элемента
+/// проходит через [`after_post_order_maybe_track_invoke`].
+pub async fn post_orders_on_clob(
+    account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
+    requests: Vec<PostOrderRequest>,
+    invokes: Vec<SingleOrderInvokeCb>,
+) -> Result<Vec<Option<String>>> {
+    let _ = project_manager;
+
+    if requests.len() != invokes.len() {
+        bail!(
+            "post_orders_on_clob: requests.len()={} != invokes.len()={}",
+            requests.len(),
+            invokes.len()
+        );
+    }
+
+    let invoke_slots: Vec<_> = invokes.into_iter().map(wrap_post_order_cb).collect();
+
+    if requests.is_empty() {
+        bail!("post_orders_on_clob: пустой requests — POST /orders требует 1..=15 ордеров");
+    }
+    if requests.len() > 15 {
+        let msg = format!(
+            "post_orders_on_clob: слишком много ордеров: {}, максимум 15 для POST /orders",
+            requests.len()
+        );
+        fire_failed_invocations_for_batch(&invoke_slots, &requests, None, msg.clone());
+        return Err(anyhow!(msg));
+    }
+
+    for (idx, request) in requests.iter().enumerate() {
+        if let Err(err) = validate_post_order_request(request) {
+            let msg = format!("validate_post_order_request[{idx}]: {err:#}");
+            fire_failed_invocations_for_batch(&invoke_slots, &requests, Some(idx), msg.clone());
+            return Err(err.context(msg));
+        }
+    }
+
+    let auth_client: clob::Client<Authenticated<Normal>> = match (**account.clob_authed.load())
+        .clone()
+    {
+        Some(c) => c,
+        None => {
+            let msg = format!(
+                "clob_authed=None — CLOB не аутентифицирован, проверьте {POLY_PRIVATE_KEY_ENV} и [heartbeat] CLOB authenticate"
+            );
+            fire_failed_invocations_for_batch(&invoke_slots, &requests, None, msg.clone());
+            return Err(anyhow!("post_orders_on_clob: {msg}"));
+        }
+    };
+    let signer = match (**account.clob_signer.load()).clone() {
+        Some(s) => s,
+        None => {
+            let msg = "clob_signer=None — auth-цикл не запускался?".to_string();
+            fire_failed_invocations_for_batch(&invoke_slots, &requests, None, msg.clone());
+            return Err(anyhow!("post_orders_on_clob: {msg}"));
+        }
+    };
+
+    let mut signed_orders = Vec::with_capacity(requests.len());
+    for (idx, request) in requests.iter().enumerate() {
+        let token_id = match U256::from_str(&request.asset_id) {
+            Ok(t) => t,
+            Err(parse_err) => {
+                let msg = format!(
+                    "невалидный asset_id[{idx}]={:?} (ожидается десятичный U256): {parse_err}",
+                    request.asset_id,
+                );
+                fire_failed_invocations_for_batch(&invoke_slots, &requests, Some(idx), msg.clone());
+                return Err(anyhow!("post_orders_on_clob: {msg}"));
+            }
+        };
+
+        let signable = match request.role {
+            OrderRole::Maker => match build_maker_signable(&auth_client, token_id, request).await {
+                Ok(s) => s,
+                Err(err) => {
+                    let msg = format!("build_maker_signable[{idx}]: {err:#}");
+                    fire_failed_invocations_for_batch(
+                        &invoke_slots,
+                        &requests,
+                        Some(idx),
+                        msg.clone(),
+                    );
+                    return Err(err.context(msg));
+                }
+            },
+            OrderRole::Taker => match build_taker_signable(&auth_client, token_id, request).await {
+                Ok(s) => s,
+                Err(err) => {
+                    let msg = format!("build_taker_signable[{idx}]: {err:#}");
+                    fire_failed_invocations_for_batch(
+                        &invoke_slots,
+                        &requests,
+                        Some(idx),
+                        msg.clone(),
+                    );
+                    return Err(err.context(msg));
+                }
+            },
+        };
+
+        let signed = match auth_client.sign(&signer, signable).await {
+            Ok(s) => s,
+            Err(err) => {
+                let msg = format!("подпись ордера[{idx}] упала: {err:#}");
+                fire_failed_invocations_for_batch(&invoke_slots, &requests, Some(idx), msg.clone());
+                return Err(anyhow!("post_orders_on_clob: {msg}"));
+            }
+        };
+        signed_orders.push(signed);
+    }
+
+    let batch_timeout = requests
+        .iter()
+        .map(|request| request.timeout)
+        .max()
+        .expect("requests is non-empty");
+    let responses =
+        match tokio::time::timeout(batch_timeout, auth_client.post_orders(signed_orders)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(err)) => {
+                let msg = format!("POST /orders SDK error: {err:#}");
+                crate::tee_eprintln!("post_orders_on_clob: {msg} (request may have hit network)");
+                fire_failed_invocations_for_batch(&invoke_slots, &requests, None, msg);
+                return Ok(vec![None; requests.len()]);
+            }
+            Err(_elapsed) => {
+                let msg = format!(
+                    "POST /orders timed out after {:?} (request may have been accepted)",
+                    batch_timeout
+                );
+                crate::tee_eprintln!("post_orders_on_clob: {msg}");
+                fire_failed_invocations_for_batch(&invoke_slots, &requests, None, msg);
+                return Ok(vec![None; requests.len()]);
+            }
+        };
+
+    if responses.len() != requests.len() {
+        crate::tee_eprintln!(
+            "post_orders_on_clob: POST /orders вернул {} ответов на {} запросов",
+            responses.len(),
+            requests.len()
+        );
+    }
+
+    let mut out = Vec::with_capacity(requests.len());
+    let mut responses_iter = responses.into_iter();
+    for (idx, (request, invoke_slot)) in requests.into_iter().zip(invoke_slots).enumerate() {
+        match responses_iter.next() {
+            Some(resp) => {
+                out.push(
+                    handle_post_order_response(account, request, invoke_slot, resp, Some(idx))
+                        .await,
+                );
+            }
+            None => {
+                let msg = format!("POST /orders не вернул response для index={idx}");
+                fire_failed_invocation_for_side(&invoke_slot, request.side, Some(msg));
+                out.push(None);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+async fn handle_post_order_response(
+    account: &SharedAccount,
+    request: PostOrderRequest,
+    invoke_slot: Arc<CompletionOnce<SingleOrderClobInvocationReport>>,
+    resp: PostOrderResponse,
+    batch_index: Option<usize>,
+) -> Option<String> {
     let PostOrderResponse {
         success,
         order_id,
@@ -248,7 +434,11 @@ pub async fn post_order_on_clob(
             OrderAmount::UsdNotional(taking_f64),
         ),
         _ => panic!(
-            "post_order_on_clob: side={:?} не поддерживается (ожидается Buy/Sell)",
+            "{}: side={:?} не поддерживается (ожидается Buy/Sell)",
+            match batch_index {
+                Some(idx) => format!("post_orders_on_clob[{idx}]"),
+                None => "post_order_on_clob".to_string(),
+            },
             request.side
         ),
     };
@@ -273,7 +463,25 @@ pub async fn post_order_on_clob(
         invoke_slot,
     )
     .await;
-    Ok((success && !order_id.is_empty()).then_some(order_id))
+    (success && !order_id.is_empty()).then_some(order_id)
+}
+
+fn fire_failed_invocations_for_batch(
+    invoke_slots: &[Arc<CompletionOnce<SingleOrderClobInvocationReport>>],
+    requests: &[PostOrderRequest],
+    primary_idx: Option<usize>,
+    msg: String,
+) {
+    for (idx, (slot, request)) in invoke_slots.iter().zip(requests.iter()).enumerate() {
+        let item_msg = if primary_idx.is_some_and(|p| p == idx) || primary_idx.is_none() {
+            msg.clone()
+        } else {
+            format!(
+                "post_orders_on_clob: batch aborted before POST because index {primary_idx:?} failed: {msg}"
+            )
+        };
+        fire_failed_invocation_for_side(slot, request.side, Some(item_msg));
+    }
 }
 
 /// Ошибки комбинаций полей до сети/SDK `build`.
@@ -357,7 +565,7 @@ fn normalize_probability_price_to_cent_tick(price: f64, ctx: &str) -> Result<f64
     Ok(rounded.clamp(0.001, 0.999))
 }
 
-/// `limit_order` post_only, GTC или GTD если есть `expiration`.
+/// `limit_order` post_only: GTC без `market_end_unix_ms`, GTD с expiration=`market_end_unix_ms`.
 async fn build_maker_signable(
     client: &clob::Client<Authenticated<Normal>>,
     token_id: U256,
@@ -372,7 +580,7 @@ async fn build_maker_signable(
     let price_dec = f64_to_decimal(price, "maker price (tick-normalized)")?;
     let size_dec = f64_to_decimal(shares, "maker shares")?;
 
-    let order_type = if req.expiration.is_some() {
+    let order_type = if req.market_end_unix_ms.is_some() {
         OrderType::GTD
     } else {
         OrderType::GTC
@@ -387,8 +595,16 @@ async fn build_maker_signable(
         .order_type(order_type)
         .post_only(true);
 
-    if let Some(exp) = req.expiration {
-        builder = builder.expiration(exp);
+    if let Some(market_end_ms) = req.market_end_unix_ms {
+        let expiration =
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(market_end_ms).ok_or_else(
+                || {
+                    anyhow!(
+                        "post_order_on_clob: market_end_unix_ms={market_end_ms} не конвертируется в DateTime<Utc>"
+                    )
+                },
+            )?;
+        builder = builder.expiration(expiration);
     }
 
     builder
@@ -764,12 +980,13 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
         let asset_id_str = pos.asset.to_string();
         let request = PostOrderRequest {
             asset_id: asset_id_str.clone(),
+            disable_http_settlement_poll_during_market: false,
             side: Side::Sell,
             role: OrderRole::Taker,
             amount: OrderAmount::Shares(shares),
             price: None,
             max_slippage_pp: None,
-            expiration: None,
+            market_start_unix_ms: None,
             market_end_unix_ms: None,
             timeout: Duration::from_secs(EXIT_HTTP_TIMEOUT_SEC),
             strict_book: None,

@@ -2,7 +2,7 @@
 //! Data API позиции по derived Safe → SELL taker. В виртуальных режимах не вызывается.
 
 use crate::account::SharedAccount;
-use crate::account_order::{cancel_all_orders_on_clob, sell_all_positions_on_clob};
+use crate::account_order::cancel_all_orders_on_clob;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Стратегия не открывает новых ордеров после `graceful_exit` (`Acquire`/`Release`).
@@ -23,7 +23,7 @@ pub async fn graceful_exit(account: SharedAccount) {
     );
 
     cancel_all_orders_on_clob(&account).await;
-    sell_all_positions_on_clob(&account).await;
+    //sell_all_positions_on_clob(&account).await;
 
     crate::tee_println!("[account_exit] Graceful shutdown завершён");
 }

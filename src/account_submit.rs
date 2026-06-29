@@ -15,9 +15,9 @@
 //!   как в `history_sim` backtest).
 use crate::account::SharedAccount;
 use crate::account_order::{
-    CancelOrderRequest, CancelOrderResult, OrderAmount, OrderRole, PostOrderRequest,
-    SingleOrderClobInvocationReport, invoke_settlement_ready, invoke_settlement_report,
-    invoke_settlement_watch, wait_invoke_settlement,
+    CancelOrderRequest, CancelOrderResult, InvokeSettlementWatch, OrderAmount, OrderRole,
+    PostOrderRequest, SingleOrderClobInvocationReport, invoke_settlement_ready,
+    invoke_settlement_report, invoke_settlement_watch, wait_invoke_settlement,
 };
 use crate::constants::CurrencyUpDownOutcome;
 use crate::history_sim::{
@@ -26,7 +26,6 @@ use crate::history_sim::{
 };
 use crate::project_manager::ProjectManager;
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
-use chrono::{DateTime, Utc};
 use polymarket_client_sdk::clob::types::Side;
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,18 +93,80 @@ async fn post_order_on_clob(
             crate::account_order::post_order_on_clob(account, None, request, invoke).await
         }
         SubmitMode::Mock => {
-            crate::account_mock_order::post_order_on_clob(
-                account,
-                project_manager,
-                request,
-                invoke,
-            )
-            .await
+            crate::account_mock_order::post_order_on_clob(account, project_manager, request, invoke)
+                .await
         }
         SubmitMode::None => unreachable!(
             "post_order_on_clob (account_submit) вызывается из spawn_* только при \
              submit_mode != SubmitMode::None"
         ),
+    }
+}
+
+/// Диспатч `post_orders_on_clob` по [`SubmitMode`]: batch-двойник [`post_order_on_clob`]
+/// для real/mock submit-путей.
+#[allow(dead_code)]
+async fn post_orders_on_clob(
+    account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
+    submit_mode: SubmitMode,
+    requests: Vec<PostOrderRequest>,
+    invokes: Vec<crate::account_order::SingleOrderInvokeCb>,
+) -> anyhow::Result<Vec<Option<String>>> {
+    match submit_mode {
+        SubmitMode::Submit => {
+            crate::account_order::post_orders_on_clob(account, None, requests, invokes).await
+        }
+        SubmitMode::Mock => {
+            crate::account_mock_order::post_orders_on_clob(
+                account,
+                project_manager,
+                requests,
+                invokes,
+            )
+            .await
+        }
+        SubmitMode::None => unreachable!(
+            "post_orders_on_clob (account_submit) вызывается из spawn_* только при \
+             submit_mode != SubmitMode::None"
+        ),
+    }
+}
+
+pub(crate) struct OpenBuyRequest {
+    pub(crate) position: SharedOpenPosition,
+    pub(crate) price: Option<f64>,
+    pub(crate) delta_price: Option<f64>,
+}
+
+struct PreparedOpenBuy {
+    position: SharedOpenPosition,
+    buy_role_label: &'static str,
+    invoke_rx: InvokeSettlementWatch,
+    invoke_wait: Duration,
+}
+
+async fn drain_position_from_account(account: &SharedAccount, pos_id: &str) {
+    {
+        let mut positions_guard = account.positions.write().await;
+        for lane_positions in positions_guard.values_mut() {
+            lane_positions.shift_remove(pos_id);
+        }
+    }
+    {
+        let mut pending_guard = account.pending_close_positions.write().await;
+        for lane_pending in pending_guard.values_mut() {
+            lane_pending.shift_remove(pos_id);
+        }
+    }
+    // Future-позиция (BUY выставлен до наступления рынка) ещё может «жить» в
+    // `future_positions` до промоушена — чистим и там, чтобы провал BUY не оставил
+    // висящую запись.
+    {
+        let mut future_guard = account.future_positions.write().await;
+        for lane_future in future_guard.values_mut() {
+            lane_future.shift_remove(pos_id);
+        }
     }
 }
 
@@ -123,8 +184,7 @@ async fn cancel_order_on_clob(
             crate::account_order::cancel_order_on_clob(account, None, request).await
         }
         SubmitMode::Mock => {
-            crate::account_mock_order::cancel_order_on_clob(account, project_manager, request)
-                .await
+            crate::account_mock_order::cancel_order_on_clob(account, project_manager, request).await
         }
         SubmitMode::None => unreachable!(
             "cancel_order_on_clob (account_submit) вызывается из spawn_* только при \
@@ -169,7 +229,9 @@ pub(crate) fn spawn_cancel_order(
                 maker_closing_read.canceled,
             )
         };
-        let Some(order_id) = maker_tp_order_id else { return };
+        let Some(order_id) = maker_tp_order_id else {
+            return;
+        };
         if maker_already_canceled {
             return;
         }
@@ -290,7 +352,7 @@ pub(crate) fn spawn_sell_taker(
             );
             return;
         }
-        
+
         if reason == CloseReason::TakeProfit {
             if let Some(maker_tp_arc) = maker_tp_position.as_ref() {
                 let maker_closing = maker_tp_arc.read().await;
@@ -359,10 +421,7 @@ pub(crate) fn spawn_sell_taker(
             // Клонируем `OpenPosition` перед await, чтобы не держать read-lock
             // через `position.write().await` ниже (запись `taker_closing`).
             let position_snapshot = position.read().await.clone();
-            let shares_remaining = match position_snapshot
-                .shares_remaining_to_sell(true)
-                .await
-            {
+            let shares_remaining = match position_snapshot.shares_remaining_to_sell(true).await {
                 Ok(Some(n)) => n,
                 Ok(None) => {
                     crate::tee_eprintln!(
@@ -426,12 +485,13 @@ pub(crate) fn spawn_sell_taker(
 
             let sell_post_request = PostOrderRequest {
                 asset_id: asset_id.clone(),
+                disable_http_settlement_poll_during_market: false,
                 side: Side::Sell,
                 role: OrderRole::Taker,
                 amount: OrderAmount::Shares(shares_to_sell),
                 price: None,
                 max_slippage_pp: Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
-                expiration: None,
+                market_start_unix_ms: None,
                 market_end_unix_ms: event_end_unix_ms,
                 timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                 strict_book: strict_book.clone(),
@@ -566,707 +626,789 @@ pub(crate) fn spawn_sell_taker(
     });
 }
 
-
-/// Открытие позиции на CLOB: taker-FAK или maker-GTD.
+/// Открытие позиции на CLOB: taker-FAK или maker-GTC.
 ///
 /// * `delta_price = None` — taker BUY по `planned_entry_cost` (cap `price`, как раньше).
-/// * `delta_price = Some(delta)` — maker limit BUY по `price + delta`, GTD
-///   `maker_gtd_sec` секунд; размер в shares из `amount / limit_price`.
+/// * `delta_price = Some(delta)` — maker limit BUY по `price + delta`; ждём invoke до
+///   `event_end_ms + ORDER_HTTP_TIMEOUT_SEC`, размер в shares из `amount / limit_price`.
 pub(crate) fn spawn_open_buy(
     account: SharedAccount,
     project_manager: Option<Arc<ProjectManager>>,
-    position: SharedOpenPosition,
-    price: Option<f64>,
-    delta_price: Option<f64>,
-    maker_gtd_sec: Option<u64>,
+    open_buys: Vec<OpenBuyRequest>,
     strict_book: Option<StrictBook>,
+    min_order_size_shares: Option<f64>,
     submit_mode: SubmitMode,
 ) {
-    if submit_mode == SubmitMode::None {
+    if submit_mode == SubmitMode::None || open_buys.is_empty() {
         return;
     }
     tokio::spawn(async move {
-        let buy_role_label = if delta_price.is_some() {
-            "maker"
-        } else {
-            "taker"
-        };
         crate::tee_eprintln!(
-            "[submit/{submit_mode:?}] open BUY {buy_role_label}: POST BUY по planned_entry_cost \
-             (price={price:?}, delta_price={delta_price:?}), invoke settle → actual shares/fee \
-             в позицию и stats; при успехе — выставляем maker TP; после event_end — \
-             post-market-end resolution",
+            "[submit/{submit_mode:?}] open BUY batch size={}: POST BUY по planned_entry_cost, \
+             invoke settle → actual shares/fee в позицию и stats; при успехе — выставляем \
+             maker TP; после event_end — post-market-end resolution",
+            open_buys.len(),
         );
-        // `planned_*` живут в `OpenPosition` (выставлены в `open_position`) и более не
-        // меняются — для submit-CSV их читает `close_position_maker_tp` из позиции.
-        // Локально снимаем только то, что нужно ДО POST. `currency/interval/side`
-        // тоже иммутабельные после создания и нужны post-settle для коррекции
-        // `stats.fees_paid` дельтой `actual − planned`.
-        let (
-            asset_id,
-            amount,
-            event_end_ms,
-            pos_id,
-            planned_entry_fee,
-            currency_str,
-            interval_kind,
-            side,
-            opened_in_hold_zone,
-            redeem_01,
-            redeem_x,
-        ) = {
-            let p = position.read().await;
-            (
-                p.asset_id.clone(),
-                p.planned_entry_cost,
-                p.event_end_ms,
-                p.id.clone(),
-                p.planned_fee_usdc,
-                p.currency.clone(),
-                crate::constants::XFrameIntervalKind::from_i32(p.xframe_interval_type_at_open),
-                CurrencyUpDownOutcome::from_i32(p.currency_up_down_outcome_at_open),
-                p.opened_in_hold_zone,
-                p.redeem_01,
-                p.redeem_x,
-            )
-        };
 
-        if !(amount > 0.0 && amount.is_finite()) {
-            crate::tee_eprintln!(
-                "[submit] open BUY {buy_role_label} pos_id={pos_id}: невалидный amount={amount} — OpenFailed",
-            );
-            return;
-        }
-        // Как в duel: USDC к центам вверх (`ceil`), иначе CLOB видит лишние знаки.
-        let amount = (amount * 100.0).ceil() / 100.0;
-
-        let min_order_size_shares = strict_book
-            .as_ref()
-            .and_then(|b| b.min_order_size)
-            .filter(|m| m.is_finite() && *m > 0.0);
-
-        let (invoke_tx, mut invoke_rx) = invoke_settlement_watch();
+        let mut prepared = Vec::with_capacity(open_buys.len());
+        let mut post_requests = Vec::with_capacity(open_buys.len());
+        let mut invokes = Vec::with_capacity(open_buys.len());
+        for OpenBuyRequest {
+            position,
+            price,
+            delta_price,
+        } in open_buys
         {
-            let mut open_position = position.write().await;
-            open_position.open_buy_invoke = Some(invoke_rx.clone());
-        }
-        let drain_position_from_account = || async {
-            {
-                let mut positions_guard = account.positions.write().await;
-                for lane_positions in positions_guard.values_mut() {
-                    lane_positions.shift_remove(&pos_id);
-                }
-            }
-            {
-                let mut pending_guard = account.pending_close_positions.write().await;
-                for lane_pending in pending_guard.values_mut() {
-                    lane_pending.shift_remove(&pos_id);
-                }
-            }
-        };
-
-        let (buy_post_request, invoke_wait) = match delta_price {
-            None => (
-                PostOrderRequest {
-                    asset_id: asset_id.clone(),
-                    side: Side::Buy,
-                    role: OrderRole::Taker,
-                    amount: OrderAmount::UsdNotional(amount),
-                    price,
-                    max_slippage_pp: None,
-                    expiration: None,
-                    market_end_unix_ms: event_end_ms,
-                    timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-                    strict_book: strict_book.clone(),
-                },
-                Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-            ),
-            Some(delta) => {
-                let Some(gtd_sec) = maker_gtd_sec.filter(|&s| s > 0) else {
-                    crate::tee_eprintln!(
-                        "[submit] open BUY maker pos_id={pos_id}: maker_gtd_sec={maker_gtd_sec:?} \
-                         при delta_price={delta} — OpenFailed",
-                    );
-                    drain_position_from_account().await;
-                    return;
-                };
-                let Some(base_price) = price else {
-                    crate::tee_eprintln!(
-                        "[submit] open BUY maker pos_id={pos_id}: price=None при delta_price={delta} — OpenFailed",
-                    );
-                    drain_position_from_account().await;
-                    return;
-                };
-                let maker_price = (base_price + delta).clamp(0.001, 0.999);
-                let shares_floor = (amount / maker_price * 100.0).floor() / 100.0;
-                if !(shares_floor > 0.0 && shares_floor.is_finite()) {
-                    crate::tee_eprintln!(
-                        "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor} из amount={amount} \
-                         @ price={maker_price:.6} — OpenFailed",
-                    );
-                    drain_position_from_account().await;
-                    return;
-                }
-                if let Some(min_order_size) = min_order_size_shares && shares_floor + 1e-9 < min_order_size
-                {
-                    crate::tee_eprintln!(
-                        "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor:.4} < \
-                         min_order_size={min_order_size:.4} — OpenFailed",
-                    );
-                    drain_position_from_account().await;
-                    return;
-                }
-                let expiration: Option<DateTime<Utc>> = Some(
-                    Utc::now() + chrono::Duration::seconds(gtd_sec as i64),
-                );
+            let buy_role_label = if delta_price.is_some() {
+                "maker"
+            } else {
+                "taker"
+            };
+            crate::tee_eprintln!(
+                "[submit/{submit_mode:?}] open BUY {buy_role_label}: POST BUY по planned_entry_cost \
+                 (price={price:?}, delta_price={delta_price:?})",
+            );
+            // `planned_*` живут в `OpenPosition` (выставлены в `open_position`) и более не
+            // меняются — для submit-CSV их читает `close_position_maker_tp` из позиции.
+            // Локально снимаем только то, что нужно ДО POST. `currency/interval/side`
+            // тоже иммутабельные после создания и нужны post-settle для коррекции
+            // `stats.fees_paid` дельтой `actual − planned`.
+            let (asset_id, amount, event_end_ms, pos_id, interval_kind) = {
+                let p = position.read().await;
                 (
+                    p.asset_id.clone(),
+                    p.planned_entry_cost,
+                    p.event_end_ms,
+                    p.id.clone(),
+                    crate::constants::XFrameIntervalKind::from_i32(p.xframe_interval_type_at_open),
+                )
+            };
+
+            if !(amount > 0.0 && amount.is_finite()) {
+                crate::tee_eprintln!(
+                    "[submit] open BUY {buy_role_label} pos_id={pos_id}: невалидный amount={amount} — OpenFailed",
+                );
+                drain_position_from_account(&account, &pos_id).await;
+                continue;
+            }
+            // Как в duel: USDC к центам вверх (`ceil`), иначе CLOB видит лишние знаки.
+            let amount = (amount * 100.0).ceil() / 100.0;
+
+            let event_start_ms = event_end_ms.and_then(|end_ms| {
+                interval_kind.map(|kind| end_ms.saturating_sub(kind.interval_ms()))
+            });
+
+            let (invoke_tx, invoke_rx) = invoke_settlement_watch();
+            {
+                let mut open_position = position.write().await;
+                open_position.open_buy_invoke = Some(invoke_rx.clone());
+            }
+
+            let (buy_post_request, invoke_wait) = match delta_price {
+                None => (
                     PostOrderRequest {
                         asset_id: asset_id.clone(),
+                        disable_http_settlement_poll_during_market: false,
                         side: Side::Buy,
-                        role: OrderRole::Maker,
-                        amount: OrderAmount::Shares(shares_floor),
-                        price: Some(maker_price),
+                        role: OrderRole::Taker,
+                        amount: OrderAmount::UsdNotional(amount),
+                        price,
                         max_slippage_pp: None,
-                        expiration,
+                        market_start_unix_ms: event_start_ms,
                         market_end_unix_ms: event_end_ms,
                         timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-                        strict_book: None,
+                        strict_book: strict_book.clone(),
                     },
-                    Duration::from_secs(gtd_sec.saturating_add(ORDER_HTTP_TIMEOUT_SEC)),
-                )
-            }
+                    Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                ),
+                Some(delta) => {
+                    let Some(base_price) = price else {
+                        crate::tee_eprintln!(
+                            "[submit] open BUY maker pos_id={pos_id}: price=None при delta_price={delta} — OpenFailed",
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        continue;
+                    };
+                    let maker_price = (base_price + delta).clamp(0.001, 0.999);
+                    let shares_floor = (amount / maker_price * 100.0).floor() / 100.0;
+                    if !(shares_floor > 0.0 && shares_floor.is_finite()) {
+                        crate::tee_eprintln!(
+                            "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor} из amount={amount} \
+                             @ price={maker_price:.6} — OpenFailed",
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        continue;
+                    }
+                    if let Some(min_order_size) = min_order_size_shares
+                        && shares_floor + 1e-9 < min_order_size
+                    {
+                        crate::tee_eprintln!(
+                            "[submit] open BUY maker pos_id={pos_id}: shares_floor={shares_floor:.4} < \
+                             min_order_size={min_order_size:.4} — OpenFailed",
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        continue;
+                    }
+                    (
+                        PostOrderRequest {
+                            asset_id: asset_id.clone(),
+                            disable_http_settlement_poll_during_market: false,
+                            side: Side::Buy,
+                            role: OrderRole::Maker,
+                            amount: OrderAmount::Shares(shares_floor),
+                            price: Some(maker_price),
+                            max_slippage_pp: None,
+                            market_start_unix_ms: event_start_ms,
+                            market_end_unix_ms: event_end_ms,
+                            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                            strict_book: None,
+                        },
+                        invoke_wait_until_market_end_plus(event_end_ms),
+                    )
+                }
+            };
+
+            let buy_invoke_cb: crate::account_order::SingleOrderInvokeCb =
+                Box::new(move |buy_rep| {
+                    let _ = invoke_tx.send(Some(buy_rep));
+                });
+            post_requests.push(buy_post_request);
+            invokes.push(buy_invoke_cb);
+            prepared.push(PreparedOpenBuy {
+                position,
+                buy_role_label,
+                invoke_rx,
+                invoke_wait,
+            });
+        }
+
+        if prepared.is_empty() {
+            return;
+        }
+
+        let post_results = if post_requests.len() == 1 {
+            let buy_post_request = post_requests
+                .pop()
+                .expect("prepared не пустой, значит есть один request");
+            let buy_invoke_cb = invokes
+                .pop()
+                .expect("prepared не пустой, значит есть один invoke");
+            post_order_on_clob(
+                &account,
+                project_manager.as_ref(),
+                submit_mode,
+                buy_post_request,
+                buy_invoke_cb,
+            )
+            .await
+            .map(|order_id| vec![order_id])
+        } else {
+            post_orders_on_clob(
+                &account,
+                project_manager.as_ref(),
+                submit_mode,
+                post_requests,
+                invokes,
+            )
+            .await
         };
 
-        let buy_invoke_cb: crate::account_order::SingleOrderInvokeCb =
-            Box::new(move |buy_rep| {
-                let _ = invoke_tx.send(Some(buy_rep));
-            });
-        let post_result = post_order_on_clob(
-            &account,
-            project_manager.as_ref(),
-            submit_mode,
-            buy_post_request,
-            buy_invoke_cb,
-        )
-        .await;
+        let post_results = match post_results {
+            Ok(results) => results,
+            Err(err) => {
+                for prepared_open_buy in prepared {
+                    let (pos_id, asset_id) = {
+                        let p = prepared_open_buy.position.read().await;
+                        (p.id.clone(), p.asset_id.clone())
+                    };
+                    crate::tee_eprintln!(
+                        "[submit] open BUY {} pos_id={} asset_id={}: post_order(s)_on_clob err={err:#} — OpenFailed",
+                        prepared_open_buy.buy_role_label,
+                        pos_id,
+                        asset_id,
+                    );
+                    drain_position_from_account(&account, &pos_id).await;
+                }
+                return;
+            }
+        };
+        if post_results.len() != prepared.len() {
+            crate::tee_eprintln!(
+                "[submit] open BUY batch: post results len={} != prepared len={} — OpenFailed",
+                post_results.len(),
+                prepared.len(),
+            );
+            for prepared_open_buy in prepared {
+                let pos_id = prepared_open_buy.position.read().await.id.clone();
+                drain_position_from_account(&account, &pos_id).await;
+            }
+            return;
+        }
 
-        let http_order_id = match post_result {
-            Ok(Some(order_id)) => {
+        for (prepared_open_buy, post_result) in prepared.into_iter().zip(post_results) {
+            let account = account.clone();
+            let project_manager = project_manager.clone();
+            tokio::spawn(async move {
+                let PreparedOpenBuy {
+                    position,
+                    buy_role_label,
+                    mut invoke_rx,
+                    invoke_wait,
+                } = prepared_open_buy;
+                let (
+                    asset_id,
+                    event_start_ms,
+                    event_end_ms,
+                    pos_id,
+                    planned_entry_fee,
+                    currency_str,
+                    interval_kind,
+                    side,
+                    opened_in_hold_zone,
+                    redeem_01,
+                    redeem_x,
+                ) = {
+                    let p = position.read().await;
+                    let interval_kind = crate::constants::XFrameIntervalKind::from_i32(
+                        p.xframe_interval_type_at_open,
+                    );
+                    (
+                        p.asset_id.clone(),
+                        p.event_end_ms.and_then(|end_ms| {
+                            interval_kind.map(|kind| end_ms.saturating_sub(kind.interval_ms()))
+                        }),
+                        p.event_end_ms,
+                        p.id.clone(),
+                        p.planned_fee_usdc,
+                        p.currency.clone(),
+                        interval_kind,
+                        CurrencyUpDownOutcome::from_i32(p.currency_up_down_outcome_at_open),
+                        p.opened_in_hold_zone,
+                        p.redeem_01,
+                        p.redeem_x,
+                    )
+                };
+
+                let http_order_id = match post_result {
+                    Some(order_id) => {
+                        {
+                            let mut p = position.write().await;
+                            p.open_order_id = Some(order_id.clone());
+                        }
+                        crate::tee_println!(
+                            "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: HTTP POST ok order_id={order_id}",
+                        );
+                        Some(order_id)
+                    }
+                    None => {
+                        crate::tee_eprintln!(
+                            "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: HTTP POST отклонён — OpenFailed",
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        return;
+                    }
+                };
+
+                let buy_rep = match wait_invoke_settlement(&mut invoke_rx, invoke_wait).await {
+                    Some(rep) => rep,
+                    None => {
+                        crate::tee_eprintln!(
+                            "[submit] open BUY {buy_role_label} pos_id={pos_id} order_id={http_order_id:?}: \
+                     invoke timeout {:?} — OpenFailed",
+                            invoke_wait,
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        return;
+                    }
+                };
+
+                crate::tee_println!(
+                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: invoke settle success={} partial={} \
+             order_id={:?}; making={:?}, taking={:?}, err={:?}",
+                    buy_rep.success,
+                    buy_rep.partial,
+                    buy_rep.order_id,
+                    buy_rep.making_amount,
+                    buy_rep.taking_amount,
+                    buy_rep.error_msg,
+                );
+
+                if !buy_rep.success {
+                    drain_position_from_account(&account, &pos_id).await;
+                    return;
+                }
+
+                let shares_net = match buy_rep.taking_amount {
+                    OrderAmount::Shares(s) if s.is_finite() && s > 0.0 => s,
+                    _ => {
+                        crate::tee_eprintln!(
+                            "[submit] maker TP pos_id={pos_id}: BUY taking_amount не Shares — пропуск maker",
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        return;
+                    }
+                };
+
+                let shares_floor = (shares_net * 100.0).floor() / 100.0;
+                let Some(implied_buy_price) = implied_buy_price_per_share(&buy_rep) else {
+                    crate::tee_eprintln!(
+                        "[submit] maker TP pos_id={pos_id}: не восстановили USD/share из BUY invoke — пропуск maker",
+                    );
+                    drain_position_from_account(&account, &pos_id).await;
+                    return;
+                };
+                let usd_spent_on_buy = match buy_rep.making_amount {
+                    OrderAmount::UsdNotional(spent_usd)
+                        if spent_usd.is_finite() && spent_usd > 0.0 =>
+                    {
+                        spent_usd
+                    }
+                    _ => {
+                        crate::tee_eprintln!(
+                            "[submit] maker TP pos_id={pos_id}: BUY making_amount не UsdNotional ({:?}) — \
+                     пропуск maker",
+                            buy_rep.making_amount,
+                        );
+                        drain_position_from_account(&account, &pos_id).await;
+                        return;
+                    }
+                };
+                // Применяем actual из `buy_rep` к позиции. `planned_*` остаются неизменными
+                // (они выставлены в `crate::history_sim::open_position` и нужны для plan-vs-actual
+                // колонок submit-CSV). После этого `OpenPosition.{shares_held,buy_price,position_size,
+                // entry_fee_usdc}` консистентны с фактическим BUY-fill и корректны для
+                // MtM/locked-капитала в `tick_once`, и для будущих SL/Timeout/EvExit/Resolution
+                // submit-веток.
+                //
+                // Параллельно фиксируем фактическую entry-fee. `open_position` записал в
+                // `stats.fees_paid` плановую fee (по историческому стакану кадра); фактический
+                // mock/CLOB fill может удержать другую (другая глубина / другой VWAP). Берём
+                // авторитативную fee из `buy_rep.fee_paid_usdc` — mock считает её явно через
+                // `polymarket_taker_fee_usd(gross, vwap)`, real CLOB-агрегатор аккумулирует
+                // `Σ trade.size × trade.price × trade.fee_rate_bps / 10_000` по on-chain
+                // settled trades. Дельту `actual − planned` применяем к нужному
+                // `SideStats.fees_paid` через `real_sim_state_for_currency` (как
+                // `close_position_after_submit`).
+                let actual_entry_fee = buy_rep.fee_paid_usdc;
                 {
                     let mut p = position.write().await;
-                    p.open_order_id = Some(order_id.clone());
+                    p.shares_held = shares_net;
+                    p.buy_price = implied_buy_price;
+                    p.position_size = usd_spent_on_buy;
+                    p.entry_fee_usdc = actual_entry_fee;
                 }
-                crate::tee_println!(
-                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: HTTP POST ok order_id={order_id}",
-                );
-                Some(order_id)
-            }
-            Ok(None) => {
-                crate::tee_eprintln!(
-                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: HTTP POST отклонён — OpenFailed",
-                );
-                drain_position_from_account().await;
-                return;
-            }
-            Err(err) => {
-                crate::tee_eprintln!(
-                    "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: post_order_on_clob err={err:#} — OpenFailed",
-                );
-                drain_position_from_account().await;
-                return;
-            }
-        };
-
-        let buy_rep = match wait_invoke_settlement(&mut invoke_rx, invoke_wait).await
-        {
-            Some(rep) => rep,
-            None => {
-                crate::tee_eprintln!(
-                    "[submit] open BUY {buy_role_label} pos_id={pos_id} order_id={http_order_id:?}: \
-                     invoke timeout {:?} — OpenFailed",
-                    invoke_wait,
-                );
-                drain_position_from_account().await;
-                return;
-            }
-        };
-
-        crate::tee_println!(
-            "[submit] open BUY {buy_role_label} pos_id={pos_id} asset_id={asset_id}: invoke settle success={} partial={} \
-             order_id={:?}; making={:?}, taking={:?}, err={:?}",
-            buy_rep.success,
-            buy_rep.partial,
-            buy_rep.order_id,
-            buy_rep.making_amount,
-            buy_rep.taking_amount,
-            buy_rep.error_msg,
-        );
-
-        if !buy_rep.success {
-            drain_position_from_account().await;
-            return;
-        }
-
-        let shares_net = match buy_rep.taking_amount {
-            OrderAmount::Shares(s) if s.is_finite() && s > 0.0 => s,
-            _ => {
-                crate::tee_eprintln!(
-                    "[submit] maker TP pos_id={pos_id}: BUY taking_amount не Shares — пропуск maker",
-                );
-                drain_position_from_account().await;
-                return;
-            }
-        };
-   
-        let shares_floor = (shares_net * 100.0).floor() / 100.0;
-        let Some(implied_buy_price) = implied_buy_price_per_share(&buy_rep) else {
-            crate::tee_eprintln!(
-                "[submit] maker TP pos_id={pos_id}: не восстановили USD/share из BUY invoke — пропуск maker",
-            );
-            drain_position_from_account().await;
-            return;
-        };
-        let usd_spent_on_buy = match buy_rep.making_amount {
-            OrderAmount::UsdNotional(spent_usd) if spent_usd.is_finite() && spent_usd > 0.0 => {
-                spent_usd
-            }
-            _ => {
-                crate::tee_eprintln!(
-                    "[submit] maker TP pos_id={pos_id}: BUY making_amount не UsdNotional ({:?}) — \
-                     пропуск maker",
-                    buy_rep.making_amount,
-                );
-                drain_position_from_account().await;
-                return;
-            }
-        };
-        // Применяем actual из `buy_rep` к позиции. `planned_*` остаются неизменными
-        // (они выставлены в `crate::history_sim::open_position` и нужны для plan-vs-actual
-        // колонок submit-CSV). После этого `OpenPosition.{shares_held,buy_price,position_size,
-        // entry_fee_usdc}` консистентны с фактическим BUY-fill и корректны для
-        // MtM/locked-капитала в `tick_once`, и для будущих SL/Timeout/EvExit/Resolution
-        // submit-веток.
-        //
-        // Параллельно фиксируем фактическую entry-fee. `open_position` записал в
-        // `stats.fees_paid` плановую fee (по историческому стакану кадра); фактический
-        // mock/CLOB fill может удержать другую (другая глубина / другой VWAP). Берём
-        // авторитативную fee из `buy_rep.fee_paid_usdc` — mock считает её явно через
-        // `polymarket_taker_fee_usd(gross, vwap)`, real CLOB-агрегатор аккумулирует
-        // `Σ trade.size × trade.price × trade.fee_rate_bps / 10_000` по on-chain
-        // settled trades. Дельту `actual − planned` применяем к нужному
-        // `SideStats.fees_paid` через `real_sim_state_for_currency` (как
-        // `close_position_after_submit`).
-        let actual_entry_fee = buy_rep.fee_paid_usdc;
-        {
-            let mut p = position.write().await;
-            p.shares_held = shares_net;
-            p.buy_price = implied_buy_price;
-            p.position_size = usd_spent_on_buy;
-            p.entry_fee_usdc = actual_entry_fee;
-        }
-        let entry_fee_delta = actual_entry_fee - planned_entry_fee;
-        if entry_fee_delta.abs() > 1e-9
-            && let Some(real_sim_state) = account
-                .real_sim_state_for_currency(currency_str.as_str())
-                .await
-            && let (Some(interval_kind), Some(side)) = (interval_kind, side)
-        {
-            let mut state_guard = real_sim_state.write().await;
-            if let Some(sim_stats) = state_guard.stats.get_mut(&interval_kind) {
-                let side_stats = match side {
-                    CurrencyUpDownOutcome::Up => &mut sim_stats.up,
-                    CurrencyUpDownOutcome::Down => &mut sim_stats.down,
-                };
-                side_stats.fees_paid += entry_fee_delta;
-            }
-            crate::tee_println!(
-                "[submit] open BUY {buy_role_label} pos_id={pos_id}: entry_fee planned={planned_entry_fee:.6} \
+                let entry_fee_delta = actual_entry_fee - planned_entry_fee;
+                if entry_fee_delta.abs() > 1e-9
+                    && let Some(real_sim_state) = account
+                        .real_sim_state_for_currency(currency_str.as_str())
+                        .await
+                    && let (Some(interval_kind), Some(side)) = (interval_kind, side)
+                {
+                    let mut state_guard = real_sim_state.write().await;
+                    if let Some(sim_stats) = state_guard.stats.get_mut(&interval_kind) {
+                        let side_stats = match side {
+                            CurrencyUpDownOutcome::Up => &mut sim_stats.up,
+                            CurrencyUpDownOutcome::Down => &mut sim_stats.down,
+                        };
+                        side_stats.fees_paid += entry_fee_delta;
+                    }
+                    crate::tee_println!(
+                        "[submit] open BUY {buy_role_label} pos_id={pos_id}: entry_fee planned={planned_entry_fee:.6} \
                  actual={actual_entry_fee:.6} delta={entry_fee_delta:+.6} \
                  (fees_paid corrected)",
-            );
-        }
-
-        // Post-market-end safety-net: через `event_end_ms +
-        // POST_MARKET_END_RESOLUTION_DELAY_MS` спавним финализацию для случая,
-        // когда maker TP не добил позицию И taker SELL ретраи не успели до
-        // закрытия маркета (например, depth thin / маркет умер / WS-fill
-        // отставал). После маркет-энда CLOB ордеров не принимает, ловить
-        // дальше нечего — закрываем PNL по тому, что фактически продали.
-        // Спавним до setup'а maker TP, чтобы safety-net жил даже при сбое
-        // maker-выставления (нет min_order_size в strict_book, shares_floor <
-        // min_order_size). Идемпотентность с maker-TP-callback / taker-callback —
-        // через `OpenPosition::close_after_submit_finalized`. `event_end_ms = None`
-        // — не спавним (нет времени, на которое можно ориентироваться).
-        if let Some(end_ms) = event_end_ms {
-            let account_cloned = account.clone();
-            let project_manager_cloned = project_manager.clone();
-            let position_cloned = position.clone();
-            let pos_id_post_end = pos_id.clone();
-            tokio::spawn(async move {
-                let target_ms = end_ms.saturating_add(POST_MARKET_END_RESOLUTION_DELAY_MS as i64);
-                let now_ms = crate::util::current_timestamp_ms();
-                let wait_ms = (target_ms - now_ms).max(0) as u64;
-                if wait_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                    );
                 }
-                crate::tee_eprintln!(
-                    "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+
+                // Post-market-end safety-net: через `event_end_ms +
+                // POST_MARKET_END_RESOLUTION_DELAY_MS` спавним финализацию для случая,
+                // когда maker TP не добил позицию И taker SELL ретраи не успели до
+                // закрытия маркета (например, depth thin / маркет умер / WS-fill
+                // отставал). После маркет-энда CLOB ордеров не принимает, ловить
+                // дальше нечего — закрываем PNL по тому, что фактически продали.
+                // Спавним до setup'а maker TP, чтобы safety-net жил даже при сбое
+                // maker-выставления (нет min_order_size_shares, shares_floor <
+                // min_order_size). Идемпотентность с maker-TP-callback / taker-callback —
+                // через `OpenPosition::close_after_submit_finalized`. `event_end_ms = None`
+                // — не спавним (нет времени, на которое можно ориентироваться).
+                if let Some(end_ms) = event_end_ms {
+                    let account_cloned = account.clone();
+                    let project_manager_cloned = project_manager.clone();
+                    let position_cloned = position.clone();
+                    let pos_id_post_end = pos_id.clone();
+                    tokio::spawn(async move {
+                        let target_ms =
+                            end_ms.saturating_add(POST_MARKET_END_RESOLUTION_DELAY_MS as i64);
+                        let now_ms = crate::util::current_timestamp_ms();
+                        let wait_ms = (target_ms - now_ms).max(0) as u64;
+                        if wait_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                        }
+                        crate::tee_eprintln!(
+                            "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
                      ждём event_end_ms={end_ms} + {POST_MARKET_END_RESOLUTION_DELAY_MS}ms, \
                      затем проверим residual shares; при остатке — MarketResolution \
                      (price_to_beat/final_price) и close_position_after_submit \
                      (ResolutionWin/Loss); если final_price ещё не пришёл — \
                      повторяем проверку каждые {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
-                );
-                let shares_remaining = match position_cloned
-                    .read()
-                    .await
-                    .clone()
-                    .shares_remaining_to_sell(true)
-                    .await
-                {
-                    Ok(Some(remaining)) => remaining,
-                    Ok(None) => {
-                        crate::tee_eprintln!(
-                            "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
-                             shares_remaining_to_sell=None — финализация не нужна",
                         );
-                        return;
-                    }
-                    Err(err) => {
-                        crate::tee_eprintln!(
-                            "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
-                             shares_remaining_to_sell pending invoke ({}) — финализация пропускается",
-                            err.which,
-                        );
-                        return;
-                    }
-                };
-                if shares_remaining <= CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE {
-                    return;
-                }
-                let Some(project_manager_cloned) = project_manager_cloned.as_ref() else {
-                    crate::tee_eprintln!(
-                        "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
-                         project_manager=None — финализация невозможна, пропуск",
-                    );
-                    return;
-                };
-                let (market_id, our_side, redeem_x) = {
-                    let position_read = position_cloned.read().await;
-                    (
-                        position_read.market_id.clone(),
-                        CurrencyUpDownOutcome::from_i32(
-                            position_read.currency_up_down_outcome_at_open,
-                        ),
-                        position_read.redeem_x,
-                    )
-                };
-                // Бесконечный retry-loop с шагом `POST_MARKET_END_RESOLUTION_DELAY_MS`:
-                // ждём, пока `MarketResolution` появится в кэше и `final_price` будет
-                // выставлен (refine следующего окна). Раньше это был one-shot — если
-                // на момент пробуждения `final_price=None`, позиция оставалась незакрытой
-                // и не попадала в CSV.
-                let (price_to_beat, final_price) = loop {
-                    let market_resolution = project_manager_cloned
-                        .market_resolution_by_market
-                        .read()
-                        .await
-                        .get(&market_id)
-                        .copied();
-                    match market_resolution {
-                        Some(mr) => match mr.final_price {
-                            Some(final_price) => break (mr.price_to_beat, final_price),
-                            None => {
+                        let shares_remaining = match position_cloned
+                            .read()
+                            .await
+                            .clone()
+                            .shares_remaining_to_sell(true)
+                            .await
+                        {
+                            Ok(Some(remaining)) => remaining,
+                            Ok(None) => {
                                 crate::tee_eprintln!(
-                                    "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                                    "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                             shares_remaining_to_sell=None — финализация не нужна",
+                                );
+                                return;
+                            }
+                            Err(err) => {
+                                crate::tee_eprintln!(
+                                    "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                             shares_remaining_to_sell pending invoke ({}) — финализация пропускается",
+                                    err.which,
+                                );
+                                return;
+                            }
+                        };
+                        if shares_remaining <= CLOSE_AFTER_SELL_REMAINING_SHARES_TOLERANCE {
+                            return;
+                        }
+                        let Some(project_manager_cloned) = project_manager_cloned.as_ref() else {
+                            crate::tee_eprintln!(
+                                "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                         project_manager=None — финализация невозможна, пропуск",
+                            );
+                            return;
+                        };
+                        let (market_id, our_side, redeem_x, redeem_01) = {
+                            let position_read = position_cloned.read().await;
+                            (
+                                position_read.market_id.clone(),
+                                CurrencyUpDownOutcome::from_i32(
+                                    position_read.currency_up_down_outcome_at_open,
+                                ),
+                                position_read.redeem_x,
+                                position_read.redeem_01,
+                            )
+                        };
+                        // Бесконечный retry-loop с нелинейным backoff от
+                        // `POST_MARKET_END_RESOLUTION_DELAY_MS`:
+                        // ждём, пока `MarketResolution` появится в кэше и `final_price` будет
+                        // выставлен (refine следующего окна). Раньше это был one-shot — если
+                        // на момент пробуждения `final_price=None`, позиция оставалась незакрытой
+                        // и не попадала в CSV.
+                        let mut resolution_retry_attempt: u64 = 0;
+                        let (price_to_beat, final_price) = loop {
+                            resolution_retry_attempt = resolution_retry_attempt.saturating_add(1);
+                            let retry_sleep_ms = POST_MARKET_END_RESOLUTION_DELAY_MS
+                                .saturating_mul(
+                                    resolution_retry_attempt
+                                        .saturating_mul(resolution_retry_attempt),
+                                )
+                                .min(Duration::from_secs(60).as_millis() as u64);
+                            let market_resolution = project_manager_cloned
+                                .market_resolution_by_market
+                                .read()
+                                .await
+                                .get(&market_id)
+                                .copied();
+                            match market_resolution {
+                                Some(mr) => match mr.final_price {
+                                    Some(final_price) => break (mr.price_to_beat, final_price),
+                                    None => {
+                                        crate::tee_eprintln!(
+                                            "[submit] post-market-end resolution pos_id={pos_id_post_end} \
                                      market_id={market_id}: final_price=None (refine следующего \
                                      окна ещё не пришёл) — повтор через \
-                                     {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
-                                );
-                            }
-                        },
-                        None => {
-                            crate::tee_eprintln!(
-                                "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                                     {retry_sleep_ms}ms"
+                                        );
+                                    }
+                                },
+                                None => {
+                                    crate::tee_eprintln!(
+                                        "[submit] post-market-end resolution pos_id={pos_id_post_end} \
                                  market_id={market_id}: MarketResolution отсутствует в кэше — \
-                                 повтор через {POST_MARKET_END_RESOLUTION_DELAY_MS}ms",
-                            );
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(
-                        POST_MARKET_END_RESOLUTION_DELAY_MS,
-                    ))
-                    .await;
-                };
-                let up_won = final_price >= price_to_beat;
-                if redeem_x {
-                    let mut candidates: Vec<SharedOpenPosition> = Vec::new();
-                    candidates.push(position_cloned.clone());
-                    {
-                        let positions_guard = account_cloned.positions.read().await;
-                        for lane_positions in positions_guard.values() {
-                            for pos_arc in lane_positions.values() {
-                                candidates.push(pos_arc.clone());
+                                 повтор через {retry_sleep_ms}ms",
+                                    );
+                                }
                             }
-                        }
-                    }
-                    {
-                        let pending_guard = account_cloned.pending_close_positions.read().await;
-                        for lane_positions in pending_guard.values() {
-                            for pos_arc in lane_positions.values() {
-                                candidates.push(pos_arc.clone());
+                            tokio::time::sleep(Duration::from_millis(retry_sleep_ms)).await;
+                        };
+                        let up_won = final_price >= price_to_beat;
+                        if redeem_x || redeem_01 {
+                            let mut candidates: Vec<SharedOpenPosition> = Vec::new();
+                            candidates.push(position_cloned.clone());
+                            {
+                                let positions_guard = account_cloned.positions.read().await;
+                                for lane_positions in positions_guard.values() {
+                                    for pos_arc in lane_positions.values() {
+                                        candidates.push(pos_arc.clone());
+                                    }
+                                }
                             }
-                        }
-                    }
+                            {
+                                let pending_guard =
+                                    account_cloned.pending_close_positions.read().await;
+                                for lane_positions in pending_guard.values() {
+                                    for pos_arc in lane_positions.values() {
+                                        candidates.push(pos_arc.clone());
+                                    }
+                                }
+                            }
 
-                    let mut seen_pos_ids: Vec<String> = Vec::new();
-                    let mut redeem_group = Vec::new();
-                    for pos_arc in candidates {
-                        let mut pos = pos_arc.write().await;
-                        if seen_pos_ids.iter().any(|id| id == &pos.id) {
-                            continue;
-                        }
-                        seen_pos_ids.push(pos.id.clone());
-                        if !pos.redeem_x
-                            || pos.market_id.as_str() != market_id.as_str()
-                            || pos.close_after_submit_finalized
-                        {
-                            continue;
-                        }
-                        let Some(side) = CurrencyUpDownOutcome::from_i32(
-                            pos.currency_up_down_outcome_at_open,
-                        ) else {
-                            crate::tee_eprintln!(
-                                "[submit] post-market-end redeem_x pos_id={} market_id={market_id}: \
+                            let mut seen_pos_ids: Vec<String> = Vec::new();
+                            let mut redeem_group = Vec::new();
+                            for pos_arc in candidates {
+                                let mut pos = pos_arc.write().await;
+                                if seen_pos_ids.iter().any(|id| id == &pos.id) {
+                                    continue;
+                                }
+                                seen_pos_ids.push(pos.id.clone());
+                                if !(pos.redeem_x || pos.redeem_01)
+                                    || pos.market_id.as_str() != market_id.as_str()
+                                    || pos.close_after_submit_finalized
+                                {
+                                    continue;
+                                }
+                                let Some(side) = CurrencyUpDownOutcome::from_i32(
+                                    pos.currency_up_down_outcome_at_open,
+                                ) else {
+                                    crate::tee_eprintln!(
+                                        "[submit] post-market-end redeem_x pos_id={} market_id={market_id}: \
                                  неизвестный currency_up_down_outcome_at_open — позицию пропускаем",
-                                pos.id,
-                            );
-                            continue;
-                        };
-                        pos.price_to_beat = Some(price_to_beat);
-                        pos.final_price = Some(final_price);
-                        let token_won = match side {
-                            CurrencyUpDownOutcome::Up => up_won,
-                            CurrencyUpDownOutcome::Down => !up_won,
-                        };
-                        drop(pos);
-                        redeem_group.push((pos_arc, token_won));
-                    }
-                    crate::tee_println!(
-                        "[submit] post-market-end redeem_x pos_id={pos_id_post_end} \
+                                        pos.id,
+                                    );
+                                    continue;
+                                };
+                                pos.price_to_beat = Some(price_to_beat);
+                                pos.final_price = Some(final_price);
+                                let token_won = match side {
+                                    CurrencyUpDownOutcome::Up => up_won,
+                                    CurrencyUpDownOutcome::Down => !up_won,
+                                };
+                                drop(pos);
+                                redeem_group.push((pos_arc, token_won));
+                            }
+                            crate::tee_println!(
+                                "[submit] post-market-end redeem_x pos_id={pos_id_post_end} \
                          market_id={market_id}: остаток \
                          {shares_remaining:.6} шер после market end + \
                          {POST_MARKET_END_RESOLUTION_DELAY_MS}ms; group_positions={} \
                          price_to_beat={price_to_beat:.6} final_price={final_price:.6} \
                          up_won={up_won}",
-                        redeem_group.len(),
-                    );
-                    crate::account_close_position::close_position_redeem_after_submit(
-                        &account_cloned,
-                        redeem_group,
-                        up_won,
-                        "post_market_end_redeem_x",
-                    )
-                    .await;
-                    return;
-                }
+                                redeem_group.len(),
+                            );
+                            crate::account_close_position::close_position_redeem_after_submit(
+                                &account_cloned,
+                                redeem_group,
+                                up_won,
+                                "post_market_end_redeem_x",
+                            )
+                            .await;
+                            return;
+                        }
 
-                let token_won = match our_side {
-                    Some(CurrencyUpDownOutcome::Up) => up_won,
-                    Some(CurrencyUpDownOutcome::Down) => !up_won,
-                    None => {
-                        crate::tee_eprintln!(
-                            "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
+                        let token_won = match our_side {
+                            Some(CurrencyUpDownOutcome::Up) => up_won,
+                            Some(CurrencyUpDownOutcome::Down) => !up_won,
+                            None => {
+                                crate::tee_eprintln!(
+                                    "[submit] post-market-end resolution pos_id={pos_id_post_end}: \
                              неизвестный currency_up_down_outcome_at_open — \
                              финализируем как ResolutionLoss",
-                        );
-                        false
-                    }
-                };
-                let reason = if token_won {
-                    CloseReason::ResolutionWin
-                } else {
-                    CloseReason::ResolutionLoss
-                };
-                // Записываем актуальные `price_to_beat` / `final_price` в позицию
-                // ДО вызова close_position_after_submit: CSV-логгер внутри читает
-                // эти поля из `position_snapshot` напрямую (resolution-override
-                // как отдельный аргумент больше не передаём).
-                {
-                    let mut position_write = position_cloned.write().await;
-                    position_write.price_to_beat = Some(price_to_beat);
-                    position_write.final_price = Some(final_price);
-                }
-                crate::tee_println!(
-                    "[submit] post-market-end resolution pos_id={pos_id_post_end} \
+                                );
+                                false
+                            }
+                        };
+                        let reason = if token_won {
+                            CloseReason::ResolutionWin
+                        } else {
+                            CloseReason::ResolutionLoss
+                        };
+                        // Записываем актуальные `price_to_beat` / `final_price` в позицию
+                        // ДО вызова close_position_after_submit: CSV-логгер внутри читает
+                        // эти поля из `position_snapshot` напрямую (resolution-override
+                        // как отдельный аргумент больше не передаём).
+                        {
+                            let mut position_write = position_cloned.write().await;
+                            position_write.price_to_beat = Some(price_to_beat);
+                            position_write.final_price = Some(final_price);
+                        }
+                        crate::tee_println!(
+                            "[submit] post-market-end resolution pos_id={pos_id_post_end} \
                      market_id={market_id}: остаток {shares_remaining:.6} шер после \
                      market end + {POST_MARKET_END_RESOLUTION_DELAY_MS}ms; \
                      price_to_beat={price_to_beat:.6} final_price={final_price:.6} \
                      up_won={up_won} token_won={token_won} → reason={reason:?}",
+                        );
+                        crate::account_close_position::close_position_after_submit(
+                            &account_cloned,
+                            &position_cloned,
+                            Some(project_manager_cloned),
+                            &reason,
+                            "post_market_end_residual",
+                        )
+                        .await;
+                    });
+                }
+
+                let Some(min_order_size) = min_order_size_shares else {
+                    crate::tee_eprintln!(
+                        "[submit] maker TP pos_id={pos_id}: нет min_order_size_shares — пропуск maker",
+                    );
+                    return;
+                };
+                if shares_floor + 1e-9 < min_order_size {
+                    crate::tee_eprintln!(
+                        "[submit] maker TP pos_id={pos_id}: shares_floor={shares_floor:.4} < min_order_size={min_order_size:.4} — \
+                 maker не выставляем (CLOB Size lower than the minimum)",
+                    );
+                    return;
+                }
+                if opened_in_hold_zone || redeem_01 || redeem_x {
+                    crate::tee_println!(
+                        "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: \
+                 {} — maker TP не выставляем",
+                        if redeem_01 {
+                            "redeem_01 (hold-to-resolution)"
+                        } else if redeem_x {
+                            "redeem_x (hold-to-resolution)"
+                        } else {
+                            "resolution-channel entry (hold-to-resolution)"
+                        },
+                    );
+                    return;
+                }
+
+                let maker_price = (implied_buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
+                crate::tee_println!(
+                    "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: NET shares {shares_net:.6} → floor {shares_floor:.2}; \
+             buy≈{implied_buy_price:.6} TP price={maker_price:.6} (+{Y_TRAIN_TAKE_PROFIT_PP} pp)",
                 );
+
+                let (mk_invoke_tx, mut mk_invoke_rx) = invoke_settlement_watch();
+                let closing_arc: SharedClosingPosition = {
+                    let mut p = position.write().await;
+                    let closing_arc = Arc::new(tokio::sync::RwLock::new(ClosingPosition {
+                        reason: CloseReason::TakeProfit,
+                        order_id: None,
+                        invoke_settle: Some(mk_invoke_rx.clone()),
+                        canceled: false,
+                        created_unix_ms: crate::util::current_timestamp_ms(),
+                    }));
+                    p.maker_tp_position = Some(closing_arc.clone());
+                    closing_arc
+                };
+
+                let maker_post_request = PostOrderRequest {
+                    asset_id: asset_id.clone(),
+                    disable_http_settlement_poll_during_market: false,
+                    side: Side::Sell,
+                    role: OrderRole::Maker,
+                    amount: OrderAmount::Shares(shares_floor),
+                    price: Some(maker_price),
+                    max_slippage_pp: None,
+                    market_start_unix_ms: event_start_ms,
+                    market_end_unix_ms: event_end_ms,
+                    timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                    strict_book: None,
+                };
+                let maker_invoke_cb: crate::account_order::SingleOrderInvokeCb =
+                    Box::new(move |rep| {
+                        let _ = mk_invoke_tx.send(Some(rep));
+                    });
+                let post_res = post_order_on_clob(
+                    &account,
+                    project_manager.as_ref(),
+                    submit_mode,
+                    maker_post_request,
+                    maker_invoke_cb,
+                )
+                .await;
+
+                let resting_oid = match &post_res {
+                    Ok(Some(oid)) if !oid.trim().is_empty() => Some(oid.clone()),
+                    Ok(Some(_)) => {
+                        crate::tee_eprintln!(
+                            "[submit] maker TP pos_id={pos_id}: POST вернул пустой order_id",
+                        );
+                        None
+                    }
+                    Ok(None) => {
+                        crate::tee_eprintln!(
+                            "[submit] maker TP pos_id={pos_id}: POST Ok(None) — resting нет до invoke",
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        crate::tee_eprintln!("[submit] maker TP pos_id={pos_id}: POST err={err:#}",);
+                        None
+                    }
+                };
+                if let Some(oid) = resting_oid.as_ref() {
+                    let mut c = closing_arc.write().await;
+                    c.order_id = Some(oid.clone());
+                    crate::tee_println!(
+                        "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: HTTP POST ok order_id={oid} \
+                 price={maker_price:.6} shares={shares_floor:.2}",
+                    );
+                }
+
+                let maker_invoke_wait = invoke_wait_until_market_end_plus(event_end_ms);
+                let maker_rep = match wait_invoke_settlement(&mut mk_invoke_rx, maker_invoke_wait)
+                    .await
+                {
+                    Some(rep) => rep,
+                    None => {
+                        crate::tee_eprintln!(
+                            "[submit] maker TP pos_id={pos_id} order_id={resting_oid:?}: invoke timeout {:?} \
+                     (до event_end + {ORDER_HTTP_TIMEOUT_SEC}s)",
+                            maker_invoke_wait,
+                        );
+                        return;
+                    }
+                };
+
+                crate::tee_println!(
+                    "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: invoke settle success={} partial={} \
+             order_id={:?}; making={:?}, taking={:?}, err={:?}",
+                    maker_rep.success,
+                    maker_rep.partial,
+                    maker_rep.order_id,
+                    maker_rep.making_amount,
+                    maker_rep.taking_amount,
+                    maker_rep.error_msg,
+                );
+
+                // PNL-callback: только полное успешное закрытие maker TP. Гард
+                // `!success || partial` живёт здесь (а не внутри `close_position_after_sell`),
+                // чтобы общая ветка переиспользовалась и для taker-FAK SELL в
+                // `spawn_sell_taker`. Если maker отработал partial — НЕ финализируем здесь:
+                // оставляем позицию доживать; когда manage_positions запустит taker FAK на
+                // остаток, finalize произойдёт там через тот же метод (он сам соберёт
+                // partial-maker + taker fills из `position`). SL / Timeout / EvExit /
+                // Resolution в submit — отдельным промтом. `buy_rep` нужен для sanity-check
+                // vs `position.position_size`; order-id'шники / sell-fills общая ветка
+                // вытащит из `position` сама — `resting_oid` / `http_order_id` / `maker_rep`
+                // передавать не надо.
+                if !maker_rep.success || maker_rep.partial {
+                    return;
+                }
                 crate::account_close_position::close_position_after_submit(
-                    &account_cloned,
-                    &position_cloned,
-                    Some(project_manager_cloned),
-                    &reason,
-                    "post_market_end_residual",
+                    &account,
+                    &position,
+                    project_manager.as_ref(),
+                    &CloseReason::TakeProfit,
+                    "maker_tp_fill",
                 )
                 .await;
             });
         }
-
-        
-
-        let Some(min_order_size) = min_order_size_shares else {
-            crate::tee_eprintln!(
-                "[submit] maker TP pos_id={pos_id}: нет min_order_size в strict_book — пропуск maker",
-            );
-            return;
-        };
-        if shares_floor + 1e-9 < min_order_size {
-            crate::tee_eprintln!(
-                "[submit] maker TP pos_id={pos_id}: shares_floor={shares_floor:.4} < min_order_size={min_order_size:.4} — \
-                 maker не выставляем (CLOB Size lower than the minimum)",
-            );
-            return;
-        }
-        if opened_in_hold_zone || redeem_01 || redeem_x {
-            crate::tee_println!(
-                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: \
-                 {} — maker TP не выставляем",
-                if redeem_01 {
-                    "redeem_01 (hold-to-resolution)"
-                } else if redeem_x {
-                    "redeem_x (hold-to-resolution)"
-                } else {
-                    "resolution-channel entry (hold-to-resolution)"
-                },
-            );
-            return;
-        }
-
-        let maker_price = (implied_buy_price + Y_TRAIN_TAKE_PROFIT_PP).clamp(0.001, 0.999);
-        crate::tee_println!(
-            "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: NET shares {shares_net:.6} → floor {shares_floor:.2}; \
-             buy≈{implied_buy_price:.6} TP price={maker_price:.6} (+{Y_TRAIN_TAKE_PROFIT_PP} pp)",
-        );
-
-        let (mk_invoke_tx, mut mk_invoke_rx) = invoke_settlement_watch();
-        let closing_arc: SharedClosingPosition = {
-            let mut p = position.write().await;
-            let closing_arc = Arc::new(tokio::sync::RwLock::new(ClosingPosition {
-                reason: CloseReason::TakeProfit,
-                order_id: None,
-                invoke_settle: Some(mk_invoke_rx.clone()),
-                canceled: false,
-                created_unix_ms: crate::util::current_timestamp_ms(),
-            }));
-            p.maker_tp_position = Some(closing_arc.clone());
-            closing_arc
-        };
-
-        let maker_post_request = PostOrderRequest {
-            asset_id: asset_id.clone(),
-            side: Side::Sell,
-            role: OrderRole::Maker,
-            amount: OrderAmount::Shares(shares_floor),
-            price: Some(maker_price),
-            max_slippage_pp: None,
-            expiration: None,
-            market_end_unix_ms: event_end_ms,
-            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
-            strict_book: None,
-        };
-        let maker_invoke_cb: crate::account_order::SingleOrderInvokeCb =
-            Box::new(move |rep| {
-                let _ = mk_invoke_tx.send(Some(rep));
-            });
-        let post_res = post_order_on_clob(
-            &account,
-            project_manager.as_ref(),
-            submit_mode,
-            maker_post_request,
-            maker_invoke_cb,
-        )
-        .await;
-
-        let resting_oid = match &post_res {
-            Ok(Some(oid)) if !oid.trim().is_empty() => Some(oid.clone()),
-            Ok(Some(_)) => {
-                crate::tee_eprintln!(
-                    "[submit] maker TP pos_id={pos_id}: POST вернул пустой order_id",
-                );
-                None
-            }
-            Ok(None) => {
-                crate::tee_eprintln!(
-                    "[submit] maker TP pos_id={pos_id}: POST Ok(None) — resting нет до invoke",
-                );
-                None
-            }
-            Err(err) => {
-                crate::tee_eprintln!(
-                    "[submit] maker TP pos_id={pos_id}: POST err={err:#}",
-                );
-                None
-            }
-        };
-        if let Some(oid) = resting_oid.as_ref() {
-            let mut c = closing_arc.write().await;
-            c.order_id = Some(oid.clone());
-            crate::tee_println!(
-                "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: HTTP POST ok order_id={oid} \
-                 price={maker_price:.6} shares={shares_floor:.2}",
-            );
-        }
-
-        let maker_invoke_wait = invoke_wait_until_market_end_plus(event_end_ms);
-        let maker_rep = match wait_invoke_settlement(&mut mk_invoke_rx, maker_invoke_wait).await
-        {
-            Some(rep) => rep,
-            None => {
-                crate::tee_eprintln!(
-                    "[submit] maker TP pos_id={pos_id} order_id={resting_oid:?}: invoke timeout {:?} \
-                     (до event_end + {ORDER_HTTP_TIMEOUT_SEC}s)",
-                    maker_invoke_wait,
-                );
-                return;
-            }
-        };
-
-        crate::tee_println!(
-            "[submit] maker TP pos_id={pos_id} asset_id={asset_id}: invoke settle success={} partial={} \
-             order_id={:?}; making={:?}, taking={:?}, err={:?}",
-            maker_rep.success,
-            maker_rep.partial,
-            maker_rep.order_id,
-            maker_rep.making_amount,
-            maker_rep.taking_amount,
-            maker_rep.error_msg,
-        );
-
-        // PNL-callback: только полное успешное закрытие maker TP. Гард
-        // `!success || partial` живёт здесь (а не внутри `close_position_after_sell`),
-        // чтобы общая ветка переиспользовалась и для taker-FAK SELL в
-        // `spawn_sell_taker`. Если maker отработал partial — НЕ финализируем здесь:
-        // оставляем позицию доживать; когда manage_positions запустит taker FAK на
-        // остаток, finalize произойдёт там через тот же метод (он сам соберёт
-        // partial-maker + taker fills из `position`). SL / Timeout / EvExit /
-        // Resolution в submit — отдельным промтом. `buy_rep` нужен для sanity-check
-        // vs `position.position_size`; order-id'шники / sell-fills общая ветка
-        // вытащит из `position` сама — `resting_oid` / `http_order_id` / `maker_rep`
-        // передавать не надо.
-        if !maker_rep.success || maker_rep.partial {
-            return;
-        }
-        crate::account_close_position::close_position_after_submit(
-            &account,
-            &position,
-            project_manager.as_ref(),
-            &CloseReason::TakeProfit,
-            "maker_tp_fill",
-        )
-        .await;
     });
 }
 

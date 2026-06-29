@@ -7,9 +7,8 @@ pub const XFRAMES_LAST_DAYS_ENV: &str = "XFRAMES_LAST_DAYS";
 pub const DEFAULT_XFRAMES_DIR: &str = "xframes";
 pub const DEFAULT_XFRAMES_LAST_DAYS: usize = 3;
 
-static XFRAMES_DATE_DIR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("valid xframes date-dir regex")
-});
+static XFRAMES_DATE_DIR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("valid xframes date-dir regex"));
 
 pub fn xframes_root() -> PathBuf {
     std::env::var(XFRAMES_DIR_ENV)

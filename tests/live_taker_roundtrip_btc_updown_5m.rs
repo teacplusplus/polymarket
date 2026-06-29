@@ -6,16 +6,16 @@ use poly::account::{
     try_authenticate_clob_for_heartbeats,
 };
 use poly::account_order::{
-    best_ask_sdk, invoke_settlement_watch, post_order_on_clob, wait_invoke_settlement, OrderAmount,
-    OrderRole, PostOrderRequest,
+    OrderAmount, OrderRole, PostOrderRequest, best_ask_sdk, invoke_settlement_watch,
+    post_order_on_clob, wait_invoke_settlement,
 };
 use poly::account_ws::spawn_user_ws_listener;
 use poly::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use poly::util::{
     current_timestamp_ms, detect_country_and_ip, fetch_gamma_event_data_for_gamma_client,
 };
-use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::clob::types::Side;
+use polymarket_client_sdk::clob::types::request::OrderBookSummaryRequest;
 use polymarket_client_sdk::types::U256;
 use std::str::FromStr;
 use std::time::Duration;
@@ -134,7 +134,10 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         poly::tee_log::finish_user_stream_tee_log();
         return Ok(());
     }
-    let slug = current_btc_updown_5m_slug(current_timestamp_ms());
+    let now_ms = current_timestamp_ms();
+    let market_start_unix_ms =
+        Some((now_ms / 1000 / BTC_UPDOWN_5M_PERIOD_SEC) * BTC_UPDOWN_5M_PERIOD_SEC * 1000);
+    let slug = current_btc_updown_5m_slug(now_ms);
     let gamma = fetch_gamma_event_data_for_gamma_client(account.gamma.as_ref(), &slug).await?;
     let currency_up_down_by_asset_id = &gamma.currency_up_down_by_asset_id;
     let (dt, wall) = evt_ms!(last_evt, t0);
@@ -206,12 +209,13 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         None,
         PostOrderRequest {
             asset_id: asset_id.clone(),
+            disable_http_settlement_poll_during_market: false,
             side: Side::Buy,
             role: OrderRole::Taker,
             amount: OrderAmount::UsdNotional(market_floor_buy_usd),
             price: Some(worst_acceptable_buy),
             max_slippage_pp: None,
-            expiration: None,
+            market_start_unix_ms,
             market_end_unix_ms: None,
             timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
             strict_book: None,
@@ -299,12 +303,13 @@ async fn live_taker_roundtrip_btc_updown_5m() -> anyhow::Result<()> {
         None,
         PostOrderRequest {
             asset_id: asset_id.clone(),
+            disable_http_settlement_poll_during_market: false,
             side: Side::Sell,
             role: OrderRole::Taker,
             amount: OrderAmount::Shares(shares_to_sell),
             price: None,
             max_slippage_pp: None,
-            expiration: None,
+            market_start_unix_ms,
             market_end_unix_ms: None,
             timeout: Duration::from_secs(LIVE_ORDER_HTTP_TIMEOUT_SEC),
             strict_book: None,

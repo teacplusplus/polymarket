@@ -345,4 +345,3 @@ fn parse_decimal_str(v: Option<&Value>) -> Option<f64> {
     }
     s.parse::<f64>().ok().filter(|x| x.is_finite())
 }
-

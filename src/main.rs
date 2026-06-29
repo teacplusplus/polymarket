@@ -2,8 +2,8 @@ use anyhow::Result;
 use poly::account::Account;
 use poly::project_manager::ProjectManager;
 use poly::{
-    account, account_exit, account_ws, history_sim, migration, migration_graph_html,
-    migration_price_to_beat, path_config, real_sim, tee_log, trade_csv_log, train_mode, util, CURRENCIES,
+    CURRENCIES, account, account_exit, account_ws, history_sim, migration, migration_graph_html,
+    migration_price_to_beat, path_config, real_sim, tee_log, trade_csv_log, train_mode, util,
 };
 
 /// Режим из переменной окружения `STATUS` (`.env`).
@@ -95,12 +95,8 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
-            tee_log::init_tee_log_file(
-                &path_config::xframes_path("last_real_sim.txt")
-            )?;
-            tee_log::init_sim_stats_tee_log_file(
-                &path_config::xframes_path("last_sim_stats.txt")
-            )?;
+            tee_log::init_tee_log_file(&path_config::xframes_path("last_real_sim.txt"))?;
+            tee_log::init_sim_stats_tee_log_file(&path_config::xframes_path("last_sim_stats.txt"))?;
             trade_csv_log::init_submit_trade_csv_log_file(&path_config::xframes_path(
                 "last_real_sim_submit_trades.csv",
             ))?;
@@ -108,11 +104,8 @@ async fn main() -> Result<()> {
 
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
-                real_sim::run_real_sim(
-                    project_manager,
-                    poly::account_submit::SubmitMode::Mock,
-                )
-                .await?;
+                real_sim::run_real_sim(project_manager, poly::account_submit::SubmitMode::Mock)
+                    .await?;
             }
 
             std::future::pending::<()>().await;
@@ -134,9 +127,7 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
-            tee_log::init_tee_log_file(
-                &path_config::xframes_path("last_default.txt")
-            )?;
+            tee_log::init_tee_log_file(&path_config::xframes_path("last_default.txt"))?;
 
             for currency in CURRENCIES {
                 let _ = ProjectManager::new((*currency).to_string(), account.clone());
@@ -149,12 +140,8 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
-            tee_log::init_tee_log_file(
-                &path_config::xframes_path("last_real_sim.txt")
-            )?;
-            tee_log::init_sim_stats_tee_log_file(
-                &path_config::xframes_path("last_sim_stats.txt")
-            )?;
+            tee_log::init_tee_log_file(&path_config::xframes_path("last_real_sim.txt"))?;
+            tee_log::init_sim_stats_tee_log_file(&path_config::xframes_path("last_sim_stats.txt"))?;
             trade_csv_log::init_submit_trade_csv_log_file(&path_config::xframes_path(
                 "last_real_sim_submit_trades.csv",
             ))?;
@@ -162,11 +149,8 @@ async fn main() -> Result<()> {
 
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
-                real_sim::run_real_sim(
-                    project_manager,
-                    poly::account_submit::SubmitMode::Mock,
-                )
-                .await?;
+                real_sim::run_real_sim(project_manager, poly::account_submit::SubmitMode::Mock)
+                    .await?;
             }
 
             std::future::pending::<()>().await;
@@ -176,18 +160,14 @@ async fn main() -> Result<()> {
                 .install_default()
                 .expect("rustls: install ring CryptoProvider (needed for WebSocket TLS)");
 
-            tee_log::init_tee_log_file(
-                &path_config::xframes_path("last_real_sim_with_submit.txt")
-            )?;
-            tee_log::init_stream_tee_log_file(
-                &path_config::xframes_path("last_stream.txt")
-            )?;
-            tee_log::init_user_stream_tee_log_file(
-                &path_config::xframes_path("last_user_stream.txt")
-            )?;
-            tee_log::init_sim_stats_tee_log_file(
-                &path_config::xframes_path("last_sim_stats.txt")
-            )?;
+            tee_log::init_tee_log_file(&path_config::xframes_path(
+                "last_real_sim_with_submit.txt",
+            ))?;
+            tee_log::init_stream_tee_log_file(&path_config::xframes_path("last_stream.txt"))?;
+            tee_log::init_user_stream_tee_log_file(&path_config::xframes_path(
+                "last_user_stream.txt",
+            ))?;
+            tee_log::init_sim_stats_tee_log_file(&path_config::xframes_path("last_sim_stats.txt"))?;
             trade_csv_log::init_submit_trade_csv_log_file(&path_config::xframes_path(
                 "last_real_sim_with_submit_trades.csv",
             ))?;
@@ -207,11 +187,8 @@ async fn main() -> Result<()> {
 
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
-                real_sim::run_real_sim(
-                    project_manager,
-                    poly::account_submit::SubmitMode::Submit,
-                )
-                .await?;
+                real_sim::run_real_sim(project_manager, poly::account_submit::SubmitMode::Submit)
+                    .await?;
             }
 
             wait_for_shutdown_signal().await;

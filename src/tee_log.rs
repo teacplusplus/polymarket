@@ -156,10 +156,7 @@ fn close_channel(kind: TeeKind) {
         return;
     }
     let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-    let _ = writer_cmd().send(WriterMsg::Close {
-        kind,
-        ack: ack_tx,
-    });
+    let _ = writer_cmd().send(WriterMsg::Close { kind, ack: ack_tx });
     let _ = ack_rx.recv_timeout(Duration::from_secs(30));
 }
 
@@ -180,7 +177,12 @@ async fn tee_log_writer_loop(mut cmd_rx: mpsc::UnboundedReceiver<WriterMsg>) {
     loop {
         while let Ok(msg) = cmd_rx.try_recv() {
             match msg {
-                WriterMsg::Register { kind, rx, path, ack } => {
+                WriterMsg::Register {
+                    kind,
+                    rx,
+                    path,
+                    ack,
+                } => {
                     channels.retain(|slot| slot.kind != kind);
                     match File::create(&path) {
                         Ok(file) => {

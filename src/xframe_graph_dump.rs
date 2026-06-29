@@ -319,9 +319,7 @@ fn graph_html_f64_or_zero(o: Option<f64>) -> f64 {
 ///   sell-метрики **развязаны** от того, пробил ли buy slip-cap: даже если `buy_vwap = None` из-за cap'а,
 ///   sell-стороны видны (и наоборот — если bid-стакан пуст, buy всё равно может остаться).
 /// * Все три отдельно `Option<f64>` — на графике каждая ветка обрывается своими пропусками независимо.
-fn graph_sim_book_roundtrip_vwaps(
-    frame: &XFrame<SIZE>,
-) -> (Option<f64>, Option<f64>, Option<f64>) {
+fn graph_sim_book_roundtrip_vwaps(frame: &XFrame<SIZE>) -> (Option<f64>, Option<f64>, Option<f64>) {
     let buy_vwap = book_fill_buy(
         frame,
         NO_KELLY_POSITION_SIZE_USD,
@@ -534,7 +532,11 @@ pub async fn dump_market_graph_html_lane(
     let mut flat: Vec<(String, i64, XFrame<SIZE>)> = Vec::new();
     for (asset_id, by_ts) in by_asset.iter() {
         for (aligned_ts, xframe_cell) in by_ts.iter() {
-            flat.push((asset_id.clone(), *aligned_ts, xframe_cell.read().await.clone()));
+            flat.push((
+                asset_id.clone(),
+                *aligned_ts,
+                xframe_cell.read().await.clone(),
+            ));
         }
     }
     flat.sort_by_key(|(_, aligned_ts, _)| *aligned_ts);
@@ -687,14 +689,9 @@ pub fn spawn_partial_market_graph_html_for_close(
         }
 
         let interval_ms = interval_kind.interval_ms();
-        let window_start_ms = lane_window_start_ms_from_rows(up.iter().chain(down.iter()), interval_ms)
-            .unwrap_or_else(|| {
-                up.iter()
-                    .chain(down.iter())
-                    .map(|r| r.t)
-                    .min()
-                    .unwrap_or(0)
-            });
+        let window_start_ms =
+            lane_window_start_ms_from_rows(up.iter().chain(down.iter()), interval_ms)
+                .unwrap_or_else(|| up.iter().chain(down.iter()).map(|r| r.t).min().unwrap_or(0));
         let window_end_ms = window_start_ms.saturating_add(interval_ms);
         let up_f: Vec<GraphHtmlRow> = up
             .iter()
@@ -724,9 +721,7 @@ pub fn spawn_partial_market_graph_html_for_close(
         let html = match render_graph_html(&market_id, &payload) {
             Ok(s) => s,
             Err(err) => {
-                crate::tee_eprintln!(
-                    "[partial_graph_html] {market_id}: render failed: {err:#}"
-                );
+                crate::tee_eprintln!("[partial_graph_html] {market_id}: render failed: {err:#}");
                 return;
             }
         };

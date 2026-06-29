@@ -16,7 +16,7 @@ use crate::xframe::{
     apply_side_symmetry, calc_y_train_pnl, calc_y_train_resolution,
 };
 use crate::xframe_dump::MarketXFramesDump;
-use crate::{tee_eprintln, tee_println, CURRENCIES};
+use crate::{CURRENCIES, tee_eprintln, tee_println};
 use optimizer::sampler::tpe::TpeSampler;
 use optimizer::{Direction, ParamValue, Study};
 use serde::{Deserialize, Serialize};
@@ -634,27 +634,24 @@ async fn fit_calibration(
 
     // Решаем какой набор кормить в PAV.
     let min_filtered_samples = calibration_min_filtered_samples(interval_kind);
-    let (cal_preds, cal_y, source_label): (&[f32], &[f32], &'static str) = if entries.len()
-        >= min_filtered_samples
-        && n_pos_sim > 0
-        && n_neg_sim > 0
-    {
-        (preds_sim.as_slice(), y_sim.as_slice(), "sim-replay")
-    } else {
-        tee_eprintln!(
-            "[calibration] {tag}: sim-replay набор слишком мал ({} < {min_filtered_samples}) \
-                 или один класс пуст (won={n_pos_sim} lost={n_neg_sim}) — fallback на per-frame.",
-            entries.len(),
-        );
-        if n_pos_full == 0 || n_neg_full == 0 {
+    let (cal_preds, cal_y, source_label): (&[f32], &[f32], &'static str) =
+        if entries.len() >= min_filtered_samples && n_pos_sim > 0 && n_neg_sim > 0 {
+            (preds_sim.as_slice(), y_sim.as_slice(), "sim-replay")
+        } else {
             tee_eprintln!(
-                "[calibration] {tag}: per-frame набор тоже без двух классов \
-                     (n_pos={n_pos_full}, n_neg={n_neg_full}). Используется identity."
+                "[calibration] {tag}: sim-replay набор слишком мал ({} < {min_filtered_samples}) \
+                 или один класс пуст (won={n_pos_sim} lost={n_neg_sim}) — fallback на per-frame.",
+                entries.len(),
             );
-            return Ok(Calibration::identity());
-        }
-        (preds.as_slice(), y.as_slice(), "per-frame")
-    };
+            if n_pos_full == 0 || n_neg_full == 0 {
+                tee_eprintln!(
+                    "[calibration] {tag}: per-frame набор тоже без двух классов \
+                     (n_pos={n_pos_full}, n_neg={n_neg_full}). Используется identity."
+                );
+                return Ok(Calibration::identity());
+            }
+            (preds.as_slice(), y.as_slice(), "per-frame")
+        };
 
     let cal = isotonic_fit(cal_preds, cal_y);
     tee_println!(
@@ -1095,7 +1092,8 @@ async fn train_one_side_variant(
         ModelType::Pnl => PNL_MAX_LAG,
     };
 
-    let (train_markets, train_stats) = build_market_datasets(train_paths, side, model_type, max_lag);
+    let (train_markets, train_stats) =
+        build_market_datasets(train_paths, side, model_type, max_lag);
     let (val_markets, val_stats) = build_market_datasets(val_paths, side, model_type, max_lag);
     let (test_markets, test_stats) = build_market_datasets(test_paths, side, model_type, max_lag);
 

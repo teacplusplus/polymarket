@@ -16,7 +16,10 @@ use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     tungstenite::{
-        Error as WsError, client::IntoClientRequest, error::UrlError, handshake::client::Response,
+        Error as WsError,
+        client::IntoClientRequest,
+        error::UrlError,
+        handshake::client::Response,
         http::{Request, Uri},
     },
 };
@@ -59,7 +62,10 @@ impl AsyncWrite for MaybeProxyTransport {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             MaybeProxyTransport::Plain(t) => Pin::new(t).poll_shutdown(cx),
             MaybeProxyTransport::TlsToProxy(t) => Pin::new(t).poll_shutdown(cx),

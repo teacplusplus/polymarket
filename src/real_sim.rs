@@ -5,13 +5,13 @@ use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 /// Реэкспорт cap slippage для TP/strict ([`crate::history_sim`]).
 pub use crate::history_sim::SIM_MAX_SLIPPAGE_FROM_L1_PCT;
 use crate::history_sim::{
-    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, MIN_ENTRY_REMAINING_MS, REDEEM_01, REDEEM_X, StrictBook,
-    any_position_would_sell, buy_gate, compute_pnl_inference, compute_resolution_inference,
-    load_booster, manage_positions, try_open_position,
+    BuyGate, ENABLE_PNL, ENABLE_RESOLUTION, MIN_ENTRY_REMAINING_MS, REDEEM_01, REDEEM_X,
+    StrictBook, any_position_would_sell, buy_gate, compute_pnl_inference,
+    compute_resolution_inference, load_booster, manage_positions, try_open_position,
 };
 use crate::market_snapshot::MarketSnapshot;
 use crate::project_manager::{LaneFrame, ProjectManager};
-use crate::sim_stats::{SimStats};
+use crate::sim_stats::SimStats;
 use crate::train_mode::{Calibration, load_calibration};
 use crate::util::current_timestamp_ms;
 use crate::xframe::BookLevel;
@@ -129,23 +129,6 @@ pub(crate) fn interval_label(kind: XFrameIntervalKind) -> &'static str {
     }
 }
 
-/// `https://polymarket.com/event/...` из Gamma `start_ms` ([`ProjectManager::event_data_by_market`]); пустая строка если `None`.
-fn polymarket_event_url_from_frame(
-    currency: &str,
-    interval_kind: XFrameIntervalKind,
-    event_start_ms: Option<i64>,
-) -> String {
-    let Some(start_ms) = event_start_ms else {
-        return String::new();
-    };
-    let window_start_sec = start_ms / 1_000;
-    format!(
-        "https://polymarket.com/event/{currency}-updown-{interval}-{window_start_sec}",
-        currency = currency.to_lowercase(),
-        interval = interval_label(interval_kind),
-    )
-}
-
 pub(crate) fn side_label(side: CurrencyUpDownOutcome) -> &'static str {
     match side {
         CurrencyUpDownOutcome::Up => "up",
@@ -202,8 +185,16 @@ pub async fn run_real_sim(
             .ok_or_else(|| anyhow!("не загружено ни одной модели {label}/{side_lbl}"))?;
         crate::tee_println!(
             "[real_sim] {tag_prefix}/{label}/{side_lbl}: pnl={}  resolution={}",
-            if models.booster_pnl.is_some() { "✓" } else { "✗" },
-            if models.booster_resolution.is_some() { "✓" } else { "✗" },
+            if models.booster_pnl.is_some() {
+                "✓"
+            } else {
+                "✗"
+            },
+            if models.booster_resolution.is_some() {
+                "✓"
+            } else {
+                "✗"
+            },
         );
 
         let (tx, rx) = mpsc::channel::<LaneFrame>(LANE_FRAME_CHANNEL_CAP);
@@ -339,14 +330,14 @@ async fn tick_once(
     //     CurrencyUpDownOutcome::Up => "UP",
     //     CurrencyUpDownOutcome::Down => "DOWN",
     // };
-    // let polymarket_url = polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
+    // let polymarket_url = crate::util::polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
     let now_wall_ms = current_timestamp_ms();
     // let since_prev_ms_opt = last_tick_wall_ms_by_asset_id
     //     .get(asset_id)
     //     .map(|prev_ms| now_wall_ms.saturating_sub(*prev_ms));
     // let since_prev_s = since_prev_ms_opt.map(|d| d as f64 / 1000.0);
     last_tick_wall_ms_by_asset_id.insert(asset_id.to_string(), now_wall_ms);
-    // 
+    //
     // let ws_event_lag_ms: Option<i64> = {
     //     let guard = project_manager.last_snapshot_by_asset_id.read().await;
     //     guard
@@ -403,13 +394,7 @@ async fn tick_once(
 
     let market_already_resolved = event_end_ms.is_some_and(|end_ms| now_wall_ms >= end_ms);
 
-    let (
-        has_positions,
-        needs_sell,
-        available_bankroll_pre,
-        dd_halt_active,
-        account_max_dd_pct,
-    ) = {
+    let (has_positions, needs_sell, available_bankroll_pre, dd_halt_active, account_max_dd_pct) = {
         let bankroll_guard = account.bankroll.read().await;
         let max_dd_guard = account.max_drawdown_pct.read().await;
         let positions_guard = account.positions.read().await;
@@ -528,8 +513,10 @@ async fn tick_once(
             BuyGate::Proceed { .. }
         )
     };
-    let may_open =
-        !dd_halt_active && !market_already_resolved && buy_gate_proceed && submit_market_window_open;
+    let may_open = !dd_halt_active
+        && !market_already_resolved
+        && buy_gate_proceed
+        && submit_market_window_open;
 
     if buy_gate_proceed && dd_halt_active {
         crate::tee_eprintln!(
@@ -580,8 +567,7 @@ async fn tick_once(
         }
 
         let now_after_http_ms = current_timestamp_ms();
-        let market_resolved_now = event_end_ms
-            .is_some_and(|end_ms| now_after_http_ms >= end_ms);
+        let market_resolved_now = event_end_ms.is_some_and(|end_ms| now_after_http_ms >= end_ms);
         if !market_already_resolved && market_resolved_now && may_open {
             crate::tee_eprintln!(
                 "[real_sim] market={market_id} прошёл event_end_ms между snapshot'ом и HTTP \
@@ -658,12 +644,16 @@ async fn tick_once(
                     }
                     let bankroll_post = *account.bankroll.read().await;
                     let available_bankroll_post = (bankroll_post - total_locked).max(0.0);
-                    let polymarket_url =
-                        polymarket_event_url_from_frame(currency, interval_kind, event_start_ms);
+                    let polymarket_url = crate::util::polymarket_event_url_from_frame(
+                        currency,
+                        interval_kind,
+                        event_start_ms,
+                    );
                     let graph_dump_bin_path_str = gamma_question
                         .as_deref()
                         .map(|gq| {
-                            let stem = crate::util::sanitized_filename_from_gamma_question(Some(gq));
+                            let stem =
+                                crate::util::sanitized_filename_from_gamma_question(Some(gq));
                             crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(
                                 currency,
                                 interval_kind,
@@ -708,10 +698,7 @@ async fn tick_once(
         let total_value: f64 = {
             let mut active = 0.0;
             let pending_close_guard = account.pending_close_positions.read().await;
-            for ((c, i, s), pos_vec) in positions_guard
-                .iter()
-                .chain(pending_close_guard.iter())
-            {
+            for ((c, i, s), pos_vec) in positions_guard.iter().chain(pending_close_guard.iter()) {
                 let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
                     effective_prob
                 } else {
@@ -766,9 +753,7 @@ async fn fetch_http_strict_book(
         reply: reply_tx,
     };
     if book_tx.send(req).await.is_err() {
-        crate::tee_eprintln!(
-            "[real_sim] book-coord канал закрыт — strict-fill выключен на тик"
-        );
+        crate::tee_eprintln!("[real_sim] book-coord канал закрыт — strict-fill выключен на тик");
         return None;
     }
     match tokio::time::timeout(Duration::from_millis(BOOK_REPLY_TIMEOUT_MS), reply_rx).await {

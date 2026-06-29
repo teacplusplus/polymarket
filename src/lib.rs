@@ -1,5 +1,4 @@
 pub mod account;
-pub mod authenticate;
 pub mod account_close_position;
 pub mod account_exit;
 pub mod account_mock_order;
@@ -9,6 +8,7 @@ pub mod account_order_completion;
 pub mod account_proxy;
 pub mod account_submit;
 pub mod account_ws;
+pub mod authenticate;
 pub mod constants;
 pub mod currency_updown_sibling;
 pub mod currency_ws;

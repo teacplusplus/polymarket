@@ -11,12 +11,12 @@ use crate::data_ws::{
     spawn_persistent_interval_market_ws,
 };
 use crate::market_snapshot::aggregate_events;
-use crate::xframe::StrictBook;
 use crate::run_log;
 use crate::util::{
     CurrencyEventSlugData, current_timestamp_ms, fetch_gamma_event_data_for_gamma_client,
     fetch_price_to_beat_from_vatic_api,
 };
+use crate::xframe::StrictBook;
 use crate::xframe::{
     SIZE, XFrame, compute_xframe_stable, currency_price_z_score_from_sec_history,
     find_opposite_asset_id, find_same_outcome_sibling_asset_id,
@@ -80,6 +80,8 @@ pub struct MarketEventData {
     pub end_ms: Option<i64>,
     pub min_order_size: Option<f64>,
     pub gamma_question: Option<String>,
+    /// Gamma `acceptingOrdersTimestamp` (ms) — прогноз момента открытия книги.
+    pub accepting_orders_timestamp_ms: Option<i64>,
 }
 
 /// Резолюционное состояние маркета: порог (`price_to_beat`, спот в начале окна,
@@ -190,6 +192,23 @@ impl ProjectManager {
 
         spawn_persistent_interval_market_ws(project_manager.clone(), market_ws_rx);
 
+        // Раз в секунду переносим в `positions` те future-позиции, чей рынок уже
+        // стартанул по времени (`now >= event_end_ms − interval_ms`), чтобы они
+        // начали участвовать в MtM/гейтах/резолюции. Отдельный таймер-луп вместо
+        // привязки к WS-снимкам ([`Self::update_last_snapshot`]) — промоушен идёт
+        // даже без свежих book-событий. Идемпотентно: если стартанувших нет — no-op.
+        let promote_pm = project_manager.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+                promote_pm
+                    .account
+                    .promote_started_future_positions(crate::util::current_timestamp_ms())
+                    .await;
+            }
+        });
+
         crate::currency_ws::spawn_rtds_currency_pipeline(project_manager.clone());
         let project_manager_cloned = project_manager.clone();
         tokio::spawn(async move {
@@ -230,6 +249,7 @@ impl ProjectManager {
             if let Some(ref q) = data.gamma_question {
                 entry.gamma_question = Some(q.clone());
             }
+            entry.accepting_orders_timestamp_ms = data.accepting_orders_timestamp_ms;
             drop(event_data_by_market_lock);
 
             let mut slug_to_market_id_lock = self.slug_to_market_id.write().await;
@@ -258,7 +278,7 @@ impl ProjectManager {
     }
 
     /// Как [`fetch_gamma_event_data_for_gamma_client`](crate::util::fetch_gamma_event_data_for_gamma_client), но из кэшей PM.
-    async fn try_restore_currency_event_from_slug_cache(
+    pub(crate) async fn try_restore_currency_event_from_slug_cache(
         &self,
         slug: &str,
     ) -> Option<CurrencyEventSlugData> {
@@ -293,6 +313,7 @@ impl ProjectManager {
             event_end_ms: event_data.end_ms,
             min_order_size: event_data.min_order_size,
             gamma_question: event_data.gamma_question,
+            accepting_orders_timestamp_ms: event_data.accepting_orders_timestamp_ms,
         })
     }
 
@@ -438,13 +459,15 @@ impl ProjectManager {
         {
             snapshot.min_order_size = event_data.min_order_size;
         }
-        let mut last_snapshot_by_asset_id = self.last_snapshot_by_asset_id.write().await;
-        let merged = match last_snapshot_by_asset_id.remove(&snapshot.asset_id) {
-            Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms)
-                .unwrap_or_else(|| snapshot.clone()),
-            None => snapshot.clone(),
-        };
-        last_snapshot_by_asset_id.insert(snapshot.asset_id.clone(), merged);
+        {
+            let mut last_snapshot_by_asset_id = self.last_snapshot_by_asset_id.write().await;
+            let merged = match last_snapshot_by_asset_id.remove(&snapshot.asset_id) {
+                Some(prev) => aggregate_events(vec![prev, snapshot.clone()], snapshot.timestamp_ms)
+                    .unwrap_or_else(|| snapshot.clone()),
+                None => snapshot.clone(),
+            };
+            last_snapshot_by_asset_id.insert(snapshot.asset_id.clone(), merged);
+        }
     }
 
     pub async fn append_ws_stream_entries(&self, entries: Vec<WsStreamEntry>) {
@@ -461,13 +484,12 @@ impl ProjectManager {
     }
 
     /// Gamma + [`merge_market_event_data`]; возврат как у [`try_restore_currency_event_from_slug_cache`](Self::try_restore_currency_event_from_slug_cache).
-    async fn fetch_currency_event_from_gamma_and_merge(
+    pub(crate) async fn fetch_currency_event_from_gamma_and_merge(
         &self,
         slug: &str,
         period: &'static str,
     ) -> Option<CurrencyEventSlugData> {
-        let data = match fetch_gamma_event_data_for_gamma_client(self.gamma.as_ref(), slug).await
-        {
+        let data = match fetch_gamma_event_data_for_gamma_client(self.gamma.as_ref(), slug).await {
             Ok(d) => d,
             Err(e) => {
                 run_log::gamma_fetch_err(period, slug, &e);
@@ -680,8 +702,7 @@ impl ProjectManager {
             let Some(snapshot) = aggregate_events(group, 0) else {
                 continue;
             };
-            let aligned_ts =
-                align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
+            let aligned_ts = align_timestamp_ms_to_interval(snapshot.timestamp_ms, interval_secs);
             let frames_history = {
                 let xframes_by_market_read_lock = self.xframes_by_market[lane].read().await;
                 let mut history = BTreeMap::new();
@@ -761,7 +782,6 @@ impl ProjectManager {
             //     );
             // }
 
-
             built_xframes.push(BuiltXframeEntry {
                 market_id,
                 asset_id,
@@ -797,7 +817,8 @@ impl ProjectManager {
             let market_asset_ids = self.market_asset_ids_by_market.read().await;
             let sibling_market_by_market: HashMap<String, String> = {
                 let mut sibling_market_lookup = HashMap::new();
-                if let Some((five_market_id, fifteen_market_id)) = sibling_state.paired_five_and_fifteen_market_ids()
+                if let Some((five_market_id, fifteen_market_id)) =
+                    sibling_state.paired_five_and_fifteen_market_ids()
                 {
                     sibling_market_lookup.insert(five_market_id.clone(), fifteen_market_id.clone());
                     sibling_market_lookup.insert(fifteen_market_id, five_market_id);
@@ -931,7 +952,8 @@ impl ProjectManager {
 
             if lane == 0
                 && let Some(kind) = XFrameIntervalKind::from_i32(entry.frame.xframe_interval_type)
-                && let Some(side) = CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
+                && let Some(side) =
+                    CurrencyUpDownOutcome::from_i32(entry.frame.currency_up_down_outcome)
                 && let Some(state_arc) = self
                     .account
                     .real_sim_state_for_currency(self.currency.as_str())
@@ -1011,9 +1033,7 @@ impl ProjectManager {
 
             let currency_up_down_by_asset_id = &slug_data.currency_up_down_by_asset_id;
             let gamma_question = &slug_data.gamma_question;
-            let market_end_ms = slug_data
-                .event_end_ms
-                .unwrap_or(ws_end_sec * 1000);
+            let market_end_ms = slug_data.event_end_ms.unwrap_or(ws_end_sec * 1000);
             let market_id = slug_data.market_id.clone();
             let market_start_ms = slug_data.event_start_ms;
 
@@ -1135,7 +1155,8 @@ impl ProjectManager {
                 }
             };
             if let (Some(ptb), Some(mid)) = (inline_ptb_opt, market_id.as_deref()) {
-                self.merge_market_price_to_beat(ptb, mid, market_end_ms).await;
+                self.merge_market_price_to_beat(ptb, mid, market_end_ms)
+                    .await;
             }
 
             // Фон: exact PTB → кэш + oneshot для следующей итерации; дамп prev по паре exact.

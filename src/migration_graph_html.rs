@@ -90,7 +90,11 @@ pub fn run_graph_html_migration() -> Result<()> {
             let done = idx + 1;
             if done % progress_step == 0 || done == total {
                 let elapsed = started.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let rate = if elapsed > 0.0 {
+                    done as f64 / elapsed
+                } else {
+                    0.0
+                };
                 let pct = (done as f64 / total.max(1) as f64) * 100.0;
                 println!(
                     "[migration_graph_html] {currency}: {done}/{total} ({pct:.1}%), {rate:.1} файл/с, wrote={} skip_no_bounds={} skip_no_stable={} err_bin={} err_write={}",

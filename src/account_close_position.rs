@@ -26,21 +26,19 @@
 
 use crate::account::SharedAccount;
 use crate::account_order::{
-    OrderAmount, SingleOrderClobInvocationReport, invoke_settlement_ready,
-    invoke_settlement_report,
+    OrderAmount, SingleOrderClobInvocationReport, invoke_settlement_ready, invoke_settlement_report,
 };
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{
-    CloseReason, OpenPosition, POLYMARKET_CRYPTO_TAKER_FEE_RATE, SharedOpenPosition,
-    SIM_MAX_SLIPPAGE_FROM_L1_PCT, StrictBook, book_fill_sell, book_fill_sell_strict,
-    position_interval_label, position_side_label, trade_csv_close_reason_label,
+    CloseReason, OpenPosition, POLYMARKET_CRYPTO_TAKER_FEE_RATE, SIM_MAX_SLIPPAGE_FROM_L1_PCT,
+    SharedOpenPosition, StrictBook, book_fill_sell, book_fill_sell_strict, position_interval_label,
+    position_side_label, trade_csv_close_reason_label,
 };
-use crate::xframe::{SIZE, XFrame};
 use crate::project_manager::ProjectManager;
 use crate::sim_stats::{SideStats, SimStats};
 use crate::xframe::Y_TRAIN_TAKE_PROFIT_PP;
+use crate::xframe::{SIZE, XFrame};
 use std::sync::Arc;
-
 
 fn accumulate_submit_sell_fill(
     report: &SingleOrderClobInvocationReport,
@@ -129,9 +127,7 @@ pub(crate) async fn close_position(
     let sell_price = match reason {
         CloseReason::ResolutionWin => 1.0,
         CloseReason::ResolutionLoss => 0.0,
-        _ if pos.shares_held > 0.0 => {
-            (gross_usdc / pos.shares_held).clamp(0.001, 0.999)
-        }
+        _ if pos.shares_held > 0.0 => (gross_usdc / pos.shares_held).clamp(0.001, 0.999),
         _ => 0.0,
     };
     // Maker fee = 0 только если TP-таргет лежит выше bid на входе (выставляемся
@@ -150,10 +146,7 @@ pub(crate) async fn close_position(
     let fee_usdc = match reason {
         CloseReason::ResolutionWin | CloseReason::ResolutionLoss => 0.0,
         _ if voluntary_is_maker => 0.0,
-        _ => pos.shares_held
-            * POLYMARKET_CRYPTO_TAKER_FEE_RATE
-            * sell_price
-            * (1.0 - sell_price),
+        _ => pos.shares_held * POLYMARKET_CRYPTO_TAKER_FEE_RATE * sell_price * (1.0 - sell_price),
     };
 
     let net_usdc = gross_usdc - fee_usdc;
@@ -224,17 +217,16 @@ pub(crate) async fn close_position(
     // Wall-clock использовать нельзя: в backtest он не лежит на исторической
     // оси окна — обе точки клампятся к правому краю.
     let graph_close_ms: Vec<i64> = close_unix_ms.into_iter().collect();
-    let graph_html_file_uri =
-        crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
-            .map(|bin_path| {
-                crate::xframe_graph_dump::graph_html_trade_file_uri(
-                    &bin_path,
-                    open_unix_ms,
-                    &graph_close_ms,
-                    Some(side_label),
-                )
-            })
-            .unwrap_or_default();
+    let graph_html_file_uri = crate::xframe_graph_dump::graph_dump_bin_path_for_trade_csv_uri(&pos)
+        .map(|bin_path| {
+            crate::xframe_graph_dump::graph_html_trade_file_uri(
+                &bin_path,
+                open_unix_ms,
+                &graph_close_ms,
+                Some(side_label),
+            )
+        })
+        .unwrap_or_default();
     crate::trade_csv_log::write_trade_csv_row(crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &pos.polymarket_url,
         price_to_beat: pos.price_to_beat,
@@ -394,7 +386,6 @@ pub(crate) async fn close_position_redeem(
     }
 }
 
-
 pub(crate) async fn close_position_redeem_after_submit(
     account: &SharedAccount,
     group: Vec<(SharedOpenPosition, bool)>,
@@ -500,10 +491,7 @@ pub(crate) async fn close_position_redeem_after_submit(
         }
     }
 
-    let group_payout: f64 = finalized_rows
-        .iter()
-        .map(|row| row.residual_payout)
-        .sum();
+    let group_payout: f64 = finalized_rows.iter().map(|row| row.residual_payout).sum();
     let group_cost: f64 = finalized_rows
         .iter()
         .map(|row| row.snapshot.position_size)
@@ -514,7 +502,9 @@ pub(crate) async fn close_position_redeem_after_submit(
     let first = &finalized_rows[0].snapshot;
     let market_id = first.market_id.as_str();
     let interval_kind = XFrameIntervalKind::from_i32(first.xframe_interval_type_at_open);
-    let real_sim_state = account.real_sim_state_for_currency(first.currency.as_str()).await;
+    let real_sim_state = account
+        .real_sim_state_for_currency(first.currency.as_str())
+        .await;
     match (real_sim_state, interval_kind) {
         (Some(real_sim_state), Some(interval_kind)) => {
             let mut state_guard = real_sim_state.write().await;
@@ -824,7 +814,9 @@ pub(crate) async fn close_position_after_submit(
                 &mut usd_received,
                 &mut sell_fee_usdc,
             );
-            if report.success && let Some(landed_at) = report.landed_at {
+            if report.success
+                && let Some(landed_at) = report.landed_at
+            {
                 graph_close_landed_ms.push(landed_at);
             }
         }
@@ -849,7 +841,9 @@ pub(crate) async fn close_position_after_submit(
                 &mut usd_received,
                 &mut sell_fee_usdc,
             );
-            if report.success && let Some(landed_at) = report.landed_at {
+            if report.success
+                && let Some(landed_at) = report.landed_at
+            {
                 graph_close_landed_ms.push(landed_at);
             }
         }
@@ -1076,8 +1070,7 @@ pub(crate) async fn close_position_after_submit(
         }
     }
 
-    let close_order_id_refs: Vec<&str> =
-        close_order_ids.iter().map(|s| s.as_str()).collect();
+    let close_order_id_refs: Vec<&str> = close_order_ids.iter().map(|s| s.as_str()).collect();
     let trade_row = crate::trade_csv_log::TradeCsvRow {
         polymarket_url: &position_snapshot.polymarket_url,
         price_to_beat: position_snapshot.price_to_beat,
@@ -1131,9 +1124,9 @@ pub(crate) async fn close_position_after_submit(
 
     // Partial HTML только пока рынок ещё идёт; после `event_end_ms` кадры в PM уже не
     // дополняются — график бессмысленен (полный дамп делается при резолюции маркета).
-    let market_still_live = position_snapshot.event_end_ms.is_none_or(|end_ms| {
-        close_unix_ms.is_some_and(|now_ms| now_ms < end_ms)
-    });
+    let market_still_live = position_snapshot
+        .event_end_ms
+        .is_none_or(|end_ms| close_unix_ms.is_some_and(|now_ms| now_ms < end_ms));
     if market_still_live && let Some(project_manager) = project_manager {
         crate::xframe_graph_dump::spawn_partial_market_graph_html_for_close(
             project_manager.clone(),

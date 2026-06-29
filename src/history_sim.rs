@@ -3,27 +3,31 @@
 //! Логика: Kelly/gates, выход TP/SL/timeout/EV или резолюция (`calc_y_train_pnl`).
 
 use crate::account::{Account, SharedAccount};
-use crate::project_manager::ProjectManager;
 use crate::account_order::{
     InvokeSettlementWatch, OrderAmount, invoke_settlement_ready, invoke_settlement_report,
     wait_invoke_settlement,
 };
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
+use crate::project_manager::ProjectManager;
 use crate::real_sim::interval_label;
-use crate::redeem_01_tail::redeem_01_tail_entry_size;
 use crate::redeem_x::redeem_x_entry_size;
-use crate::train_mode::{
-    collect_bin_paths, load_calibration, split_counts,
-    Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION,
-};
-use crate::xframe::{BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN_NO_TRADE_PROB_LOW, Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB, Y_TRAIN_RESOLUTION_STOP_LOSS_PP, Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP, apply_side_symmetry, Y_TRAIN_PNL_MAX_ENTRY_PROB};
-use crate::xframe_dump::MarketXFramesDump;
-use crate::{tee_eprintln, tee_println, tee_progress, CURRENCIES};
 use crate::tee_log::tee_progress_finish;
+use crate::train_mode::{
+    Calibration, PNL_MAX_LAG, RESOLUTION_MAX_LAG, TEST_FRACTION, VAL_FRACTION, collect_bin_paths,
+    load_calibration, split_counts,
+};
+use crate::xframe::{
+    BookLevel, SIZE, XFrame, Y_TRAIN_NO_TRADE_PROB_HIGH, Y_TRAIN_NO_TRADE_PROB_LOW,
+    Y_TRAIN_PNL_MAX_ENTRY_PROB, Y_TRAIN_PNL_STOP_LOSS_PP, Y_TRAIN_RESOLUTION_MAX_ENTRY_PROB,
+    Y_TRAIN_RESOLUTION_STOP_LOSS_PP, Y_TRAIN_SL_MIN_REF_SELL_REL_DROP, Y_TRAIN_TAKE_PROFIT_PP,
+    apply_side_symmetry,
+};
+use crate::xframe_dump::MarketXFramesDump;
+use crate::{CURRENCIES, tee_eprintln, tee_println, tee_progress};
 use indexmap::IndexMap;
 
 pub use crate::sim_stats::{
-    print_side_stats, print_sim_stats, SideStats, SimStats, SimStatsLogSink,
+    SideStats, SimStats, SimStatsLogSink, print_side_stats, print_sim_stats,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -82,12 +86,12 @@ pub const ENABLE_PNL: bool = false;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
-pub const REDEEM_01: bool = false;
+pub const REDEEM_01: bool = true;
 
 /// Глобальный тумблер redeem-x: реконструированный buy+redeem режим по публичному
 /// профилю бота. Позиция с [`OpenPosition::redeem_x`] доживает до резолюции без
 /// TP/SL/Timeout; вход выбирает [`crate::redeem_x::redeem_x_entry_size`].
-pub const REDEEM_X: bool = true;
+pub const REDEEM_X: bool = false;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -409,7 +413,12 @@ impl OpenPosition {
         &self,
         block_on_pending_invokes: bool,
     ) -> Result<Option<f64>, InvokePendingError> {
-        let resolve_report = async |watch_opt: Option<InvokeSettlementWatch>, which: &'static str|-> Result<Option<crate::account_order::SingleOrderClobInvocationReport>, InvokePendingError> {
+        let resolve_report = async |watch_opt: Option<InvokeSettlementWatch>,
+                                    which: &'static str|
+               -> Result<
+            Option<crate::account_order::SingleOrderClobInvocationReport>,
+            InvokePendingError,
+        > {
             let Some(mut watch) = watch_opt else {
                 return Ok(None);
             };
@@ -419,7 +428,8 @@ impl OpenPosition {
             if !block_on_pending_invokes {
                 return Err(InvokePendingError { which });
             }
-            let timeout = crate::account_submit::invoke_wait_until_market_end_plus(self.event_end_ms);
+            let timeout =
+                crate::account_submit::invoke_wait_until_market_end_plus(self.event_end_ms);
             match wait_invoke_settlement(&mut watch, timeout).await {
                 Some(report) => Ok(Some(report)),
                 None => Err(InvokePendingError { which }),
@@ -427,7 +437,8 @@ impl OpenPosition {
         };
 
         // BUY invoke → shares_bought_net.
-        let Some(buy_report) = resolve_report(self.open_buy_invoke.clone(), "open_buy").await? else {
+        let Some(buy_report) = resolve_report(self.open_buy_invoke.clone(), "open_buy").await?
+        else {
             return Ok(None);
         };
         if !buy_report.success {
@@ -537,11 +548,15 @@ pub async fn run_sim_mode() -> anyhow::Result<()> {
     )?;
 
     crate::trade_csv_log::set_current_regime("kelly");
-    tee_println!("[sim] === regime=kelly (Kelly + calibration, min(MAX_BET_FRACTION × bankroll, MAX_POSITION_USD)) ===");
+    tee_println!(
+        "[sim] === regime=kelly (Kelly + calibration, min(MAX_BET_FRACTION × bankroll, MAX_POSITION_USD)) ==="
+    );
     run_sim_mode_inner(true).await?;
 
     crate::trade_csv_log::set_current_regime("raw");
-    tee_println!("[sim] === regime=raw (no Kelly, no calibration, ${NO_KELLY_POSITION_SIZE_USD} entry) ===");
+    tee_println!(
+        "[sim] === regime=raw (no Kelly, no calibration, ${NO_KELLY_POSITION_SIZE_USD} entry) ==="
+    );
     run_sim_mode_inner(false).await?;
 
     crate::trade_csv_log::set_current_regime("");
@@ -577,10 +592,13 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     continue;
                 }
 
-                let model_up_path   = version_path.join(format!("model_{interval}_1s_pnl_up.ubj"));
-                let model_down_path = version_path.join(format!("model_{interval}_1s_pnl_down.ubj"));
-                let model_resolution_up_path   = version_path.join(format!("model_{interval}_1s_resolution_up.ubj"));
-                let model_resolution_down_path = version_path.join(format!("model_{interval}_1s_resolution_down.ubj"));
+                let model_up_path = version_path.join(format!("model_{interval}_1s_pnl_up.ubj"));
+                let model_down_path =
+                    version_path.join(format!("model_{interval}_1s_pnl_down.ubj"));
+                let model_resolution_up_path =
+                    version_path.join(format!("model_{interval}_1s_resolution_up.ubj"));
+                let model_resolution_down_path =
+                    version_path.join(format!("model_{interval}_1s_resolution_down.ubj"));
 
                 let tag = format!("{currency}/{version}/{interval}/{regime_label}");
 
@@ -623,7 +641,9 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                     && !REDEEM_01
                     && !REDEEM_X
                 {
-                    tee_println!("[sim] {tag}: ни одной модели (pnl/resolution) не найдено, пропуск");
+                    tee_println!(
+                        "[sim] {tag}: ни одной модели (pnl/resolution) не найдено, пропуск"
+                    );
                     continue;
                 }
 
@@ -687,20 +707,22 @@ async fn run_sim_mode_inner(is_kelly: bool) -> anyhow::Result<()> {
                 );
 
                 let test_total = test_paths.len();
-                tee_println!(
-                    "[sim] {tag}: симуляция test-сплита: {test_total} маркетов…"
-                );
+                tee_println!("[sim] {tag}: симуляция test-сплита: {test_total} маркетов…");
 
                 for (idx, file_path) in test_paths.iter().enumerate() {
                     let market_n = idx + 1;
                     tee_progress!("[sim] {tag}: [{market_n}/{test_total}]");
                     match load_market_xframes(file_path) {
                         Ok(market_xframes) => {
-                            let polymarket_url =
-                                polymarket_event_url_from_dump_path(file_path, &currency, interval_kind)
-                                    .unwrap_or_default();
-                            let event_end_ms = window_bounds_from_dump_path(file_path, interval_kind)
-                                .map(|b| b.event_end_ms);
+                            let polymarket_url = polymarket_event_url_from_dump_path(
+                                file_path,
+                                &currency,
+                                interval_kind,
+                            )
+                            .unwrap_or_default();
+                            let event_end_ms =
+                                window_bounds_from_dump_path(file_path, interval_kind)
+                                    .map(|b| b.event_end_ms);
                             simulate_event(
                                 &market_xframes,
                                 &currency,
@@ -770,9 +792,17 @@ async fn simulate_event(
     let graph_dump_bin_path = bin_dump_path.to_string_lossy().into_owned();
     let price_to_beat = Some(market_xframes.price_to_beat);
     let final_price = Some(market_xframes.final_price);
-    let lane_key_up = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Up);
-    let lane_key_down = (currency.to_string(), interval_kind, CurrencyUpDownOutcome::Down);
-    let frames_up: Vec<&XFrame<SIZE>>   = market_xframes.frames_up.iter().collect();
+    let lane_key_up = (
+        currency.to_string(),
+        interval_kind,
+        CurrencyUpDownOutcome::Up,
+    );
+    let lane_key_down = (
+        currency.to_string(),
+        interval_kind,
+        CurrencyUpDownOutcome::Down,
+    );
+    let frames_up: Vec<&XFrame<SIZE>> = market_xframes.frames_up.iter().collect();
     let frames_down: Vec<&XFrame<SIZE>> = market_xframes.frames_down.iter().collect();
 
     let up_won = market_xframes.up_won();
@@ -1057,8 +1087,7 @@ pub(crate) fn compute_resolution_inference(
     calibration_resolution: Option<&Calibration>,
     is_kelly: bool,
 ) -> Option<PnlInference> {
-    if frame.event_remaining_ms <= 0
-        || frame.event_remaining_ms > HOLD_TO_END_THRESHOLD_SEC * 1000
+    if frame.event_remaining_ms <= 0 || frame.event_remaining_ms > HOLD_TO_END_THRESHOLD_SEC * 1000
     {
         return None;
     }
@@ -1133,12 +1162,12 @@ pub(crate) async fn buy_gate(
     bankroll: f64,
     strict_book: Option<&StrictBook>,
     is_kelly: bool,
-    currency: &str,
+    _currency: &str,
     event_end_ms: Option<i64>,
     positions_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
     pending_close_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
-    submit_mode: crate::account_submit::SubmitMode,
-    account: Option<&SharedAccount>,
+    _submit_mode: crate::account_submit::SubmitMode,
+    _account: Option<&SharedAccount>,
 ) -> BuyGate {
     if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return BuyGate::LateEntry;
@@ -1178,32 +1207,6 @@ pub(crate) async fn buy_gate(
         if matches!(res_decision, BuyGate::Proceed { .. }) {
             return res_decision;
         }
-    }
-
-    if REDEEM_01 {
-        let Some(size) = redeem_01_tail_entry_size(
-            frame,
-            strict_book,
-            entry_prob,
-            bankroll,
-            currency,
-            event_end_ms,
-            submit_mode == crate::account_submit::SubmitMode::None,
-            account,
-        )
-        .await
-        else {
-            return pnl_decision;
-        };
-        return BuyGate::Proceed {
-            raw: 0.0,
-            pred: 0.0,
-            kelly_f: 0.0,
-            size,
-            opened_in_hold_zone: false,
-            redeem_01: true,
-            redeem_x: false,
-        };
     }
 
     if REDEEM_X {
@@ -1457,8 +1460,7 @@ pub(crate) async fn try_open_position(
                         }
                     }
                 }
-                if !same_asset_open
-                    && let Some(lane_pending) = pending_close_by_lane.get(lane_key)
+                if !same_asset_open && let Some(lane_pending) = pending_close_by_lane.get(lane_key)
                 {
                     for p in lane_pending.values() {
                         if p.read().await.asset_id == frame.asset_id {
@@ -1472,36 +1474,9 @@ pub(crate) async fn try_open_position(
                     return false;
                 }
             }
-            if redeem_01 {
-                let mut redeem_01_open = false;
-                for lane_positions in positions_by_lane.values() {
-                    for p in lane_positions.values() {
-                        let pos = p.read().await;
-                        if pos.asset_id.as_str() == frame.asset_id.as_str() && pos.redeem_01 {
-                            redeem_01_open = true;
-                            break;
-                        }
-                    }
-                }
-                if !redeem_01_open {
-                    for lane_pending in pending_close_by_lane.values() {
-                        for p in lane_pending.values() {
-                            let pos = p.read().await;
-                            if pos.asset_id.as_str() == frame.asset_id.as_str() && pos.redeem_01 {
-                                redeem_01_open = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if redeem_01_open {
-                    return false;
-                }
-            }
             if let Some(max_open) = MAX_OPEN_POSITIONS {
                 let live_total: usize = positions_by_lane.values().map(|m| m.len()).sum();
-                let pending_total: usize =
-                    pending_close_by_lane.values().map(|m| m.len()).sum();
+                let pending_total: usize = pending_close_by_lane.values().map(|m| m.len()).sum();
                 if live_total + pending_total >= max_open {
                     stats.max_open_positions_skips += 1;
                     return false;
@@ -1554,10 +1529,16 @@ pub(crate) async fn try_open_position(
                     stats.histogram_cal_pred[bucket_pred] += 1;
 
                     // Submit: optimistic fill + spawn BUY taker; правки по WS ([`crate::account_ws`]).
-                    let decision_price = strict_book.and_then(crate::account_order::best_ask_strict).map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
+                    let decision_price = strict_book
+                        .and_then(crate::account_order::best_ask_strict)
+                        .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
+                    let min_order_size_shares = strict_book
+                        .and_then(|book| book.min_order_size)
+                        .filter(|min| min.is_finite() && *min > 0.0);
                     let decision_book = strict_book.cloned();
                     let pos_id = pos.id.clone();
-                    let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
+                    let pos_arc: SharedOpenPosition =
+                        std::sync::Arc::new(tokio::sync::RwLock::new(pos));
                     positions_by_lane
                         .entry(lane_key.clone())
                         .or_default()
@@ -1565,11 +1546,13 @@ pub(crate) async fn try_open_position(
                     crate::account_submit::spawn_open_buy(
                         account.clone(),
                         project_manager.cloned(),
-                        pos_arc,
-                        decision_price,
-                        None,
-                        None,
+                        vec![crate::account_submit::OpenBuyRequest {
+                            position: pos_arc,
+                            price: decision_price,
+                            delta_price: None,
+                        }],
                         decision_book,
+                        min_order_size_shares,
                         submit_mode,
                     );
                     true
@@ -1588,7 +1571,10 @@ pub(crate) enum SellGate {
     /// Держим позицию (TP/SL/Timeout не сработали, либо мы в hold-zone и решено ждать резолюцию).
     Hold,
     /// Закрыть по VWAP `exit_price` и причине (maker vs taker fee в [`crate::account_close_position::close_position`]).
-    Close { exit_price: f64, reason: CloseReason },
+    Close {
+        exit_price: f64,
+        reason: CloseReason,
+    },
 }
 
 /// VWAP цены продажи (0.001..0.999) после bid-walk по книге; единственная
@@ -1667,13 +1653,9 @@ pub(crate) fn sell_gate(
         // Resolution-канал: только SL (urgent walk, без cap), без TP/Timeout —
         // ждём резолюцию рынка. Порог как в [`calc_y_train_resolution`]:
         // `net_ret_taker ≤ Y_TRAIN_RESOLUTION_STOP_LOSS_PP`.
-        let Some(sell_vwap_u) = capped_sell_fill_for_gate(
-            frame,
-            strict_book,
-            pos.shares_held,
-            None,
-            current_prob,
-        ) else {
+        let Some(sell_vwap_u) =
+            capped_sell_fill_for_gate(frame, strict_book, pos.shares_held, None, current_prob)
+        else {
             return SellGate::Hold;
         };
         let net_ret_u = net_ret_after_exit(pos.buy_price, sell_vwap_u, true);
@@ -1705,14 +1687,9 @@ pub(crate) fn sell_gate(
         }
     }
 
-
-    let Some(sell_vwap_u) = capped_sell_fill_for_gate(
-        frame,
-        strict_book,
-        pos.shares_held,
-        None,
-        current_prob,
-    ) else {
+    let Some(sell_vwap_u) =
+        capped_sell_fill_for_gate(frame, strict_book, pos.shares_held, None, current_prob)
+    else {
         return SellGate::Hold;
     };
 
@@ -1724,7 +1701,8 @@ pub(crate) fn sell_gate(
         };
     }
 
-    if net_ret_u <= Y_TRAIN_PNL_STOP_LOSS_PP && stop_loss_sell_deteriorated_vs_entry_ref(pos, sell_vwap_u)
+    if net_ret_u <= Y_TRAIN_PNL_STOP_LOSS_PP
+        && stop_loss_sell_deteriorated_vs_entry_ref(pos, sell_vwap_u)
     {
         return SellGate::Close {
             exit_price: sell_vwap_u,
@@ -1895,11 +1873,8 @@ pub(crate) async fn manage_positions(
                 // не приведут к [`crate::account_close_position::close_position_after_submit`],
                 // который вычистит позицию из обоих мапов одним блоком.
                 {
-                    let mut pending_guard =
-                        account.pending_close_positions.write().await;
-                    let lane_pending = pending_guard
-                        .entry(lane_key.clone())
-                        .or_default();
+                    let mut pending_guard = account.pending_close_positions.write().await;
+                    let lane_pending = pending_guard.entry(lane_key.clone()).or_default();
                     lane_pending.insert(pos_id.clone(), pos_arc.clone());
                 }
                 crate::account_submit::spawn_sell_taker(
@@ -2039,7 +2014,8 @@ fn open_position(
     }
     let buy_price = buy_price.clamp(0.001, 0.999);
 
-    let fee_usdc = nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
+    let fee_usdc =
+        nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
     let fee_shares = fee_usdc / buy_price;
     let shares_held = nominal_shares - fee_shares;
 
@@ -2157,7 +2133,9 @@ pub(crate) fn book_fill_buy(
     let mut remaining_usdc = position_size;
     let mut total_shares = 0.0_f64;
     for level in asks {
-        if level.price <= 0.0 || level.size <= 0.0 { continue }
+        if level.price <= 0.0 || level.size <= 0.0 {
+            continue;
+        }
         let affordable = remaining_usdc / level.price;
         if affordable <= level.size {
             total_shares += affordable;
@@ -2209,7 +2187,9 @@ pub(crate) fn book_fill_sell(
     let mut remaining = shares_to_sell;
     let mut total_usdc = 0.0_f64;
     for level in bids {
-        if level.price <= 0.0 || level.size <= 0.0 { continue }
+        if level.price <= 0.0 || level.size <= 0.0 {
+            continue;
+        }
         if remaining <= level.size {
             total_usdc += remaining * level.price;
             remaining = 0.0;
@@ -2310,7 +2290,9 @@ pub(crate) fn top_pnl_shap_features_csv_cell(
         })
         .collect();
     contributions.sort_by(|(_, _, pct_a), (_, _, pct_b)| {
-        pct_b.partial_cmp(pct_a).unwrap_or(std::cmp::Ordering::Equal)
+        pct_b
+            .partial_cmp(pct_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     contributions
@@ -2338,7 +2320,10 @@ pub(crate) fn load_booster(path: &Path) -> Option<Booster> {
             Some(b)
         }
         Err(err) => {
-            tee_eprintln!("[sim] не удалось загрузить модель {}: {err}", path.display());
+            tee_eprintln!(
+                "[sim] не удалось загрузить модель {}: {err}",
+                path.display()
+            );
             None
         }
     }
@@ -2373,14 +2358,10 @@ fn polymarket_event_url_from_dump_path(
     interval_kind: XFrameIntervalKind,
 ) -> Option<String> {
     let bounds = window_bounds_from_dump_path(dump_file_path, interval_kind)?;
-    let interval_label_str = match interval_kind {
-        XFrameIntervalKind::FiveMin    => "5m",
-        XFrameIntervalKind::FifteenMin => "15m",
-    };
-    Some(format!(
-        "https://polymarket.com/event/{currency}-updown-{interval_label_str}-{window_start_sec}",
-        currency = currency.to_lowercase(),
-        window_start_sec = bounds.window_start_sec,
+    Some(crate::util::polymarket_event_url_from_frame(
+        currency,
+        interval_kind,
+        Some(bounds.window_start_sec * 1_000),
     ))
 }
 

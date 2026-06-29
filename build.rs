@@ -63,13 +63,16 @@ fn sync_deps_xgboost_symlink(correct_lib: &Path) -> io::Result<()> {
 }
 
 fn local_xgboost_lib_dir() -> Option<PathBuf> {
-    let base = env::var("XGBOOST_BUILD_CACHE").ok().map(PathBuf::from).or_else(|| {
-        env::var("HOME").ok().map(|home| {
-            PathBuf::from(home)
-                .join(".cache")
-                .join("poly-xgboost-build")
-        })
-    })?;
+    let base = env::var("XGBOOST_BUILD_CACHE")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var("HOME").ok().map(|home| {
+                PathBuf::from(home)
+                    .join(".cache")
+                    .join("poly-xgboost-build")
+            })
+        })?;
 
     let profile = env::var("PROFILE").unwrap_or_else(|_| "release".into());
     // Вариант кэша должен совпадать с xgboost-sys/build.rs: «cuda» только если

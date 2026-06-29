@@ -2,7 +2,7 @@ use anyhow::Context;
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::constants::CurrencyUpDownOutcome;
+use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use polymarket_client_sdk::gamma;
 use polymarket_client_sdk::gamma::types::request::MarketBySlugRequest;
 use polymarket_client_sdk::gamma::types::response::Market;
@@ -53,6 +53,35 @@ pub fn encode_path_as_file_uri(abs_path: &str) -> String {
     out
 }
 
+/// Единственная точка сборки публичного URL события Polymarket:
+/// `https://polymarket.com/event/{slug}`. Все остальные места должны звать её
+/// (напрямую по `slug` или через [`polymarket_event_url_from_frame`]).
+pub fn polymarket_event_url(slug: &str) -> String {
+    format!("https://polymarket.com/event/{slug}")
+}
+
+/// URL события из компонентов окна: slug `{currency}-updown-{5m|15m}-{window_start_sec}`
+/// (`currency` в URL — lower-case, `window_start_sec = event_start_ms / 1000`).
+/// Пустая строка, если `event_start_ms == None`.
+pub fn polymarket_event_url_from_frame(
+    currency: &str,
+    interval_kind: XFrameIntervalKind,
+    event_start_ms: Option<i64>,
+) -> String {
+    let Some(start_ms) = event_start_ms else {
+        return String::new();
+    };
+    let window_start_sec = start_ms / 1_000;
+    let interval = match interval_kind {
+        XFrameIntervalKind::FiveMin => "5m",
+        XFrameIntervalKind::FifteenMin => "15m",
+    };
+    polymarket_event_url(&format!(
+        "{}-updown-{interval}-{window_start_sec}",
+        currency.to_lowercase(),
+    ))
+}
+
 pub struct CurrencyEventSlugData {
     /// Исход токена по `asset_id`: Up / Down.
     pub currency_up_down_by_asset_id: HashMap<String, CurrencyUpDownOutcome>,
@@ -66,6 +95,9 @@ pub struct CurrencyEventSlugData {
     pub min_order_size: Option<f64>,
     /// Поле `question` маркета Gamma.
     pub gamma_question: Option<String>,
+    /// `acceptingOrdersTimestamp` (ms) — прогноз/факт момента, когда книга начинает
+    /// принимать ордера. Используется как предсказание времени открытия будущего рынка.
+    pub accepting_orders_timestamp_ms: Option<i64>,
 }
 
 /// Price-to-beat окна через Vatic [`targets/timestamp`](https://docs.vatic.trading/api-reference/targets/timestamp.md).
@@ -198,6 +230,7 @@ pub fn currency_event_slug_data_from_gamma_market(
         event_end_ms,
         min_order_size,
         gamma_question,
+        accepting_orders_timestamp_ms: m.accepting_orders_timestamp.map(|t| t.timestamp_millis()),
     })
 }
 

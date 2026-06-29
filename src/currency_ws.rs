@@ -91,8 +91,7 @@ async fn run_rtds_spot_session(project_manager: &Arc<ProjectManager>) -> Result<
                     Some(p) => {
                         eprintln!(
                             "rtds ({pair_symbol}): connect failed via proxy {}:{}: {connect_err}",
-                            p.host,
-                            p.port
+                            p.host, p.port
                         );
                     }
                     None => {

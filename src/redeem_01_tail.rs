@@ -3,698 +3,462 @@
 //! This module contains the live/project decision rule only. It does not replay
 //! bot activity and does not depend on precomputed market/asset tables.
 
-use crate::account::{Redeem01TailMarketRegimeKey, SharedAccount};
-use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
-use crate::data_ws::WsStreamPriceChange;
-use crate::history_sim::{
-    KELLY_MULTIPLIER, MAX_BET_FRACTION, MAX_POSITION_USD, MIN_POSITION_USD, StrictBook,
-};
-use crate::xframe::{BookLevel, SIZE, XFrame};
-use crate::xframe_dump::{MarketWsStreamDumpEntry, MarketWsStreamDumpMarket};
-use anyhow::Context as _;
-use flate2::read::GzDecoder;
-use indexmap::IndexMap;
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use tokio::sync::mpsc;
+use crate::account::SharedAccount;
+use crate::constants::{CurrencyUpDownOutcome, FIFTEEN_MIN_SEC, FIVE_MIN_SEC, XFrameIntervalKind};
+use crate::history_sim::{OpenPosition, SharedOpenPosition};
+use crate::project_manager::ProjectManager;
+use std::sync::Arc;
 
-const BTC_5M_CURRENCY: &str = "btc";
-const BTC_5M_MAX_TARGET_USDC: f64 = 1.0;
-const DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS: i64 = 10_000;
-const REDEEM_01_TAIL_ENTRY_PRICE_COUNT: usize = 3;
-const REDEEM_01_TAIL_ENTRY_PRICES: [f64; REDEEM_01_TAIL_ENTRY_PRICE_COUNT] = [0.01, 0.02, 0.03];
-const MARKET_REGIME_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
-const MARKET_REGIME_DUMP_CACHE_CAP: usize = 8_000;
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Redeem01TailMarketRegime {
-    pub event_end_ms: i64,
-    pub markets: usize,
-    pub price_stats: [Redeem01TailPriceRegime; REDEEM_01_TAIL_ENTRY_PRICE_COUNT],
-    pub recommendation: Option<Redeem01TailEntryRecommendation>,
-    pub updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Redeem01TailPriceRegime {
-    pub entry_price: f64,
-    pub reversals: usize,
-    pub reversal_rate: f64,
-    pub deadline_event_remaining_ms: Option<i64>,
-    pub expected_roi: f64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Redeem01TailEntryRecommendation {
-    pub entry_price: f64,
-    pub reversal_rate: f64,
-    pub expected_roi: f64,
-    pub min_event_remaining_ms: i64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Redeem01TailEntryPlan {
-    entry_price: f64,
-    target_usdc: f64,
-    min_event_remaining_ms: i64,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Redeem01TailMarketRegimeLoadCommand {
-    pub account: SharedAccount,
-    pub currency: String,
-    pub interval: XFrameIntervalKind,
-    pub event_end_ms: i64,
-}
-
-pub(crate) async fn run_redeem_01_tail_market_regime_loader(
-    mut rx: mpsc::Receiver<Redeem01TailMarketRegimeLoadCommand>,
-) {
-    while let Some(command) = rx.recv().await {
-        if let Err(err) = load_redeem_01_tail_market_regime_key(command).await {
-            crate::tee_eprintln!("[redeem_01_tail] market regime load failed: {err:#}");
-        }
-    }
-}
-
-async fn load_redeem_01_tail_market_regime_key(
-    command: Redeem01TailMarketRegimeLoadCommand,
-) -> anyhow::Result<()> {
-    let currency = command.currency.to_ascii_lowercase();
-    let key: Redeem01TailMarketRegimeKey = (currency.clone(), command.interval);
-    {
-        let guard = command.account.redeem_01_tail_market_regime.read().await;
-        if guard
-            .get(&key)
-            .is_some_and(|regime| regime.event_end_ms == command.event_end_ms)
-        {
-            return Ok(());
-        }
-    }
-
-    let streams_root = crate::path_config::streams_root();
-    let now_ms = crate::util::current_timestamp_ms();
-    let regime = scan_redeem_01_tail_market_regime(
-        &streams_root,
-        &currency,
-        command.interval,
-        command.event_end_ms,
-        now_ms,
-    )?;
-
-    let mut guard = command.account.redeem_01_tail_market_regime.write().await;
-    if guard
-        .get(&key)
-        .is_some_and(|existing| existing.event_end_ms != command.event_end_ms)
-    {
-        guard.remove(&key);
-    }
-    guard.entry(key).or_insert(regime);
-    Ok(())
-}
-
-fn scan_redeem_01_tail_market_regime(
-    streams_root: &Path,
+/// Синтетический [`OpenPosition`] для рынка, который ещё **не наступил** (нет ни
+/// [`crate::xframe::XFrame`], ни [`crate::history_sim::StrictBook`]). В отличие от
+/// [`crate::history_sim::open_position`] никакого fill по книге нет: размер/цена
+/// считаются от переданной `assumed_buy_price`
+/// (`shares = position_size / price`, planned fee = 0 для maker), а CSV-поля модели
+/// (`raw/cal_pred`, `kelly_f`, SHAP) заполняются нулями/пусто — они станут
+/// неактуальны/перезапишутся после фактического fill при промоушене.
+/// `event_remaining_ms_at_open` берём как полное окно интервала (рынок ещё впереди).
+#[allow(clippy::too_many_arguments)]
+fn future_open_position(
+    asset_id: &str,
+    market_id: &str,
     currency: &str,
-    target_interval: XFrameIntervalKind,
-    regime_event_end_ms: i64,
-    updated_at_ms: i64,
-) -> anyhow::Result<Redeem01TailMarketRegime> {
-    let currency_root = streams_root.join(currency);
-    if !currency_root.exists() {
-        return Ok(empty_redeem_01_tail_market_regime(
-            regime_event_end_ms,
-            updated_at_ms,
-        ));
+    interval_kind: XFrameIntervalKind,
+    side: CurrencyUpDownOutcome,
+    polymarket_url: &str,
+    event_end_ms: Option<i64>,
+    position_size: f64,
+    assumed_buy_price: f64,
+    opened_in_hold_zone: bool,
+    redeem_01: bool,
+    redeem_x: bool,
+    price_to_beat: Option<f64>,
+    final_price: Option<f64>,
+    graph_dump_bin_path: &str,
+    gamma_question_at_open: Option<&str>,
+) -> Option<OpenPosition> {
+    if !(position_size > 0.0 && position_size.is_finite()) {
+        return None;
     }
-
-    let cutoff_ms = regime_event_end_ms - MARKET_REGIME_WINDOW_MS;
-    let mut acc = MarketRegimeAccumulator::default();
-    let files = collect_stream_dump_files(&currency_root)?;
-
-    for path in files {
-        let Some((interval, event_end_ms)) =
-            stream_dump_path_interval_and_end_ms(&currency_root, &path)
-        else {
-            continue;
-        };
-        if interval != target_interval {
-            continue;
-        }
-        if event_end_ms < cutoff_ms || event_end_ms >= regime_event_end_ms {
-            continue;
-        }
-        let Some(cached) = cached_tail_regime_dump(&path) else {
-            continue;
-        };
-
-        acc.markets += 1;
-        for (idx, deadline_ms) in cached
-            .deadline_event_remaining_ms
-            .iter()
-            .copied()
-            .enumerate()
-        {
-            if let Some(deadline_ms) = deadline_ms {
-                let price_entry = &mut acc.price_entries[idx];
-                price_entry.reversals += 1;
-                price_entry.latest_entry_remaining_ms.push(deadline_ms);
-            }
-        }
+    let buy_price = assumed_buy_price.clamp(0.001, 0.999);
+    let nominal_shares = position_size / buy_price;
+    if !(nominal_shares > 0.0 && nominal_shares.is_finite()) {
+        return None;
     }
+    let fee_usdc = 0.0;
+    let shares_held = nominal_shares;
 
-    Ok(redeem_01_tail_market_regime_from_accumulator(
-        acc,
-        regime_event_end_ms,
-        updated_at_ms,
-    ))
-}
+    let id = uuid::Uuid::new_v4().to_string();
 
-fn empty_redeem_01_tail_market_regime(
-    event_end_ms: i64,
-    updated_at_ms: i64,
-) -> Redeem01TailMarketRegime {
-    redeem_01_tail_market_regime_from_accumulator(
-        MarketRegimeAccumulator::default(),
+    Some(OpenPosition {
+        id,
+        asset_id: asset_id.to_string(),
+        market_id: market_id.to_string(),
+        shares_held,
+        planned_shares_held: shares_held,
+        entry_prob: buy_price,
+        buy_price,
+        planned_buy_price: buy_price,
+        sell_vwap_entry: buy_price,
+        position_size,
+        planned_entry_cost: position_size,
+        best_bid_at_entry: None,
+        frames_held: 0,
+        opened_in_hold_zone,
+        redeem_01,
+        redeem_x,
+        raw_pred_at_open: 0.0,
+        cal_pred_at_open: 0.0,
+        kelly_f_at_open: 0.0,
+        event_remaining_ms_at_open: interval_kind.interval_ms(),
+        xframe_interval_type_at_open: interval_kind.as_i32(),
+        currency_up_down_outcome_at_open: side.as_i32(),
+        currency: currency.to_string(),
+        polymarket_url: polymarket_url.to_string(),
+        price_to_beat,
+        final_price,
         event_end_ms,
-        updated_at_ms,
-    )
-}
-
-fn redeem_01_tail_market_regime_from_accumulator(
-    acc: MarketRegimeAccumulator,
-    event_end_ms: i64,
-    updated_at_ms: i64,
-) -> Redeem01TailMarketRegime {
-    let price_stats = std::array::from_fn(|idx| {
-        let entry_price = REDEEM_01_TAIL_ENTRY_PRICES[idx];
-        let price_acc = &acc.price_entries[idx];
-        let reversal_rate = if acc.markets > 0 {
-            price_acc.reversals as f64 / acc.markets as f64
-        } else {
-            0.0
-        };
-        let expected_roi = if entry_price > 0.0 {
-            reversal_rate / entry_price - 1.0
-        } else {
-            0.0
-        };
-        Redeem01TailPriceRegime {
-            entry_price,
-            reversals: price_acc.reversals,
-            reversal_rate,
-            deadline_event_remaining_ms: median_i64(&price_acc.latest_entry_remaining_ms),
-            expected_roi,
-        }
-    });
-    let recommendation = choose_redeem_01_tail_recommendation(&price_stats);
-    Redeem01TailMarketRegime {
-        event_end_ms,
-        markets: acc.markets,
-        price_stats,
-        recommendation,
-        updated_at_ms,
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CachedTailRegimeDump {
-    deadline_event_remaining_ms: [Option<i64>; REDEEM_01_TAIL_ENTRY_PRICE_COUNT],
-}
-
-static TAIL_REGIME_DUMP_CACHE: OnceLock<Mutex<IndexMap<PathBuf, CachedTailRegimeDump>>> =
-    OnceLock::new();
-
-fn cached_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
-    let key = path.to_path_buf();
-    let cache = TAIL_REGIME_DUMP_CACHE.get_or_init(|| Mutex::new(IndexMap::new()));
-    {
-        let mut guard = cache.lock().ok()?;
-        if let Some(cached) = guard.shift_remove(&key) {
-            guard.insert(key.clone(), cached);
-            return Some(cached);
-        }
-    }
-
-    let cached = load_tail_regime_dump(path)?;
-    let mut guard = cache.lock().ok()?;
-    if guard.len() >= MARKET_REGIME_DUMP_CACHE_CAP {
-        guard.shift_remove_index(0);
-    }
-    guard.insert(key, cached);
-    Some(cached)
-}
-
-fn load_tail_regime_dump(path: &Path) -> Option<CachedTailRegimeDump> {
-    let event_end_ms = stream_dump_event_end_ms(path)?;
-    let bytes = fs::read(path).ok()?;
-    let mut decoder = GzDecoder::new(bytes.as_slice());
-    let mut decoded = Vec::new();
-    decoder.read_to_end(&mut decoded).ok()?;
-    let dump = bincode::deserialize::<MarketWsStreamDumpMarket>(&decoded).ok()?;
-    let winning_entries = match dump.winner {
-        CurrencyUpDownOutcome::Up => &dump.up,
-        CurrencyUpDownOutcome::Down => &dump.down,
-    };
-    Some(CachedTailRegimeDump {
-        deadline_event_remaining_ms: std::array::from_fn(|idx| {
-            latest_tail_entry_remaining_ms_from_stream(
-                winning_entries,
-                event_end_ms,
-                REDEEM_01_TAIL_ENTRY_PRICES[idx],
-            )
-        }),
+        graph_dump_bin_path: graph_dump_bin_path.to_string(),
+        gamma_question_at_open: gamma_question_at_open.map(|s| s.to_string()),
+        pnl_top5_shap_at_open: String::new(),
+        open_order_id: None,
+        open_buy_invoke: None,
+        maker_tp_position: None,
+        taker_positions: Vec::new(),
+        close_after_submit_finalized: false,
+        entry_fee_usdc: fee_usdc,
+        planned_fee_usdc: fee_usdc,
     })
 }
 
-fn latest_tail_entry_remaining_ms_from_stream(
-    entries: &[MarketWsStreamDumpEntry],
-    event_end_ms: i64,
-    max_price: f64,
-) -> Option<i64> {
-    let mut state = StreamTailState::default();
-    let mut latest_remaining_ms = None;
-    let mut sorted: Vec<&MarketWsStreamDumpEntry> = entries.iter().collect();
-    sorted.sort_by_key(|entry| (stream_entry_ts(entry), entry.ingest_wall_ms));
-    for entry in sorted {
-        let ts = stream_entry_ts(entry);
-        state = stream_tail_state_after_entry(state, entry);
-        let remaining_ms = event_end_ms.saturating_sub(ts);
-        if remaining_ms < DEFAULT_REDEEM_01_TAIL_ENTRY_REMAINING_MS {
+/// Сторона + цена входа одного maker-ордера future-лесенки.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FutureLadderEntry {
+    pub side: CurrencyUpDownOutcome,
+    /// Цена входа (она же maker-limit), напр. `0.01..=0.09`.
+    pub price: f64,
+}
+
+/// Контекст одного рынка для постановки future-лесенки.
+#[derive(Debug, Clone)]
+pub(crate) struct FutureLadderMarket {
+    pub market_id: String,
+    pub up_asset_id: String,
+    pub down_asset_id: String,
+    pub currency: String,
+    pub interval_kind: XFrameIntervalKind,
+    pub polymarket_url: String,
+    pub event_end_ms: Option<i64>,
+    pub gamma_question: Option<String>,
+}
+
+/// Выставляет **батч maker BUY-ордеров** на рынок, который **ещё не наступил**:
+/// для каждого [`FutureLadderEntry`] строит синтетический [`OpenPosition`]
+/// ([`future_open_position`], `redeem_01 = true`), кладёт его в
+/// [`crate::account::Account::future_positions`] и одним вызовом
+/// [`crate::account_submit::spawn_open_buy`] отправляет весь батч как **maker**
+/// (`delta_price = Some(0.0)` ⇒ limit ровно по `price`; размер в shares
+/// берётся из [`FUTURE_LADDER_SHARES_BY_CENT`] по ценовому уровню 1..=9c,
+/// `position_size = shares_for_level * price`).
+///
+/// Когда рынок стартует по времени (`now >= event_end_ms − interval_ms`), позиции
+/// промоутятся в [`crate::account::Account::positions`]
+/// ([`crate::account::Account::promote_started_future_positions`]) и дальше живут
+/// как обычные. Плановую fee не добавляем: открытие идёт maker-ордером.
+///
+/// Порядок в батче = порядок `entries` (вызывающий передаёт от дешёвых к дорогим).
+pub(crate) async fn future_open_positions(
+    account: &SharedAccount,
+    project_manager: Option<&Arc<ProjectManager>>,
+    submit_mode: crate::account_submit::SubmitMode,
+    market: &FutureLadderMarket,
+    entries: &[FutureLadderEntry],
+) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut requests = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let asset_id = match entry.side {
+            CurrencyUpDownOutcome::Up => market.up_asset_id.as_str(),
+            CurrencyUpDownOutcome::Down => market.down_asset_id.as_str(),
+        };
+        let level_shares = future_ladder_shares_for_price(entry.price);
+        if !(level_shares > 0.0 && level_shares.is_finite()) {
+            crate::tee_eprintln!(
+                "[future] open maker BUY market_id={}: невалидный level_shares={} для price={}",
+                market.market_id,
+                level_shares,
+                entry.price,
+            );
             continue;
         }
-        if stream_tail_ask_buyable(&state, max_price) {
-            latest_remaining_ms = Some(
-                latest_remaining_ms
-                    .map(|prev: i64| prev.min(remaining_ms))
-                    .unwrap_or(remaining_ms),
+        let position_size = level_shares * entry.price;
+        let graph_dump_bin_path = market
+            .gamma_question
+            .as_deref()
+            .map(|gq| {
+                let stem = crate::util::sanitized_filename_from_gamma_question(Some(gq));
+                crate::xframe_dump::synthetic_xframes_dump_bin_path_for_csv_link(
+                    &market.currency,
+                    market.interval_kind,
+                    &stem,
+                    market.event_end_ms,
+                )
+            })
+            .flatten()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let Some(pos) = future_open_position(
+            asset_id,
+            &market.market_id,
+            &market.currency,
+            market.interval_kind,
+            entry.side,
+            &market.polymarket_url,
+            market.event_end_ms,
+            position_size,
+            entry.price,
+            false,
+            true,
+            false,
+            None,
+            None,
+            &graph_dump_bin_path,
+            market.gamma_question.as_deref(),
+        ) else {
+            crate::tee_eprintln!(
+                "[future] open maker BUY asset_id={asset_id} market_id={}: невалидный \
+                 position_size={position_size} / price={} — пропуск",
+                market.market_id,
+                entry.price,
             );
+            continue;
+        };
+
+        let lane_key = (market.currency.clone(), market.interval_kind, entry.side);
+        let pos_id = pos.id.clone();
+        let pos_arc: SharedOpenPosition = std::sync::Arc::new(tokio::sync::RwLock::new(pos));
+        {
+            let mut future = account.future_positions.write().await;
+            future
+                .entry(lane_key)
+                .or_default()
+                .insert(pos_id, pos_arc.clone());
         }
-    }
-    latest_remaining_ms
-}
-
-#[derive(Default)]
-struct StreamTailState {
-    asks: Option<Vec<BookLevel>>,
-    ask_l1_price: Option<f64>,
-    ask_l1_size: Option<f64>,
-}
-
-fn stream_tail_state_after_entry(
-    mut state: StreamTailState,
-    entry: &MarketWsStreamDumpEntry,
-) -> StreamTailState {
-    let payload = &entry.payload;
-    if !payload.asks.is_empty() {
-        let asks = ws_levels_to_book_levels(&payload.asks, false);
-        if let Some(best) = asks.first() {
-            state.ask_l1_price = Some(best.price);
-            state.ask_l1_size = Some(best.size);
-        }
-        state.asks = Some(asks);
-    } else if let Some(best_ask) = payload.best_ask {
-        state.ask_l1_price = Some(best_ask);
-    }
-
-    if let Some(change) = select_stream_price_change(&state, &payload.price_changes)
-        && let Some(best_ask) = change.best_ask
-    {
-        state.ask_l1_price = Some(best_ask);
-    }
-    state
-}
-
-fn select_stream_price_change<'a>(
-    state: &StreamTailState,
-    changes: &'a [WsStreamPriceChange],
-) -> Option<&'a WsStreamPriceChange> {
-    if changes.len() == 1 {
-        return changes.first();
-    }
-    changes
-        .iter()
-        .filter(|change| {
-            change.best_bid.is_some() || change.best_ask.is_some() || change.price.is_some()
-        })
-        .filter_map(|change| stream_price_change_score(state, change).map(|score| (score, change)))
-        .min_by(|(left, _), (right, _)| {
-            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(_, change)| change)
-}
-
-fn stream_price_change_score(state: &StreamTailState, change: &WsStreamPriceChange) -> Option<f64> {
-    match (state.ask_l1_price, change.best_ask) {
-        (Some(current), Some(next)) => Some((current - next).abs()),
-        _ => None,
-    }
-}
-
-fn stream_tail_ask_buyable(state: &StreamTailState, max_price: f64) -> bool {
-    if state.asks.as_ref().is_some_and(|asks| {
-        asks.iter()
-            .any(|level| stream_tail_level_buyable(level, max_price))
-    }) {
-        return true;
-    }
-    state
-        .ask_l1_price
-        .is_some_and(|price| price > 0.0 && price <= max_price)
-        && state.ask_l1_size.unwrap_or(1.0) > 0.0
-}
-
-fn stream_tail_level_buyable(level: &BookLevel, max_price: f64) -> bool {
-    if level.price <= 0.0 {
-        return false;
-    }
-    if level.price > max_price {
-        return false;
-    }
-    if level.size <= 0.0 {
-        return false;
-    }
-    true
-}
-
-fn ws_levels_to_book_levels(
-    levels: &[crate::data_ws::WsStreamBookLevel],
-    bids: bool,
-) -> Vec<BookLevel> {
-    let mut out: Vec<BookLevel> = levels
-        .iter()
-        .filter(|level| {
-            level.price > 0.0
-                && level.size >= 0.0
-                && level.price.is_finite()
-                && level.size.is_finite()
-        })
-        .map(|level| BookLevel {
-            price: level.price,
-            size: level.size,
-        })
-        .collect();
-    if bids {
-        out.sort_by(|left, right| {
-            right
-                .price
-                .partial_cmp(&left.price)
-                .unwrap_or(std::cmp::Ordering::Equal)
+        requests.push(crate::account_submit::OpenBuyRequest {
+            position: pos_arc,
+            price: Some(entry.price),
+            // maker limit ровно по `price` (delta = 0): spawn_open_buy → OrderRole::Maker,
+            // size в shares = position_size / price = level_shares.
+            delta_price: Some(0.0),
         });
-    } else {
-        out.sort_by(|left, right| {
-            left.price
-                .partial_cmp(&right.price)
-                .unwrap_or(std::cmp::Ordering::Equal)
+    }
+
+    if requests.is_empty() {
+        return;
+    }
+    crate::account_submit::spawn_open_buy(
+        account.clone(),
+        project_manager.cloned(),
+        requests,
+        None,
+        None,
+        submit_mode,
+    );
+}
+
+/// Сайз в shares по ценовым уровням 1..=9c (индекс 0 = 1c).
+const FUTURE_LADDER_SHARES_BY_CENT: [f64; 9] =
+    [1000.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0, 500.0];
+/// Горизонт планирования будущих рынков (≈24ч): дальше книги ещё нет.
+const FUTURE_LADDER_HORIZON_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Дешёвые уровни — ставим первыми (фаза 1: 7×2 = 14 ордеров ≤ 15).
+const FUTURE_LADDER_PHASE1_CENTS: [i64; 7] = [1, 2, 3, 4, 5, 6, 7];
+/// Остаток лесенки (фаза 2: 2×2 = 4 ордера).
+const FUTURE_LADDER_PHASE2_CENTS: [i64; 2] = [8, 9];
+/// Если gamma не дала `acceptingOrdersTimestamp` — грубый прогноз момента открытия
+/// книги (за столько до старта окна). Основной источник — сам timestamp из gamma.
+const FUTURE_LADDER_FALLBACK_OPEN_LEAD_MS: i64 = 24 * 60 * 60 * 1_000;
+/// С какого лида от `now` начинать перебор будущих окон. Книги у этих рынков
+/// открываются ~24ч заранее, поэтому стартуем с 23ч: на холодном старте не лезем во
+/// весь суточный бэклог ближних окон, а работаем у фронта свежеоткрывшихся книг
+/// (окна в полосе `[now+23ч; now+24ч]`, верх ограничен [`FUTURE_LADDER_HORIZON_MS`]).
+const FUTURE_LADDER_SCAN_LEAD_SEC: i64 = 23 * 60 * 60;
+
+/// [`FutureLadderEntry`] на обе стороны (up+down) для набора центовых уровней,
+/// от дешёвых к дорогим.
+fn future_ladder_entries(cents: &[i64]) -> Vec<FutureLadderEntry> {
+    let mut out = Vec::with_capacity(cents.len() * 2);
+    for &c in cents {
+        let price = c as f64 / 100.0;
+        out.push(FutureLadderEntry {
+            side: CurrencyUpDownOutcome::Up,
+            price,
+        });
+        out.push(FutureLadderEntry {
+            side: CurrencyUpDownOutcome::Down,
+            price,
         });
     }
     out
 }
 
-#[derive(Default)]
-struct MarketPriceAccumulator {
-    reversals: usize,
-    latest_entry_remaining_ms: Vec<i64>,
+fn future_ladder_shares_for_price(price: f64) -> f64 {
+    // Нормализуем к центам (ожидаем уровни 0.01..=0.09).
+    let cents = (price * 100.0).round() as i64;
+    if (1..=9).contains(&cents) {
+        FUTURE_LADDER_SHARES_BY_CENT[(cents - 1) as usize]
+    } else {
+        0.0
+    }
 }
 
-struct MarketRegimeAccumulator {
-    markets: usize,
-    price_entries: [MarketPriceAccumulator; REDEEM_01_TAIL_ENTRY_PRICE_COUNT],
-}
-
-impl Default for MarketRegimeAccumulator {
-    fn default() -> Self {
-        Self {
-            markets: 0,
-            price_entries: std::array::from_fn(|_| MarketPriceAccumulator::default()),
+/// up/down `asset_id` из карты gamma-события (нужны обе стороны).
+fn future_ladder_resolve_sides(
+    data: &crate::util::CurrencyEventSlugData,
+) -> Option<(String, String)> {
+    let mut up = None;
+    let mut down = None;
+    for (asset_id, code) in &data.currency_up_down_by_asset_id {
+        match code {
+            CurrencyUpDownOutcome::Up => up = Some(asset_id.clone()),
+            CurrencyUpDownOutcome::Down => down = Some(asset_id.clone()),
         }
     }
-}
-
-fn median_i64(values: &[i64]) -> Option<i64> {
-    if values.is_empty() {
-        return None;
+    match (up, down) {
+        (Some(up), Some(down)) => Some((up, down)),
+        _ => None,
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    Some(sorted[sorted.len() / 2])
 }
 
-fn choose_redeem_01_tail_recommendation(
-    price_stats: &[Redeem01TailPriceRegime; REDEEM_01_TAIL_ENTRY_PRICE_COUNT],
-) -> Option<Redeem01TailEntryRecommendation> {
-    price_stats
-        .iter()
-        .filter(|stat| stat.reversals > 0)
-        .filter(|stat| stat.reversal_rate > stat.entry_price)
-        .filter(|stat| stat.deadline_event_remaining_ms.is_some())
-        .max_by(|a, b| {
-            let by_roi = a
-                .expected_roi
-                .partial_cmp(&b.expected_roi)
-                .unwrap_or(std::cmp::Ordering::Equal);
-            if by_roi != std::cmp::Ordering::Equal {
-                return by_roi;
-            }
-            let by_reversals = a.reversals.cmp(&b.reversals);
-            if by_reversals != std::cmp::Ordering::Equal {
-                return by_reversals;
-            }
-            b.entry_price
-                .partial_cmp(&a.entry_price)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .and_then(|stat| {
-            Some(Redeem01TailEntryRecommendation {
-                entry_price: stat.entry_price,
-                reversal_rate: stat.reversal_rate,
-                expected_roi: stat.expected_roi,
-                min_event_remaining_ms: stat.deadline_event_remaining_ms?,
-            })
-        })
+/// Прогнозируемый момент открытия книги: gamma `acceptingOrdersTimestamp`, fallback —
+/// `event_start_ms - FUTURE_LADDER_FALLBACK_OPEN_LEAD_MS`.
+fn future_ladder_open_at_ms(
+    data: &crate::util::CurrencyEventSlugData,
+    fallback_market_start_ms: i64,
+) -> i64 {
+    data.accepting_orders_timestamp_ms
+        .unwrap_or(fallback_market_start_ms - FUTURE_LADDER_FALLBACK_OPEN_LEAD_MS)
 }
 
-fn collect_stream_dump_files(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            out.extend(collect_stream_dump_files(&path)?);
-        } else if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(".bin.gz"))
-        {
-            out.push(path);
-        }
-    }
-    Ok(out)
+/// Окно, с которого начинать перебор: якорь `now + 23ч`, выровненный вниз к сетке
+/// окон периода. В установившемся режиме поднимается до конца последнего уже
+/// обработанного окна (`last_event_end_ms`), чтобы не пересканировать обработанное.
+fn future_ladder_next_window_start_sec(
+    last_event_end_ms: Option<i64>,
+    now_sec: i64,
+    period_sec: i64,
+) -> i64 {
+    let anchor_sec = now_sec + FUTURE_LADDER_SCAN_LEAD_SEC;
+    let scan_base = (anchor_sec / period_sec) * period_sec;
+    last_event_end_ms
+        .map(|end_ms| end_ms / 1_000)
+        .unwrap_or(scan_base)
+        .max(scan_base)
 }
 
-fn stream_dump_path_interval_and_end_ms(
-    currency_root: &Path,
-    path: &Path,
-) -> Option<(XFrameIntervalKind, i64)> {
-    let rel = path.strip_prefix(currency_root).ok()?;
-    let mut comps = rel.components();
-    let _version = comps.next()?;
-    let period = comps.next()?.as_os_str().to_str()?;
-    let interval = match period {
-        "5m" => XFrameIntervalKind::FiveMin,
-        "15m" => XFrameIntervalKind::FifteenMin,
-        _ => return None,
-    };
-    Some((interval, stream_dump_event_end_ms(path)?))
-}
+/// Луп future-лесенки: раз в секунду ведёт фронт перебора будущих 5m/15m окон
+/// выбранной монеты, начиная с `now + 23ч` ([`FUTURE_LADDER_SCAN_LEAD_SEC`]) и до
+/// горизонта `now + 24ч` ([`FUTURE_LADDER_HORIZON_MS`]). На каждое окно запускает
+/// отдельный `tokio::spawn`, который **спит до момента открытия книги**
+/// (`acceptingOrdersTimestamp`; `delay = 0`, если книга уже открыта) и в этот момент
+/// выставляет maker BUY-лесенку 1..9c на обе стороны (up/down) с сайзом из
+/// [`FUTURE_LADDER_SHARES_BY_CENT`].
+///
+/// Внутри спавна — два батча (≤15 ордеров/батч): сначала **1..7c** (14 ордеров),
+/// затем **8..9c** (4 ордера). За тик планируется не более одного окна на период;
+/// `last_*_event_end_ms` двигает фронт вперёд, чтобы окна не пересканировались.
+///
+/// Кэш рынков/asset_id/timestamp — через [`ProjectManager`] (`event_data_by_market`,
+/// `slug_to_market_id`, `currency_up_down_by_asset_id`, `market_asset_ids_by_market`).
+pub(crate) async fn run_redeem_01_tail_future_ladder_loop(
+    account: SharedAccount,
+    project_manager: Arc<ProjectManager>,
+    submit_mode: crate::account_submit::SubmitMode,
+) {
+    let coin_lower = project_manager.currency.to_ascii_lowercase();
+    // Последний рынок, по которому уже выставляли лесенку, отдельно по 5m/15m.
+    // Следующий кандидат считается от `event_end_ms` последнего поставленного рынка.
+    let mut last_5m_event_end_ms: Option<i64> = None;
+    let mut last_15m_event_end_ms: Option<i64> = None;
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-fn stream_dump_event_end_ms(path: &Path) -> Option<i64> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name.strip_suffix(".bin.gz")?;
-    stem.rsplit("__").next()?.parse().ok()
-}
+    loop {
+        tick.tick().await;
+        let now_ms = crate::util::current_timestamp_ms();
+        let now_sec = now_ms / 1_000;
 
-fn stream_entry_ts(entry: &MarketWsStreamDumpEntry) -> i64 {
-    entry.payload.timestamp_ms.unwrap_or(entry.ingest_wall_ms)
-}
+        for (period_label, period_sec, interval_kind, last_event_end_ms) in [
+            (
+                "5m",
+                FIVE_MIN_SEC,
+                XFrameIntervalKind::FiveMin,
+                &mut last_5m_event_end_ms,
+            ),
+            (
+                "15m",
+                FIFTEEN_MIN_SEC,
+                XFrameIntervalKind::FifteenMin,
+                &mut last_15m_event_end_ms,
+            ),
+        ] {
+            let interval_ms = period_sec * 1_000;
+            let mut window_start =
+                future_ladder_next_window_start_sec(*last_event_end_ms, now_sec, period_sec);
+            loop {
+                let window_end_ms = (window_start + period_sec) * 1_000;
+                if window_end_ms - now_ms > FUTURE_LADDER_HORIZON_MS {
+                    break;
+                }
+                let slug = format!("{coin_lower}-updown-{period_label}-{window_start}");
 
-pub(crate) async fn redeem_01_tail_entry_size(
-    frame: &XFrame<SIZE>,
-    strict_book: Option<&StrictBook>,
-    _entry_prob: f64,
-    bankroll: f64,
-    currency: &str,
-    event_end_ms: Option<i64>,
-    load_missing_inline: bool,
-    account: Option<&SharedAccount>,
-) -> Option<f64> {
-    if !currency.eq_ignore_ascii_case(BTC_5M_CURRENCY) {
-        return None;
-    }
-    let interval = XFrameIntervalKind::from_i32(frame.xframe_interval_type)?;
-    if interval != XFrameIntervalKind::FiveMin {
-        return None;
-    }
+                // Кэш PM первым; gamma дёргаем только если в кэше нет записи или в ней
+                // не хватает market_id / обеих сторон (≤1 HTTP на окно — без лагов на
+                // последовательных рынках).
+                let mut data = project_manager
+                    .try_restore_currency_event_from_slug_cache(&slug)
+                    .await;
+                let needs_fetch = match &data {
+                    Some(d) => d.market_id.is_none() || future_ladder_resolve_sides(d).is_none(),
+                    None => true,
+                };
+                if needs_fetch {
+                    if let Some(fresh) = project_manager
+                        .fetch_currency_event_from_gamma_and_merge(&slug, period_label)
+                        .await
+                    {
+                        data = Some(fresh);
+                    }
+                }
+                let Some(data) = data else {
+                    // gamma рынок ещё не создала — дальние окна тем более.
+                    break;
+                };
 
-    let event_end_ms = event_end_ms?;
-    let plan = redeem_01_tail_market_regime_entry_plan(
-        currency,
-        interval,
-        event_end_ms,
-        bankroll,
-        load_missing_inline,
-        account,
-    )
-    .await?;
-    if frame.event_remaining_ms < plan.min_event_remaining_ms {
-        return None;
-    }
-    let cheap_notional = cheap_tail_ask_notional(frame, strict_book, plan.entry_price)?;
-    if cheap_notional + 1e-9 < plan.target_usdc {
-        return None;
-    }
+                let start_ms = data.event_start_ms.unwrap_or(window_start * 1_000);
+                let predicted_open_ms = future_ladder_open_at_ms(&data, start_ms);
+                let delay_ms = predicted_open_ms - now_ms;
+                if delay_ms > interval_ms {
+                    // Откроется позже, чем через ближайший интервал (<5m/<15m) →
+                    // пока рано планировать, проверим на следующих тиках.
+                    break;
+                }
 
-    Some(plan.target_usdc)
-}
+                // Резолвим market_id и up/down asset_id (нужны обе стороны).
+                let Some(market_id) = data.market_id.clone() else {
+                    window_start += period_sec;
+                    continue;
+                };
+                let Some((up_asset_id, down_asset_id)) = future_ladder_resolve_sides(&data) else {
+                    window_start += period_sec;
+                    continue;
+                };
+                let polymarket_url = crate::util::polymarket_event_url(&slug);
+                let market = FutureLadderMarket {
+                    market_id,
+                    up_asset_id,
+                    down_asset_id,
+                    currency: coin_lower.clone(),
+                    interval_kind,
+                    polymarket_url,
+                    event_end_ms: data.event_end_ms.or(Some(window_end_ms)),
+                    gamma_question: data.gamma_question.clone(),
+                };
+                *last_event_end_ms = market.event_end_ms.or(Some(window_end_ms));
 
-async fn redeem_01_tail_market_regime_entry_plan(
-    currency: &str,
-    interval: XFrameIntervalKind,
-    event_end_ms: i64,
-    bankroll: f64,
-    load_missing_inline: bool,
-    account: Option<&SharedAccount>,
-) -> Option<Redeem01TailEntryPlan> {
-    let Some(account) = account else {
-        return None;
-    };
-    let key: Redeem01TailMarketRegimeKey = (currency.to_ascii_lowercase(), interval);
-    {
-        let guard = account.redeem_01_tail_market_regime.read().await;
-        if let Some(regime) = guard.get(&key) {
-            if regime.event_end_ms == event_end_ms {
-                return regime.recommendation.and_then(|recommendation| {
-                    redeem_01_tail_entry_plan_from_recommendation(recommendation, bankroll)
+                // Спим до момента открытия книги и в этот момент ставим лесенку.
+                let sleep_ms = delay_ms.max(0) as u64;
+                let account_for_task = account.clone();
+                let pm_for_task = project_manager.clone();
+                tokio::spawn(async move {
+                    if sleep_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                    }
+                    let phase1 = future_ladder_entries(&FUTURE_LADDER_PHASE1_CENTS);
+                    let phase2 = future_ladder_entries(&FUTURE_LADDER_PHASE2_CENTS);
+                    // Фаза 1 (1..7c), затем фаза 2 (8..9c).
+                    future_open_positions(
+                        &account_for_task,
+                        Some(&pm_for_task),
+                        submit_mode,
+                        &market,
+                        &phase1,
+                    )
+                    .await;
+                    future_open_positions(
+                        &account_for_task,
+                        Some(&pm_for_task),
+                        submit_mode,
+                        &market,
+                        &phase2,
+                    )
+                    .await;
                 });
+                break; // одно окно на период за тик
             }
         }
     }
-
-    {
-        let mut guard = account.redeem_01_tail_market_regime.write().await;
-        if guard
-            .get(&key)
-            .is_some_and(|regime| regime.event_end_ms != event_end_ms)
-        {
-            guard.remove(&key);
-        }
-    }
-
-    if load_missing_inline {
-        if let Err(err) =
-            load_redeem_01_tail_market_regime_key(Redeem01TailMarketRegimeLoadCommand {
-                account: account.clone(),
-                currency: currency.to_ascii_lowercase(),
-                interval,
-                event_end_ms,
-            })
-            .await
-        {
-            crate::tee_eprintln!("[redeem_01_tail] market regime load failed: {err:#}");
-            return None;
-        }
-        let guard = account.redeem_01_tail_market_regime.read().await;
-        return guard.get(&key).and_then(|regime| {
-            (regime.event_end_ms == event_end_ms)
-                .then_some(regime)
-                .and_then(|regime| regime.recommendation)
-                .and_then(|recommendation| {
-                    redeem_01_tail_entry_plan_from_recommendation(recommendation, bankroll)
-                })
-        });
-    }
-
-    let _ = account
-        .redeem_01_tail_market_regime_tx
-        .try_send(Redeem01TailMarketRegimeLoadCommand {
-            account: account.clone(),
-            currency: currency.to_ascii_lowercase(),
-            interval,
-            event_end_ms,
-        });
-    None
-}
-
-fn redeem_01_tail_entry_plan_from_recommendation(
-    recommendation: Redeem01TailEntryRecommendation,
-    bankroll: f64,
-) -> Option<Redeem01TailEntryPlan> {
-    let target_usdc = redeem_01_tail_recommended_usdc(
-        bankroll,
-        recommendation.entry_price,
-        recommendation.reversal_rate,
-    )?;
-    Some(Redeem01TailEntryPlan {
-        entry_price: recommendation.entry_price,
-        target_usdc,
-        min_event_remaining_ms: recommendation.min_event_remaining_ms,
-    })
-}
-
-fn redeem_01_tail_recommended_usdc(
-    bankroll: f64,
-    entry_price: f64,
-    reversal_rate: f64,
-) -> Option<f64> {
-    if !(bankroll > 0.0 && bankroll.is_finite()) {
-        return None;
-    }
-    if !(entry_price > 0.0 && entry_price < 1.0 && entry_price.is_finite()) {
-        return None;
-    }
-    let p_win = reversal_rate.clamp(0.0, 1.0);
-    if p_win <= entry_price {
-        return None;
-    }
-    let gain = (1.0 / entry_price - 1.0).max(1e-9);
-    let kelly_f = p_win - (1.0 - p_win) / gain;
-    let size = (kelly_f * KELLY_MULTIPLIER).min(MAX_BET_FRACTION).max(0.0) * bankroll;
-    let size = size.min(MAX_POSITION_USD).min(BTC_5M_MAX_TARGET_USDC);
-    (size >= MIN_POSITION_USD).then_some(size)
-}
-
-fn cheap_tail_ask_notional(
-    frame: &XFrame<SIZE>,
-    strict_book: Option<&StrictBook>,
-    max_price: f64,
-) -> Option<f64> {
-    let notional: f64 = ask_levels(frame, strict_book)
-        .into_iter()
-        .filter(|level| level.price > 0.0 && level.price <= max_price && level.size > 0.0)
-        .map(|level| level.price * level.size)
-        .sum();
-    (notional > 0.0).then_some(notional)
-}
-
-fn ask_levels(frame: &XFrame<SIZE>, strict_book: Option<&StrictBook>) -> Vec<BookLevel> {
-    if let Some(book) = strict_book {
-        return book.asks.clone();
-    }
-    if let Some(asks) = frame.book_asks.as_ref() {
-        return asks.clone();
-    }
-    [
-        (frame.book_ask_l1_price, frame.book_ask_l1_size),
-        (frame.book_ask_l2_price, frame.book_ask_l2_size),
-        (frame.book_ask_l3_price, frame.book_ask_l3_size),
-    ]
-    .into_iter()
-    .filter_map(|(price, size)| {
-        Some(BookLevel {
-            price: price?,
-            size: size?,
-        })
-    })
-    .collect()
 }

@@ -12,7 +12,7 @@
 //!   [`crate::history_sim::POLYMARKET_CRYPTO_TAKER_FEE_RATE`] с taking-стороны.
 //! * **Maker (`OrderRole::Maker`)** — таска ждёт, пока best ask/bid не достигнет лимитной
 //!   цены `request.price`; при достижении — фикс полного объёма по лимит-цене **без fee**.
-//!   Таймаут — `request.expiration` (если задан). Cancel через
+//!   Таймаут — `request.market_end_unix_ms + ORDER_HTTP_TIMEOUT_SEC` (если задан). Cancel через
 //!   [`crate::account_mock_order::cancel_order_on_clob`] фаирит фейл-репорт.
 
 use crate::account_order::{OrderAmount, OrderRole, PostOrderRequest};
@@ -186,10 +186,7 @@ fn describe_in_hand_book(book: &MockBookSnapshot) -> String {
 }
 
 /// Walk по уровням до набора `target_shares` — возвращает `(vwap, total_usd)` при полном фи.
-fn walk_levels_for_shares_target(
-    levels: &[BookLevel],
-    target_shares: f64,
-) -> Option<(f64, f64)> {
+fn walk_levels_for_shares_target(levels: &[BookLevel], target_shares: f64) -> Option<(f64, f64)> {
     if !target_shares.is_finite() || target_shares <= 0.0 {
         return None;
     }
@@ -292,11 +289,7 @@ fn taker_sell_legs(shares: f64, gross_usd: f64, vwap: f64) -> (OrderAmount, Orde
 }
 
 /// Maker — без fee, ровно `shares × limit_price` USDC. `fee_usd = 0`.
-fn maker_legs_no_fee(
-    side: Side,
-    shares: f64,
-    limit_price: f64,
-) -> (OrderAmount, OrderAmount, f64) {
+fn maker_legs_no_fee(side: Side, shares: f64, limit_price: f64) -> (OrderAmount, OrderAmount, f64) {
     let usd = shares * limit_price;
     let (making, taking) = match side {
         Side::Buy => (OrderAmount::UsdNotional(usd), OrderAmount::Shares(shares)),
@@ -382,7 +375,12 @@ pub(crate) fn spawn_mock_order_processor(
                 fee_paid_usdc,
             ),
             MockFillOutcome::Failed { error_msg } => {
-                fire_mock_failed_report(&slot, Some(order_id.clone()), request.side, Some(error_msg));
+                fire_mock_failed_report(
+                    &slot,
+                    Some(order_id.clone()),
+                    request.side,
+                    Some(error_msg),
+                );
             }
             MockFillOutcome::Canceled => fire_mock_failed_report(
                 &slot,
@@ -457,8 +455,7 @@ async fn run_taker_fill(
             }
         }
         (Side::Buy, OrderAmount::Shares(target_shares)) => {
-            let Some((vwap, _gross_usd)) =
-                walk_levels_for_shares_target(&book.asks, target_shares)
+            let Some((vwap, _gross_usd)) = walk_levels_for_shares_target(&book.asks, target_shares)
             else {
                 return MockFillOutcome::Failed {
                     error_msg: format!(
@@ -481,8 +478,7 @@ async fn run_taker_fill(
             }
         }
         (Side::Sell, OrderAmount::Shares(shares)) => {
-            let Some((vwap, gross_usd)) = walk_levels_for_shares_target(&book.bids, shares)
-            else {
+            let Some((vwap, gross_usd)) = walk_levels_for_shares_target(&book.bids, shares) else {
                 return MockFillOutcome::Failed {
                     error_msg: format!(
                         "mock_taker_sell_no_depth: shares={shares:.4} asset_id={} {book_state} {want}",
@@ -574,8 +570,9 @@ async fn run_maker_wait_for_fill(
             };
         }
     };
-    let maker_deadline = request.expiration.map(|expiration_dt| {
-        let target_ms = expiration_dt.timestamp_millis();
+    let maker_deadline = request.market_end_unix_ms.map(|market_end_ms| {
+        let target_ms = market_end_ms
+            .saturating_add((crate::account_submit::ORDER_HTTP_TIMEOUT_SEC * 1000) as i64);
         let now_ms = crate::util::current_timestamp_ms();
         let remaining_ms = target_ms.saturating_sub(now_ms).max(0) as u64;
         Instant::now() + Duration::from_millis(remaining_ms)
@@ -590,14 +587,14 @@ async fn run_maker_wait_for_fill(
         {
             return MockFillOutcome::Failed {
                 error_msg: format!(
-                    "mock_maker_expired: order_id={order_id} limit_price={limit_price:.6} \
-                     shares={shares:.4}"
+                    "mock_maker_market_end_timeout: order_id={order_id} limit_price={limit_price:.6} \
+                     shares={shares:.4} market_end_unix_ms={:?}",
+                    request.market_end_unix_ms,
                 ),
             };
         }
 
-        let condition_met = match load_mock_book(project_manager, &request.asset_id).await
-        {
+        let condition_met = match load_mock_book(project_manager, &request.asset_id).await {
             Some(book) => match request.side {
                 Side::Buy => book
                     .best_ask_price()

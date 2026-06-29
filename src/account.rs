@@ -1,16 +1,13 @@
 //! Капитал и MtM (`bankroll`, peak, max DD); per-lane позиции и CLOB-клиенты.
 //! Один [`SharedAccount`] на процесс: поля под отдельными `RwLock`, auth в [`ArcSwapAny`] (read-mostly).
 //! CLOB L2 authenticate и heartbeat — [`crate::authenticate`].
-//! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_close_positions` → `closing` → `recently_resolved_markets` → один inner на позицию.
+//! Порядок локов: `bankroll` → `peak_bankroll` → `max_drawdown_pct` → `last_prob` → `positions` → `pending_close_positions` → `future_positions` → `closing` → `recently_resolved_markets` → один inner на позицию.
 
 use crate::account_order_completion::TrackerEntry;
 use crate::account_proxy::PolyProxyEnvGuard;
 use crate::constants::{CurrencyUpDownOutcome, XFrameIntervalKind};
 use crate::history_sim::{CloseReason, INITIAL_BANKROLL, LanePositions, SharedOpenPosition};
 use crate::real_sim::RealSimState;
-use crate::redeem_01_tail::{
-    Redeem01TailMarketRegime, Redeem01TailMarketRegimeLoadCommand,
-};
 use crate::sim_stats::SimStats;
 use alloy::signers::local::PrivateKeySigner;
 use arc_swap::ArcSwapAny;
@@ -21,7 +18,7 @@ use polymarket_client_sdk::data;
 use polymarket_client_sdk::gamma;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 
 /// Production CLOB V2 host (cutover 2026-04-28; см.
 /// [docs.polymarket.com/v2-migration](https://docs.polymarket.com/v2-migration)).
@@ -64,6 +61,14 @@ pub struct Account {
     /// [`crate::account_close_position::close_position_after_submit`] ещё не
     /// финализировал PnL (BUY/maker-TP/taker-FAK invoke'ы в полёте).
     pub pending_close_positions: Arc<RwLock<HashMap<LaneKey, LanePositions>>>,
+    /// Позиции рынков, которые ещё не наступили: создаются
+    /// [`crate::history_sim::future_open_positions`] (BUY-ордер выставляется сразу),
+    /// но до первого WS-снимка их `asset_id` они «припаркованы» здесь и НЕ
+    /// участвуют ни в `tick_once` MtM, ни в гейтах (`MAX_OPEN_POSITIONS` /
+    /// same-asset), ни в [`Self::resolve_pending_market_sync`]. Когда рынок
+    /// стартует по времени (`now >= event_end_ms − interval_ms`) переносятся в
+    /// [`Self::positions`] через [`Self::promote_started_future_positions`].
+    pub future_positions: Arc<RwLock<HashMap<LaneKey, LanePositions>>>,
     /// HTTP с rustls; тот же `Arc`, что у [`ProjectManager::http`](crate::project_manager::ProjectManager::http).
     pub http: Arc<reqwest::Client>,
     /// Общий unauth CLOB SDK-клиент (клоны в PM и др.).
@@ -80,11 +85,6 @@ pub struct Account {
     pub order_invoke_hub: Arc<RwLock<HashMap<String, TrackerEntry>>>,
     /// `currency` → [`RealSimState`]; лок отдельно от цепочки `bankroll → …`.
     pub real_sim_state_by_currency: Arc<RwLock<HashMap<String, Arc<RwLock<RealSimState>>>>>,
-    /// Redeem-01 tail режим рынка по `(coin, period)`; лениво создаётся worker'ом из xframes.
-    pub redeem_01_tail_market_regime:
-        Arc<RwLock<HashMap<Redeem01TailMarketRegimeKey, Redeem01TailMarketRegime>>>,
-    pub(crate) redeem_01_tail_market_regime_tx:
-        mpsc::Sender<Redeem01TailMarketRegimeLoadCommand>,
 }
 
 impl Account {
@@ -110,12 +110,6 @@ impl Account {
         let data = Arc::new(data::Client::default());
         PolyProxyEnvGuard::uninstall_from_env(poly_proxy_env);
 
-        let (redeem_01_tail_market_regime_tx, redeem_01_tail_market_regime_rx) =
-            mpsc::channel(1024);
-        tokio::spawn(crate::redeem_01_tail::run_redeem_01_tail_market_regime_loader(
-            redeem_01_tail_market_regime_rx,
-        ));
-
         Self {
             bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
             peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
@@ -123,6 +117,7 @@ impl Account {
             last_prob: Arc::new(RwLock::new(HashMap::new())),
             positions: Arc::new(RwLock::new(HashMap::new())),
             pending_close_positions: Arc::new(RwLock::new(HashMap::new())),
+            future_positions: Arc::new(RwLock::new(HashMap::new())),
             http,
             clob,
             gamma,
@@ -131,8 +126,6 @@ impl Account {
             clob_signer: ArcSwapAny::new(Arc::new(None)),
             order_invoke_hub: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state_by_currency: Arc::new(RwLock::new(HashMap::new())),
-            redeem_01_tail_market_regime: Arc::new(RwLock::new(HashMap::new())),
-            redeem_01_tail_market_regime_tx,
         }
     }
 
@@ -158,10 +151,68 @@ impl Account {
     ) {
         let mut positions = self.positions.write().await;
         let mut pending = self.pending_close_positions.write().await;
+        let mut future = self.future_positions.write().await;
         for (interval, side) in lanes {
             let key = (currency.to_string(), *interval, *side);
             positions.entry(key.clone()).or_default();
-            pending.entry(key).or_default();
+            pending.entry(key.clone()).or_default();
+            future.entry(key).or_default();
+        }
+    }
+
+    /// Переносит из [`Self::future_positions`] в [`Self::positions`] все позиции,
+    /// чей рынок уже **стартанул** по времени: `now_ms >= market_start`, где
+    /// `market_start = event_end_ms − interval_ms`. Если у позиции нет
+    /// `event_end_ms` (старт неизвестен) — переносим сразу, чтобы она не застряла
+    /// в `future_positions` навсегда. После переноса позиция становится обычной
+    /// (MtM/гейты/резолюция). Вызывается периодически
+    /// ([`crate::project_manager::ProjectManager::update_last_snapshot`]).
+    ///
+    /// Два фазы, чтобы НЕ брать write-лок `positions`, если переносить нечего:
+    /// сначала под локом `future_positions` дренируем стартанувшие позиции в
+    /// локальный буфер; `positions` лочим только если буфер не пуст. Так оба лока
+    /// никогда не держатся одновременно (модульная цепочка `positions → … →
+    /// future_positions` не нарушается). Идемпотентно: нет стартанувших — no-op без
+    /// касания `positions`.
+    pub async fn promote_started_future_positions(&self, now_ms: i64) {
+        let mut started: Vec<(LaneKey, String, SharedOpenPosition)> = Vec::new();
+        {
+            let mut future = self.future_positions.write().await;
+            for (lane_key, lane_positions) in future.iter_mut() {
+                let pos_ids: Vec<String> = lane_positions.keys().cloned().collect();
+                for pos_id in pos_ids {
+                    let is_started = match lane_positions.get(&pos_id) {
+                        Some(pos_arc) => {
+                            let pos = pos_arc.read().await;
+                            match pos.event_end_ms {
+                                Some(end_ms) => {
+                                    let interval_ms = XFrameIntervalKind::from_i32(
+                                        pos.xframe_interval_type_at_open,
+                                    )
+                                    .map(|kind| kind.interval_ms())
+                                    .unwrap_or(0);
+                                    now_ms >= end_ms.saturating_sub(interval_ms)
+                                }
+                                None => true,
+                            }
+                        }
+                        None => false,
+                    };
+                    if is_started && let Some(pos_arc) = lane_positions.shift_remove(&pos_id) {
+                        started.push((lane_key.clone(), pos_id, pos_arc));
+                    }
+                }
+            }
+        }
+        if started.is_empty() {
+            return;
+        }
+        let mut positions = self.positions.write().await;
+        for (lane_key, pos_id, pos_arc) in started {
+            positions
+                .entry(lane_key)
+                .or_default()
+                .insert(pos_id, pos_arc);
         }
     }
 
@@ -257,12 +308,7 @@ impl Account {
             // разворачиваются под коротким локом ВНУТРИ функции — здесь не
             // держим ни pos.read, ни bankroll.write.
             crate::account_close_position::close_position(
-                account,
-                &pos_arc,
-                side_stats,
-                &reason,
-                None,
-                0,
+                account, &pos_arc, side_stats, &reason, None, 0,
             )
             .await;
         }
@@ -278,7 +324,6 @@ impl Account {
             .await;
         }
     }
-
 
     /// `Arc::new(Account::new())` для `main` и PM.
     pub fn new_shared() -> SharedAccount {
@@ -308,7 +353,7 @@ impl Default for Account {
 }
 
 pub use crate::authenticate::{
-    spawn_heartbeat, try_authenticate_clob_for_heartbeats, POLY_PRIVATE_KEY_ENV,
+    POLY_PRIVATE_KEY_ENV, spawn_heartbeat, try_authenticate_clob_for_heartbeats,
 };
 
 // Ордерный API — [`crate::account_order`] (здесь только `clob_authed` / `clob_signer`).
