@@ -14,6 +14,11 @@ use tokio::io::AsyncWriteExt as _;
 
 /// Писать сжатый WS-стрим в `streams/...` после дампа xframes ([`dump_market_ws_stream_bin`]).
 const DUMP_MARKET_WS_STREAM_BIN: bool = true;
+/// Писать HTML-граф по рынку после дампа xframes.
+const DUMP_MARKET_GRAPH_HTML: bool = false;
+/// Глобальный флаг дампов завершённого рынка (xframes + graph + stream).
+/// По умолчанию выключен.
+const ENABLE_MARKET_DUMPS: bool = true;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MarketXFramesDump {
@@ -85,53 +90,57 @@ pub fn spawn_dump_market_xframes_binary(
             "xframe_dump: market_id={market_id} polymarket={polymarket_event_url} price_to_beat={price_to_beat} final_price={final_price} up_won={up_won}"
         );
 
-        for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
-            if let Err(err) = dump_market_xframes_binary_lane(
-                project_manager.clone(),
-                market_id.clone(),
-                gamma_question.clone(),
-                interval_kind,
-                lane,
-                price_to_beat,
-                final_price,
-                event_end_ms,
-            )
-            .await
-            {
-                eprintln!("xframe_dump lane={lane}: {err:#}");
+        if ENABLE_MARKET_DUMPS {
+            for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
+                if let Err(err) = dump_market_xframes_binary_lane(
+                    project_manager.clone(),
+                    market_id.clone(),
+                    gamma_question.clone(),
+                    interval_kind,
+                    lane,
+                    price_to_beat,
+                    final_price,
+                    event_end_ms,
+                )
+                .await
+                {
+                    eprintln!("xframe_dump lane={lane}: {err:#}");
+                }
+                if DUMP_MARKET_GRAPH_HTML {
+                    if let Err(err) = crate::xframe_graph_dump::dump_market_graph_html_lane(
+                        project_manager.clone(),
+                        market_id.clone(),
+                        gamma_question.clone(),
+                        interval_kind,
+                        lane,
+                        price_to_beat,
+                        final_price,
+                        event_end_ms,
+                    )
+                    .await
+                    {
+                        eprintln!("graph_dump lane={lane}: {err:#}");
+                    }
+                }
             }
-            if let Err(err) = crate::xframe_graph_dump::dump_market_graph_html_lane(
-                project_manager.clone(),
-                market_id.clone(),
-                gamma_question.clone(),
-                interval_kind,
-                lane,
-                price_to_beat,
-                final_price,
-                event_end_ms,
-            )
-            .await
-            {
-                eprintln!("graph_dump lane={lane}: {err:#}");
-            }
-        }
-        if DUMP_MARKET_WS_STREAM_BIN {
-            let winner = if final_price >= price_to_beat {
-                CurrencyUpDownOutcome::Up
-            } else {
-                CurrencyUpDownOutcome::Down
-            };
-            if let Err(err) = dump_market_ws_stream_bin(
-                project_manager.clone(),
-                market_id.clone(),
-                gamma_question.clone(),
-                interval_kind,
-                event_end_ms,
-                winner,
-            )
-            .await
-            {
-                eprintln!("stream_dump: {err:#}");
+            if DUMP_MARKET_WS_STREAM_BIN {
+                let winner = if final_price >= price_to_beat {
+                    CurrencyUpDownOutcome::Up
+                } else {
+                    CurrencyUpDownOutcome::Down
+                };
+                if let Err(err) = dump_market_ws_stream_bin(
+                    project_manager.clone(),
+                    market_id.clone(),
+                    gamma_question.clone(),
+                    interval_kind,
+                    event_end_ms,
+                    winner,
+                )
+                .await
+                {
+                    eprintln!("stream_dump: {err:#}");
+                }
             }
         }
         project_manager.cleanup_stale_market_data(&market_id).await;

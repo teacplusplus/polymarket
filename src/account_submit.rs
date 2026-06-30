@@ -137,6 +137,9 @@ pub(crate) struct OpenBuyRequest {
     pub(crate) position: SharedOpenPosition,
     pub(crate) price: Option<f64>,
     pub(crate) delta_price: Option<f64>,
+    /// Для maker: если `Some`, лимитный ордер истекает в этот unix ms вместо конца
+    /// рынка (см. [`crate::account_order::PostOrderRequest::expiration`]).
+    pub(crate) expiration: Option<i64>,
 }
 
 struct PreparedOpenBuy {
@@ -493,6 +496,7 @@ pub(crate) fn spawn_sell_taker(
                 max_slippage_pp: Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
                 market_start_unix_ms: None,
                 market_end_unix_ms: event_end_unix_ms,
+                expiration: None,
                 timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                 strict_book: strict_book.clone(),
             };
@@ -657,6 +661,7 @@ pub(crate) fn spawn_open_buy(
             position,
             price,
             delta_price,
+            expiration,
         } in open_buys
         {
             let buy_role_label = if delta_price.is_some() {
@@ -716,6 +721,7 @@ pub(crate) fn spawn_open_buy(
                         max_slippage_pp: None,
                         market_start_unix_ms: event_start_ms,
                         market_end_unix_ms: event_end_ms,
+                        expiration: None,
                         timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                         strict_book: strict_book.clone(),
                     },
@@ -760,10 +766,12 @@ pub(crate) fn spawn_open_buy(
                             max_slippage_pp: None,
                             market_start_unix_ms: event_start_ms,
                             market_end_unix_ms: event_end_ms,
+                            expiration,
                             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                             strict_book: None,
                         },
-                        invoke_wait_until_market_end_plus(event_end_ms),
+                        // Явный expiration переопределяет дедлайн ожидания invoke.
+                        invoke_wait_until_market_end_plus(expiration.or(event_end_ms)),
                     )
                 }
             };
@@ -1315,6 +1323,7 @@ pub(crate) fn spawn_open_buy(
                     max_slippage_pp: None,
                     market_start_unix_ms: event_start_ms,
                     market_end_unix_ms: event_end_ms,
+                    expiration: None,
                     timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                     strict_book: None,
                 };

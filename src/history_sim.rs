@@ -86,12 +86,12 @@ pub const ENABLE_PNL: bool = false;
 
 /// Глобальный тумблер redeem-01: позиция с [`OpenPosition::redeem_01`] доживает до
 /// резолюции рынка без TP/SL/Timeout; maker TP в [`crate::account_submit::spawn_open_buy`] не выставляется.
-pub const REDEEM_01: bool = true;
+pub const REDEEM_01: bool = false;
 
 /// Глобальный тумблер redeem-x: реконструированный buy+redeem режим по публичному
 /// профилю бота. Позиция с [`OpenPosition::redeem_x`] доживает до резолюции без
 /// TP/SL/Timeout; вход выбирает [`crate::redeem_x::redeem_x_entry_size`].
-pub const REDEEM_X: bool = false;
+pub const REDEEM_X: bool = true;
 
 /// Кадров без TP/SL → Timeout (как горизонт в xframe train).
 pub const POSITION_TIMEOUT_FRAMES: usize = 30;
@@ -1162,12 +1162,12 @@ pub(crate) async fn buy_gate(
     bankroll: f64,
     strict_book: Option<&StrictBook>,
     is_kelly: bool,
-    _currency: &str,
+    currency: &str,
     event_end_ms: Option<i64>,
     positions_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
     pending_close_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
-    _submit_mode: crate::account_submit::SubmitMode,
-    _account: Option<&SharedAccount>,
+    submit_mode: crate::account_submit::SubmitMode,
+    account: Option<&SharedAccount>,
 ) -> BuyGate {
     if frame.event_remaining_ms < MIN_ENTRY_REMAINING_MS {
         return BuyGate::LateEntry;
@@ -1209,14 +1209,16 @@ pub(crate) async fn buy_gate(
         }
     }
 
-    if REDEEM_X {
+    if REDEEM_X && submit_mode != crate::account_submit::SubmitMode::None {
         let Some(size) = redeem_x_entry_size(
             frame,
             strict_book,
             bankroll,
+            currency,
             event_end_ms,
             positions_by_lane,
             pending_close_by_lane,
+            account,
         )
         .await
         else {
@@ -1528,10 +1530,23 @@ pub(crate) async fn try_open_position(
                     stats.histogram_entry_prob[bucket_entry] += 1;
                     stats.histogram_cal_pred[bucket_pred] += 1;
 
-                    // Submit: optimistic fill + spawn BUY taker; правки по WS ([`crate::account_ws`]).
-                    let decision_price = strict_book
-                        .and_then(crate::account_order::best_ask_strict)
-                        .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
+                    // Submit: optimistic fill + spawn BUY. REDEEM_X входит ПАССИВНЫМ
+                    // maker'ом — лимитный bid в очередь L1 (`delta_price=Some` → maker
+                    // GTC в [`crate::account_submit::spawn_open_buy`], размер в shares
+                    // = planned_entry_cost / maker_price). Остальные каналы — taker FAK
+                    // по best_ask + slippage. Правки по WS ([`crate::account_ws`]).
+                    let (decision_price, decision_delta_price, entry_expiration) = if redeem_x {
+                        let maker_bid = strict_book
+                            .and_then(crate::account_order::best_bid_strict)
+                            .or(frame.book_bid_l1_price)
+                            .map(|bid| bid.clamp(0.001, 0.999));
+                        (maker_bid, Some(0.0), Some(crate::util::current_timestamp_ms().saturating_add(1_000)))
+                    } else {
+                        let taker_price = strict_book
+                            .and_then(crate::account_order::best_ask_strict)
+                            .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
+                        (taker_price, None, None)
+                    };
                     let min_order_size_shares = strict_book
                         .and_then(|book| book.min_order_size)
                         .filter(|min| min.is_finite() && *min > 0.0);
@@ -1549,7 +1564,8 @@ pub(crate) async fn try_open_position(
                         vec![crate::account_submit::OpenBuyRequest {
                             position: pos_arc,
                             price: decision_price,
-                            delta_price: None,
+                            delta_price: decision_delta_price,
+                            expiration: entry_expiration,
                         }],
                         decision_book,
                         min_order_size_shares,

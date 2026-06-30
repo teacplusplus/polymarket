@@ -65,6 +65,10 @@ pub struct PostOrderRequest {
     /// Для maker: если `Some`, CLOB-ордер будет GTD с expiration в этот unix ms; если `None` — GTC.
     /// Вызывающий также ждёт invoke до этого времени + запас.
     pub market_end_unix_ms: Option<i64>,
+    /// Для maker: если `Some`, переопределяет момент истечения GTD-ордера — ордер
+    /// живёт до этого unix ms вместо [`Self::market_end_unix_ms`] (конца рынка).
+    /// На taker и на settlement-семантику не влияет.
+    pub expiration: Option<i64>,
     /// Таймаут HTTP только на `POST /order`.
     pub timeout: Duration,
     /// При slip-cap без `price`: L1 без лишнего GET /book.
@@ -580,7 +584,9 @@ async fn build_maker_signable(
     let price_dec = f64_to_decimal(price, "maker price (tick-normalized)")?;
     let size_dec = f64_to_decimal(shares, "maker shares")?;
 
-    let order_type = if req.market_end_unix_ms.is_some() {
+    // Истечение maker-ордера: явный `expiration` переопределяет конец рынка.
+    let maker_expiry_ms = req.expiration.or(req.market_end_unix_ms);
+    let order_type = if maker_expiry_ms.is_some() {
         OrderType::GTD
     } else {
         OrderType::GTC
@@ -595,12 +601,12 @@ async fn build_maker_signable(
         .order_type(order_type)
         .post_only(true);
 
-    if let Some(market_end_ms) = req.market_end_unix_ms {
+    if let Some(expiry_ms) = maker_expiry_ms {
         let expiration =
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(market_end_ms).ok_or_else(
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(expiry_ms).ok_or_else(
                 || {
                     anyhow!(
-                        "post_order_on_clob: market_end_unix_ms={market_end_ms} не конвертируется в DateTime<Utc>"
+                        "post_order_on_clob: expiration={expiry_ms} не конвертируется в DateTime<Utc>"
                     )
                 },
             )?;
@@ -988,6 +994,7 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
             max_slippage_pp: None,
             market_start_unix_ms: None,
             market_end_unix_ms: None,
+            expiration: None,
             timeout: Duration::from_secs(EXIT_HTTP_TIMEOUT_SEC),
             strict_book: None,
         };

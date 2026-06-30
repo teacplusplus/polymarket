@@ -16,9 +16,10 @@ use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::data;
 use polymarket_client_sdk::gamma;
+use crate::redeem_x::{RedeemXMarketRegime, RedeemXMarketRegimeLoadCommand};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 
 /// Production CLOB V2 host (cutover 2026-04-28; см.
 /// [docs.polymarket.com/v2-migration](https://docs.polymarket.com/v2-migration)).
@@ -38,6 +39,9 @@ pub type LaneKey = (String, XFrameIntervalKind, CurrencyUpDownOutcome);
 
 /// Ключ redeem-01 tail режима: `(coin, period)`.
 pub type Redeem01TailMarketRegimeKey = (String, XFrameIntervalKind);
+
+/// Ключ redeem-x режима (устойчивость momentum-maker'а): `(coin, period)`.
+pub type RedeemXMarketRegimeKey = (String, XFrameIntervalKind);
 
 /// Счёт процесса: cash, MtM, позиции, CLOB. См. модульный комментарий про порядок локов и один inner на позицию.
 #[derive(Debug)]
@@ -85,6 +89,12 @@ pub struct Account {
     pub order_invoke_hub: Arc<RwLock<HashMap<String, TrackerEntry>>>,
     /// `currency` → [`RealSimState`]; лок отдельно от цепочки `bankroll → …`.
     pub real_sim_state_by_currency: Arc<RwLock<HashMap<String, Arc<RwLock<RealSimState>>>>>,
+    /// Кэш исторического режима redeem-x по `(coin, period)`: сохраняется ли
+    /// преимущество momentum-maker'а за последний час ([`crate::redeem_x`]).
+    pub redeem_x_market_regime:
+        Arc<RwLock<HashMap<RedeemXMarketRegimeKey, RedeemXMarketRegime>>>,
+    /// Канал ленивой фоновой загрузки redeem-x режима ([`crate::redeem_x::run_redeem_x_market_regime_loader`]).
+    pub(crate) redeem_x_market_regime_tx: mpsc::Sender<RedeemXMarketRegimeLoadCommand>,
 }
 
 impl Account {
@@ -110,6 +120,11 @@ impl Account {
         let data = Arc::new(data::Client::default());
         PolyProxyEnvGuard::uninstall_from_env(poly_proxy_env);
 
+        let (redeem_x_market_regime_tx, redeem_x_market_regime_rx) = mpsc::channel(1024);
+        tokio::spawn(crate::redeem_x::run_redeem_x_market_regime_loader(
+            redeem_x_market_regime_rx,
+        ));
+
         Self {
             bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
             peak_bankroll: Arc::new(RwLock::new(INITIAL_BANKROLL)),
@@ -126,6 +141,8 @@ impl Account {
             clob_signer: ArcSwapAny::new(Arc::new(None)),
             order_invoke_hub: Arc::new(RwLock::new(HashMap::new())),
             real_sim_state_by_currency: Arc::new(RwLock::new(HashMap::new())),
+            redeem_x_market_regime: Arc::new(RwLock::new(HashMap::new())),
+            redeem_x_market_regime_tx,
         }
     }
 

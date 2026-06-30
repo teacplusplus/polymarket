@@ -570,9 +570,9 @@ async fn run_maker_wait_for_fill(
             };
         }
     };
-    let maker_deadline = request.market_end_unix_ms.map(|market_end_ms| {
-        let target_ms = market_end_ms
-            .saturating_add((crate::account_submit::ORDER_HTTP_TIMEOUT_SEC * 1000) as i64);
+    let maker_deadline = request.expiration.or(request.market_end_unix_ms).map(|end_ms| {
+        let target_ms =
+            end_ms.saturating_add((crate::account_submit::ORDER_HTTP_TIMEOUT_SEC * 1000) as i64);
         let now_ms = crate::util::current_timestamp_ms();
         let remaining_ms = target_ms.saturating_sub(now_ms).max(0) as u64;
         Instant::now() + Duration::from_millis(remaining_ms)
