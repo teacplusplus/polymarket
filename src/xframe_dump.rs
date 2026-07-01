@@ -13,12 +13,12 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 
 /// Писать сжатый WS-стрим в `streams/...` после дампа xframes ([`dump_market_ws_stream_bin`]).
-const DUMP_MARKET_WS_STREAM_BIN: bool = true;
+const DUMP_MARKET_WS_STREAM_BIN: bool = false;
 /// Писать HTML-граф по рынку после дампа xframes.
 const DUMP_MARKET_GRAPH_HTML: bool = false;
 /// Глобальный флаг дампов завершённого рынка (xframes + graph + stream).
 /// По умолчанию выключен.
-const ENABLE_MARKET_DUMPS: bool = true;
+const ENABLE_MARKET_DUMPS: bool = false;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MarketXFramesDump {

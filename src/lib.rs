@@ -37,5 +37,5 @@ pub mod xframe_dump;
 pub mod xframe_graph_dump;
 
 /// Валюты процесса: по одному [`project_manager::ProjectManager`] на элемент (Default/RealSim/миграции).
-pub const CURRENCIES: &[&str] = &["bnb", "btc", "doge", "eth", "sol", "xrp"];
-// pub const CURRENCIES: &[&str] = &["btc"];
+// pub const CURRENCIES: &[&str] = &["bnb", "btc", "doge", "eth", "sol", "xrp"];
+pub const CURRENCIES: &[&str] = &["btc"];
