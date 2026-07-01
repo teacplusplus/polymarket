@@ -62,13 +62,10 @@ pub struct PostOrderRequest {
     pub max_slippage_pp: Option<f64>,
     /// Если `Some`, invoke fallback poll не шлёт `GET /order` до старта рынка.
     pub market_start_unix_ms: Option<i64>,
-    /// Для maker: если `Some`, CLOB-ордер будет GTD с expiration в этот unix ms; если `None` — GTC.
-    /// Вызывающий также ждёт invoke до этого времени + запас.
+    /// Дедлайн ожидания invoke (не тип ордера): вызывающий ждёт invoke до этого unix ms
+    /// + запас. maker всегда GTC (см. [`build_maker_signable`]); истечение мейкера теперь
+    /// делается явным cancel'ом, а не GTD-`expiration`.
     pub market_end_unix_ms: Option<i64>,
-    /// Для maker: если `Some`, переопределяет момент истечения GTD-ордера — ордер
-    /// живёт до этого unix ms вместо [`Self::market_end_unix_ms`] (конца рынка).
-    /// На taker и на settlement-семантику не влияет.
-    pub expiration: Option<i64>,
     /// Таймаут HTTP только на `POST /order`.
     pub timeout: Duration,
     /// При slip-cap без `price`: L1 без лишнего GET /book.
@@ -569,7 +566,8 @@ fn normalize_probability_price_to_cent_tick(price: f64, ctx: &str) -> Result<f64
     Ok(rounded.clamp(0.001, 0.999))
 }
 
-/// `limit_order` post_only: GTC без `market_end_unix_ms`, GTD с expiration=`market_end_unix_ms`.
+/// `limit_order` post_only, всегда GTC: ордер живёт в книге до fill'а или явного cancel'а
+/// (истечение мейкера делается отменой, не GTD — у Polymarket GTD имеет 60с security-порог).
 async fn build_maker_signable(
     client: &clob::Client<Authenticated<Normal>>,
     token_id: U256,
@@ -584,36 +582,16 @@ async fn build_maker_signable(
     let price_dec = f64_to_decimal(price, "maker price (tick-normalized)")?;
     let size_dec = f64_to_decimal(shares, "maker shares")?;
 
-    // Истечение maker-ордера: явный `expiration` переопределяет конец рынка.
-    let maker_expiry_ms = req.expiration.or(req.market_end_unix_ms);
-    let order_type = if maker_expiry_ms.is_some() {
-        OrderType::GTD
-    } else {
-        OrderType::GTC
-    };
-
-    let mut builder = client
+    // Всегда GTC post_only: ордер живёт до fill'а или явного cancel'а. GTD не используем —
+    // у Polymarket GTD-`expiration` имеет 60с security-порог, несовместимый с коротким TTL.
+    client
         .limit_order()
         .token_id(token_id)
         .side(req.side)
         .price(price_dec)
         .size(size_dec)
-        .order_type(order_type)
-        .post_only(true);
-
-    if let Some(expiry_ms) = maker_expiry_ms {
-        let expiration =
-            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(expiry_ms).ok_or_else(
-                || {
-                    anyhow!(
-                        "post_order_on_clob: expiration={expiry_ms} не конвертируется в DateTime<Utc>"
-                    )
-                },
-            )?;
-        builder = builder.expiration(expiration);
-    }
-
-    builder
+        .order_type(OrderType::GTC)
+        .post_only(true)
         .build()
         .await
         .map_err(|err| anyhow!("post_order_on_clob: limit_order().build() упал: {err:#}"))
@@ -766,6 +744,15 @@ pub(crate) fn best_bid_strict(book: &StrictBook) -> Option<f64> {
         .iter()
         .find(|l| l.price > 0.0 && l.size > 0.0)
         .map(|l| l.price)
+}
+
+/// Размер (shares) на лучшем bid из локального книжного снимка (та же строка, что и
+/// [`best_bid_strict`]).
+pub(crate) fn best_bid_size_strict(book: &StrictBook) -> Option<f64> {
+    book.bids
+        .iter()
+        .find(|l| l.price > 0.0 && l.size > 0.0)
+        .map(|l| l.size)
 }
 
 pub fn best_ask_sdk(
@@ -994,7 +981,6 @@ pub(crate) async fn sell_all_positions_on_clob(account: &SharedAccount) {
             max_slippage_pp: None,
             market_start_unix_ms: None,
             market_end_unix_ms: None,
-            expiration: None,
             timeout: Duration::from_secs(EXIT_HTTP_TIMEOUT_SEC),
             strict_book: None,
         };

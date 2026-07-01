@@ -1533,19 +1533,20 @@ pub(crate) async fn try_open_position(
                     // Submit: optimistic fill + spawn BUY. REDEEM_X входит ПАССИВНЫМ
                     // maker'ом — лимитный bid в очередь L1 (`delta_price=Some` → maker
                     // GTC в [`crate::account_submit::spawn_open_buy`], размер в shares
-                    // = planned_entry_cost / maker_price). Остальные каналы — taker FAK
-                    // по best_ask + slippage. Правки по WS ([`crate::account_ws`]).
-                    let (decision_price, decision_delta_price, entry_expiration) = if redeem_x {
+                    // = planned_entry_cost / maker_price). Ордер живёт до fill'а или явного
+                    // cancel'а (GTD с коротким TTL несовместим с 60с security-порогом
+                    // Polymarket). Остальные каналы — taker FAK по best_ask + slippage.
+                    let (decision_price, decision_delta_price) = if redeem_x {
                         let maker_bid = strict_book
                             .and_then(crate::account_order::best_bid_strict)
                             .or(frame.book_bid_l1_price)
                             .map(|bid| bid.clamp(0.001, 0.999));
-                        (maker_bid, Some(0.0), Some(crate::util::current_timestamp_ms().saturating_add(1_000)))
+                        (maker_bid, Some(0.0))
                     } else {
                         let taker_price = strict_book
                             .and_then(crate::account_order::best_ask_strict)
                             .map(|ask| (ask + SIM_MAX_SLIPPAGE_FROM_L1_PCT).clamp(0.001, 0.999));
-                        (taker_price, None, None)
+                        (taker_price, None)
                     };
                     let min_order_size_shares = strict_book
                         .and_then(|book| book.min_order_size)
@@ -1565,7 +1566,6 @@ pub(crate) async fn try_open_position(
                             position: pos_arc,
                             price: decision_price,
                             delta_price: decision_delta_price,
-                            expiration: entry_expiration,
                         }],
                         decision_book,
                         min_order_size_shares,

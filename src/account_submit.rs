@@ -137,9 +137,6 @@ pub(crate) struct OpenBuyRequest {
     pub(crate) position: SharedOpenPosition,
     pub(crate) price: Option<f64>,
     pub(crate) delta_price: Option<f64>,
-    /// Для maker: если `Some`, лимитный ордер истекает в этот unix ms вместо конца
-    /// рынка (см. [`crate::account_order::PostOrderRequest::expiration`]).
-    pub(crate) expiration: Option<i64>,
 }
 
 struct PreparedOpenBuy {
@@ -496,7 +493,6 @@ pub(crate) fn spawn_sell_taker(
                 max_slippage_pp: Some(SIM_MAX_SLIPPAGE_FROM_L1_PCT),
                 market_start_unix_ms: None,
                 market_end_unix_ms: event_end_unix_ms,
-                expiration: None,
                 timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                 strict_book: strict_book.clone(),
             };
@@ -661,7 +657,6 @@ pub(crate) fn spawn_open_buy(
             position,
             price,
             delta_price,
-            expiration,
         } in open_buys
         {
             let buy_role_label = if delta_price.is_some() {
@@ -721,7 +716,6 @@ pub(crate) fn spawn_open_buy(
                         max_slippage_pp: None,
                         market_start_unix_ms: event_start_ms,
                         market_end_unix_ms: event_end_ms,
-                        expiration: None,
                         timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                         strict_book: strict_book.clone(),
                     },
@@ -766,12 +760,10 @@ pub(crate) fn spawn_open_buy(
                             max_slippage_pp: None,
                             market_start_unix_ms: event_start_ms,
                             market_end_unix_ms: event_end_ms,
-                            expiration,
                             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                             strict_book: None,
                         },
-                        // Явный expiration переопределяет дедлайн ожидания invoke.
-                        invoke_wait_until_market_end_plus(expiration.or(event_end_ms)),
+                        invoke_wait_until_market_end_plus(event_end_ms),
                     )
                 }
             };
@@ -916,6 +908,50 @@ pub(crate) fn spawn_open_buy(
                         return;
                     }
                 };
+
+                
+
+                // REDEEM_X: открывающий maker — GTC, поэтому истечение делаем сами. Через
+                // `REDEEM_X_MAKER_1_EXPIRATION_MS` отменяем открывающий ордер отдельным
+                // спавном, чтобы он не висел в книге дольше нужного; частичные fill'ы,
+                // случившиеся до отмены, settl'ятся штатно (invoke ниже увидит терминал).
+                if redeem_x
+                    && let Some(open_order_id) = http_order_id.clone()
+                {
+                    let cancel_account = account.clone();
+                    let cancel_project_manager = project_manager.clone();
+                    let cancel_pos_id = pos_id.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(
+                            crate::redeem_x::REDEEM_X_MAKER_1_EXPIRATION_MS.max(0) as u64,
+                        ))
+                        .await;
+                        let cancel_request = CancelOrderRequest {
+                            order_id: open_order_id.clone(),
+                            timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
+                        };
+                        match cancel_order_on_clob(
+                            &cancel_account,
+                            cancel_project_manager.as_ref(),
+                            submit_mode,
+                            cancel_request,
+                        )
+                        .await
+                        {
+                            Ok(cancel_result) => crate::tee_println!(
+                                "[submit/{submit_mode:?}] redeem_x open cancel pos_id={cancel_pos_id} \
+                                 order_id={} canceled={} err={:?}",
+                                cancel_result.order_id,
+                                cancel_result.canceled,
+                                cancel_result.error_msg,
+                            ),
+                            Err(err) => crate::tee_eprintln!(
+                                "[submit/{submit_mode:?}] redeem_x open cancel pos_id={cancel_pos_id} \
+                                 order_id={open_order_id}: cancel_order_on_clob err={err:#}",
+                            ),
+                        }
+                    });
+                }
 
                 let buy_rep = match wait_invoke_settlement(&mut invoke_rx, invoke_wait).await {
                     Some(rep) => rep,
@@ -1323,7 +1359,6 @@ pub(crate) fn spawn_open_buy(
                     max_slippage_pp: None,
                     market_start_unix_ms: event_start_ms,
                     market_end_unix_ms: event_end_ms,
-                    expiration: None,
                     timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),
                     strict_book: None,
                 };

@@ -12,7 +12,8 @@
 //!   [`crate::history_sim::POLYMARKET_CRYPTO_TAKER_FEE_RATE`] с taking-стороны.
 //! * **Maker (`OrderRole::Maker`)** — таска ждёт, пока best ask/bid не достигнет лимитной
 //!   цены `request.price`; при достижении — фикс полного объёма по лимит-цене **без fee**.
-//!   Таймаут — `request.market_end_unix_ms + ORDER_HTTP_TIMEOUT_SEC` (если задан). Cancel через
+//!   Maker всегда GTC (истечение — явным cancel'ом, не GTD): в mock TTL нет, ждём филл до
+//!   `request.market_end_unix_ms + ORDER_HTTP_TIMEOUT_SEC`. Cancel через
 //!   [`crate::account_mock_order::cancel_order_on_clob`] фаирит фейл-репорт.
 
 use crate::account_order::{OrderAmount, OrderRole, PostOrderRequest};
@@ -570,7 +571,10 @@ async fn run_maker_wait_for_fill(
             };
         }
     };
-    let maker_deadline = request.expiration.or(request.market_end_unix_ms).map(|end_ms| {
+    // Maker всегда GTC: живёт до fill'а/cancel'а. В mock нет собственного TTL — ждём филл
+    // до конца рынка + HTTP-grace (там же мы дожидаемся позднего филла/репорта). Досрочная
+    // отмена приходит через cancel-registry (`cancel_rx`).
+    let maker_deadline = request.market_end_unix_ms.map(|end_ms| {
         let target_ms =
             end_ms.saturating_add((crate::account_submit::ORDER_HTTP_TIMEOUT_SEC * 1000) as i64);
         let now_ms = crate::util::current_timestamp_ms();

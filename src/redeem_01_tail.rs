@@ -213,7 +213,6 @@ pub(crate) async fn future_open_positions(
             // maker limit ровно по `price` (delta = 0): spawn_open_buy → OrderRole::Maker,
             // size в shares = position_size / price = level_shares.
             delta_price: Some(0.0),
-            expiration: None,
         });
     }
 
