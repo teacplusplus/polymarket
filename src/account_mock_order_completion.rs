@@ -10,8 +10,9 @@
 //!   Условие срабатывания: всё или ничего в пределах cap-цены (`request.price`) или
 //!   `max_slippage_pp` от L1. Применяется «крипто»-fee
 //!   [`crate::history_sim::POLYMARKET_CRYPTO_TAKER_FEE_RATE`] с taking-стороны.
-//! * **Maker (`OrderRole::Maker`)** — таска ждёт, пока best ask/bid не достигнет лимитной
-//!   цены `request.price`; при достижении — фикс полного объёма по лимит-цене **без fee**.
+//! * **Maker (`OrderRole::Maker`)** — таска ждёт, пока рынок держит цену на нашем уровне
+//!   (BUY: `best_bid ≥ limit`; SELL: `best_ask ≤ limit`) или пока лимит не станет marketable;
+//!   при выполнении — фикс полного объёма по лимит-цене **без fee**.
 //!   Maker всегда GTC (истечение — явным cancel'ом, не GTD): в mock TTL нет, ждём филл до
 //!   `request.market_end_unix_ms + ORDER_HTTP_TIMEOUT_SEC`. Cancel через
 //!   [`crate::account_mock_order::cancel_order_on_clob`] фаирит фейл-репорт.
@@ -600,12 +601,34 @@ async fn run_maker_wait_for_fill(
 
         let condition_met = match load_mock_book(project_manager, &request.asset_id).await {
             Some(book) => match request.side {
-                Side::Buy => book
-                    .best_ask_price()
-                    .is_some_and(|best_ask| best_ask <= limit_price + PRICE_COMPARE_EPS),
-                Side::Sell => book
-                    .best_bid_price()
-                    .is_some_and(|best_bid| best_bid + PRICE_COMPARE_EPS >= limit_price),
+                // Пассивный maker BUY стоит на `limit_price` (= best_bid на постановке).
+                // Он исполняется окружающим встречным потоком, пока рынок держит бид на
+                // нашем уровне или выше (`best_bid ≥ limit`), либо сразу если стал marketable
+                // (`best_ask ≤ limit`). Прежнее одиночное условие `best_ask ≤ limit` давало
+                // инверсию: заявка филлилась только когда цена ПАДАЛА к нашему биду, т.е.
+                // систематически набиралась проигрывающая нога, а растущая (выигрышная) —
+                // никогда. Теперь лидер (бид держится/растёт) исполняется, а отстающая нога
+                // (бид уходит ниже лимита) чаще промахивается — как у реального бота.
+                Side::Buy => {
+                    let best_bid_ok = book
+                        .best_bid_price()
+                        .is_some_and(|best_bid| best_bid + PRICE_COMPARE_EPS >= limit_price);
+                    let marketable = book
+                        .best_ask_price()
+                        .is_some_and(|best_ask| best_ask <= limit_price + PRICE_COMPARE_EPS);
+                    best_bid_ok || marketable
+                }
+                // Симметрично для maker SELL, стоящего на best_ask: рынок аскает на нашем
+                // уровне или ниже (`best_ask ≤ limit`), либо сразу marketable (`best_bid ≥ limit`).
+                Side::Sell => {
+                    let best_ask_ok = book
+                        .best_ask_price()
+                        .is_some_and(|best_ask| best_ask <= limit_price + PRICE_COMPARE_EPS);
+                    let marketable = book
+                        .best_bid_price()
+                        .is_some_and(|best_bid| best_bid + PRICE_COMPARE_EPS >= limit_price);
+                    best_ask_ok || marketable
+                }
                 _ => false,
             },
             None => false,

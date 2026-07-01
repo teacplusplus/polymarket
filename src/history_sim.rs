@@ -112,7 +112,12 @@ pub const MIN_ORDER_SIZE_BUY_HEADROOM_PCT: f64 = 0.05;
 pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
 
 /// Стоп новых входов при DD ≥ pct (`real_sim` только).
-pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
+///
+/// Отключено (`None`) для реконструкции бот-профиля REDEEM_X: стратегия
+/// held-to-resolution держит обе ноги до резолюции, поэтому внутриокновый MtM
+/// drawdown (проигрывающая нога → 0) заведомо большой и ложно срабатывает на
+/// малом банке. У самого бота такого предохранителя нет.
+pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = None;
 
 pub use crate::xframe::StrictBook;
 
@@ -2030,12 +2035,21 @@ fn open_position(
     }
     let buy_price = buy_price.clamp(0.001, 0.999);
 
-    let fee_usdc =
-        nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price);
-    let fee_shares = fee_usdc / buy_price;
+    // REDEEM_X — пассивный maker без комиссии: fee = 0 уже при создании. Плановую
+    // taker-fee НЕ начисляем в `stats.fees_paid`, иначе на массово отменяемых
+    // (неисполнившихся) maker-ордерах копятся «фантомные» fees, которых по факту нет
+    // (реальный maker-fill даёт fee = 0). Для не-redeem_x (taker) плановую fee считаем.
+    let fee_usdc = if redeem_x {
+        0.0
+    } else {
+        nominal_shares * POLYMARKET_CRYPTO_TAKER_FEE_RATE * buy_price * (1.0 - buy_price)
+    };
+    let fee_shares = if buy_price > 0.0 { fee_usdc / buy_price } else { 0.0 };
     let shares_held = nominal_shares - fee_shares;
 
-    stats.fees_paid += fee_usdc;
+    if fee_usdc != 0.0 {
+        stats.fees_paid += fee_usdc;
+    }
 
     let entry_prob = effective_implied_prob(frame, strict_book).unwrap_or(buy_price);
 

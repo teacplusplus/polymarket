@@ -389,7 +389,9 @@ pub(crate) async fn close_position_redeem(
 pub(crate) async fn close_position_redeem_after_submit(
     account: &SharedAccount,
     group: Vec<(SharedOpenPosition, bool)>,
-    up_won: bool,
+    // Направление резолюции рынка. Пер-ножная атрибуция берёт `row.token_won` (у каждой
+    // ноги своё), поэтому сам флаг здесь больше не нужен — оставлен для сигнатуры/вызовов.
+    _up_won: bool,
     finalized_via: &'static str,
 ) {
     if group.is_empty() {
@@ -510,29 +512,43 @@ pub(crate) async fn close_position_redeem_after_submit(
             let mut state_guard = real_sim_state.write().await;
             *account.bankroll.write().await += group_pnl;
             if let Some(sim_stats) = state_guard.stats.get_mut(&interval_kind) {
-                let group_side = if up_won {
-                    CurrencyUpDownOutcome::Up
-                } else {
-                    CurrencyUpDownOutcome::Down
-                };
-                let side_stats = match group_side {
-                    CurrencyUpDownOutcome::Up => &mut sim_stats.up,
-                    CurrencyUpDownOutcome::Down => &mut sim_stats.down,
-                };
-                side_stats.pnl_usd += group_pnl;
-                side_stats.trades += 1;
-                if group_pnl >= 0.0 {
-                    side_stats.wins += 1;
-                } else {
-                    side_stats.losses += 1;
-                }
-                side_stats.fees_paid += group_fee_usdc;
-                side_stats.resolution_win += 1;
-                side_stats.pnl_resolution_win += group_pnl;
-                if group_pnl >= 0.0 {
-                    side_stats.resolution_win_profit += 1;
-                } else {
-                    side_stats.resolution_win_loss += 1;
+                // Пер-ножная атрибуция: каждая исполненная нога (позиция) относится к своей
+                // стороне (UP/DOWN) со своим `row_pnl = payout − cost`. Раньше весь market-group
+                // писался как ОДНА сделка на победившую сторону, из-за чего проигравшая нога
+                // была невидима («нет сделок»), `trades` считал рынки, а `Res✗` не рос.
+                // Теперь `trades` = число исполненных покупок, суммы по сторонам дают group_pnl.
+                for row in &finalized_rows {
+                    let Some(leg_side) =
+                        CurrencyUpDownOutcome::from_i32(row.snapshot.currency_up_down_outcome_at_open)
+                    else {
+                        continue;
+                    };
+                    let side_stats = match leg_side {
+                        CurrencyUpDownOutcome::Up => &mut sim_stats.up,
+                        CurrencyUpDownOutcome::Down => &mut sim_stats.down,
+                    };
+                    let row_pnl = row.row_pnl;
+                    side_stats.pnl_usd += row_pnl;
+                    side_stats.trades += 1;
+                    if row_pnl >= 0.0 {
+                        side_stats.wins += 1;
+                    } else {
+                        side_stats.losses += 1;
+                    }
+                    // maker held-to-resolution → fee ноги = 0 (open/fill/cancel учитывают fee
+                    // отдельно в `spawn_open_buy`/`drain_position_from_account`).
+                    if row.token_won {
+                        side_stats.resolution_win += 1;
+                        side_stats.pnl_resolution_win += row_pnl;
+                        if row_pnl >= 0.0 {
+                            side_stats.resolution_win_profit += 1;
+                        } else {
+                            side_stats.resolution_win_loss += 1;
+                        }
+                    } else {
+                        side_stats.resolution_loss += 1;
+                        side_stats.pnl_resolution_loss += row_pnl;
+                    }
                 }
             }
         }
