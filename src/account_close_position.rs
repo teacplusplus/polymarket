@@ -386,6 +386,85 @@ pub(crate) async fn close_position_redeem(
     }
 }
 
+/// Суммарный залоченный капитал (cost-basis) открытых и pending-close позиций по всем лейнам.
+async fn total_locked_usd(account: &SharedAccount) -> f64 {
+    let mut locked = 0.0;
+    {
+        let positions = account.positions.read().await;
+        for lane in positions.values() {
+            for p in lane.values() {
+                locked += p.read().await.position_size;
+            }
+        }
+    }
+    {
+        let pending = account.pending_close_positions.read().await;
+        for lane in pending.values() {
+            for p in lane.values() {
+                locked += p.read().await.position_size;
+            }
+        }
+    }
+    locked
+}
+
+/// При резолюции рынка: (submit) синхронизирует `bankroll` с реальным балансом USDC
+/// кошелька, затем обновляет **realized** peak/max_drawdown и проверяет
+/// [`crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT`] (halt новых входов).
+///
+/// Инвариант: `bankroll := реальный_баланс_USDC + locked(cost открытых позиций)`, тогда
+/// `available = bankroll − locked = свободный баланс кошелька`, а realized-equity (кэш +
+/// открытые по cost-базису) не зависит от внутриокнового MtM. В mock (CLOB не
+/// аутентифицирован) `bankroll` уже равен `initial + realized PnL` — берём его как есть.
+async fn sync_bankroll_and_check_halt_on_resolution(
+    account: &SharedAccount,
+    market_id: &str,
+    finalized_via: &'static str,
+) {
+    if account.clob_authed.load().is_some() {
+        match crate::account_order::fetch_usdc_balance_usd(account).await {
+            Some(real_balance) => {
+                let locked = total_locked_usd(account).await;
+                *account.bankroll.write().await = real_balance + locked;
+                crate::tee_println!(
+                    "[real_sim] bankroll sync (resolution): real_usdc={real_balance:.2} + \
+                     locked={locked:.2} → bankroll={:.2} (market={market_id})",
+                    real_balance + locked,
+                );
+            }
+            None => {
+                crate::tee_eprintln!(
+                    "[real_sim] bankroll sync (resolution): не удалось получить баланс USDC — \
+                     оставляем арифметический bankroll (market={market_id})"
+                );
+            }
+        }
+    }
+
+    let equity = *account.bankroll.read().await;
+    let mut peak = account.peak_bankroll.write().await;
+    let mut max_dd = account.max_drawdown_pct.write().await;
+    if equity > *peak {
+        *peak = equity;
+    }
+    if *peak > 0.0 {
+        let drawdown_pct = (*peak - equity) / *peak * 100.0;
+        if drawdown_pct > *max_dd {
+            *max_dd = drawdown_pct;
+        }
+        if let Some(threshold) = crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT
+            && *max_dd >= threshold
+        {
+            crate::tee_eprintln!(
+                "[real_sim] EMERGENCY_HALT: realized max_drawdown={:.2}% ≥ порог={threshold:.2}% \
+                 (market={market_id}, via={finalized_via}) — новые входы заблокированы, \
+                 закрытия продолжаем",
+                *max_dd,
+            );
+        }
+    }
+}
+
 pub(crate) async fn close_position_redeem_after_submit(
     account: &SharedAccount,
     group: Vec<(SharedOpenPosition, bool)>,
@@ -556,6 +635,9 @@ pub(crate) async fn close_position_redeem_after_submit(
             *account.bankroll.write().await += group_pnl;
         }
     }
+
+    // Синхронизация с реальными деньгами (submit) + realized drawdown/halt в момент резолюции.
+    sync_bankroll_and_check_halt_on_resolution(account, market_id, finalized_via).await;
 
     let close_unix_ms = Some(crate::util::current_timestamp_ms());
     crate::tee_println!(

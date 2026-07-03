@@ -185,6 +185,25 @@ async fn main() -> Result<()> {
             account::spawn_heartbeat(account.clone());
             account_ws::spawn_user_ws_listener(account.clone());
 
+            // Стартовый банкролл = реальный баланс USDC кошелька: redeem_x-сайзинг и
+            // realized drawdown/halt считаются от реальных денег, а не от INITIAL_BANKROLL.
+            match poly::account_order::fetch_usdc_balance_usd(&account).await {
+                Some(balance) => {
+                    *account.bankroll.write().await = balance;
+                    *account.peak_bankroll.write().await = balance;
+                    poly::tee_println!(
+                        "[main/RealSimWithSubmit] стартовый банкролл из баланса кошелька: {balance:.2} USDC"
+                    );
+                }
+                None => {
+                    panic!(
+                        "[main/RealSimWithSubmit] баланс USDC получить не удалось — банкролл \
+                         остаётся {:.2} USDC (INITIAL_BANKROLL)",
+                        history_sim::INITIAL_BANKROLL,
+                    );
+                }
+            }
+
             for currency in CURRENCIES {
                 let project_manager = ProjectManager::new((*currency).to_string(), account.clone());
                 real_sim::run_real_sim(project_manager, poly::account_submit::SubmitMode::Submit)

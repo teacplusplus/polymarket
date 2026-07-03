@@ -111,13 +111,15 @@ pub const MIN_ORDER_SIZE_BUY_HEADROOM_PCT: f64 = 0.05;
 /// Min `event_remaining_ms` для входа ([`BuyGate::LateEntry`]).
 pub const MIN_ENTRY_REMAINING_MS: i64 = 10 * 1000;
 
-/// Стоп новых входов при DD ≥ pct (`real_sim` только).
+/// Стоп новых входов при **realized** drawdown ≥ pct (`real_sim`, Mock и Submit).
 ///
-/// Отключено (`None`) для реконструкции бот-профиля REDEEM_X: стратегия
-/// held-to-resolution держит обе ноги до резолюции, поэтому внутриокновый MtM
-/// drawdown (проигрывающая нога → 0) заведомо большой и ложно срабатывает на
-/// малом банке. У самого бота такого предохранителя нет.
-pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = None;
+/// Просадка считается по РЕАЛИЗОВАННОМУ equity и обновляется в момент резолюции
+/// рынка ([`crate::account_close_position::close_position_redeem_after_submit`]), а
+/// НЕ по внутриокновому MtM (в тике MtM-обновление отключено). Для held-to-resolution
+/// это принципиально: обе ноги держатся до конца, поэтому MtM-просадка заведомо
+/// большая (проигрывающая нога → 0) и раньше ложно срабатывала. Realized-просадка
+/// растёт только на реальной серии убыточных рынков.
+pub const EMERGENCY_HALT_DRAWDOWN_PCT: Option<f64> = Some(30.0);
 
 pub use crate::xframe::StrictBook;
 
@@ -1481,7 +1483,7 @@ pub(crate) async fn try_open_position(
                     return false;
                 }
             }
-            if let Some(max_open) = MAX_OPEN_POSITIONS {
+            if let Some(max_open) = MAX_OPEN_POSITIONS && !redeem_x {
                 let live_total: usize = positions_by_lane.values().map(|m| m.len()).sum();
                 let pending_total: usize = pending_close_by_lane.values().map(|m| m.len()).sum();
                 if live_total + pending_total >= max_open {

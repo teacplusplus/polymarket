@@ -33,7 +33,7 @@ const REDEEM_X_LEAD_PROB: f64 = 0.50;
 const REDEEM_X_MAX_LEAD_SHARES_BTC_5M: f64 = 8_000.0;
 const REDEEM_X_MAX_LAG_SHARES_BTC_5M: f64 = 6_000.0;
 /// Минимальный интервал между покупками в одном рынке: не чаще раза в N мс.
-const REDEEM_X_MIN_REBUY_INTERVAL_MS: Option<i64> = Some(3_000);
+const REDEEM_X_MIN_REBUY_INTERVAL_MS: Option<i64> = None;
 /// Минимальная глубина best_bid на входе относительно текущего клипа.
 const REDEEM_X_MIN_BID_SIZE_CLIPS: f64 = 2.0;
 /// Абсолютная минимальная глубина best_bid для BTC 5m (tail: p50 ≈ 308, p40≈200).
@@ -53,7 +53,7 @@ pub(crate) const REDEEM_X_MAKER_1_EXPIRATION_MS: i64 = 1_000;
 pub(crate) async fn redeem_x_entry_size(
     frame: &XFrame<SIZE>,
     strict_book: Option<&StrictBook>,
-    _bankroll: f64,
+    available_bankroll: f64,
     currency: &str,
     _event_end_ms: Option<i64>,
     positions_by_lane: &HashMap<crate::account::LaneKey, LanePositions>,
@@ -110,7 +110,17 @@ pub(crate) async fn redeem_x_entry_size(
 
     // (3) Полный клип → нотинал USDC с потолками банка/позиции.
     let size = (clip * maker_price).min(MAX_POSITION_USD);
-    (size >= MIN_POSITION_USD).then_some(size)
+    if size < MIN_POSITION_USD {
+        return None;
+    }
+    // (3a) Учёт доступного банкролла: `available_bankroll` = bankroll − весь залоченный
+    // капитал (см. вызов из [`crate::history_sim::buy_gate`]). Не открываем клип, если на
+    // него не хватает свободных средств — иначе на реальном сабмите ловим отказы CLOB, а
+    // в mock оборот бесконтрольно превышает банк. Стоп набора при исчерпании банка.
+    if size > available_bankroll {
+        return None;
+    }
+    Some(size)
 }
 
 /// Фиксированный клип ОДНОГО лимитного ордера по `coin+period` (медиана размера ордера из

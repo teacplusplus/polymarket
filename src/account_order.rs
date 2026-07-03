@@ -24,6 +24,29 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Реальный баланс USDC (в целых долларах) с CLOB `GET /balance-allowance`
+/// (collateral). `None`, если CLOB не аутентифицирован (mock/None-режим) либо
+/// запрос/парсинг упал. SDK отдаёт `balance` уже в целых USDC (напр. `"1000.50"`),
+/// поэтому масштабировать на 1e6 не нужно.
+pub async fn fetch_usdc_balance_usd(account: &SharedAccount) -> Option<f64> {
+    let auth_client = (**account.clob_authed.load()).clone()?;
+    let request = clob::types::request::BalanceAllowanceRequest::builder()
+        .asset_type(clob::types::AssetType::Collateral)
+        .build();
+    match auth_client.balance_allowance(request).await {
+        Ok(resp) => {
+            let usd = resp.balance.to_string().parse::<f64>().ok()?;
+            (usd.is_finite() && usd >= 0.0).then_some(usd)
+        }
+        Err(err) => {
+            crate::tee_eprintln!(
+                "fetch_usdc_balance_usd: CLOB balance-allowance провалился: {err:#}"
+            );
+            None
+        }
+    }
+}
+
 /// Маркет (FAK) или лимит post-only (GTC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderRole {

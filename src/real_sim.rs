@@ -547,8 +547,9 @@ async fn tick_once(
         // `manage_positions`) берёт его сам коротким локом для apply'я PNL;
         // try_open_position bankroll не пишет (только positions). Чтения для
         // `available_bankroll_post` / `equity` ниже берём отдельным read'ом.
-        let mut peak_guard = account.peak_bankroll.write().await;
-        let mut max_dd_guard = account.max_drawdown_pct.write().await;
+        // `max_drawdown_pct` в тике только ЧИТАЕМ (гейт halt); пишется он теперь по
+        // realized-equity в момент резолюции (см. close_position_redeem_after_submit).
+        let max_dd_guard = account.max_drawdown_pct.read().await;
         let mut last_prob_guard = account.last_prob.write().await;
         let mut positions_guard = account.positions.write().await;
 
@@ -694,40 +695,9 @@ async fn tick_once(
         }
 
         drop(state_guard);
-
-        let total_value: f64 = {
-            let mut active = 0.0;
-            let pending_close_guard = account.pending_close_positions.read().await;
-            for ((c, i, s), pos_vec) in positions_guard.iter().chain(pending_close_guard.iter()) {
-                let prob_raw = if c.as_str() == currency && *i == interval_kind && *s == side {
-                    effective_prob
-                } else {
-                    last_prob_guard
-                        .get(&(c.clone(), *i, *s))
-                        .copied()
-                        .unwrap_or(0.5)
-                };
-                let prob = if prob_raw.is_finite() {
-                    prob_raw.clamp(0.001, 0.999)
-                } else {
-                    0.5
-                };
-                for p in pos_vec.values() {
-                    active += p.read().await.shares_held * prob;
-                }
-            }
-            active
-        };
-        let equity = *account.bankroll.read().await + total_value;
-        if equity > *peak_guard {
-            *peak_guard = equity;
-        }
-        if *peak_guard > 0.0 {
-            let drawdown_pct = (*peak_guard - equity) / *peak_guard * 100.0;
-            if drawdown_pct > *max_dd_guard {
-                *max_dd_guard = drawdown_pct;
-            }
-        }
+        // MtM peak/drawdown в тике НЕ обновляем: realized-просадка (и её max) считается
+        // в момент резолюции рынка в close_position_redeem_after_submit. Внутриокновый MtM
+        // для held-to-resolution заведомо большой (проигрывающая нога → 0) и ложно бил halt.
     }
 
     *last_market_id = Some(market_id.to_string());

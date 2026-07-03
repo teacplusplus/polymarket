@@ -555,6 +555,65 @@ fn taker_cap_violation_message(
     }
 }
 
+/// Размер (shares) резервного уровня по цене `price` (совпадение по тик-цене), `None`/0 —
+/// уровня нет. Уровни уже отсортированы лучшим первым, но ищем по точной цене.
+fn size_at_price(levels: &[BookLevel], price: f64) -> Option<f64> {
+    levels
+        .iter()
+        .find(|level| (level.price - price).abs() < PRICE_COMPARE_EPS && level.size > 0.0)
+        .map(|level| level.size)
+}
+
+/// Снапшот-прокси очереди FIFO для mock-maker'а — заменяет прежний мгновенный филл
+/// (`best_bid ≥ limit`), который игнорировал очередь и завышал fill-rate.
+///
+/// Логика для BUY (симметрично для SELL):
+///   * если заявка marketable (`best_ask ≤ limit`) — немедленный филл (пересекли встречную);
+///   * иначе моделируем очередь на нашем уровне: `queue_ahead` = объём, стоявший на
+///     `limit` при постановке (мы встаём в хвост по времени). Прогресс очереди копим по
+///     суммарному УМЕНЬШЕНИЮ размера уровня между снимками (fills/отмены впереди двигают
+///     нас к голове; приросты = заявки ПОЗАДИ нас — игнорируем). Клип исполнен, когда
+///     накопленное потребление покрыло `queue_ahead + наш объём`.
+///
+/// Данных ленты трейдов нет, поэтому это прокси по снимкам книги, но он честно отражает:
+/// (а) не мгновенный филл; (б) чем глубже бид, тем реже филл в пределах TTL; (в) на
+/// растущем лидере бид «отстаёт» (уровень не потребляется) → чаще промах, как в реале.
+fn maker_queue_fill_progress(
+    book: &MockBookSnapshot,
+    side: Side,
+    limit_price: f64,
+    shares: f64,
+    queue_ahead: &mut Option<f64>,
+    last_level_size: &mut Option<f64>,
+    consumed: &mut f64,
+) -> bool {
+    let (own_side_levels, marketable) = match side {
+        Side::Buy => (
+            &book.bids,
+            book.best_ask_price()
+                .is_some_and(|best_ask| best_ask <= limit_price + PRICE_COMPARE_EPS),
+        ),
+        Side::Sell => (
+            &book.asks,
+            book.best_bid_price()
+                .is_some_and(|best_bid| best_bid + PRICE_COMPARE_EPS >= limit_price),
+        ),
+        _ => return false,
+    };
+    if marketable {
+        return true;
+    }
+    let level_size = size_at_price(own_side_levels, limit_price).unwrap_or(0.0);
+    let queue = *queue_ahead.get_or_insert(level_size);
+    if let Some(prev) = *last_level_size
+        && level_size + FILL_QUANTITY_EPS < prev
+    {
+        *consumed += prev - level_size;
+    }
+    *last_level_size = Some(level_size);
+    *consumed + FILL_QUANTITY_EPS >= queue + shares
+}
+
 async fn run_maker_wait_for_fill(
     project_manager: &Arc<ProjectManager>,
     request: &PostOrderRequest,
@@ -583,6 +642,13 @@ async fn run_maker_wait_for_fill(
         Instant::now() + Duration::from_millis(remaining_ms)
     });
 
+    // Состояние очереди FIFO (см. `maker_queue_fill_progress`): `queue_ahead` фиксируется на
+    // первом снимке (объём впереди нас на уровне `limit`), `consumed` копит его потребление
+    // между снимками, `last_level_size` — предыдущий размер уровня для расчёта убыли.
+    let mut queue_ahead: Option<f64> = None;
+    let mut last_level_size: Option<f64> = None;
+    let mut consumed: f64 = 0.0;
+
     loop {
         if matches!(cancel_rx.try_recv(), Ok(())) {
             return MockFillOutcome::Canceled;
@@ -600,37 +666,15 @@ async fn run_maker_wait_for_fill(
         }
 
         let condition_met = match load_mock_book(project_manager, &request.asset_id).await {
-            Some(book) => match request.side {
-                // Пассивный maker BUY стоит на `limit_price` (= best_bid на постановке).
-                // Он исполняется окружающим встречным потоком, пока рынок держит бид на
-                // нашем уровне или выше (`best_bid ≥ limit`), либо сразу если стал marketable
-                // (`best_ask ≤ limit`). Прежнее одиночное условие `best_ask ≤ limit` давало
-                // инверсию: заявка филлилась только когда цена ПАДАЛА к нашему биду, т.е.
-                // систематически набиралась проигрывающая нога, а растущая (выигрышная) —
-                // никогда. Теперь лидер (бид держится/растёт) исполняется, а отстающая нога
-                // (бид уходит ниже лимита) чаще промахивается — как у реального бота.
-                Side::Buy => {
-                    let best_bid_ok = book
-                        .best_bid_price()
-                        .is_some_and(|best_bid| best_bid + PRICE_COMPARE_EPS >= limit_price);
-                    let marketable = book
-                        .best_ask_price()
-                        .is_some_and(|best_ask| best_ask <= limit_price + PRICE_COMPARE_EPS);
-                    best_bid_ok || marketable
-                }
-                // Симметрично для maker SELL, стоящего на best_ask: рынок аскает на нашем
-                // уровне или ниже (`best_ask ≤ limit`), либо сразу marketable (`best_bid ≥ limit`).
-                Side::Sell => {
-                    let best_ask_ok = book
-                        .best_ask_price()
-                        .is_some_and(|best_ask| best_ask <= limit_price + PRICE_COMPARE_EPS);
-                    let marketable = book
-                        .best_bid_price()
-                        .is_some_and(|best_bid| best_bid + PRICE_COMPARE_EPS >= limit_price);
-                    best_ask_ok || marketable
-                }
-                _ => false,
-            },
+            Some(book) => maker_queue_fill_progress(
+                &book,
+                request.side,
+                limit_price,
+                shares,
+                &mut queue_ahead,
+                &mut last_level_size,
+                &mut consumed,
+            ),
             None => false,
         };
         if condition_met {
