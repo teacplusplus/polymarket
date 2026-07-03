@@ -26,18 +26,18 @@ use XFrameIntervalKind::FiveMin;
 /// Ценовая полоса ноги (maker встаёт на best_bid): не котируем пыль / уже разрешённый исход.
 const REDEEM_X_MIN_PRICE: f64 = 0.02;
 const REDEEM_X_MAX_PRICE: f64 = 0.98;
-/// Порог implied prob, выше которого нога — лидирующая (фаворит).
-const REDEEM_X_LEAD_PROB: f64 = 0.50;
-/// Абсолютные потолки inventory (shares) для BTC 5m из профиля бота:
-/// лидер держим шире, отстающую ногу уже.
-const REDEEM_X_MAX_LEAD_SHARES_BTC_5M: f64 = 8_000.0;
-const REDEEM_X_MAX_LAG_SHARES_BTC_5M: f64 = 6_000.0;
 /// Минимальный интервал между покупками в одном рынке: не чаще раза в N мс.
 const REDEEM_X_MIN_REBUY_INTERVAL_MS: Option<i64> = None;
 /// Минимальная глубина best_bid на входе относительно текущего клипа.
 const REDEEM_X_MIN_BID_SIZE_CLIPS: f64 = 2.0;
 /// Абсолютная минимальная глубина best_bid для BTC 5m (tail: p50 ≈ 308, p40≈200).
 const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 200.0;
+/// Пропорция сторон: ОТСТАЮЩУЮ (проигрывающую сейчас) ногу держим не больше `ratio ×`
+/// инвентаря ВЫИГРЫВАЮЩЕЙ (sibling) ноги того же рынка → у бота тяжёлая нога = будущий
+/// победитель (BTC 5m lead:lag ≈ 8000:6000 = 0.75). Выигрывающая нога свободна (её потолок
+/// — только банкролл), поэтому она набирается в большей доле. При нулевом лидере отстающая
+/// нога заблокирована (сначала набираем текущего фаворита).
+const REDEEM_X_LAG_TO_LEAD_RATIO: f64 = 0.75;
 /// Fallback-«время сделки» maker-входа REDEEM_X, когда `open_buy_invoke.report.landed_at
 /// == None` (см. [`redeem_x_leg_scan`]). Сам ордер теперь GTC — истечение делается явным
 /// cancel'ом, а не GTD-`expiration`, поэтому TTL-константы для постановки больше нет.
@@ -47,8 +47,9 @@ pub(crate) const REDEEM_X_MAKER_1_EXPIRATION_MS: i64 = 1_000;
 /// Правило входа REDEEM_X: **полный клип** `coin+period` без исторического regime-гейта.
 ///
 /// `None` — не заходим: не BTC 5m, нет цены/вне полосы, нет нужной глубины best bid,
-/// нога уперлась в потолок инвентаря, либо размер ниже минимума по банку/позиции.
-/// Иначе — нотинал USDC для полного клипа.
+/// отстающая нога упёрлась в пропорцию к лидеру ([`REDEEM_X_LAG_TO_LEAD_RATIO`]), либо
+/// размер ниже минимума по банку/позиции. Иначе — нотинал USDC для полного клипа.
+/// Двухсторонний набор с креном к текущему победителю — повторяем пассивного MM-бота.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn redeem_x_entry_size(
     frame: &XFrame<SIZE>,
@@ -65,8 +66,9 @@ pub(crate) async fn redeem_x_entry_size(
     if !currency.eq_ignore_ascii_case("btc") || interval != XFrameIntervalKind::FiveMin {
         return None;
     }
-    // Один проход по позициям рынка: шеры текущей ноги + мс с последней приземлившейся покупки.
-    let (own_shares, ms_since_last_buy) =
+    // Один проход по позициям: шеры текущей ноги, шеры sibling-ноги того же рынка (для
+    // пропорции сторон) и мс с последней приземлившейся покупки (троттлинг).
+    let (own_shares, sibling_shares, ms_since_last_buy) =
         redeem_x_leg_scan([positions_by_lane, pending_close_by_lane], frame).await;
     // Троттлинг по времени: не чаще раза в N мс с последней покупки в этом рынке.
     if let (Some(since_ms), Some(min_rebuy_interval_ms)) =
@@ -97,14 +99,17 @@ pub(crate) async fn redeem_x_entry_size(
         return None;
     }
 
-    // (2) Асимметричный потолок инвентаря ноги в абсолютных shares (ботоподобный профиль).
+    // (2) Пропорция сторон с креном к ТЕКУЩЕМУ победителю. Нога считается выигрывающей,
+    // если её implied prob не ниже prob второй ноги (fallback — по цене best_bid: prob ноги
+    // ≈ maker_price, prob второй ≈ 1 − maker_price). Выигрывающую не ограничиваем (её
+    // потолок — только банкролл), а отстающую держим не больше `ratio ×` инвентаря sibling —
+    // так тяжёлая нога (будущий победитель) набирается в большей доле, как у бота.
     let leg_prob = frame.currency_implied_prob.unwrap_or(maker_price);
-    let leg_cap = if leg_prob >= REDEEM_X_LEAD_PROB {
-        REDEEM_X_MAX_LEAD_SHARES_BTC_5M
-    } else {
-        REDEEM_X_MAX_LAG_SHARES_BTC_5M
-    };
-    if own_shares + clip > leg_cap {
+    let other_prob = frame
+        .other_currency_implied_prob
+        .unwrap_or(1.0 - maker_price);
+    let is_leading = leg_prob >= other_prob;
+    if !is_leading && own_shares + clip > sibling_shares * REDEEM_X_LAG_TO_LEAD_RATIO {
         return None;
     }
 
@@ -134,20 +139,21 @@ fn redeem_x_clip_shares(currency: &str, interval: XFrameIntervalKind) -> Option<
     })
 }
 
-/// Один проход по обоим bucket'ам для рынка `frame.market_id`: возвращает
-/// `(own_shares, ms_since_last_buy)`:
-///   * `own_shares` — суммарные **фактически удержанные** шеры ТЕКУЩЕЙ ноги
-///     (`shares_held` обновляется после fill'а → корректно и для частичного исполнения);
+/// Один проход по обоим bucket'ам по позициям ТЕКУЩЕГО рынка. Возвращает
+/// `(own_shares, sibling_shares, ms_since_last_buy)`:
+///   * `own_shares` — фактически удержанные шеры ТЕКУЩЕЙ ноги (тот же `asset_id`);
+///   * `sibling_shares` — удержанные шеры ПРОТИВОПОЛОЖНОЙ ноги (другой `asset_id`, тот же
+///     `market_id`) — база для пропорции сторон lag↔lead;
 ///   * `ms_since_last_buy` — мс с последней **приземлившейся** покупки по `landed_at`
 ///     settled-отчёта `open_buy_invoke` (Some ⇔ success, включая partial; мок ставит
-///     `landed_at = current_timestamp_ms()` — поэтому единый wall-clock и для моков).
-///     `None`, если ни одна покупка ещё не приземлилась.
+///     `landed_at = current_timestamp_ms()`). `None`, если ни одна ещё не приземлилась.
 async fn redeem_x_leg_scan(
     buckets: [&HashMap<crate::account::LaneKey, LanePositions>; 2],
     frame: &XFrame<SIZE>,
-) -> (f64, Option<i64>) {
+) -> (f64, f64, Option<i64>) {
     let now_ms = crate::util::current_timestamp_ms();
     let mut own_shares = 0.0;
+    let mut sibling_shares = 0.0;
     let mut ms_since_last_buy: Option<i64> = None;
     for by_lane in buckets {
         for lane_positions in by_lane.values() {
@@ -158,6 +164,8 @@ async fn redeem_x_leg_scan(
                 }
                 if p.asset_id == frame.asset_id {
                     own_shares += p.shares_held;
+                } else {
+                    sibling_shares += p.shares_held;
                 }
                 let landed_at = p
                     .open_buy_invoke
@@ -180,5 +188,5 @@ async fn redeem_x_leg_scan(
             }
         }
     }
-    (own_shares, ms_since_last_buy)
+    (own_shares, sibling_shares, ms_since_last_buy)
 }

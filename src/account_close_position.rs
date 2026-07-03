@@ -416,11 +416,13 @@ async fn total_locked_usd(account: &SharedAccount) -> f64 {
 /// `available = bankroll − locked = свободный баланс кошелька`, а realized-equity (кэш +
 /// открытые по cost-базису) не зависит от внутриокнового MtM. В mock (CLOB не
 /// аутентифицирован) `bankroll` уже равен `initial + realized PnL` — берём его как есть.
+/// Возвращает `true`, если на этой резолюции realized max_drawdown впервые достиг порога
+/// [`crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT`] — сигнал вызывающей завершить процесс.
 async fn sync_bankroll_and_check_halt_on_resolution(
     account: &SharedAccount,
     market_id: &str,
     finalized_via: &'static str,
-) {
+) -> bool {
     if account.clob_authed.load().is_some() {
         match crate::account_order::fetch_usdc_balance_usd(account).await {
             Some(real_balance) => {
@@ -447,6 +449,7 @@ async fn sync_bankroll_and_check_halt_on_resolution(
     if equity > *peak {
         *peak = equity;
     }
+    let mut halt_tripped = false;
     if *peak > 0.0 {
         let drawdown_pct = (*peak - equity) / *peak * 100.0;
         if drawdown_pct > *max_dd {
@@ -455,14 +458,15 @@ async fn sync_bankroll_and_check_halt_on_resolution(
         if let Some(threshold) = crate::history_sim::EMERGENCY_HALT_DRAWDOWN_PCT
             && *max_dd >= threshold
         {
+            halt_tripped = true;
             crate::tee_eprintln!(
                 "[real_sim] EMERGENCY_HALT: realized max_drawdown={:.2}% ≥ порог={threshold:.2}% \
-                 (market={market_id}, via={finalized_via}) — новые входы заблокированы, \
-                 закрытия продолжаем",
+                 (market={market_id}, via={finalized_via}) — завершаю процесс",
                 *max_dd,
             );
         }
     }
+    halt_tripped
 }
 
 pub(crate) async fn close_position_redeem_after_submit(
@@ -637,7 +641,8 @@ pub(crate) async fn close_position_redeem_after_submit(
     }
 
     // Синхронизация с реальными деньгами (submit) + realized drawdown/halt в момент резолюции.
-    sync_bankroll_and_check_halt_on_resolution(account, market_id, finalized_via).await;
+    let halt_tripped =
+        sync_bankroll_and_check_halt_on_resolution(account, market_id, finalized_via).await;
 
     let close_unix_ms = Some(crate::util::current_timestamp_ms());
     crate::tee_println!(
@@ -646,6 +651,18 @@ pub(crate) async fn close_position_redeem_after_submit(
          pnl={group_pnl:+.6}",
         finalized_rows.len(),
     );
+
+    // Halt по realized drawdown → завершаем процесс сразу (а не спамим halt до конца окна).
+    // В submit сначала graceful cancel-all открытых ордеров, затем выход.
+    if halt_tripped {
+        crate::tee_eprintln!(
+            "[real_sim] EMERGENCY_HALT достигнут (market={market_id}) — завершение процесса"
+        );
+        if account.clob_authed.load().is_some() {
+            crate::account_exit::graceful_exit(account.clone()).await;
+        }
+        std::process::exit(1);
+    }
 
     for row in &finalized_rows {
         let position_snapshot = &row.snapshot;
