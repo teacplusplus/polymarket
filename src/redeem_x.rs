@@ -32,22 +32,32 @@ const REDEEM_X_MIN_REBUY_INTERVAL_MS: Option<i64> = None;
 /// Минимальная глубина best_bid на входе относительно текущего клипа.
 const REDEEM_X_MIN_BID_SIZE_CLIPS: f64 = 2.0;
 /// Абсолютная минимальная глубина best_bid для BTC 5m (tail: p50 ≈ 308, p40≈200).
-const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 200.0;
+const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 50.0;
 /// Пропорция сторон: ОТСТАЮЩУЮ (проигрывающую сейчас) ногу держим не больше `ratio ×`
-/// инвентаря ВЫИГРЫВАЮЩЕЙ (sibling) ноги того же рынка → у бота тяжёлая нога = будущий
+/// инвентаря ВЫИГРЫВАЮЩЕЙ (other) ноги того же рынка → у бота тяжёлая нога = будущий
 /// победитель (BTC 5m lead:lag ≈ 8000:6000 = 0.75). Выигрывающая нога свободна (её потолок
 /// — только банкролл), поэтому она набирается в большей доле. При нулевом лидере отстающая
 /// нога заблокирована (сначала набираем текущего фаворита).
-const REDEEM_X_LAG_TO_LEAD_RATIO: f64 = 0.75;
-/// Потолок КОМБИНИРОВАННОЙ цены пары `own_avg + sibling_avg` (VWAP обеих ног рынка) ПОСЛЕ
-/// добавления нового клипа. Пара UP+DOWN на резолюции платит ровно $1, поэтому набранная
-/// дороже этого порога сматченная пара — структурный убыток на каждой шере (в 8h-прогоне
-/// средняя цена пары была 1.12, до 1.34 → −155 USDC на парах). Гейт запрещает докупать
-/// ногу, если это поднимет средневзвешенную цену пары выше порога; при пустой sibling-ноге
-/// (пары ещё нет) не применяется. Небольшой допуск >1.0 оставляет место направленному
-/// излишку на тяжёлой ноге, ради которого бот и торгует. `None` — гейт выключен (у самого
-/// бота такого потолка нет: он набирает пары до ~1.57, медиана ~1.04).
-const REDEEM_X_MAX_PAIR_PRICE: Option<f64> = None;
+const REDEEM_X_LAG_TO_LEAD_RATIO: f64 = 0.95;
+/// Ступеньки потолка цены пары по вероятности ФАВОРИТА `fav = max(prob, other_prob)` —
+/// «Вариант А», откалиброван под p90-envelope принятых ботом 2 пар (BTC 5m): чем увереннее
+/// фаворит, тем выше допускается пара, т.к. направленный излишок на тяжёлой ноге окупает
+/// переплату. Формат: `(верхняя граница fav [исключительно], потолок пары)`, отсортировано
+/// по возрастанию. Последний бакет ловит `fav → 1.0`. См. [`redeem_x_max_pair_price`].
+const REDEEM_X_PAIR_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
+    (0.70, 1.02),
+    (0.80, 1.04),
+    (0.90, 1.04),
+    (1.01, 1.15),
+];
+/// Абсолютный потолок суммарной экспозиции (потраченных USDC по ОБЕИМ ногам) в ОДНОМ рынке.
+/// Считается по фактическому филлу (`own_cost + other_cost`); если добавление клипа выведет
+/// сумму за порог — новый вход в этот рынок блокируется. Ограничивает максимальный убыток
+/// одного 5m-окна независимо от того, угадали ли мы сторону: у бота такого кэпа нет, и на
+/// whipsaw-часах он грузил до ~$12.7k в одно окно с разворотом тяжёлой ноги → −$2.8k за окно
+/// (BTC 5m 2026-07-03 02:45 UTC). `None` — кэп выключен. Значение подобрано под
+/// `INITIAL_BANKROLL≈500` (в healthy-прогоне медиана оборота/рынок ≈ $75, max ≈ $200).
+const REDEEM_X_MAX_MARKET_EXPOSURE_USD: Option<f64> = Some(300.0);
 /// Fallback-«время сделки» maker-входа REDEEM_X, когда `open_buy_invoke.report.landed_at
 /// == None` (см. [`redeem_x_leg_scan`]). Сам ордер теперь GTC — истечение делается явным
 /// cancel'ом, а не GTD-`expiration`, поэтому TTL-константы для постановки больше нет.
@@ -76,9 +86,9 @@ pub(crate) async fn redeem_x_entry_size(
     if !currency.eq_ignore_ascii_case("btc") || interval != XFrameIntervalKind::FiveMin {
         return None;
     }
-    // Один проход по позициям: шеры текущей ноги, шеры sibling-ноги того же рынка (для
+    // Один проход по позициям: шеры текущей ноги, шеры other-ноги того же рынка (для
     // пропорции сторон) и мс с последней приземлившейся покупки (троттлинг).
-    let (own_shares, own_cost, sibling_shares, sibling_cost, ms_since_last_buy) =
+    let (own_shares, own_cost, other_shares, other_cost, ms_since_last_buy) =
         redeem_x_leg_scan([positions_by_lane, pending_close_by_lane], frame).await;
     // Троттлинг по времени: не чаще раза в N мс с последней покупки в этом рынке.
     if let (Some(since_ms), Some(min_rebuy_interval_ms)) =
@@ -109,42 +119,121 @@ pub(crate) async fn redeem_x_entry_size(
         return None;
     }
 
-    // (2) Пропорция сторон с креном к ТЕКУЩЕМУ победителю. Нога считается выигрывающей,
-    // если её implied prob не ниже prob второй ноги (fallback — по цене best_bid: prob ноги
-    // ≈ maker_price, prob второй ≈ 1 − maker_price). Выигрывающую не ограничиваем (её
-    // потолок — только банкролл), а отстающую держим не больше `ratio ×` инвентаря sibling —
-    // так тяжёлая нога (будущий победитель) набирается в большей доле, как у бота.
-    let leg_prob = frame.currency_implied_prob.unwrap_or(maker_price);
+    // (2) Гейт цены пары. Режим определяется ФАКТИЧЕСКОЙ проекцией пары `own_avg + other_avg`
+    // ПОСЛЕ клипа, а не константным потолком. Применяется только при непустой other-ноге —
+    // без неё пары ещё нет, и первый клип рынка свободен (любая нога), как открывает бот.
+    // Правила (никогда не блокируют ОБЕ ноги сразу → нет «мёртвых зон»):
+    //   * клип, который УСРЕДНЯЕТ пару вниз (`lowers_pair`), разрешён всегда — это безопасно
+    //     снижает уже набранную стоимость пары (и это же «спасение» дорогой пары у бота);
+    //   * если клип НЕ снижает пару:
+    //       - проекция > $1  → наращивать пару разрешаем ТОЛЬКО фавориту (prob ≥ other_prob)
+    //         и только в пределах динамического потолка [`redeem_x_max_pair_price`]; догон
+    //         андердога за $1 — это whipsaw-клип, что сгорает (см. Up@0.75 → Down в 15m);
+    //       - проекция ≤ $1 → есть запас под $1, приоритет ДЕШЁВОЙ ноге (андердогу): у бота
+    //         при pair<1 в 64% докупается именно дешёвая/отстающая нога. Фаворита в этом
+    //         режиме не наращиваем (ждём докуп андердога), андердог — разрешён.
+    // Вероятности ног: implied prob из фрейма, fallback — по цене best_bid (prob своей ноги
+    // ≈ maker_price, второй ≈ 1 − maker_price).
+    let prob = frame
+        .currency_implied_prob
+        .filter(|p| p.is_finite() && *p >= 0.0 && *p <= 1.0)
+        .unwrap_or(maker_price.clamp(0.0, 1.0));
     let other_prob = frame
         .other_currency_implied_prob
-        .unwrap_or(1.0 - maker_price);
-    let is_leading = leg_prob >= other_prob;
-    if !is_leading && own_shares + clip > sibling_shares * REDEEM_X_LAG_TO_LEAD_RATIO {
+        .filter(|p| p.is_finite() && *p >= 0.0 && *p <= 1.0)
+        .unwrap_or((1.0 - prob).clamp(0.0, 1.0));
+
+    if other_shares > 0.0 {
+        let max_pair_price = redeem_x_max_pair_price(prob, other_prob);
+        let other_avg = other_cost / other_shares;
+        let own_avg_after = (own_cost + clip * maker_price) / (own_shares + clip);
+        let projected_pair_price = own_avg_after + other_avg;
+        // Старая цена пары до клипа — только если у своей ноги уже есть шеры (иначе пары нет,
+        // это первый клип ноги, и «усреднения вниз» быть не может).
+        let old_pair_price = (own_shares > 0.0).then(|| own_cost / own_shares + other_avg);
+        let lowers_pair = old_pair_price.is_some_and(|old| projected_pair_price < old);
+        let is_favorite = prob >= other_prob;
+
+        // Клип, который снижает пару, всегда пропускаем. Иначе — режимные ограничения.
+        if !lowers_pair {
+            let blocked_reason = if projected_pair_price > 1.0 {
+                // Пара уходит выше $1: наращивать может только фаворит и только в пределах кэпа.
+                if !is_favorite {
+                    Some("underdog @ pair>1")
+                } else if projected_pair_price > max_pair_price {
+                    Some("favorite over cap @ pair>1")
+                } else {
+                    None
+                }
+            } else {
+                // Есть запас под $1: приоритет андердогу, фаворита не наращиваем.
+                if is_favorite {
+                    Some("favorite @ pair<=1, prefer underdog")
+                } else {
+                    None
+                }
+            };
+            if let Some(reason) = blocked_reason {
+                crate::tee_println!(
+                    "[redeem_x] skip pair-price gate ({}) market_id={} asset_id={} prob={:.3} other_prob={:.3} own_avg_after={:.4} other_avg={:.4} pair={:.4} old_pair={:?} cap={:.4} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
+                    reason,
+                    frame.market_id,
+                    frame.asset_id,
+                    prob,
+                    other_prob,
+                    own_avg_after,
+                    other_avg,
+                    projected_pair_price,
+                    old_pair_price,
+                    max_pair_price,
+                    own_shares,
+                    other_shares,
+                    clip,
+                    maker_price,
+                );
+                return None;
+            }
+        }
+    } else if prob >= other_prob {
+        // Первый клип рынка (противоположная нога пуста). Воркеры up/down спавнятся параллельно
+        // на все лейны (см. real_sim::LANE_FRAME_ROUTES), поэтому без этого гейта на старте
+        // открылись бы СРАЗУ обе ноги. Открываем рынок только ДЕШЁВОЙ стороной — андердогом
+        // (prob < other_prob): квалифицируется ровно одна нога, устойчиво к гонке (фаворит
+        // режется по prob, а не по other_shares). Бот так и делает: первый клип в ~90% —
+        // дешёвая/underdog-нога (в 15m-примере это Down@47c). Фаворит откроется позже, когда
+        // сам станет дешёвой стороной или включится логика пары (см. ветку выше).
+        crate::tee_println!(
+            "[redeem_x] skip first-clip gate (favorite, wait for underdog) market_id={} asset_id={} prob={:.3} other_prob={:.3} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
+            frame.market_id,
+            frame.asset_id,
+            prob,
+            other_prob,
+            own_shares,
+            other_shares,
+            clip,
+            maker_price,
+        );
         return None;
     }
 
-    // (2a) Гейт комбинированной цены пары. Пара UP+DOWN гасится в $1 на резолюции, поэтому
-    // сматченная часть, набранная дороже $1, — структурный убыток. Считаем VWAP пары ПОСЛЕ
-    // добавления клипа: own_avg' = (own_cost + clip·price)/(own_shares + clip), sibling_avg =
-    // sibling_cost/sibling_shares. Применяем только когда гейт включён и sibling-нога непустая
-    // (иначе пары ещё нет). Если проекция цены пары выше потолка — не докупаем ногу.
-    if let Some(max_pair_price) = REDEEM_X_MAX_PAIR_PRICE
-        && sibling_shares > 0.0
-    {
-        let own_avg_after = (own_cost + clip * maker_price) / (own_shares + clip);
-        let sibling_avg = sibling_cost / sibling_shares;
-        let projected_pair_price = own_avg_after + sibling_avg;
-        if projected_pair_price > max_pair_price {
+    // (2b) Абсолютный кэп экспозиции на рынок. Суммарно потрачено по обеим ногам
+    // (`own_cost + other_cost`, по фактическому филлу); если добавление клипа выведет за
+    // порог — новый вход в этот рынок блокируем. Ограничивает максимальный убыток одного
+    // окна при развороте тяжёлой ноги (см. BTC 5m 02:45 UTC у бота: $12.7k → −$2.8k).
+    if let Some(max_market_exposure) = REDEEM_X_MAX_MARKET_EXPOSURE_USD {
+        let current_exposure = own_cost + other_cost;
+        let projected_exposure = current_exposure + clip * maker_price;
+        if projected_exposure > max_market_exposure {
             crate::tee_println!(
-                "[redeem_x] skip pair-price gate market_id={} asset_id={} own_avg_after={:.4} sibling_avg={:.4} pair={:.4} > cap={:.4} (own_sh={:.2} sib_sh={:.2} clip={:.2} price={:.4})",
+                "[redeem_x] skip market-exposure gate market_id={} asset_id={} current={:.2} +clip={:.2} projected={:.2} > cap={:.2} (own_cost={:.2} sib_cost={:.2} clip={:.2} price={:.4})",
                 frame.market_id,
                 frame.asset_id,
-                own_avg_after,
-                sibling_avg,
-                projected_pair_price,
-                max_pair_price,
-                own_shares,
-                sibling_shares,
+                current_exposure,
+                clip * maker_price,
+                projected_exposure,
+                max_market_exposure,
+                own_cost,
+                other_cost,
                 clip,
                 maker_price,
             );
@@ -167,6 +256,21 @@ pub(crate) async fn redeem_x_entry_size(
     Some(size)
 }
 
+/// Потолок КОМБИНИРОВАННОЙ цены пары `own_avg + other_avg` в зависимости от вероятности
+/// ФАВОРИТА `fav = max(prob, other_prob)` («Вариант А», см. [`REDEEM_X_PAIR_CAP_BY_FAV_PROB`]).
+/// Пара UP+DOWN гасится в $1 на резолюции, поэтому сматченная часть дороже потолка —
+/// структурный убыток; но чем увереннее фаворит, тем больше направленного излишка на тяжёлой
+/// ноге окупает переплату, поэтому порог растёт с `fav`. Аргументы `prob` / `other_prob` —
+/// implied prob текущей и противоположной ноги в [0..1].
+fn redeem_x_max_pair_price(prob: f64, other_prob: f64) -> f64 {
+    let fav = prob.max(other_prob).clamp(0.0, 1.0);
+    REDEEM_X_PAIR_CAP_BY_FAV_PROB
+        .iter()
+        .find(|(hi, _)| fav < *hi)
+        .map(|(_, cap)| *cap)
+        .unwrap_or(1.0)
+}
+
 /// Фиксированный клип ОДНОГО лимитного ордера по `coin+period` (медиана размера ордера из
 /// tail-отчёта, инвариантна к цене). Неизвестная комбинация → `panic!`.
 fn redeem_x_clip_shares(currency: &str, interval: XFrameIntervalKind) -> Option<f64> {  
@@ -179,10 +283,10 @@ fn redeem_x_clip_shares(currency: &str, interval: XFrameIntervalKind) -> Option<
 }
 
 /// Один проход по обоим bucket'ам по позициям ТЕКУЩЕГО рынка. Возвращает
-/// `(own_shares, own_cost, sibling_shares, sibling_cost, ms_since_last_buy)`:
+/// `(own_shares, own_cost, other_shares, other_cost, ms_since_last_buy)`:
 ///   * `own_shares` / `own_cost` — фактически удержанные шеры и потраченные USDC
 ///     (`position_size`) ТЕКУЩЕЙ ноги (тот же `asset_id`);
-///   * `sibling_shares` / `sibling_cost` — то же для ПРОТИВОПОЛОЖНОЙ ноги (другой
+///   * `other_shares` / `other_cost` — то же для ПРОТИВОПОЛОЖНОЙ ноги (другой
 ///     `asset_id`, тот же `market_id`) — база для пропорции сторон lag↔lead и для гейта
 ///     комбинированной цены пары (см. [`REDEEM_X_MAX_PAIR_PRICE`]);
 ///   * `ms_since_last_buy` — мс с последней **приземлившейся** покупки по `landed_at`
@@ -195,8 +299,8 @@ async fn redeem_x_leg_scan(
     let now_ms = crate::util::current_timestamp_ms();
     let mut own_shares = 0.0;
     let mut own_cost = 0.0;
-    let mut sibling_shares = 0.0;
-    let mut sibling_cost = 0.0;
+    let mut other_shares = 0.0;
+    let mut other_cost = 0.0;
     let mut ms_since_last_buy: Option<i64> = None;
     for by_lane in buckets {
         for lane_positions in by_lane.values() {
@@ -232,8 +336,8 @@ async fn redeem_x_leg_scan(
                         own_shares += shares;
                         own_cost += usd;
                     } else {
-                        sibling_shares += shares;
-                        sibling_cost += usd;
+                        other_shares += shares;
+                        other_cost += usd;
                     }
                 }
                 let landed_at = p
@@ -260,8 +364,8 @@ async fn redeem_x_leg_scan(
     (
         own_shares,
         own_cost,
-        sibling_shares,
-        sibling_cost,
+        other_shares,
+        other_cost,
         ms_since_last_buy,
     )
 }
