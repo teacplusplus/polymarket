@@ -13,6 +13,7 @@
 //! гейты цены/времени и асимметричный потолок инвентаря lead/lag (мягкий крен к лидеру).
 
 use crate::account::SharedAccount;
+use crate::account_order::{OrderAmount, invoke_settlement_report};
 use crate::constants::XFrameIntervalKind;
 use crate::history_sim::{
     LanePositions, MAX_POSITION_USD, MIN_POSITION_USD, StrictBook,
@@ -38,6 +39,15 @@ const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 200.0;
 /// — только банкролл), поэтому она набирается в большей доле. При нулевом лидере отстающая
 /// нога заблокирована (сначала набираем текущего фаворита).
 const REDEEM_X_LAG_TO_LEAD_RATIO: f64 = 0.75;
+/// Потолок КОМБИНИРОВАННОЙ цены пары `own_avg + sibling_avg` (VWAP обеих ног рынка) ПОСЛЕ
+/// добавления нового клипа. Пара UP+DOWN на резолюции платит ровно $1, поэтому набранная
+/// дороже этого порога сматченная пара — структурный убыток на каждой шере (в 8h-прогоне
+/// средняя цена пары была 1.12, до 1.34 → −155 USDC на парах). Гейт запрещает докупать
+/// ногу, если это поднимет средневзвешенную цену пары выше порога; при пустой sibling-ноге
+/// (пары ещё нет) не применяется. Небольшой допуск >1.0 оставляет место направленному
+/// излишку на тяжёлой ноге, ради которого бот и торгует. `None` — гейт выключен (у самого
+/// бота такого потолка нет: он набирает пары до ~1.57, медиана ~1.04).
+const REDEEM_X_MAX_PAIR_PRICE: Option<f64> = None;
 /// Fallback-«время сделки» maker-входа REDEEM_X, когда `open_buy_invoke.report.landed_at
 /// == None` (см. [`redeem_x_leg_scan`]). Сам ордер теперь GTC — истечение делается явным
 /// cancel'ом, а не GTD-`expiration`, поэтому TTL-константы для постановки больше нет.
@@ -68,7 +78,7 @@ pub(crate) async fn redeem_x_entry_size(
     }
     // Один проход по позициям: шеры текущей ноги, шеры sibling-ноги того же рынка (для
     // пропорции сторон) и мс с последней приземлившейся покупки (троттлинг).
-    let (own_shares, sibling_shares, ms_since_last_buy) =
+    let (own_shares, own_cost, sibling_shares, sibling_cost, ms_since_last_buy) =
         redeem_x_leg_scan([positions_by_lane, pending_close_by_lane], frame).await;
     // Троттлинг по времени: не чаще раза в N мс с последней покупки в этом рынке.
     if let (Some(since_ms), Some(min_rebuy_interval_ms)) =
@@ -113,6 +123,35 @@ pub(crate) async fn redeem_x_entry_size(
         return None;
     }
 
+    // (2a) Гейт комбинированной цены пары. Пара UP+DOWN гасится в $1 на резолюции, поэтому
+    // сматченная часть, набранная дороже $1, — структурный убыток. Считаем VWAP пары ПОСЛЕ
+    // добавления клипа: own_avg' = (own_cost + clip·price)/(own_shares + clip), sibling_avg =
+    // sibling_cost/sibling_shares. Применяем только когда гейт включён и sibling-нога непустая
+    // (иначе пары ещё нет). Если проекция цены пары выше потолка — не докупаем ногу.
+    if let Some(max_pair_price) = REDEEM_X_MAX_PAIR_PRICE
+        && sibling_shares > 0.0
+    {
+        let own_avg_after = (own_cost + clip * maker_price) / (own_shares + clip);
+        let sibling_avg = sibling_cost / sibling_shares;
+        let projected_pair_price = own_avg_after + sibling_avg;
+        if projected_pair_price > max_pair_price {
+            crate::tee_println!(
+                "[redeem_x] skip pair-price gate market_id={} asset_id={} own_avg_after={:.4} sibling_avg={:.4} pair={:.4} > cap={:.4} (own_sh={:.2} sib_sh={:.2} clip={:.2} price={:.4})",
+                frame.market_id,
+                frame.asset_id,
+                own_avg_after,
+                sibling_avg,
+                projected_pair_price,
+                max_pair_price,
+                own_shares,
+                sibling_shares,
+                clip,
+                maker_price,
+            );
+            return None;
+        }
+    }
+
     // (3) Полный клип → нотинал USDC с потолками банка/позиции.
     let size = (clip * maker_price).min(MAX_POSITION_USD);
     if size < MIN_POSITION_USD {
@@ -140,20 +179,24 @@ fn redeem_x_clip_shares(currency: &str, interval: XFrameIntervalKind) -> Option<
 }
 
 /// Один проход по обоим bucket'ам по позициям ТЕКУЩЕГО рынка. Возвращает
-/// `(own_shares, sibling_shares, ms_since_last_buy)`:
-///   * `own_shares` — фактически удержанные шеры ТЕКУЩЕЙ ноги (тот же `asset_id`);
-///   * `sibling_shares` — удержанные шеры ПРОТИВОПОЛОЖНОЙ ноги (другой `asset_id`, тот же
-///     `market_id`) — база для пропорции сторон lag↔lead;
+/// `(own_shares, own_cost, sibling_shares, sibling_cost, ms_since_last_buy)`:
+///   * `own_shares` / `own_cost` — фактически удержанные шеры и потраченные USDC
+///     (`position_size`) ТЕКУЩЕЙ ноги (тот же `asset_id`);
+///   * `sibling_shares` / `sibling_cost` — то же для ПРОТИВОПОЛОЖНОЙ ноги (другой
+///     `asset_id`, тот же `market_id`) — база для пропорции сторон lag↔lead и для гейта
+///     комбинированной цены пары (см. [`REDEEM_X_MAX_PAIR_PRICE`]);
 ///   * `ms_since_last_buy` — мс с последней **приземлившейся** покупки по `landed_at`
 ///     settled-отчёта `open_buy_invoke` (Some ⇔ success, включая partial; мок ставит
 ///     `landed_at = current_timestamp_ms()`). `None`, если ни одна ещё не приземлилась.
 async fn redeem_x_leg_scan(
     buckets: [&HashMap<crate::account::LaneKey, LanePositions>; 2],
     frame: &XFrame<SIZE>,
-) -> (f64, f64, Option<i64>) {
+) -> (f64, f64, f64, f64, Option<i64>) {
     let now_ms = crate::util::current_timestamp_ms();
     let mut own_shares = 0.0;
+    let mut own_cost = 0.0;
     let mut sibling_shares = 0.0;
+    let mut sibling_cost = 0.0;
     let mut ms_since_last_buy: Option<i64> = None;
     for by_lane in buckets {
         for lane_positions in by_lane.values() {
@@ -162,15 +205,41 @@ async fn redeem_x_leg_scan(
                 if p.market_id != frame.market_id {
                     continue;
                 }
-                if p.asset_id == frame.asset_id {
-                    own_shares += p.shares_held;
-                } else {
-                    sibling_shares += p.shares_held;
+                // Инвентарь и стоимость берём из ФАКТИЧЕСКОГО отчёта об исполнении
+                // открывающего BUY (`open_buy_invoke`), только при `success` и ненулевом
+                // filled'е: до/без успешного исполнения `shares_held`/`position_size` — лишь
+                // план (виртуальные значения на момент создания), в пропорцию сторон и в VWAP
+                // пары их учитывать нельзя. BUY-отчёт: `taking_amount` = net shares (после
+                // fee), `making_amount` = потраченные USDC.
+                let filled = p
+                    .open_buy_invoke
+                    .as_ref()
+                    .and_then(invoke_settlement_report)
+                    .filter(|report| report.success)
+                    .and_then(|report| match (report.taking_amount, report.making_amount) {
+                        (OrderAmount::Shares(shares), OrderAmount::UsdNotional(usd))
+                            if shares.is_finite()
+                                && shares > 0.0
+                                && usd.is_finite()
+                                && usd >= 0.0 =>
+                        {
+                            Some((shares, usd))
+                        }
+                        _ => None,
+                    });
+                if let Some((shares, usd)) = filled {
+                    if p.asset_id == frame.asset_id {
+                        own_shares += shares;
+                        own_cost += usd;
+                    } else {
+                        sibling_shares += shares;
+                        sibling_cost += usd;
+                    }
                 }
                 let landed_at = p
                     .open_buy_invoke
                     .as_ref()
-                    .and_then(crate::account_order::invoke_settlement_report)
+                    .and_then(invoke_settlement_report)
                     .and_then(|report| report.landed_at);
                 // Если landed_at ещё нет, считаем «время сделки» как момент входа +
                 // [`REDEEM_X_MAKER_1_EXPIRATION_MS`] (грубая оценка задержки до fill'а).
@@ -188,5 +257,11 @@ async fn redeem_x_leg_scan(
             }
         }
     }
-    (own_shares, sibling_shares, ms_since_last_buy)
+    (
+        own_shares,
+        own_cost,
+        sibling_shares,
+        sibling_cost,
+        ms_since_last_buy,
+    )
 }
