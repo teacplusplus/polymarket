@@ -11,6 +11,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // Вшиваем версию сборки (время компиляции + git) в бинарь. Печатается на старте программы,
+    // чтобы сразу видеть, что запущен свежий бинарь, а не устаревшая копия (см. инцидент с
+    // CARGO_TARGET_DIR: собиралось в sandbox-кэш, а запускалась старая ./target/release/poly).
+    // ВАЖНО: делаем это ДО раннего return ниже — иначе без фичи xgb-local переменные не вшьются.
+    // Сознательно НЕ эмитим `cargo:rerun-if-changed`: тогда сохраняется дефолтное поведение
+    // (build.rs перезапускается при изменении любого файла пакета), и POLY_BUILD_UTC совпадает
+    // с реальным моментом пересборки бинаря.
+    emit_build_version();
+
     if env::var("CARGO_FEATURE_XGB_LOCAL").is_err() {
         return;
     }
@@ -37,6 +46,34 @@ fn main() {
     if let Err(err) = sync_deps_xgboost_symlink(&lib_path) {
         println!("cargo:warning=failed to sync deps/libxgboost.so symlink: {err}");
     }
+}
+
+/// Вшивает в бинарь компайл-тайм переменные версии через `cargo:rustc-env` (читаются в
+/// рантайме макросом `env!`): время компиляции в UTC, короткий git-хэш и флаг «грязного»
+/// рабочего дерева. git-вызовы best-effort — при отсутствии git значения = "unknown".
+fn emit_build_version() {
+    let build_utc = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    println!("cargo:rustc-env=POLY_BUILD_UTC={build_utc}");
+
+    let git_hash =
+        run_git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    let dirty = match run_git(&["status", "--porcelain"]) {
+        Some(s) if !s.trim().is_empty() => "-dirty",
+        _ => "",
+    };
+    println!("cargo:rustc-env=POLY_GIT_HASH={git_hash}{dirty}");
+}
+
+/// Запускает `git <args>` в каталоге пакета и возвращает trimmed stdout при успехе.
+fn run_git(args: &[&str]) -> Option<String> {
+    std::process::Command::new("git")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Заменяет `target/<profile>/deps/libxgboost.so` симлинком на локальную CUDA/CPU-сборку.

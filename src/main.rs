@@ -52,6 +52,14 @@ impl AppMode {
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
+    // Версия сборки (вшита в build.rs через cargo:rustc-env). Печатаем сразу, чтобы по логу
+    // было видно, что запущен именно свежескомпилированный бинарь, а не устаревшая копия.
+    println!(
+        "poly build: {} | git {}",
+        env!("POLY_BUILD_UTC"),
+        env!("POLY_GIT_HASH"),
+    );
+
     let account = Account::new_shared();
     match util::detect_country_and_ip(account.http.as_ref()).await {
         Some(info) => {

@@ -45,6 +45,9 @@ xgb-prebuilt = ["xgb/use_prebuilt_xgb"]
 # CUDA в XGBoost. Без xgb-local бессмысленно (prebuilt без GPU).
 cuda = ["xgb/cuda"]
 
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
 [dev-dependencies]
 anyhow = "1.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
