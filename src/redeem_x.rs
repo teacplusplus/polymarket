@@ -15,12 +15,10 @@
 use crate::account::SharedAccount;
 use crate::account_order::{OrderAmount, invoke_settlement_report};
 use crate::constants::XFrameIntervalKind;
-use crate::history_sim::{
-    LanePositions, MAX_POSITION_USD, MIN_POSITION_USD, StrictBook,
-};
+use crate::history_sim::{LanePositions, MAX_POSITION_USD, MIN_POSITION_USD, StrictBook};
 use crate::xframe::{SIZE, XFrame};
-use std::collections::HashMap;
 use XFrameIntervalKind::FiveMin;
+use std::collections::HashMap;
 
 // --- Параметры входа (направленный momentum-maker) ------------------------------------
 
@@ -33,23 +31,13 @@ const REDEEM_X_MIN_REBUY_INTERVAL_MS: Option<i64> = None;
 const REDEEM_X_MIN_BID_SIZE_CLIPS: f64 = 2.0;
 /// Абсолютная минимальная глубина best_bid для BTC 5m (tail: p50 ≈ 308, p40≈200).
 const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 50.0;
-/// Потолок перекоса ног по ЧИСЛУ ШЕРОВ, действующий ВЕСЬ период окна: клип по текущей ноге
-/// разрешаем, только пока после него она не превышает `ratio ×` шеров ДРУГОЙ ноги того же рынка;
-/// иначе блокируем тяжёлую ногу и ждём, пока догонит отстающая. Данные бота 2 (BTC 5m, 288
-/// рынков) показывают НЕПРЕРЫВНЫЙ баланс, а не выравнивание в конце: перекос `max/min` держится
-/// ~1.4–1.5× на всём окне (медиана по бакетам времени до конца практически плоская), доля шеров
-/// в отстающую ногу ~47–50% в каждом бакете, финал median 1.24× / p90 2.08×. Прибыль — с пары,
-/// купленной maker'ом ниже $1 и погашенной в $1 (рыночно-нейтрально), а НЕ с направленного
-/// перекоса (наш прошлый крен `prefer underdog` давал own=33/other=90=2.7× → убытки на победах
-/// фаворита). Стартовый одноногий разгон ограничивает first-clip + быстрый догон второй ногой.
-const REDEEM_X_MAX_LEG_SHARE_RATIO: f64 = 2.0;
 /// Ступеньки потолка цены пары по вероятности ФАВОРИТА `fav = max(prob, other_prob)` —
 /// «Вариант А», откалиброван под p90-envelope принятых ботом 2 пар (BTC 5m): чем увереннее
 /// фаворит, тем выше допускается пара, т.к. направленный излишок на тяжёлой ноге окупает
 /// переплату. Формат: `(верхняя граница fav [исключительно], потолок пары)`, отсортировано
 /// по возрастанию. Последний бакет ловит `fav → 1.0`. См. [`redeem_x_max_pair_price`].
 const REDEEM_X_PAIR_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
-    (0.60, 1.00),
+    (0.60, 1.01),
     (0.70, 1.02),
     (0.80, 1.03),
     (0.90, 1.04),
@@ -119,7 +107,8 @@ pub(crate) async fn redeem_x_entry_size(
         .and_then(crate::account_order::best_bid_size_strict)
         .or(frame.book_bid_l1_size)
         .filter(|s| s.is_finite() && *s > 0.0)?;
-    let min_bid_size = (REDEEM_X_MIN_BID_SIZE_CLIPS * clip).max(REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M);
+    let min_bid_size =
+        (REDEEM_X_MIN_BID_SIZE_CLIPS * clip).max(REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M);
     if best_bid_size < min_bid_size {
         return None;
     }
@@ -131,11 +120,9 @@ pub(crate) async fn redeem_x_entry_size(
     //   * первый клип рынка (ОБЕ ноги пусты) открывает ТОЛЬКО андердог (prob < other_prob):
     //     воркеры up/down спавнятся параллельно (real_sim::LANE_FRAME_ROUTES), иначе на старте
     //     открылись бы СРАЗУ обе; по prob квалифицируется ровно одна нога (устойчиво к гонке);
-    //   * иначе клип по текущей ноге разрешаем, только если ПОСЛЕ него она не уходит дальше
-    //     `REDEEM_X_MAX_LEG_SHARE_RATIO ×` шеров другой ноги — не даём тяжёлой ноге убежать
-    //     (при пустой другой ноге блок: ждём её первый клип). Отстающая нога свободно догоняет,
-    //     равные ноги растут симметрично → перекоса underdog/favorite (own=33/other=90=2.7x),
-    //     который жёг нас, больше нет;
+    //   * при непустой паре разрешаем усреднение вниз только для лёгкой/равной ноги, либо клип,
+    //     который улучшает worst-case redemption и не пробивает потолок цены пары; тяжёлую ногу
+    //     без такого edge не докармливаем;
     //   * при непустой паре — ещё и потолок цены пары [`redeem_x_max_pair_price`]: не
     //     переплачиваем за матч сверх кэпа, кроме клипов, что усредняют пару ВНИЗ.
     // Вероятности ног: implied prob из фрейма, fallback — по цене best_bid (prob своей ноги
@@ -149,30 +136,38 @@ pub(crate) async fn redeem_x_entry_size(
         .filter(|p| p.is_finite() && *p >= 0.0 && *p <= 1.0)
         .unwrap_or((1.0 - prob).clamp(0.0, 1.0));
 
+    let clip_cost = clip * maker_price;
     if other_shares > 0.0 {
+        let guaranteed_before = own_shares.min(other_shares) - (own_cost + other_cost);
+        let guaranteed_after =
+            (own_shares + clip).min(other_shares) - (own_cost + other_cost + clip_cost);
+        let improves_worst_case = guaranteed_after > guaranteed_before;
+
         let max_pair_price = redeem_x_max_pair_price(prob, other_prob);
         let other_avg = other_cost / other_shares;
-        let own_avg_after = (own_cost + clip * maker_price) / (own_shares + clip);
+        let own_avg_after = (own_cost + clip_cost) / (own_shares + clip);
         let projected_pair_price = own_avg_after + other_avg;
         // Старая цена пары до клипа — только если у своей ноги уже есть шеры (иначе пары нет,
         // это первый клип ноги, и «усреднения вниз» быть не может).
         let old_pair_price = (own_shares > 0.0).then(|| own_cost / own_shares + other_avg);
         let lowers_pair = old_pair_price.is_some_and(|old| projected_pair_price < old);
 
-        // Баланс ног ВЕСЬ период (как бот 2 — непрерывно, а не в конце): блокируем тяжёлую ногу,
-        // пока после клипа она выше `RATIO ×` шеров другой — ждём догон отстающей. Плюс потолок
-        // цены пары: профит баланса = N·(1−pair), поэтому пару выше кэпа не наращиваем (клипы,
-        // что СНИЖАЮТ пару, пропускаем всегда — это безопасное усреднение вниз).
-        let blocked_reason = if own_shares + clip > other_shares * REDEEM_X_MAX_LEG_SHARE_RATIO {
-            Some("heavy leg over share-balance")
-        } else if !lowers_pair && projected_pair_price > max_pair_price {
-            Some("pair over cap")
-        } else {
+        // Баланс ног ВЕСЬ период: лёгкая/равная нога может усредняться вниз без проверки
+        // кэпа, а остальные клипы проходят только если улучшают worst-case redemption и остаются
+        // ниже потолка пары. Тяжёлую ногу без такого edge не наращиваем.
+        let blocked_reason = if lowers_pair && own_shares <= other_shares {
+            // усреднение вниз своей ноги (price < own_avg) разрешаем БЕЗ проверки кэпа пары —
+            // но только для лёгкой/равной ноги; для тяжёлой (own > other) такой докорм без
+            // проверки кэпа был бы скрытой направленной ставкой без edge (см. точку 2 разбора).
             None
+        } else if improves_worst_case && projected_pair_price < max_pair_price {
+            None
+        } else {
+            Some("pair over cap")
         };
         if let Some(reason) = blocked_reason {
             crate::tee_println!(
-                "[redeem_x] skip pair gate ({}) market_id={} asset_id={} prob={:.3} other_prob={:.3} own_avg_after={:.4} other_avg={:.4} pair={:.4} old_pair={:?} cap={:.4} ratio={:.2} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
+                "[redeem_x] skip pair gate ({}) market_id={} asset_id={} prob={:.3} other_prob={:.3} own_avg_after={:.4} other_avg={:.4} pair={:.4} old_pair={:?} cap={:.4} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
                 reason,
                 frame.market_id,
                 frame.asset_id,
@@ -183,7 +178,6 @@ pub(crate) async fn redeem_x_entry_size(
                 projected_pair_price,
                 old_pair_price,
                 max_pair_price,
-                REDEEM_X_MAX_LEG_SHARE_RATIO,
                 own_shares,
                 other_shares,
                 clip,
@@ -219,14 +213,14 @@ pub(crate) async fn redeem_x_entry_size(
     // окна при развороте тяжёлой ноги (см. BTC 5m 02:45 UTC у бота: $12.7k → −$2.8k).
     if let Some(max_market_exposure) = REDEEM_X_MAX_MARKET_EXPOSURE_USD {
         let current_exposure = own_cost + other_cost;
-        let projected_exposure = current_exposure + clip * maker_price;
+        let projected_exposure = current_exposure + clip_cost;
         if projected_exposure > max_market_exposure {
             crate::tee_println!(
                 "[redeem_x] skip market-exposure gate market_id={} asset_id={} current={:.2} +clip={:.2} projected={:.2} > cap={:.2} (own_cost={:.2} sib_cost={:.2} clip={:.2} price={:.4})",
                 frame.market_id,
                 frame.asset_id,
                 current_exposure,
-                clip * maker_price,
+                clip_cost,
                 projected_exposure,
                 max_market_exposure,
                 own_cost,
@@ -239,7 +233,7 @@ pub(crate) async fn redeem_x_entry_size(
     }
 
     // (3) Полный клип → нотинал USDC с потолками банка/позиции.
-    let size = (clip * maker_price).min(MAX_POSITION_USD);
+    let size = (clip_cost).min(MAX_POSITION_USD);
     if size < MIN_POSITION_USD {
         return None;
     }
@@ -270,7 +264,7 @@ fn redeem_x_max_pair_price(prob: f64, other_prob: f64) -> f64 {
 
 /// Фиксированный клип ОДНОГО лимитного ордера по `coin+period` (медиана размера ордера из
 /// tail-отчёта, инвариантна к цене). Неизвестная комбинация → `panic!`.
-fn redeem_x_clip_shares(currency: &str, interval: XFrameIntervalKind) -> Option<f64> {  
+fn redeem_x_clip_shares(currency: &str, interval: XFrameIntervalKind) -> Option<f64> {
     Some(match (currency.to_ascii_lowercase().as_str(), interval) {
         ("btc", FiveMin) => 5.0,
         (coin, interval) => panic!(
@@ -317,17 +311,19 @@ async fn redeem_x_leg_scan(
                     .as_ref()
                     .and_then(invoke_settlement_report)
                     .filter(|report| report.success)
-                    .and_then(|report| match (report.taking_amount, report.making_amount) {
-                        (OrderAmount::Shares(shares), OrderAmount::UsdNotional(usd))
-                            if shares.is_finite()
-                                && shares > 0.0
-                                && usd.is_finite()
-                                && usd >= 0.0 =>
-                        {
-                            Some((shares, usd))
-                        }
-                        _ => None,
-                    });
+                    .and_then(
+                        |report| match (report.taking_amount, report.making_amount) {
+                            (OrderAmount::Shares(shares), OrderAmount::UsdNotional(usd))
+                                if shares.is_finite()
+                                    && shares > 0.0
+                                    && usd.is_finite()
+                                    && usd >= 0.0 =>
+                            {
+                                Some((shares, usd))
+                            }
+                            _ => None,
+                        },
+                    );
                 if let Some((shares, usd)) = filled {
                     if p.asset_id == frame.asset_id {
                         own_shares += shares;
