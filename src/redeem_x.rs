@@ -148,11 +148,6 @@ pub(crate) async fn redeem_x_entry_size(
 
     let clip_cost = clip * maker_price;
     if other_shares > 0.0 {
-        let guaranteed_before = own_shares.min(other_shares) - (own_cost + other_cost);
-        let guaranteed_after =
-            (own_shares + clip).min(other_shares) - (own_cost + other_cost + clip_cost);
-        let improves_worst_case = guaranteed_after > guaranteed_before;
-
         let max_pair_price = redeem_x_max_pair_price(prob, other_prob);
         let other_avg = other_cost / other_shares;
         let own_avg_after = (own_cost + clip_cost) / (own_shares + clip);
@@ -162,15 +157,23 @@ pub(crate) async fn redeem_x_entry_size(
         let old_pair_price = (own_shares > 0.0).then(|| own_cost / own_shares + other_avg);
         let lowers_pair = old_pair_price.is_some_and(|old| projected_pair_price < old);
 
-        // Баланс ног ВЕСЬ период: лёгкая/равная нога может усредняться вниз без проверки
-        // кэпа, а остальные клипы проходят только если улучшают worst-case redemption и остаются
-        // ниже потолка пары. Тяжёлую ногу без такого edge не наращиваем.
+        // Баланс ног ВЕСЬ период + правильное НАПРАВЛЕНИЕ перекоса (как у бота 2: тяжёлая нога =
+        // фаворит в 63%, побеждает в 62%). Клип проходит без проверки max-cap, если ЛИБО:
+        //   1) `lowers_pair && own_shares <= other_shares` — усреднение вниз, но ТОЛЬКО пока нога
+        //      не тяжелее другой (до паритета). Так андердог не может разогнаться за паритет
+        //      (в v8 без этого ограничения проигравший андердог раздулся до 118:32, ratio 3.62);
+        //   2) `projected_pair_price < 1.0 && prob >= other_prob` — ТЕКУЩИЙ ФАВОРИТ добирает, пока
+        //      пара остаётся ниже $1 (матч-часть гарантированно в плюсе). Это доп. путь набора,
+        //      которого у андердога нет, → тяжёлой становится нога вероятного победителя.
+        // Всё остальное — только если клип держит пару под потолком И это нога ФАВОРИТА
+        // (prob >= other_prob). Это единственный путь добора выше $1
+        // (cap растёт с уверенностью фаворита до 1.15 — так же, как бот 2: он уводил пару за 1.0
+        // тем охотнее, чем выше prob фаворита, median 0.795 vs 0.665; от времени до конца это НЕ
+        // зависит). Догон ОТСТАЮЩЕГО андердога выше $1 здесь режется — андердогу остаётся только
+        // усреднение вниз (ветка 1), что и есть его поведение у бота 2 при паре>1.0 (prob≈0.245).
         let blocked_reason = if lowers_pair && own_shares <= other_shares {
-            // усреднение вниз своей ноги (price < own_avg) разрешаем БЕЗ проверки кэпа пары —
-            // но только для лёгкой/равной ноги; для тяжёлой (own > other) такой докорм без
-            // проверки кэпа был бы скрытой направленной ставкой без edge (см. точку 2 разбора).
             None
-        } else if improves_worst_case && projected_pair_price < max_pair_price {
+        } else if projected_pair_price < max_pair_price && prob >= other_prob {
             None
         } else {
             Some("pair over cap")
