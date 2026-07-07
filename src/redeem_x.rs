@@ -59,7 +59,36 @@ const REDEEM_X_BOOTSTRAP_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
     (1.00, 1.32),
 ];
 
-const REDEEM_X_BALANCE_ZONE_MS: i64 = 60_000;
+/// Потолок цены пары для клипов, УЛУЧШАЮЩИХ гарантию (`pnl_guaranteed_improves`), по
+/// вероятности СВОЕЙ ноги `prob` (не фаворита пары). Калибровка по p90 бота-2: из 5476
+/// гарантию-улучшающих сделок пара, при которой бот их делает, растёт с уверенностью своей
+/// ноги — андердог/середина (prob<0.55) держится ~1.04–1.05, фаворит (prob≥0.8) добирает до
+/// p90≈1.20 (60% таких клипов у фаворита идут при паре > $1.0). Жёсткий хардкат `< 1.0`
+/// (v21) резал именно прибыльный докорм фаворита; здесь порог prob-масштабирован. Для
+/// андердога порог ≈1.0 душит переплату за пару на whipsaw-рынках (0xe0a950de, pair→1.08).
+/// Формат: `(верхняя граница prob своей ноги [исключительно], потолок пары)`, по возрастанию.
+const REDEEM_X_GUAR_CAP_BY_OWN_PROB: &[(f64, f64)] = &[
+    (0.35, 1.06),
+    (0.45, 1.04),
+    (0.55, 1.05),
+    (0.65, 1.07),
+    (0.80, 1.11),
+    (1.00, 1.20),
+];
+
+/// Потолок цены пары для клипов ЧИСТОГО ТИЛТА В ФАВОРИТА (`prob >= other_prob`, клип не
+/// улучшает гарантию и не опускает пару — просто перевес в вероятного победителя) по
+/// вероятности СВОЕЙ ноги. Калибровка по p90 бота-2 (1690 тилт-сделок): при prob>0.6
+/// более половины таких клипов бот делает при паре > $1.0 (у сильного фаворита prob≥0.9 —
+/// 72%, p90≈1.22). Хардкат `< 1.0` (v21/v22) резал именно этот прибыльный перевес в
+/// победителя. Формат: `(верхняя граница prob своей ноги [исключительно], потолок пары)`.
+const REDEEM_X_TILT_CAP_BY_OWN_PROB: &[(f64, f64)] = &[
+    (0.60, 1.10),
+    (0.70, 1.14),
+    (0.80, 1.14),
+    (0.90, 1.13),
+    (1.00, 1.22),
+];
 
 /// Лестница допуска разбега ног `pnl_diff_after` (|выплата своей ноги − выплата чужой| =
 /// |own_shares + clip − other_shares|) как доля суммарно вложенных USDC обеих ног.
@@ -182,7 +211,6 @@ pub(crate) async fn redeem_x_entry_size(
 
     let clip_cost = clip * maker_price;
 
-
     //let pnl_before = own_shares - (own_cost + other_cost);
     let pnl_after = other_shares + clip - (own_cost + other_cost + clip_cost);
 
@@ -191,7 +219,8 @@ pub(crate) async fn redeem_x_entry_size(
     //let pnl_total_improves = (pnl_after > pnl_before) && pnl_after > 0.0 && (other_pnl_after > other_pnl_before) && other_pnl_after > 0.0;
 
     let guaranteed_before = own_shares.min(other_shares) - (own_cost + other_cost);
-    let guaranteed_after = (own_shares + clip).min(other_shares) - (own_cost + other_cost + clip_cost);
+    let guaranteed_after =
+        (own_shares + clip).min(other_shares) - (own_cost + other_cost + clip_cost);
     let pnl_guaranteed_improves = guaranteed_after > guaranteed_before;
 
     // Разбег выплат ног (метрика pnl_diff из отчёта бота 2): |PnL если своя нога выиграет −
@@ -200,7 +229,6 @@ pub(crate) async fn redeem_x_entry_size(
     // diff_before ≡ 0 и diff_after ≡ clip, что не несёт информации о позиции.
     let share_diff_before = (own_shares - other_shares).abs();
     let share_diff_after = (own_shares + clip - other_shares).abs();
-
 
     if other_shares > 0.0 {
         let max_pair_price = redeem_x_max_pair_price(prob, other_prob, own_shares == 0.0);
@@ -222,29 +250,32 @@ pub(crate) async fn redeem_x_entry_size(
         // −$1.4 у безусловного блока). У бота ранний андердог EV+, но на мок-исполнении
         // (buy at best_bid) этот edge не воспроизводится — блокируем безусловно.
         let grows_heavy_underdog = prob < other_prob && own_shares + clip > other_shares;
-        let blocked_reason =
-            if grows_heavy_underdog {
-                Some("grows heavy underdog (за паритет — только фаворит)")
-            } else {
-                if projected_pair_price < max_pair_price {
-                    if guaranteed_after > REDEEM_X_MAX_PNL {
-                        Some("guaranteed_after > REDEEM_X_MAX_PNL")
-                    } else {
-                        if pnl_after < REDEEM_X_MIN_PNL {
-                            Some("pnl_after < REDEEM_X_MIN_PNL")
-                        } else {
-                            if pnl_guaranteed_improves || lowers_pair || (prob >= other_prob && projected_pair_price < 1.0) {
-                                None
-                            } else {
-                                Some("!pnl_guaranteed_improves && !lowers_pair && !favorite")
-                            }
-                        }                      
-                    }      
+        let blocked_reason = if grows_heavy_underdog {
+            Some("grows heavy underdog (за паритет — только фаворит)")
+        } else {
+            if projected_pair_price < max_pair_price {
+                if guaranteed_after > REDEEM_X_MAX_PNL {
+                    Some("guaranteed_after > REDEEM_X_MAX_PNL")
                 } else {
-                    Some("projected_pair_price >= max_pair_price")
+                    if pnl_after < REDEEM_X_MIN_PNL {
+                        Some("pnl_after < REDEEM_X_MIN_PNL")
+                    } else {
+                        if (pnl_guaranteed_improves
+                            && projected_pair_price < redeem_x_guar_cap(prob))
+                            || lowers_pair
+                            || (prob >= other_prob
+                                && projected_pair_price < redeem_x_tilt_cap(prob))
+                        {
+                            None
+                        } else {
+                            Some("!pnl_guaranteed_improves && !lowers_pair && !favorite")
+                        }
+                    }
                 }
-            };
-            
+            } else {
+                Some("projected_pair_price >= max_pair_price")
+            }
+        };
 
         if let Some(reason) = blocked_reason {
             crate::tee_println!(
@@ -270,7 +301,8 @@ pub(crate) async fn redeem_x_entry_size(
         // Гейт разбега ног (bot-2: разбег зависит только от времени, не от pair).
         // Блокируем ТОЛЬКО клипы, растящие разбег сверх временного допуска; сокращающие
         // разбег проходят всегда — иначе отстающая нога не сможет догонять.
-        let max_diff = redeem_x_max_pnl_diff_frac(frame.event_remaining_ms) * (own_cost + other_cost + clip_cost);
+        let max_diff = redeem_x_max_pnl_diff_frac(frame.event_remaining_ms)
+            * (own_cost + other_cost + clip_cost);
         if share_diff_after > share_diff_before && share_diff_after > max_diff {
             crate::tee_println!(
                 "[redeem_x] skip pnl_diff gate market_id={} asset_id={} diff_before={:.2} diff_after={:.2} max_diff={:.2} remaining_ms={} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
@@ -287,7 +319,7 @@ pub(crate) async fn redeem_x_entry_size(
             );
             return None;
         }
-    } else if pnl_after > REDEEM_X_MIN_PNL {        
+    } else if pnl_after > REDEEM_X_MIN_PNL {
         if prob >= other_prob {
             crate::tee_println!(
                 "[redeem_x] skip first-clip gate (favorite, wait for underdog) market_id={} asset_id={} prob={:.3} other_prob={:.3} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
@@ -301,8 +333,8 @@ pub(crate) async fn redeem_x_entry_size(
                 maker_price,
             );
             return None;
-        }        
-    } else {        
+        }
+    } else {
         crate::tee_println!(
             "[redeem_x] skip solo-leg gate (own open, partner empty — wait for other leg) market_id={} asset_id={} prob={:.3} other_prob={:.3} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
             frame.market_id,
@@ -373,6 +405,28 @@ fn redeem_x_max_pair_price(prob: f64, other_prob: f64, own_empty: bool) -> f64 {
     table
         .iter()
         .find(|(hi, _)| fav < *hi)
+        .map(|(_, cap)| *cap)
+        .unwrap_or(1.0)
+}
+
+/// Потолок пары для гарантию-улучшающего клипа по вероятности СВОЕЙ ноги.
+/// См. [`REDEEM_X_GUAR_CAP_BY_OWN_PROB`].
+fn redeem_x_guar_cap(own_prob: f64) -> f64 {
+    let p = own_prob.clamp(0.0, 1.0);
+    REDEEM_X_GUAR_CAP_BY_OWN_PROB
+        .iter()
+        .find(|(hi, _)| p < *hi)
+        .map(|(_, cap)| *cap)
+        .unwrap_or(1.0)
+}
+
+/// Потолок пары для клипа чистого тилта в фаворита по вероятности СВОЕЙ ноги.
+/// См. [`REDEEM_X_TILT_CAP_BY_OWN_PROB`].
+fn redeem_x_tilt_cap(own_prob: f64) -> f64 {
+    let p = own_prob.clamp(0.0, 1.0);
+    REDEEM_X_TILT_CAP_BY_OWN_PROB
+        .iter()
+        .find(|(hi, _)| p < *hi)
         .map(|(_, cap)| *cap)
         .unwrap_or(1.0)
 }
