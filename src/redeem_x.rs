@@ -37,12 +37,46 @@ const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 50.0;
 /// переплату. Формат: `(верхняя граница fav [исключительно], потолок пары)`, отсортировано
 /// по возрастанию. Последний бакет ловит `fav → 1.0`. См. [`redeem_x_max_pair_price`].
 const REDEEM_X_PAIR_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
-    (0.60, 1.01),
-    (0.70, 1.02),
-    (0.80, 1.03),
-    (0.90, 1.04),
-    (1.00, 1.15),
+    (0.60, 1.03),
+    (0.70, 1.08),
+    (0.80, 1.10),
+    (0.90, 1.12),
+    (1.00, 1.22),
 ];
+
+/// Более широкий кап пары для ПЕРВИЧНОЙ установки второй ноги (своя нога пуста,
+/// `own_shares == 0`, партнёр уже есть). Калибровка по p90 установочных сделок бота-2
+/// (own=0, other>0; 281 сделка): бот ставит партнёра до пары ~1.07/1.17/1.18/1.22/1.32 для
+/// фаворита 0.6/0.7/0.8/0.9/1.0. Строгий [`REDEEM_X_PAIR_CAP_BY_FAV_PROB`] душил партнёра
+/// (v18: UP-фаворит не смог зайти — пара 1.09 при cap 1.02 — DOWN остался соло и сгорел,
+/// payout=0 на 0x516d30b1). Bootstrap важнее идеальной цены: любая вторая нога срезает
+/// directional-риск. Докорм уже открытой ноги остаётся под строгим капом.
+const REDEEM_X_BOOTSTRAP_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
+    (0.60, 1.07),
+    (0.70, 1.17),
+    (0.80, 1.18),
+    (0.90, 1.22),
+    (1.00, 1.32),
+];
+
+const REDEEM_X_BALANCE_ZONE_MS: i64 = 60_000;
+
+/// Лестница допуска разбега ног `pnl_diff_after` (|выплата своей ноги − выплата чужой| =
+/// |own_shares + clip − other_shares|) как доля суммарно вложенных USDC обеих ног.
+/// Калибровка по p90 бота 2 (287 рынков BTC 5m, обе ноги уже открыты): в ранней фазе набора
+/// разбег может превышать вложенное (~1.8×, одна нога стартует раньше), к T-180s сходится
+/// к ~1×. От `pair` разбег НЕ зависит (r=+0.00), только от времени. Блокируются лишь клипы,
+/// РАСТЯЩИЕ разбег сверх допуска; сокращающие разбег проходят всегда.
+fn redeem_x_max_pnl_diff_frac(event_remaining_ms: i64) -> f64 {
+    if event_remaining_ms >= 240_000 {
+        1.8
+    } else if event_remaining_ms >= 180_000 {
+        1.25
+    } else {
+        1.0
+    }
+}
+
 /// Абсолютный потолок суммарной экспозиции (потраченных USDC по ОБЕИМ ногам) в ОДНОМ рынке.
 /// Считается по фактическому филлу (`own_cost + other_cost`); если добавление клипа выведет
 /// сумму за порог — новый вход в этот рынок блокируется. Ограничивает максимальный убыток
@@ -56,7 +90,8 @@ const REDEEM_X_MAX_MARKET_EXPOSURE_USD: Option<f64> = Some(300.0);
 /// вложено ≥ X, докорм соло-ноги блокируется (см. solo-leg gate). Ограничивает максимальный
 /// директональный убыток окна, где партнёр так и не встал (цена убежала, пара > cap): вместо
 /// слива всей ноги (−$64 на 0x321edc92) теряем не больше ~X. `0.0` ⇒ открывается ровно один клип.
-const REDEEM_X_SOLO_LEG_MAX_USD: f64 = 10.0;
+const REDEEM_X_MIN_PNL: f64 = -15.0;
+const REDEEM_X_MAX_PNL: f64 = 15.0;
 /// Fallback-«время сделки» maker-входа REDEEM_X, когда `open_buy_invoke.report.landed_at
 /// == None` (см. [`redeem_x_leg_scan`]). Сам ордер теперь GTC — истечение делается явным
 /// cancel'ом, а не GTD-`expiration`, поэтому TTL-константы для постановки больше нет.
@@ -130,11 +165,10 @@ pub(crate) async fn redeem_x_entry_size(
     //     по вложенным USDC; дальше докорм соло-ноги блокируется (см. solo-leg gate ниже) — без
     //     партнёра это направленная ставка, которая при разбегании цены сливала ногу целиком,
     //     поэтому директональный риск окна ограничен ~$X, а не всей ногой; ждём вторую ногу;
-    //   * при непустой паре разрешаем усреднение вниз только для лёгкой/равной ноги, либо клип,
-    //     который улучшает worst-case redemption и не пробивает потолок цены пары; тяжёлую ногу
-    //     без такого edge не докармливаем;
-    //   * при непустой паре — ещё и потолок цены пары [`redeem_x_max_pair_price`]: не
-    //     переплачиваем за матч сверх кэпа, кроме клипов, что усредняют пару ВНИЗ.
+    //   * при непустой паре ЛЁГКАЯ/равная нога докупается, если клип усредняет её вниз ЛИБО
+    //     держит пару после клипа ниже $1 (догон отстающей — матч в плюсе); ФАВОРИТ добирает
+    //     вплоть до потолка пары [`redeem_x_max_pair_price`] (растёт с уверенностью до 1.15) —
+    //     так перевес уходит в ногу вероятного победителя; тяжёлый андердог не докармливается.
     // Вероятности ног: implied prob из фрейма, fallback — по цене best_bid (prob своей ноги
     // ≈ maker_price, второй ≈ 1 − maker_price).
     let prob = frame
@@ -147,37 +181,71 @@ pub(crate) async fn redeem_x_entry_size(
         .unwrap_or((1.0 - prob).clamp(0.0, 1.0));
 
     let clip_cost = clip * maker_price;
+
+
+    //let pnl_before = own_shares - (own_cost + other_cost);
+    let pnl_after = other_shares + clip - (own_cost + other_cost + clip_cost);
+
+    //let other_pnl_before = own_shares - (own_cost + other_cost);
+    //let other_pnl_after = other_shares - (own_cost + other_cost + clip_cost);
+    //let pnl_total_improves = (pnl_after > pnl_before) && pnl_after > 0.0 && (other_pnl_after > other_pnl_before) && other_pnl_after > 0.0;
+
+    let guaranteed_before = own_shares.min(other_shares) - (own_cost + other_cost);
+    let guaranteed_after = (own_shares + clip).min(other_shares) - (own_cost + other_cost + clip_cost);
+    let pnl_guaranteed_improves = guaranteed_after > guaranteed_before;
+
+    // Разбег выплат ног (метрика pnl_diff из отчёта бота 2): |PnL если своя нога выиграет −
+    // PnL если чужая|. Затраты в разности сокращаются, остаётся дисбаланс шеров.
+    // НЕ через pnl_after/other_pnl_after выше: у тех формулы дают тождественно
+    // diff_before ≡ 0 и diff_after ≡ clip, что не несёт информации о позиции.
+    let share_diff_before = (own_shares - other_shares).abs();
+    let share_diff_after = (own_shares + clip - other_shares).abs();
+
+
     if other_shares > 0.0 {
-        let max_pair_price = redeem_x_max_pair_price(prob, other_prob);
+        let max_pair_price = redeem_x_max_pair_price(prob, other_prob, own_shares == 0.0);
         let other_avg = other_cost / other_shares;
         let own_avg_after = (own_cost + clip_cost) / (own_shares + clip);
         let projected_pair_price = own_avg_after + other_avg;
-        // Старая цена пары до клипа — только если у своей ноги уже есть шеры (иначе пары нет,
-        // это первый клип ноги, и «усреднения вниз» быть не может).
+
         let old_pair_price = (own_shares > 0.0).then(|| own_cost / own_shares + other_avg);
         let lowers_pair = old_pair_price.is_some_and(|old| projected_pair_price < old);
+        // Крен (тяжёлая нога сверх паритета шеров) разрешён только текущему фавориту.
+        // Бот-2: тяжёлая нога = победитель в 65% рынков; v13 у нас тяжёлой всегда
+        // оказывался дешевевший андердог (`lowers_pair` пропускал усреднение падающей
+        // ноги без ограничений) — тяжёлая нога проиграла в 17/17 рынков с дисбалансом.
+        // Проверка стоит ДО bypass'а pnl_total_improves: он тоже пропускал андердога
+        // за паритет по клипу за раз.
+        // Тяжёлой ногой (сверх паритета шеров) может быть только текущий фаворит.
+        // Временное послабление (пропуск раннего докорма андердога, T>60s) в v15 вернуло
+        // v13-сценарий: андердог по ~0.12 переходил паритет и сгорал (−$4.5/рынок против
+        // −$1.4 у безусловного блока). У бота ранний андердог EV+, но на мок-исполнении
+        // (buy at best_bid) этот edge не воспроизводится — блокируем безусловно.
+        let grows_heavy_underdog = prob < other_prob && own_shares + clip > other_shares;
+        let blocked_reason =
+            if grows_heavy_underdog {
+                Some("grows heavy underdog (за паритет — только фаворит)")
+            } else {
+                if projected_pair_price < max_pair_price {
+                    if guaranteed_after > REDEEM_X_MAX_PNL {
+                        Some("guaranteed_after > REDEEM_X_MAX_PNL")
+                    } else {
+                        if pnl_after < REDEEM_X_MIN_PNL {
+                            Some("pnl_after < REDEEM_X_MIN_PNL")
+                        } else {
+                            if pnl_guaranteed_improves || lowers_pair || (prob >= other_prob && projected_pair_price < 1.0) {
+                                None
+                            } else {
+                                Some("!pnl_guaranteed_improves && !lowers_pair && !favorite")
+                            }
+                        }                      
+                    }      
+                } else {
+                    Some("projected_pair_price >= max_pair_price")
+                }
+            };
+            
 
-        // Баланс ног ВЕСЬ период + правильное НАПРАВЛЕНИЕ перекоса (как у бота 2: тяжёлая нога =
-        // фаворит в 63%, побеждает в 62%). Клип проходит без проверки max-cap, если ЛИБО:
-        //   1) `lowers_pair && own_shares <= other_shares` — усреднение вниз, но ТОЛЬКО пока нога
-        //      не тяжелее другой (до паритета). Так андердог не может разогнаться за паритет
-        //      (в v8 без этого ограничения проигравший андердог раздулся до 118:32, ratio 3.62);
-        //   2) `projected_pair_price < 1.0 && prob >= other_prob` — ТЕКУЩИЙ ФАВОРИТ добирает, пока
-        //      пара остаётся ниже $1 (матч-часть гарантированно в плюсе). Это доп. путь набора,
-        //      которого у андердога нет, → тяжёлой становится нога вероятного победителя.
-        // Всё остальное — только если клип держит пару под потолком И это нога ФАВОРИТА
-        // (prob >= other_prob). Это единственный путь добора выше $1
-        // (cap растёт с уверенностью фаворита до 1.15 — так же, как бот 2: он уводил пару за 1.0
-        // тем охотнее, чем выше prob фаворита, median 0.795 vs 0.665; от времени до конца это НЕ
-        // зависит). Догон ОТСТАЮЩЕГО андердога выше $1 здесь режется — андердогу остаётся только
-        // усреднение вниз (ветка 1), что и есть его поведение у бота 2 при паре>1.0 (prob≈0.245).
-        let blocked_reason = if lowers_pair && own_shares <= other_shares {
-            None
-        } else if projected_pair_price < max_pair_price && prob >= other_prob {
-            None
-        } else {
-            Some("pair over cap")
-        };
         if let Some(reason) = blocked_reason {
             crate::tee_println!(
                 "[redeem_x] skip pair gate ({}) market_id={} asset_id={} prob={:.3} other_prob={:.3} own_avg_after={:.4} other_avg={:.4} pair={:.4} old_pair={:?} cap={:.4} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
@@ -198,16 +266,28 @@ pub(crate) async fn redeem_x_entry_size(
             );
             return None;
         }
-    } else if own_cost < REDEEM_X_SOLO_LEG_MAX_USD {
-        // Партнёр ещё пуст (other_shares == 0), а в свою ногу вложено < REDEEM_X_SOLO_LEG_MAX_USD:
-        // фаза открытия/набора дешёвой базы. Воркеры up/down спавнятся параллельно на все лейны
-        // (см. real_sim::LANE_FRAME_ROUTES), поэтому без гейта на старте открылись бы СРАЗУ обе
-        // ноги. Открываем/добираем рынок только ДЕШЁВОЙ стороной — андердогом (prob < other_prob):
-        // квалифицируется ровно одна нога, устойчиво к гонке (фаворит режется по prob, а не по
-        // other_shares). Бот так и делает: первый клип в ~90% — дешёвая/underdog-нога (в 15m-примере
-        // Down@47c). Набор соло-ноги ограничен $X по вложенным USDC — дальше ждём партнёра
-        // (solo-leg gate ниже); партнёр откроется через логику пары (ветка выше), как только пара
-        // влезет под cap. Так директональный риск окна без партнёра ограничен ~$X, а не всей ногой.
+
+        // Гейт разбега ног (bot-2: разбег зависит только от времени, не от pair).
+        // Блокируем ТОЛЬКО клипы, растящие разбег сверх временного допуска; сокращающие
+        // разбег проходят всегда — иначе отстающая нога не сможет догонять.
+        let max_diff = redeem_x_max_pnl_diff_frac(frame.event_remaining_ms) * (own_cost + other_cost + clip_cost);
+        if share_diff_after > share_diff_before && share_diff_after > max_diff {
+            crate::tee_println!(
+                "[redeem_x] skip pnl_diff gate market_id={} asset_id={} diff_before={:.2} diff_after={:.2} max_diff={:.2} remaining_ms={} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
+                frame.market_id,
+                frame.asset_id,
+                share_diff_before,
+                share_diff_after,
+                max_diff,
+                frame.event_remaining_ms,
+                own_shares,
+                other_shares,
+                clip,
+                maker_price,
+            );
+            return None;
+        }
+    } else if pnl_after > REDEEM_X_MIN_PNL {        
         if prob >= other_prob {
             crate::tee_println!(
                 "[redeem_x] skip first-clip gate (favorite, wait for underdog) market_id={} asset_id={} prob={:.3} other_prob={:.3} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
@@ -221,16 +301,8 @@ pub(crate) async fn redeem_x_entry_size(
                 maker_price,
             );
             return None;
-        }
-        // андердог — разрешаем клип (открытие рынка или добор базы до $X; далее к гейтам ниже).
-    } else {
-        // Партнёр ПУСТ (other_shares == 0), а в свою ногу уже вложено ≥ REDEEM_X_SOLO_LEG_MAX_USD.
-        // НЕ доливаем соло-ногу дальше: именно безпартнёрный разгон одной стороны слил всю ногу
-        // (-64.73 на 0x321edc92 — андердог открылся у ~0.46, цена убежала, партнёр так и не встал,
-        // т.к. пара пробивала cap, а мы догнали ногу до ~298 шт и потеряли её целиком). pair-логика
-        // выше авторизует докорм только при НЕПУСТОМ партнёре (улучшение worst-case или усреднение
-        // пары вниз) — до его появления держим набранную базу (≤ $X). Кэп экспозиции ($300) тут не
-        // спасает: дешёвую ногу можно набрать на сотни штук в лимите, поэтому лимит именно по соло-USD.
+        }        
+    } else {        
         crate::tee_println!(
             "[redeem_x] skip solo-leg gate (own open, partner empty — wait for other leg) market_id={} asset_id={} prob={:.3} other_prob={:.3} (own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
             frame.market_id,
@@ -291,9 +363,14 @@ pub(crate) async fn redeem_x_entry_size(
 /// структурный убыток; но чем увереннее фаворит, тем больше направленного излишка на тяжёлой
 /// ноге окупает переплату, поэтому порог растёт с `fav`. Аргументы `prob` / `other_prob` —
 /// implied prob текущей и противоположной ноги в [0..1].
-fn redeem_x_max_pair_price(prob: f64, other_prob: f64) -> f64 {
+fn redeem_x_max_pair_price(prob: f64, other_prob: f64, own_empty: bool) -> f64 {
     let fav = prob.max(other_prob).clamp(0.0, 1.0);
-    REDEEM_X_PAIR_CAP_BY_FAV_PROB
+    let table = if own_empty {
+        REDEEM_X_BOOTSTRAP_CAP_BY_FAV_PROB
+    } else {
+        REDEEM_X_PAIR_CAP_BY_FAV_PROB
+    };
+    table
         .iter()
         .find(|(hi, _)| fav < *hi)
         .map(|(_, cap)| *cap)
