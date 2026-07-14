@@ -90,6 +90,15 @@ const REDEEM_X_TILT_CAP_BY_OWN_PROB: &[(f64, f64)] = &[
     (1.00, 1.22),
 ];
 
+/// Порог ДЕШЁВОЙ маржинальной пары: `maker_price + other_avg` (почём прямо сейчас докупается
+/// своя нога против средней чужой). Ниже порога грузим крупнее ([`REDEEM_X_CHEAP_PAIR_CLIP_MULT`]):
+/// в стакане такие окна редки (1–9% времени по xframes 40 общих рынков, медиана пары бидов
+/// ≈0.99), а именно на них бот-2 собирает свои крупные плюсы (pair 0.70–0.86 → +$116…+$257;
+/// у него это много клипов подряд в провал, у нас с фикс-клипом 5 — эквивалент через размер).
+const REDEEM_X_CHEAP_PAIR_THRESHOLD: f64 = 0.95;
+/// Множитель клипа в окне дешёвой пары: 5 → 15 шер.
+const REDEEM_X_CHEAP_PAIR_CLIP_MULT: f64 = 3.0;
+
 /// Лестница допуска разбега ног `pnl_diff_after` (|выплата своей ноги − выплата чужой| =
 /// |own_shares + clip − other_shares|) как доля суммарно вложенных USDC обеих ног.
 /// Калибровка по p90 бота 2 (287 рынков BTC 5m, обе ноги уже открыты): в ранней фазе набора
@@ -162,13 +171,23 @@ pub(crate) async fn redeem_x_entry_size(
     }
 
     // (1) Фиксированный клип coin+period; maker встаёт на best_bid (= цена shares↔USDC).
-    let clip = redeem_x_clip_shares(currency, interval)?;
+    let mut clip = redeem_x_clip_shares(currency, interval)?;
     let maker_price = strict_book
         .and_then(crate::account_order::best_bid_strict)
         .or(frame.book_bid_l1_price)
         .filter(|p| p.is_finite() && *p > 0.0)?;
     if !(REDEEM_X_MIN_PRICE..=REDEEM_X_MAX_PRICE).contains(&maker_price) {
         return None;
+    }
+
+    // (1b) Окно дешёвой пары: партнёр уже стоит, и маржинальная пара (текущая цена своей
+    // ноги + средняя чужой) ниже порога — грузим крупнее. Именно такие окна дают боту-2
+    // его крупные плюсы; гейты ниже оценивают уже УВЕЛИЧЕННЫЙ клип (паритет/разбег/капы).
+    if other_shares > 0.0 {
+        let other_avg = other_cost / other_shares;
+        if maker_price + other_avg < REDEEM_X_CHEAP_PAIR_THRESHOLD {
+            clip *= REDEEM_X_CHEAP_PAIR_CLIP_MULT;
+        }
     }
 
     // (1a) Гейт глубины best_bid по профилю бота BTC 5m: требуем абсолютный floor и

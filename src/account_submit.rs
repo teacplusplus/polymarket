@@ -911,21 +911,26 @@ pub(crate) fn spawn_open_buy(
 
                 
 
-                // REDEEM_X: открывающий maker — GTC, поэтому истечение делаем сами. Через
-                // `REDEEM_X_MAKER_1_EXPIRATION_MS` отменяем открывающий ордер отдельным
-                // спавном, чтобы он не висел в книге дольше нужного; частичные fill'ы,
-                // случившиеся до отмены, settl'ятся штатно (invoke ниже увидит терминал).
+                // REDEEM_X: открывающий maker — GTC, поэтому истечение делаем сами.
+                // Отменяем открывающий ордер отдельным спавном — по `select!` между
+                // таймаутом `REDEEM_X_MAKER_1_EXPIRATION_MS` (обычный «живёт не дольше
+                // секунды») и per-position `redeem_x_cancel_notify` (падение best_bid этой
+                // ноги, взводит frame-builder → отменяем сразу, не дожидаясь секунды).
+                // Частичные fill'ы до отмены settl'ятся штатно (invoke ниже увидит терминал).
                 if redeem_x
                     && let Some(open_order_id) = http_order_id.clone()
                 {
                     let cancel_account = account.clone();
                     let cancel_project_manager = project_manager.clone();
                     let cancel_pos_id = pos_id.clone();
+                    let cancel_notify = position.read().await.redeem_x_cancel_notify.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(
-                            crate::redeem_x::REDEEM_X_MAKER_1_EXPIRATION_MS.max(0) as u64,
-                        ))
-                        .await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(
+                                crate::redeem_x::REDEEM_X_MAKER_1_EXPIRATION_MS.max(0) as u64,
+                            )) => {}
+                            _ = cancel_notify.notified() => {}
+                        }
                         let cancel_request = CancelOrderRequest {
                             order_id: open_order_id.clone(),
                             timeout: Duration::from_secs(ORDER_HTTP_TIMEOUT_SEC),

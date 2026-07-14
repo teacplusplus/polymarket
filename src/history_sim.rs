@@ -368,6 +368,12 @@ pub struct OpenPosition {
     pub(crate) open_order_id: Option<String>,
     /// Taker BUY invoke: `None` до POST; затем [`InvokeSettlementWatch`] (`Some(report)` после колбэка).
     pub(crate) open_buy_invoke: Option<InvokeSettlementWatch>,
+    /// Сигнал открывающему redeem_x-cancel спавну ([`crate::account_submit::spawn_open_buy`])
+    /// отменить resting maker немедленно, не дожидаясь
+    /// [`crate::redeem_x::REDEEM_X_MAKER_1_EXPIRATION_MS`]: взводится при падении
+    /// best_bid этой ноги (WS → [`crate::project_manager::ProjectManager::ingest_snapshot`]
+    /// → frame-builder). Для не-redeem_x позиций не используется.
+    pub(crate) redeem_x_cancel_notify: Arc<tokio::sync::Notify>,
     pub(crate) maker_tp_position: Option<SharedClosingPosition>,
     /// Taker FAK SELL: по одной записи на каждый успешный invoke ([`crate::account_submit`]).
     pub(crate) taker_positions: Vec<SharedClosingPosition>,
@@ -2101,6 +2107,7 @@ fn open_position(
         pnl_top5_shap_at_open: pnl_top5_shap_at_open.to_string(),
         open_order_id: None,
         open_buy_invoke: None,
+        redeem_x_cancel_notify: Arc::new(tokio::sync::Notify::new()),
         maker_tp_position: None,
         taker_positions: Vec::new(),
         close_after_submit_finalized: false,

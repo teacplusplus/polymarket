@@ -23,14 +23,30 @@ use crate::xframe::{
 };
 use crate::xframe_dump;
 use anyhow::bail;
+use indexmap::IndexMap;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob;
 use polymarket_client_sdk::gamma;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::time::{self, Duration};
+
+/// Scope frame-build'а: `All` — регулярный секундный тик (перед рассылкой кадров
+/// отменяем свежие redeem_x-ордера всех рассылаемых ног), `AssetId` — реакция на
+/// падение best_bid конкретной ноги (отменяем только её ордер). Передаётся третьим
+/// параметром в [`ProjectManager::build_frames_from_buffer_lane_once`] — данные
+/// прокидываются без внешней shared-переменной.
+#[derive(Debug, Clone)]
+pub enum FrameBuildScope {
+    All,
+    AssetId(String),
+}
+
+/// Ёмкость broadcast-канала [`ProjectManager::frame_build_notify`]: буфер `asset_id`
+/// ног с упавшим best_bid между тиками frame-builder'а.
+const FRAME_BUILD_NOTIFY_CHANNEL_CAP: usize = 1024;
 
 type XFrameCell = Arc<RwLock<XFrame<SIZE>>>;
 type MarketFrames = HashMap<String, HashMap<String, BTreeMap<i64, XFrameCell>>>;
@@ -128,6 +144,17 @@ pub struct ProjectManager {
     pub market_ws_tx: mpsc::Sender<WsCommand>,
     pub xframe_interval_kind_by_asset_id: Arc<RwLock<HashMap<String, XFrameIntervalKind>>>,
     pub last_snapshot_by_asset_id: Arc<RwLock<HashMap<String, MarketSnapshot>>>,
+    /// L1 best_bid по `asset_id` на момент последнего frame-build («последний
+    /// отправленный»). Опора для реактивного досыла build при падении best_bid
+    /// внутри секундного окна: WS-снапшот в [`Self::ingest_snapshot`] сравнивает
+    /// свой bid с этой картой и, если он ниже, будит [`Self::frame_build_notify`].
+    /// Обновляется в конце [`Self::build_frames_from_buffer_lane_once`] после каждого build.
+    pub last_sent_best_bid_by_asset_id: Arc<RwLock<HashMap<String, f64>>>,
+    /// Канал внеочередного frame-build'а: несёт `asset_id` ноги, чей best_bid упал
+    /// внутри секунды (источник — WS, [`Self::ingest_snapshot`]). Аналог `Notify`, но
+    /// с payload — frame-builder ([`Self::run_frame_builder_loop`]) подписывается и
+    /// строит кадры со scope [`FrameBuildScope::AssetId`].
+    pub frame_build_notify: broadcast::Sender<String>,
     pub account: SharedAccount,
 }
 
@@ -187,6 +214,8 @@ impl ProjectManager {
             market_ws_tx,
             xframe_interval_kind_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
             last_snapshot_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
+            last_sent_best_bid_by_asset_id: Arc::new(RwLock::new(HashMap::new())),
+            frame_build_notify: broadcast::channel(FRAME_BUILD_NOTIFY_CHANNEL_CAP).0,
             account,
         });
 
@@ -433,6 +462,13 @@ impl ProjectManager {
             }
         }
         {
+            let mut last_sent_best_bid_by_asset_id =
+                self.last_sent_best_bid_by_asset_id.write().await;
+            for asset_id in &asset_ids {
+                last_sent_best_bid_by_asset_id.remove(asset_id);
+            }
+        }
+        {
             let mut slugs = self.slug_to_market_id.write().await;
             slugs.retain(|_, v| v != market_id);
         }
@@ -614,27 +650,112 @@ impl ProjectManager {
             let mut ws_buffer_by_market_lock = ws_buffer_by_market.write().await;
             ws_buffer_by_market_lock.push_snapshot(snapshot.clone());
         }
+        // Сравниваем merged WS best_bid с последним отправленным на build; при падении
+        // шлём `asset_id` в `frame_build_notify` — frame-builder сделает внеочередной
+        // build со scope `FrameBuildScope::AssetId` (источник bid — `update_last_snapshot` / WS).
+        {
+            const EPS: f64 = 1e-9;
+            let current_bid = {
+                let guard = self.last_snapshot_by_asset_id.read().await;
+                guard
+                    .get(&snapshot.asset_id)
+                    .and_then(|snapshot| snapshot.book_bid_l1_price)
+            };
+            if let Some(current_bid) = current_bid {
+                let dropped = {
+                    let guard = self.last_sent_best_bid_by_asset_id.read().await;
+                    guard
+                        .get(&snapshot.asset_id)
+                        .is_some_and(|&prev| current_bid + EPS < prev)
+                };
+                if dropped {
+                    let _ = self.frame_build_notify.send(snapshot.asset_id.clone());
+                }
+            }
+        }
         Ok(())
     }
 
     /// Спавнит цикл на каждый лейн: тик раз в `FRAME_BUILD_INTERVALS_SEC[i]` с.
+    /// Дополнительно слушает [`Self::frame_build_notify`]: падение best_bid внутри
+    /// секунды (WS → [`Self::ingest_snapshot`]) — отмена свежих redeem_x-ордеров и
+    /// внеочередной build.
     pub fn run_frame_builder_loop(self: Arc<Self>) {
         for lane in 0..FRAME_BUILD_INTERVALS_SEC.len() {
             let project_manager = self.clone();
+            let mut drop_rx = self.frame_build_notify.subscribe();
             tokio::spawn(async move {
                 let secs = FRAME_BUILD_INTERVALS_SEC[lane];
                 let mut interval = time::interval(Duration::from_secs(secs));
+                // Троттлинг notify-build'ов (best_bid drop) — на каждый asset_id
+                // отдельно: не чаще чем раз в 200мс и не более 2 раз в секунду.
+                // Регулярный тик (`All`) и Lagged-fallback не ограничиваем.
+                const NOTIFY_BUILD_MIN_GAP: Duration = Duration::from_millis(200);
+                const NOTIFY_BUILD_MAX_PER_SEC: usize = 2;
+                // На каждый активный asset_id — свой дек времён notify-build'ов;
+                // устаревшие (последний build > 1с назад) вычищаются по всей карте
+                // на каждом событии.
+                let mut recent_notify_builds: IndexMap<String, VecDeque<time::Instant>> =
+                    IndexMap::new();
                 loop {
-                    interval.tick().await;
-                    project_manager
-                        .build_frames_from_buffer_lane_once(lane)
-                        .await;
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            project_manager
+                                .build_frames_from_buffer_lane_once(lane, FrameBuildScope::All)
+                                .await;
+                        }
+                        recv = drop_rx.recv() => {
+                            let asset_id = match recv {
+                                Ok(asset_id) => asset_id,
+                                // Отстали от producer'а (буфер переполнен) — падений было
+                                // больше, чем успели обработать: делаем полный build без
+                                // per-asset троттлинга (asset_id тут неизвестен).
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    project_manager
+                                        .build_frames_from_buffer_lane_once(lane, FrameBuildScope::All)
+                                        .await;
+                                    continue;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            };
+                            let now = time::Instant::now();
+                            // Удаляем слишком старые asset_id (последний build > 1с назад)
+                            // по всей карте — несколько ног (2 рынка × up/down) активны
+                            // одновременно, поэтому чистим full-scan, а не только фронт,
+                            // чтобы карта не росла на отставленных (зарезолвленных) рынках.
+                            recent_notify_builds.retain(|_, ts| {
+                                ts.back()
+                                    .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(1))
+                            });
+                            // Троттлинг независимо на каждый активный asset_id.
+                            let builds = recent_notify_builds.entry(asset_id.clone()).or_default();
+                            while builds
+                                .front()
+                                .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(1))
+                            {
+                                builds.pop_front();
+                            }
+                            let too_soon = builds
+                                .back()
+                                .is_some_and(|t| now.duration_since(*t) < NOTIFY_BUILD_MIN_GAP);
+                            if too_soon || builds.len() >= NOTIFY_BUILD_MAX_PER_SEC {
+                                continue;
+                            }
+                            builds.push_back(now);
+                            project_manager
+                                .build_frames_from_buffer_lane_once(
+                                    lane,
+                                    FrameBuildScope::AssetId(asset_id),
+                                )
+                                .await;
+                        }
+                    }
                 }
             });
         }
     }
 
-    pub async fn build_frames_from_buffer_lane_once(&self, lane: usize) {
+    pub async fn build_frames_from_buffer_lane_once(&self, lane: usize, scope: FrameBuildScope) {
         let drained = {
             let mut buf = self.ws_buffer_by_market[lane].write().await;
             buf.drain_all()
@@ -976,6 +1097,27 @@ impl ProjectManager {
                         price_to_beat,
                         gamma_question,
                     };
+                    // Перед рассылкой кадра (воркер может открыть новый redeem_x-ордер)
+                    // отменяем старый ордер: при `All` — у каждой рассылаемой ноги, при
+                    // `AssetId` — только у ноги с упавшим best_bid («текущей»). Будим
+                    // открывающий redeem_x-cancel спавн через per-position
+                    // `redeem_x_cancel_notify`, чтобы он отменил resting maker немедленно.
+                    let cancel_current = match &scope {
+                        FrameBuildScope::All => true,
+                        FrameBuildScope::AssetId(asset_id) => *asset_id == entry.asset_id,
+                    };
+                    if cancel_current {
+                        let positions = self.account.positions.read().await;
+                        for lane_positions in positions.values() {
+                            for pos_arc in lane_positions.values() {
+                                let pos = pos_arc.read().await;
+                                if !pos.redeem_x || pos.asset_id != entry.asset_id {
+                                    continue;
+                                }
+                                pos.redeem_x_cancel_notify.notify_one();
+                            }
+                        }
+                    }
                     let _ = tx.send(lane_frame).await;
                 }
             }
@@ -987,6 +1129,18 @@ impl ProjectManager {
                 .or_insert_with(BTreeMap::new)
                 .insert(entry.aligned_ts, Arc::new(RwLock::new(entry.frame)));
             drop(xframes_by_market_lock);
+        }
+
+        // После build обновляем «последний отправленный» L1 best_bid по каждому
+        // `asset_id` из живого WS-кэша `last_snapshot_by_asset_id`.
+        {
+            let snapshots = self.last_snapshot_by_asset_id.read().await;
+            let mut sent = self.last_sent_best_bid_by_asset_id.write().await;
+            for (asset_id, snapshot) in snapshots.iter() {
+                if let Some(bid) = snapshot.book_bid_l1_price {
+                    sent.insert(asset_id.clone(), bid);
+                }
+            }
         }
     }
 
