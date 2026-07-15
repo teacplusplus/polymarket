@@ -37,10 +37,10 @@ const REDEEM_X_MIN_BID_SIZE_SHARES_BTC_5M: f64 = 50.0;
 /// переплату. Формат: `(верхняя граница fav [исключительно], потолок пары)`, отсортировано
 /// по возрастанию. Последний бакет ловит `fav → 1.0`. См. [`redeem_x_max_pair_price`].
 const REDEEM_X_PAIR_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
-    (0.60, 1.03),
-    (0.70, 1.08),
-    (0.80, 1.10),
-    (0.90, 1.12),
+    (0.60, 1.07),
+    (0.70, 1.11),
+    (0.80, 1.15),
+    (0.90, 1.19),
     (1.00, 1.22),
 ];
 
@@ -60,58 +60,156 @@ const REDEEM_X_BOOTSTRAP_CAP_BY_FAV_PROB: &[(f64, f64)] = &[
 ];
 
 /// Потолок цены пары для клипов, УЛУЧШАЮЩИХ гарантию (`pnl_guaranteed_improves`), по
-/// вероятности СВОЕЙ ноги `prob` (не фаворита пары). Калибровка по p90 бота-2: из 5476
-/// гарантию-улучшающих сделок пара, при которой бот их делает, растёт с уверенностью своей
-/// ноги — андердог/середина (prob<0.55) держится ~1.04–1.05, фаворит (prob≥0.8) добирает до
-/// p90≈1.20 (60% таких клипов у фаворита идут при паре > $1.0). Жёсткий хардкат `< 1.0`
-/// (v21) резал именно прибыльный докорм фаворита; здесь порог prob-масштабирован. Для
-/// андердога порог ≈1.0 душит переплату за пару на whipsaw-рынках (0xe0a950de, pair→1.08).
-/// Формат: `(верхняя граница prob своей ноги [исключительно], потолок пары)`, по возрастанию.
+/// вероятности СВОЕЙ ноги `prob` (не фаворита пары). Перекалибровка по p90 свежего отчёта
+/// бота-2 (869 гарантию-улучшающих сделок BTC 5m): пара, при которой бот их делает, растёт с
+/// уверенностью своей ноги — андердог/середина (prob<0.65) держится p90≈1.10–1.12, фаворит
+/// (prob≥0.8) добирает до p90≈1.20, а сильный фаворит (prob≥0.8..1.0) до ≈1.29. Прежние
+/// значения (1.04–1.06 в середине) душили именно прибыльный докорм. Формат:
+/// `(верхняя граница prob своей ноги [исключительно], потолок пары)`, по возрастанию.
 const REDEEM_X_GUAR_CAP_BY_OWN_PROB: &[(f64, f64)] = &[
-    (0.35, 1.06),
-    (0.45, 1.04),
-    (0.55, 1.05),
-    (0.65, 1.07),
-    (0.80, 1.11),
-    (1.00, 1.20),
+    (0.35, 1.10),
+    (0.45, 1.11),
+    (0.55, 1.12),
+    (0.65, 1.12),
+    (0.80, 1.20),
+    (1.00, 1.29),
 ];
 
 /// Потолок цены пары для клипов ЧИСТОГО ТИЛТА В ФАВОРИТА (`prob >= other_prob`, клип не
 /// улучшает гарантию и не опускает пару — просто перевес в вероятного победителя) по
-/// вероятности СВОЕЙ ноги. Калибровка по p90 бота-2 (1690 тилт-сделок): при prob>0.6
-/// более половины таких клипов бот делает при паре > $1.0 (у сильного фаворита prob≥0.9 —
-/// 72%, p90≈1.22). Хардкат `< 1.0` (v21/v22) резал именно этот прибыльный перевес в
-/// победителя. Формат: `(верхняя граница prob своей ноги [исключительно], потолок пары)`.
+/// вероятности СВОЕЙ ноги. Перекалибровка по p90 свежего отчёта бота-2 (361 тилт-сделка):
+/// у слабого фаворита (prob<0.6) бот осторожен — p90≈1.05 (прежние 1.10 были СВОБОДНЕЕ бота);
+/// с ростом уверенности коридор расширяется до p90≈1.18/1.20/1.25, у самого верха (prob→1.0)
+/// сходится к ≈1.22. Формат: `(верхняя граница prob своей ноги [исключительно], потолок пары)`.
 const REDEEM_X_TILT_CAP_BY_OWN_PROB: &[(f64, f64)] = &[
-    (0.60, 1.10),
-    (0.70, 1.14),
-    (0.80, 1.14),
-    (0.90, 1.13),
+    (0.60, 1.05),
+    (0.70, 1.18),
+    (0.80, 1.20),
+    (0.90, 1.25),
     (1.00, 1.22),
 ];
 
+/// Коридоры цены пары `[pair_min, pair_max)`, где направленный докорм ТЯЖЁЛОГО АНДЕРДОГА (своя
+/// нога дешевле чужой по prob, но после клипа перевешивает её по шерам) у бота-2 оказывается
+/// EV+, В ЗАВИСИМОСТИ от `prob` своей ноги И ВРЕМЕНИ до конца рынка. Перекалибровка по EV/шер
+/// на сетке prob×время (545 underdog-grow сделок отчёта BTC 5m):
+///   * докорм андердога — это ПОЗДНИЙ edge: у среднего андердога (prob 0.15–0.35) EV+ только
+///     при Trem<120s (цена перелетела, нога отскакивает), а рано он нулевой/минусовой;
+///   * ГЛУБОКИЙ андердог (prob<0.15) не плюсовой НИ в одном временном бакете (лучшая выборка,
+///     <60s, даёт −0.02 при winrate 18%) — поэтому НИГДЕ не входит в коридоры (нижняя граница
+///     prob≥0.15), и `find` его не подхватывает → срабатывает безусловный блок grows_heavy;
+///   * около-паритетный андердог (prob 0.35–0.50) плюсовой в любое время — он есть во всех
+///     бакетах.
+/// Итог: чем глубже андердог, тем ПОЗЖЕ он должен быть, чтобы окупаться (это чинит слив в
+/// deep-андердога сверх паритета, напр. UP@$0.03–0.16 при DOWN@0.98).
+/// Формат бакета: `(prob_lo [включ.], prob_hi [исключ.], pair_min, pair_max)`.
+type UnderdogBand = &'static [(f64, f64, f64, f64)];
+/// Ранняя/средняя фаза (Trem ≥ 180s): плюсовой только около-паритет.
+const REDEEM_X_UNDERDOG_BAND_EARLY: UnderdogBand = &[(0.35, 0.50, 0.85, 1.05)];
+/// Средняя фаза (120s ≤ Trem < 180s): мёртвая середина по EV — только около-паритет,
+/// мид-андердог 0.15–0.35 тут ≈0 EV, поэтому режем его как в early.
+const REDEEM_X_UNDERDOG_BAND_MID: UnderdogBand = &[(0.35, 0.50, 0.90, 1.05)];
+/// Поздняя фаза (Trem < 120s): широкий late-edge для среднего андердога, но без deep<0.15.
+const REDEEM_X_UNDERDOG_BAND_LATE: UnderdogBand = &[(0.15, 0.50, 0.80, 1.10)];
+
+/// Коридоры underdog-grow для данного остатка времени рынка (лесенка как у
+/// [`redeem_x_max_pnl_diff_frac`]).
+fn redeem_x_underdog_band(event_remaining_ms: i64) -> UnderdogBand {
+    if event_remaining_ms >= 180_000 {
+        REDEEM_X_UNDERDOG_BAND_EARLY
+    } else if event_remaining_ms >= 120_000 {
+        REDEEM_X_UNDERDOG_BAND_MID
+    } else {
+        REDEEM_X_UNDERDOG_BAND_LATE
+    }
+}
+
+/// Разрешён ли направленный докорм тяжёлого андердога: своя нога — андердог
+/// (`prob < other_prob`) И `projected_pair_price` попадает в prob-зависимый коридор для текущей
+/// фазы рынка (см. [`redeem_x_underdog_band`]). Все параметры через логическое И. Для не-андердога
+/// (`prob >= other_prob`) — всегда `false` (эта ветка про тилт в фаворита, не сюда). Глубокий
+/// андердог (prob<0.15) не попадает ни в один коридор → всегда `false`.
+fn redeem_x_underdog_directional_ok(
+    prob: f64,
+    other_prob: f64,
+    projected_pair_price: f64,
+    event_remaining_ms: i64,
+) -> bool {
+    prob < other_prob
+        && redeem_x_underdog_band(event_remaining_ms)
+            .iter()
+            .find(|(prob_lo, prob_hi, _, _)| *prob_lo <= prob && prob < *prob_hi)
+            .is_some_and(|(_, _, pair_min, pair_max)| {
+                (*pair_min..*pair_max).contains(&projected_pair_price)
+            })
+}
+
 /// Порог ДЕШЁВОЙ маржинальной пары: `maker_price + other_avg` (почём прямо сейчас докупается
-/// своя нога против средней чужой). Ниже порога грузим крупнее ([`REDEEM_X_CHEAP_PAIR_CLIP_MULT`]):
+/// своя нога против средней чужой). Ниже порога грузим крупнее ([`redeem_x_cheap_pair_clip_mult`]):
 /// в стакане такие окна редки (1–9% времени по xframes 40 общих рынков, медиана пары бидов
 /// ≈0.99), а именно на них бот-2 собирает свои крупные плюсы (pair 0.70–0.86 → +$116…+$257;
 /// у него это много клипов подряд в провал, у нас с фикс-клипом 5 — эквивалент через размер).
 const REDEEM_X_CHEAP_PAIR_THRESHOLD: f64 = 0.95;
-/// Множитель клипа в окне дешёвой пары: 5 → 15 шер.
-const REDEEM_X_CHEAP_PAIR_CLIP_MULT: f64 = 3.0;
+/// Диапазон множителя клипа в окне дешёвой пары (нижняя = прежний фикс ×3, верхняя ×7):
+/// вместо жёсткого ×3 подбираем максимальный размер, который ещё улучшает гарантию и
+/// держит её положительной (см. [`redeem_x_cheap_pair_clip_mult`]).
+const REDEEM_X_CHEAP_PAIR_CLIP_MULT_MIN: f64 = 3.0;
+const REDEEM_X_CHEAP_PAIR_CLIP_MULT_MAX: f64 = 7.0;
+/// Шаг перебора множителя от MAX к MIN.
+const REDEEM_X_CHEAP_PAIR_CLIP_MULT_STEP: f64 = 0.5;
+
+/// Подбирает множитель клипа в окне дешёвой пары в диапазоне
+/// [`REDEEM_X_CHEAP_PAIR_CLIP_MULT_MIN`]..=[`REDEEM_X_CHEAP_PAIR_CLIP_MULT_MAX`]: берём
+/// **наибольший** размер, при котором докуп ещё улучшает гарантию
+/// (`guaranteed_after > guaranteed_before`) и держит её строго положительной
+/// (`guaranteed_after > 0`). Гарантия `min(own,other) − затраты` вогнута по размеру клипа
+/// (растёт, пока догоняем лёгкую ногу, падает после паритета шеров), поэтому перебор идёт
+/// от MAX к MIN и возвращает первый проходящий множитель. Если ни один не даёт
+/// положительной улучшающейся гарантии — откатываемся к MIN (прежнее ×3-поведение;
+/// нижележащие гейты сами отклонят клип, если он вредит паритету/разбегу).
+fn redeem_x_cheap_pair_clip_mult(
+    base_clip: f64,
+    maker_price: f64,
+    own_shares: f64,
+    own_cost: f64,
+    other_shares: f64,
+    other_cost: f64,
+) -> f64 {
+    let guaranteed_before = own_shares.min(other_shares) - (own_cost + other_cost);
+    let mut mult = REDEEM_X_CHEAP_PAIR_CLIP_MULT_MAX;
+    while mult >= REDEEM_X_CHEAP_PAIR_CLIP_MULT_MIN {
+        let clip = base_clip * mult;
+        let clip_cost = clip * maker_price;
+        let guaranteed_after =
+            (own_shares + clip).min(other_shares) - (own_cost + other_cost + clip_cost);
+        if guaranteed_after > guaranteed_before && guaranteed_after > 0.0 {
+            return mult;
+        }
+        mult -= REDEEM_X_CHEAP_PAIR_CLIP_MULT_STEP;
+    }
+    REDEEM_X_CHEAP_PAIR_CLIP_MULT_MIN
+}
 
 /// Лестница допуска разбега ног `pnl_diff_after` (|выплата своей ноги − выплата чужой| =
 /// |own_shares + clip − other_shares|) как доля суммарно вложенных USDC обеих ног.
-/// Калибровка по p90 бота 2 (287 рынков BTC 5m, обе ноги уже открыты): в ранней фазе набора
-/// разбег может превышать вложенное (~1.8×, одна нога стартует раньше), к T-180s сходится
-/// к ~1×. От `pair` разбег НЕ зависит (r=+0.00), только от времени. Блокируются лишь клипы,
-/// РАСТЯЩИЕ разбег сверх допуска; сокращающие разбег проходят всегда.
+/// Калибровка по p90 бота 2 (свежий отчёт BTC 5m, 1984 сделки): разбег/вложенное сильно
+/// зависит от времени (r=+0.51) — рано (набор ног) допускается до ~2.4× вложенного (одна нога
+/// стартует раньше), к резолюции сходится к ~0.7×. От `prob` НЕ зависит (r=−0.04). Мнимая
+/// корреляция с `pair` (сырой r=−0.71) — это конфаунд со временем: низкий pair = ранняя
+/// соло-фаза; при pair≥0.85 разбег ровный ~1× вне зависимости от пары, поэтому в формулу
+/// входит только время. Блокируются лишь клипы, РАСТЯЩИЕ разбег сверх допуска; сокращающие
+/// разбег проходят всегда.
 fn redeem_x_max_pnl_diff_frac(event_remaining_ms: i64) -> f64 {
     if event_remaining_ms >= 240_000 {
-        1.8
+        2.4
     } else if event_remaining_ms >= 180_000 {
+        2.1
+    } else if event_remaining_ms >= 120_000 {
         1.25
+    } else if event_remaining_ms >= 60_000 {
+        0.9
     } else {
-        1.0
+        0.7
     }
 }
 
@@ -123,13 +221,20 @@ fn redeem_x_max_pnl_diff_frac(event_remaining_ms: i64) -> f64 {
 /// (BTC 5m 2026-07-03 02:45 UTC). `None` — кэп выключен. Значение подобрано под
 /// `INITIAL_BANKROLL≈500` (в healthy-прогоне медиана оборота/рынок ≈ $75, max ≈ $200).
 const REDEEM_X_MAX_MARKET_EXPOSURE_USD: Option<f64> = Some(300.0);
+/// Множитель жёсткого потолка экспозиции для клипов, улучшающих гарантию. Клип пускаем поверх
+/// [`REDEEM_X_MAX_MARKET_EXPOSURE_USD`] только если он строго повышает безрисковый пол
+/// `guaranteed = min(own_sh, other_sh) − (own_cost + other_cost)` И держит его положительным
+/// (`guaranteed_after > guaranteed_before && guaranteed_after > 0`) — та же гарантия, что и в
+/// [`redeem_x_cheap_pair_clip_mult`]. Такой клип не может увеличить директный убыток окна, он лишь
+/// докладывает безрисковую прибыль. Всё остальное (тилт, докорм при pair>1 и т.п.) режется по
+/// обычному кэпу. Бэкстоп: не дальше `cap * MULT`, даже если гарантия растёт.
+const REDEEM_X_MAX_MARKET_EXPOSURE_HARD_MULT: f64 = 2.0;
 /// Потолок вложенных USDC в ОДИНОКУЮ ногу (партнёр ещё пуст, `other_shares == 0`). Пока
 /// `own_cost < X` — андердогу разрешено набирать дешёвую базу в ожидании партнёра; как только
 /// вложено ≥ X, докорм соло-ноги блокируется (см. solo-leg gate). Ограничивает максимальный
 /// директональный убыток окна, где партнёр так и не встал (цена убежала, пара > cap): вместо
 /// слива всей ноги (−$64 на 0x321edc92) теряем не больше ~X. `0.0` ⇒ открывается ровно один клип.
 const REDEEM_X_MIN_PNL: f64 = -15.0;
-const REDEEM_X_MAX_PNL: f64 = 15.0;
 /// Fallback-«время сделки» maker-входа REDEEM_X, когда `open_buy_invoke.report.landed_at
 /// == None` (см. [`redeem_x_leg_scan`]). Сам ордер теперь GTC — истечение делается явным
 /// cancel'ом, а не GTD-`expiration`, поэтому TTL-константы для постановки больше нет.
@@ -186,7 +291,14 @@ pub(crate) async fn redeem_x_entry_size(
     if other_shares > 0.0 {
         let other_avg = other_cost / other_shares;
         if maker_price + other_avg < REDEEM_X_CHEAP_PAIR_THRESHOLD {
-            clip *= REDEEM_X_CHEAP_PAIR_CLIP_MULT;
+            clip *= redeem_x_cheap_pair_clip_mult(
+                clip,
+                maker_price,
+                own_shares,
+                own_cost,
+                other_shares,
+                other_cost,
+            );
         }
     }
 
@@ -266,29 +378,34 @@ pub(crate) async fn redeem_x_entry_size(
         // Тяжёлой ногой (сверх паритета шеров) может быть только текущий фаворит.
         // Временное послабление (пропуск раннего докорма андердога, T>60s) в v15 вернуло
         // v13-сценарий: андердог по ~0.12 переходил паритет и сгорал (−$4.5/рынок против
-        // −$1.4 у безусловного блока). У бота ранний андердог EV+, но на мок-исполнении
-        // (buy at best_bid) этот edge не воспроизводится — блокируем безусловно.
-        let grows_heavy_underdog = prob < other_prob && own_shares + clip > other_shares;
+        // −$1.4 у безусловного блока). Поэтому докорм тяжёлого андердога разрешён НЕ везде,
+        // а только в prob-зависимом коридоре пары (см. [`redeem_x_underdog_directional_ok`] /
+        // [`REDEEM_X_UNDERDOG_PAIR_BAND_BY_PROB`]) — вне коридора прежний безусловный блок.
+        let underdog_directional_ok = redeem_x_underdog_directional_ok(
+            prob,
+            other_prob,
+            projected_pair_price,
+            frame.event_remaining_ms,
+        );
+        let grows_heavy_underdog =
+            prob < other_prob && own_shares + clip > other_shares && !underdog_directional_ok;
         let blocked_reason = if grows_heavy_underdog {
             Some("grows heavy underdog (за паритет — только фаворит)")
         } else {
             if projected_pair_price < max_pair_price {
-                if guaranteed_after > REDEEM_X_MAX_PNL {
-                    Some("guaranteed_after > REDEEM_X_MAX_PNL")
+                if pnl_after < REDEEM_X_MIN_PNL {
+                    Some("pnl_after < REDEEM_X_MIN_PNL")
                 } else {
-                    if pnl_after < REDEEM_X_MIN_PNL {
-                        Some("pnl_after < REDEEM_X_MIN_PNL")
+                    if (pnl_guaranteed_improves
+                        && projected_pair_price < redeem_x_guar_cap(prob))
+                        || lowers_pair
+                        || (prob >= other_prob
+                            && projected_pair_price < redeem_x_tilt_cap(prob))
+                        || underdog_directional_ok
+                    {
+                        None
                     } else {
-                        if (pnl_guaranteed_improves
-                            && projected_pair_price < redeem_x_guar_cap(prob))
-                            || lowers_pair
-                            || (prob >= other_prob
-                                && projected_pair_price < redeem_x_tilt_cap(prob))
-                        {
-                            None
-                        } else {
-                            Some("!pnl_guaranteed_improves && !lowers_pair && !favorite")
-                        }
+                        Some("!pnl_guaranteed_improves && !lowers_pair && !favorite")
                     }
                 }
             } else {
@@ -376,20 +493,36 @@ pub(crate) async fn redeem_x_entry_size(
         let current_exposure = own_cost + other_cost;
         let projected_exposure = current_exposure + clip_cost;
         if projected_exposure > max_market_exposure {
-            crate::tee_println!(
-                "[redeem_x] skip market-exposure gate market_id={} asset_id={} current={:.2} +clip={:.2} projected={:.2} > cap={:.2} (own_cost={:.2} sib_cost={:.2} clip={:.2} price={:.4})",
-                frame.market_id,
-                frame.asset_id,
-                current_exposure,
-                clip_cost,
-                projected_exposure,
-                max_market_exposure,
-                own_cost,
-                other_cost,
-                clip,
-                maker_price,
-            );
-            return None;
+            // Поверх кэпа пускаем ТОЛЬКО клип, который строго улучшает безрисковый пол и держит
+            // его положительным (`guaranteed_after > guaranteed_before && guaranteed_after > 0`) —
+            // такой докуп не увеличивает директный убыток, а докладывает гарантированную прибыль.
+            // `guaranteed_before`/`guaranteed_after` уже посчитаны выше по функции. Бэкстоп —
+            // жёсткий потолок `cap * HARD_MULT`.
+            let improves_guarantee =
+                guaranteed_after > guaranteed_before && guaranteed_after > 0.0;
+            let hard_ceiling = max_market_exposure * REDEEM_X_MAX_MARKET_EXPOSURE_HARD_MULT;
+            if !improves_guarantee || projected_exposure > hard_ceiling {
+                crate::tee_println!(
+                    "[redeem_x] skip market-exposure gate market_id={} asset_id={} current={:.2} +clip={:.2} projected={:.2} > cap={:.2} guar_before={:.2} guar_after={:.2} improves={} hard_ceiling={:.2} (own_cost={:.2} sib_cost={:.2} own_sh={:.2} other_sh={:.2} clip={:.2} price={:.4})",
+                    frame.market_id,
+                    frame.asset_id,
+                    current_exposure,
+                    clip_cost,
+                    projected_exposure,
+                    max_market_exposure,
+                    guaranteed_before,
+                    guaranteed_after,
+                    improves_guarantee,
+                    hard_ceiling,
+                    own_cost,
+                    other_cost,
+                    own_shares,
+                    other_shares,
+                    clip,
+                    maker_price,
+                );
+                return None;
+            }
         }
     }
 

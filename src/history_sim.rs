@@ -44,7 +44,7 @@ pub const SIM_RESOLUTION_BUY_THRESHOLD: f32 = 0.60;
 pub const SIM_MAX_SLIPPAGE_FROM_L1_PCT: f64 = 0.02;
 
 /// Стартовый банкролл (USDC).
-pub const INITIAL_BANKROLL: f64 = 500.0;
+pub const INITIAL_BANKROLL: f64 = 5000.0;
 /// Доля Kelly (<1 — fractional).
 pub const KELLY_MULTIPLIER: f64 = 0.1;
 /// Max доля банкролла на сделку.

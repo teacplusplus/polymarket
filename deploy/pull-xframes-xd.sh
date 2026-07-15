@@ -3,6 +3,7 @@
 # с удалённого сервера.
 #   DAYS                — сколько последних суток тянуть по mtime на remote
 #                         (по умолчанию 2: последние 48 часов)
+#   COIN                — опционально: тянуть только одну монету, например btc
 #   FETCH_REMOTE        — хост (по умолчанию root@204.13.237.94)
 #   REMOTE_XFRAMES_DIR  — путь на сервере (по умолчанию /home/poly/xframes)
 #   REMOTE_GRAPH_DIR    — путь graph на сервере (по умолчанию sibling к REMOTE_XFRAMES_DIR)
@@ -15,6 +16,7 @@
 # Запускайте откуда угодно, например:
 #   bash deploy/pull-xframes-xd.sh
 #   DAYS=3 bash deploy/pull-xframes-xd.sh
+#   DAYS=1 COIN=btc bash deploy/pull-xframes-xd.sh
 
 set -euo pipefail
 
@@ -24,10 +26,19 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REMOTE="${FETCH_REMOTE:-root@204.13.237.94}"
 REMOTE_XFRAMES_DIR="${REMOTE_XFRAMES_DIR:-/home/poly/xframes}"
 DAYS="${DAYS:-2}"
+COIN="${COIN:-}"
 
 if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || [[ "$DAYS" -lt 1 ]]; then
   echo "[fetch-xframes-xd] DAYS must be a positive integer, got: $DAYS" >&2
   exit 2
+fi
+
+if [[ -n "$COIN" ]]; then
+  COIN="${COIN,,}"
+  if ! [[ "$COIN" =~ ^[a-z0-9_-]+$ ]]; then
+    echo "[fetch-xframes-xd] COIN must contain only [a-z0-9_-], got: $COIN" >&2
+    exit 2
+  fi
 fi
 
 sibling_dir() {
@@ -94,8 +105,13 @@ fetch_recent_tree() {
   list_file="$(mktemp)"
   TMP_FILES+=("$list_file")
 
-  echo "[fetch-${label}-xd] build remote file-list: ${REMOTE}:${remote_dir}/ newer than ${MINUTES}m"
-  ssh "$REMOTE" "cd \"$remote_dir\" && find . -type f -mmin -$MINUTES -print | LC_ALL=C sort" > "$list_file"
+  if [[ -n "$COIN" ]]; then
+    echo "[fetch-${label}-xd] build remote file-list: ${REMOTE}:${remote_dir}/${COIN}/ newer than ${MINUTES}m"
+    ssh "$REMOTE" "cd \"$remote_dir\" && if [ -d \"./$COIN\" ]; then find \"./$COIN\" -type f -mmin -$MINUTES -print | LC_ALL=C sort; fi" > "$list_file"
+  else
+    echo "[fetch-${label}-xd] build remote file-list: ${REMOTE}:${remote_dir}/ newer than ${MINUTES}m"
+    ssh "$REMOTE" "cd \"$remote_dir\" && find . -type f -mmin -$MINUTES -print | LC_ALL=C sort" > "$list_file"
+  fi
 
   count="$(wc -l < "$list_file" | tr -d ' ')"
   echo "[fetch-${label}-xd] files: $count"
